@@ -1,0 +1,264 @@
+import { join } from 'node:path';
+
+import type { ConfirmedSteamMatch } from '@vaulttrack/shared-types';
+import {
+  app,
+  BrowserWindow,
+  Menu,
+  Notification,
+  Tray,
+  dialog,
+  ipcMain,
+  nativeImage,
+  safeStorage,
+  shell,
+} from 'electron';
+
+import { VaultTrackDatabase } from './services/database.js';
+import { NativeBridgeServer } from './services/bridge.js';
+import { MyJDownloaderService } from './services/myjdownloader.js';
+import { VaultTrackScheduler } from './services/scheduler.js';
+import { VaultTrackService } from './services/vaulttrack-service.js';
+
+let mainWindow: BrowserWindow | null = null;
+let tray: Tray | null = null;
+let bridge: NativeBridgeServer | null = null;
+let scheduler: VaultTrackScheduler | null = null;
+let quitting = false;
+const backgroundLaunch = process.argv.includes('--background');
+
+function createTrayIcon() {
+  return nativeImage.createFromDataURL(
+    'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAQAAAC1+jfqAAAAQ0lEQVR42mNgoBAwUqifgYGB4T8Ghv9nYGBg2I8BikETMVE2zMDA8J+BgYHhPwMDA1NkYGBgYOBfYo0JjIEYBhaGAQDxLA9aP42gnQAAAABJRU5ErkJggg==',
+  );
+}
+
+function getRendererUrl() {
+  return join(__dirname, '..', 'renderer', 'index.html');
+}
+
+function createWindow(options?: { showOnReady?: boolean }) {
+  if (mainWindow) {
+    return mainWindow;
+  }
+
+  mainWindow = new BrowserWindow({
+    backgroundColor: '#f4efe5',
+    height: 840,
+    show: false,
+    title: 'VaultTrack',
+    webPreferences: {
+      contextIsolation: true,
+      preload: join(__dirname, 'preload.cjs'),
+    },
+    width: 1280,
+  });
+  void mainWindow.loadFile(getRendererUrl());
+
+  mainWindow.on('close', (event) => {
+    if (!quitting) {
+      event.preventDefault();
+      mainWindow?.hide();
+    }
+  });
+
+  if (options?.showOnReady) {
+    mainWindow.once('ready-to-show', () => {
+      mainWindow?.show();
+      mainWindow?.focus();
+    });
+  }
+
+  return mainWindow;
+}
+
+async function bootstrap() {
+  app.setAppUserModelId('VaultTrack');
+  if (!app.requestSingleInstanceLock()) {
+    app.quit();
+    return;
+  }
+  app.on('second-instance', (_event, argv) => {
+    if (argv.includes('--background')) {
+      return;
+    }
+    const window = createWindow({ showOnReady: true });
+    window.show();
+    window.focus();
+  });
+
+  await app.whenReady();
+  createWindow({ showOnReady: !backgroundLaunch });
+
+  const userDataPath = app.getPath('userData');
+  const database = await VaultTrackDatabase.open(
+    join(userDataPath, 'vaulttrack.sqlite'),
+    join(__dirname, 'sql-wasm.wasm'),
+  );
+
+  const serviceRef: { current: VaultTrackService | null } = { current: null };
+  const myJDownloader = new MyJDownloaderService(async () => {
+    if (!serviceRef.current) {
+      throw new Error('VaultTrack service is not initialized.');
+    }
+    return serviceRef.current.getMyJDownloaderCredentials();
+  });
+  const service = new VaultTrackService(
+    database,
+    myJDownloader,
+    {
+      decrypt(text) {
+        return safeStorage.decryptString(Buffer.from(text, 'base64'));
+      },
+      encrypt(text) {
+        if (!safeStorage.isEncryptionAvailable()) {
+          throw new Error('safeStorage encryption is not available');
+        }
+        return safeStorage.encryptString(text).toString('base64');
+      },
+    },
+    (level, message) => {
+      if (level === 'info') {
+        return;
+      }
+      new Notification({
+        body: message,
+        title: level === 'error' ? 'VaultTrack Error' : 'VaultTrack',
+      }).show();
+    },
+    () => {
+      createWindow({ showOnReady: true }).show();
+      createWindow({ showOnReady: true }).focus();
+    },
+    async () => {
+      const result = await dialog.showOpenDialog(createWindow(), {
+        properties: ['openDirectory'],
+      });
+      return result.canceled ? null : (result.filePaths[0] ?? null);
+    },
+  );
+  serviceRef.current = service;
+
+  bridge = new NativeBridgeServer(service);
+  await bridge.start();
+
+  scheduler = new VaultTrackScheduler(service);
+  scheduler.start();
+
+  tray = new Tray(createTrayIcon());
+  tray.setToolTip('VaultTrack');
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      {
+        click: () => {
+          createWindow().show();
+          createWindow().focus();
+        },
+        label: 'Open VaultTrack',
+      },
+      {
+        click: () => {
+          quitting = true;
+          app.quit();
+        },
+        label: 'Quit',
+      },
+    ]),
+  );
+  tray.on('double-click', () => {
+    createWindow().show();
+    createWindow().focus();
+  });
+
+  ipcMain.handle('vault:listTrackedItems', () => service.listTrackedItems());
+  ipcMain.handle('vault:getConnectionHealth', () =>
+    service.getConnectionHealth(),
+  );
+  ipcMain.handle('vault:getSettings', () => service.getSettings());
+  ipcMain.handle('vault:authenticateMyJDownloader', (_event, payload) =>
+    service.authenticateMyJDownloader(payload.email, payload.password),
+  );
+  ipcMain.handle('vault:disconnectMyJDownloader', () =>
+    service.disconnectMyJDownloader(),
+  );
+  ipcMain.handle('vault:saveSettings', (_event, payload) =>
+    service.saveSettings(payload),
+  );
+  ipcMain.handle('vault:scanImportFolders', (_event, rootLibraryPath: string) =>
+    service.importRootLibrary(rootLibraryPath),
+  );
+  ipcMain.handle('vault:updateInstallRecord', (_event, payload) =>
+    service.updateInstallRecord(payload),
+  );
+  ipcMain.handle('vault:resolveSteamMatch', (_event, payload) =>
+    service.resolveSteamMatch(
+      payload.title,
+      'manual',
+      null,
+      payload.queryTitle ?? null,
+    ),
+  );
+  ipcMain.handle('vault:resolveSteamPatches', (_event, payload) =>
+    service.resolveSteamPatches(payload.appId),
+  );
+  ipcMain.handle(
+    'vault:applySteamMatch',
+    (_event, payload: { trackedItemId: string; match: ConfirmedSteamMatch }) =>
+      service.applySteamMatch(payload.trackedItemId, payload.match),
+  );
+  ipcMain.handle('vault:refreshTrackedItem', (_event, trackedItemId: string) =>
+    service.refreshTrackedItem(trackedItemId),
+  );
+  ipcMain.handle('vault:retryDownload', (_event, trackedItemId: string) =>
+    service.retryDownload(trackedItemId),
+  );
+  ipcMain.handle(
+    'vault:retryDownloadWithSelection',
+    (_event, payload: { selectedDownloads?: unknown; trackedItemId: string }) =>
+      service.retryDownload(
+        payload.trackedItemId,
+        payload.selectedDownloads as {
+          fullUrl: string;
+          patchUrl?: string | null;
+        } | undefined,
+      ),
+  );
+  ipcMain.handle('vault:markDownloadFailed', (_event, trackedItemId: string) =>
+    service.markDownloadFailed(trackedItemId),
+  );
+  ipcMain.handle(
+    'vault:clearDownloadMirrorFailed',
+    (_event, payload: { trackedItemId: string; url: string }) =>
+      service.markDownloadMirrorFailed(payload.trackedItemId, payload.url, false),
+  );
+  ipcMain.handle(
+    'vault:completeStagedInstall',
+    (_event, trackedItemId: string) =>
+      service.completeStagedInstall(trackedItemId),
+  );
+  ipcMain.handle('vault:removeTrackedItem', (_event, payload) =>
+    service.removeTrackedItem(payload),
+  );
+  ipcMain.handle(
+    'vault:selectMyJDownloaderDevice',
+    (_event, deviceId: string) => service.selectMyJDownloaderDevice(deviceId),
+  );
+  ipcMain.handle('vault:getLogs', () => service.getLogs());
+  ipcMain.handle('vault:pickDirectory', () => service.pickDirectory());
+  ipcMain.handle('vault:openExternal', (_event, target: string) =>
+    shell.openExternal(target),
+  );
+  ipcMain.handle('vault:openDesktop', (_event, trackedItemId?: string) =>
+    service.openDesktop(trackedItemId),
+  );
+
+  app.on('activate', () => {
+    createWindow({ showOnReady: true }).show();
+  });
+  app.on('before-quit', () => {
+    quitting = true;
+    scheduler?.stop();
+  });
+}
+
+void bootstrap();

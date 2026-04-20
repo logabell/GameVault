@@ -1,0 +1,10 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/shared-types" },
+    { "path": "./packages/source-core" },
+    { "path": "./packages/steam-core" },
+    { "path": "./apps/desktop" },
+    { "path": "./apps/extension" }
+  ]
+}

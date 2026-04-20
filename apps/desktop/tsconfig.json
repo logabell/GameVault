@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "declaration": true,
+    "declarationMap": true,
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "references": [
+    { "path": "../../packages/shared-types" },
+    { "path": "../../packages/source-core" },
+    { "path": "../../packages/steam-core" }
+  ],
+  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts"]
+}

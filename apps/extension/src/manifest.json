@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "VaultTrack",
+  "version": "0.1.0",
+  "description": "Add supported game pages to VaultTrack and monitor library status.",
+  "permissions": ["activeTab", "nativeMessaging", "scripting", "storage", "tabs"],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "https://elamigos.site/*",
+    "https://steamrip.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://elamigos.site/data/*.html",
+        "https://steamrip.com/*-free-download/*",
+        "https://steamrip.com/*-free-download"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "name": "@vaulttrack/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/main/index.cjs",
+  "scripts": {
+    "build": "npm run build --workspace @vaulttrack/shared-types && npm run build --workspace @vaulttrack/source-core && npm run build --workspace @vaulttrack/steam-core && node ./scripts/build.mjs",
+    "dev": "npm run build && electron .",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@vaulttrack/shared-types": "0.1.0",
+    "@vaulttrack/source-core": "0.1.0",
+    "@vaulttrack/steam-core": "0.1.0",
+    "electron": "^41.2.1",
+    "jdownloader-connect": "^1.0.8",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "sql.js": "^1.14.1"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "declaration": true,
+    "declarationMap": true,
+    "noEmit": true,
+    "rootDir": ".",
+    "types": ["chrome", "node"]
+  },
+  "references": [
+    { "path": "../../packages/shared-types" },
+    { "path": "../../packages/source-core" }
+  ],
+  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts"]
+}

@@ -1,0 +1,12 @@
+node_modules
+dist
+coverage
+.tmp
+*.log
+*.tsbuildinfo
+packages/*/tests/*.test.js
+packages/*/tests/*.test.d.ts
+packages/*/tests/*.test.d.ts.map
+apps/desktop/.vite
+apps/extension/.cache
+apps/desktop/dev-data
