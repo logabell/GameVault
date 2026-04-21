@@ -125,6 +125,12 @@ export class NativeBridgeServer {
             ),
             type: request.type,
           };
+        case 'updateSourcePatch':
+          return {
+            ok: true,
+            payload: await this.service.updateSourcePatch(request.payload),
+            type: request.type,
+          };
         case 'markDownloadFailed':
           return {
             ok: true,

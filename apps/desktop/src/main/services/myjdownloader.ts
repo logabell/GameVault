@@ -152,7 +152,7 @@ interface ArchiveSettingsPayload {
 const MYJD_API_ENDPOINT = 'https://api.jdownloader.org';
 const MYJD_APP_KEY = 'VaultTrack';
 const MYJD_API_VERSION = 1;
-const MYJD_TIMEOUT_MS = 10000;
+const MYJD_TIMEOUT_MS = 30000;
 const HEALTH_CACHE_TTL_MS = 15 * 1000;
 const LINK_CRAWLER_RESOLVE_TIMEOUT_MS = 12 * 1000;
 const LINK_CRAWLER_RESOLVE_POLL_MS = 500;
@@ -185,6 +185,23 @@ function withTimeout<T>(
       },
     );
   });
+}
+
+function normalizeMyJDownloaderEmail(email: string): string {
+  return email.trim().toLowerCase();
+}
+
+function normalizeMyJDownloaderError(error: unknown): Error {
+  const message =
+    error instanceof Error
+      ? error.message
+      : 'Unable to connect to MyJDownloader.';
+  if (/^403:\s*Forbidden$/i.test(message)) {
+    return new Error(
+      'MyJDownloader rejected the email or password (403 Forbidden). Check your MyJDownloader login and try again.',
+    );
+  }
+  return error instanceof Error ? error : new Error(message);
 }
 
 function normalizeDevice(
@@ -265,7 +282,9 @@ function usesSharedElamigosContainer(
     return false;
   }
 
-  const urls = new Set(requests.map((request) => normalizeQueueUrl(request.url)));
+  const urls = new Set(
+    requests.map((request) => normalizeQueueUrl(request.url)),
+  );
   return urls.size === 1;
 }
 
@@ -535,7 +554,7 @@ class MyJDownloaderRawClient implements MyJDownloaderClient {
   private sessionPromise: Promise<RawSession> | null = null;
 
   private buildSessionKey(email: string, password: string): string {
-    return `${email.toLowerCase()}\n${password}`;
+    return `${normalizeMyJDownloaderEmail(email)}\n${password}`;
   }
 
   private nextRid(session: RawSession): number {
@@ -581,7 +600,7 @@ class MyJDownloaderRawClient implements MyJDownloaderClient {
   }
 
   private async connect(email: string, password: string): Promise<RawSession> {
-    const normalizedEmail = email.toLowerCase();
+    const normalizedEmail = normalizeMyJDownloaderEmail(email);
     const loginSecret = await sha256ByString(
       `${normalizedEmail}${password}server`,
     );
@@ -787,10 +806,17 @@ export class MyJDownloaderService {
     password: string;
     selectedDeviceId?: string | null;
   }): Promise<MyJDownloaderConnectionSnapshot> {
-    const devices = await this.rawClient.listDevices(
-      params.email,
-      params.password,
-    );
+    const email = normalizeMyJDownloaderEmail(params.email);
+    if (!email || !params.password) {
+      throw new Error('Enter your MyJDownloader email and password first.');
+    }
+
+    let devices: RawDeviceInfo[];
+    try {
+      devices = await this.rawClient.listDevices(email, params.password);
+    } catch (error) {
+      throw normalizeMyJDownloaderError(error);
+    }
     const selectedDeviceId =
       params.selectedDeviceId &&
       devices.some((device) => device.id === params.selectedDeviceId)
@@ -1223,10 +1249,7 @@ export class MyJDownloaderService {
             ...params,
             packageIds,
           });
-          const filteredLinks = filterCrawledLinksForRole(
-            packageLinks,
-            role,
-          );
+          const filteredLinks = filterCrawledLinksForRole(packageLinks, role);
           const linkIds = filteredLinks
             .map((link) => link.uuid)
             .filter((uuid): uuid is number => typeof uuid === 'number');
@@ -1808,7 +1831,10 @@ export class MyJDownloaderService {
   }): Promise<void> {
     const device = await this.getSelectedDevice();
     const downloadPackageIds = new Set<number>();
-    const packageNames = new Set([params.packageName, ...(params.packageNames ?? [])]);
+    const packageNames = new Set([
+      params.packageName,
+      ...(params.packageNames ?? []),
+    ]);
 
     if (params.packageId != null) {
       downloadPackageIds.add(params.packageId);

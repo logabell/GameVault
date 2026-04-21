@@ -7,10 +7,12 @@ import type {
   DownloadMirrorRecord,
   EventLogRecord,
   MyJDownloaderDeviceSummary,
+  PatchSelectionSource,
   RemoveTrackedItemMode,
   SelectedDownloads,
   SettingsView,
   SteamCandidate,
+  SteamPatchCandidate,
   SteamPatchFeedResult,
   ThemeMode,
   TrackedItemView,
@@ -27,6 +29,7 @@ type ItemBusyAction =
   | 'refresh'
   | 'remove'
   | 'retry'
+  | 'updatePatch'
   | 'updateInstall';
 type RetryMirrorOption = Pick<
   DownloadMirrorRecord,
@@ -88,6 +91,10 @@ declare global {
         installedAt?: string | null;
         installedBuildId?: string | null;
         installedVersion?: string | null;
+        trackedItemId: string;
+      }): Promise<TrackedItemView>;
+      updateSourcePatch(payload: {
+        selectedSteamPatch: SteamPatchCandidate;
         trackedItemId: string;
       }): Promise<TrackedItemView>;
     };
@@ -164,6 +171,46 @@ function formatLabel(value: string | null | undefined): string {
   return String(value)
     .replaceAll('_', ' ')
     .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function formatPatchSourceLabel(
+  value: PatchSelectionSource | null | undefined,
+): string | null {
+  if (value === 'manual') return 'Manually added';
+  if (value === 'steamdb_builds') return 'SteamDB manual override';
+  return null;
+}
+
+function patchCandidateKey(
+  patch: Pick<SteamPatchCandidate, 'buildId' | 'link' | 'patchDate'>,
+): string {
+  return patch.link || `${patch.buildId ?? 'no-build'}:${patch.patchDate}`;
+}
+
+function mergePatchCandidates(
+  patches: SteamPatchCandidate[],
+): SteamPatchCandidate[] {
+  const seen = new Set<string>();
+  const merged: SteamPatchCandidate[] = [];
+  for (const patch of patches) {
+    const key = patchCandidateKey(patch);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    merged.push(patch);
+  }
+  return merged;
+}
+
+function patchSummary(patch: SteamPatchCandidate): string {
+  return [
+    patch.buildId ? `Build ${patch.buildId}` : null,
+    patch.version ? `Version ${patch.version}` : null,
+    patch.patchDate,
+  ]
+    .filter(Boolean)
+    .join(' | ');
 }
 
 function normalizeComparableUrl(
@@ -463,6 +510,13 @@ function App() {
     fullUrl: string | null;
     item: TrackedItemView;
     patchUrl: string | null;
+  } | null>(null);
+  const [patchEditor, setPatchEditor] = useState<{
+    error: string | null;
+    item: TrackedItemView;
+    loading: boolean;
+    patches: SteamPatchCandidate[];
+    selectedKey: string | null;
   } | null>(null);
   const [systemPrefersDark, setSystemPrefersDark] = useState(
     window.matchMedia('(prefers-color-scheme: dark)').matches,
@@ -805,6 +859,86 @@ function App() {
     }
   }
 
+  async function openSourcePatchEditor(item: TrackedItemView) {
+    if (!item.item.steamAppId) return;
+
+    const seedPatches = item.selectedPatch ? [item.selectedPatch] : [];
+    setPatchEditor({
+      error: null,
+      item,
+      loading: true,
+      patches: seedPatches,
+      selectedKey: item.selectedPatch
+        ? patchCandidateKey(item.selectedPatch)
+        : null,
+    });
+    setBusyId(item.item.id);
+    setBusyAction('updatePatch');
+    try {
+      const result = await window.vaultTrackApi.resolveSteamPatches({
+        appId: item.item.steamAppId,
+      });
+      const patches = mergePatchCandidates([
+        ...seedPatches,
+        ...result.patches,
+      ]);
+      setPatchEditor((current) =>
+        current
+          ? {
+              ...current,
+              error: null,
+              loading: false,
+              patches,
+              selectedKey:
+                current.selectedKey ??
+                (patches[0] ? patchCandidateKey(patches[0]) : null),
+            }
+          : current,
+      );
+    } catch (error) {
+      setPatchEditor((current) =>
+        current
+          ? {
+              ...current,
+              error:
+                error instanceof Error
+                  ? error.message
+                  : 'Unable to load SteamDB patches.',
+              loading: false,
+            }
+          : current,
+      );
+    } finally {
+      setBusyId(null);
+      setBusyAction(null);
+    }
+  }
+
+  async function applySourcePatchSelection() {
+    if (!patchEditor?.selectedKey) return;
+
+    const selectedPatch = patchEditor.patches.find(
+      (patch) => patchCandidateKey(patch) === patchEditor.selectedKey,
+    );
+    if (!selectedPatch) return;
+
+    setBusyId(patchEditor.item.item.id);
+    setBusyAction('updatePatch');
+    try {
+      await window.vaultTrackApi.updateSourcePatch({
+        selectedSteamPatch: selectedPatch,
+        trackedItemId: patchEditor.item.item.id,
+      });
+      setPatchEditor(null);
+      await refreshItems();
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : 'Action failed.');
+    } finally {
+      setBusyId(null);
+      setBusyAction(null);
+    }
+  }
+
   const deviceChoices = connectionHealth?.devices ?? [];
 
   return (
@@ -921,6 +1055,10 @@ function App() {
                 const showRetryDownload = canRetryDownload(item);
                 const itemBusy = busyId === item.item.id;
                 const itemBusyAction = itemBusy ? busyAction : null;
+                const patchSourceLabel = formatPatchSourceLabel(
+                  item.selectedPatch?.selectionSource ??
+                    item.sourceSnapshot?.patchSelectionSource,
+                );
                 return (
                   <article className="media-card" key={item.item.id}>
                     {cover ? (
@@ -986,7 +1124,8 @@ function App() {
                               'none'}
                           </span>
                           <span>
-                            {item.selectedPatch?.patchDate ??
+                            {patchSourceLabel ??
+                              item.selectedPatch?.patchDate ??
                               item.sourceSnapshot?.observedPatchDate ??
                               'n/a'}
                           </span>
@@ -1105,6 +1244,21 @@ function App() {
                             >
                               Open SteamDB
                             </button>
+                            {item.sourceSnapshot ? (
+                              <button
+                                className="ghost-button"
+                                aria-busy={itemBusyAction === 'updatePatch'}
+                                disabled={itemBusy}
+                                onClick={() =>
+                                  void openSourcePatchEditor(item)
+                                }
+                                type="button"
+                              >
+                                {itemBusyAction === 'updatePatch'
+                                  ? 'Loading Patches...'
+                                  : 'Edit Source Patch'}
+                              </button>
+                            ) : null}
                           </>
                         ) : null}
                         <button
@@ -1720,6 +1874,83 @@ function App() {
             );
           })()
         : null}
+      {patchEditor ? (
+        <div className="modal-backdrop" role="presentation">
+          <div
+            className="modal-panel patch-modal"
+            role="dialog"
+            aria-modal="true"
+          >
+            <div className="panel-heading retry-modal__heading">
+              <div>
+                <p className="panel-title">Edit Source Patch</p>
+                <p className="muted-text">{patchEditor.item.item.title}</p>
+              </div>
+              <button
+                aria-label="Close source patch editor"
+                className="modal-close-button"
+                onClick={() => setPatchEditor(null)}
+                type="button"
+              >
+                x
+              </button>
+            </div>
+            {patchEditor.loading ? (
+              <p className="muted-text">Loading SteamDB patches...</p>
+            ) : null}
+            {patchEditor.error ? (
+              <p className="muted-text">{patchEditor.error}</p>
+            ) : null}
+            <div className="patch-list" role="listbox">
+              {patchEditor.patches.map((patch) => {
+                const key = patchCandidateKey(patch);
+                const selected = key === patchEditor.selectedKey;
+                return (
+                  <button
+                    aria-selected={selected}
+                    className={`patch-option ${selected ? 'is-selected' : ''}`}
+                    key={key}
+                    onClick={() =>
+                      setPatchEditor((current) =>
+                        current ? { ...current, selectedKey: key } : current,
+                      )
+                    }
+                    role="option"
+                    type="button"
+                  >
+                    <span>{patch.patchTitle}</span>
+                    <small>{patchSummary(patch)}</small>
+                  </button>
+                );
+              })}
+            </div>
+            <div className="action-row">
+              <button
+                className="ghost-button"
+                onClick={() => setPatchEditor(null)}
+                type="button"
+              >
+                Cancel
+              </button>
+              <button
+                className="primary-button"
+                disabled={
+                  patchEditor.loading ||
+                  busyId === patchEditor.item.item.id ||
+                  !patchEditor.selectedKey
+                }
+                onClick={() => void applySourcePatchSelection()}
+                type="button"
+              >
+                {busyId === patchEditor.item.item.id &&
+                busyAction === 'updatePatch'
+                  ? 'Saving...'
+                  : 'Save Patch'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

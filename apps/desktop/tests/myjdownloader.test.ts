@@ -47,6 +47,7 @@ function projectQueryFields(entries: unknown[], params: unknown): unknown[] {
 
 class FakeMyJDownloaderClient implements MyJDownloaderClient {
   readonly calls: DeviceCall[] = [];
+  readonly listDeviceCalls: Array<{ email: string; password: string }> = [];
   crawledLinksByJob = new Map<number, unknown[]>([
     [
       9001,
@@ -108,7 +109,9 @@ class FakeMyJDownloaderClient implements MyJDownloaderClient {
             params,
           ) as T;
         }
-        if (Array.isArray((params as { packageUUIDs?: number[] }).packageUUIDs)) {
+        if (
+          Array.isArray((params as { packageUUIDs?: number[] }).packageUUIDs)
+        ) {
           const packageIds = new Set(
             (params as { packageUUIDs: number[] }).packageUUIDs,
           );
@@ -130,7 +133,9 @@ class FakeMyJDownloaderClient implements MyJDownloaderClient {
       case '/downloadsV2/queryPackages':
         return projectQueryFields(this.downloadPackages, params) as T;
       case '/downloadsV2/queryLinks':
-        if (Array.isArray((params as { packageUUIDs?: number[] }).packageUUIDs)) {
+        if (
+          Array.isArray((params as { packageUUIDs?: number[] }).packageUUIDs)
+        ) {
           const packageIds = new Set(
             (params as { packageUUIDs: number[] }).packageUUIDs,
           );
@@ -156,7 +161,9 @@ class FakeMyJDownloaderClient implements MyJDownloaderClient {
         const linkIdSet = new Set(linkIds);
         const linkPackageIds = Array.from(this.crawledLinksByJob.values())
           .flat()
-          .filter((entry) => linkIdSet.has((entry as { uuid?: number }).uuid ?? -1))
+          .filter((entry) =>
+            linkIdSet.has((entry as { uuid?: number }).uuid ?? -1),
+          )
           .map((entry) => (entry as { packageUUID?: number }).packageUUID)
           .filter((uuid): uuid is number => typeof uuid === 'number');
         const effectivePackageIds = new Set([...packageIds, ...linkPackageIds]);
@@ -190,7 +197,8 @@ class FakeMyJDownloaderClient implements MyJDownloaderClient {
 
   async disconnect(): Promise<void> {}
 
-  async listDevices(): Promise<RawDeviceInfo[]> {
+  async listDevices(email: string, password: string): Promise<RawDeviceInfo[]> {
+    this.listDeviceCalls.push({ email, password });
     return [{ id: 'device-1', name: 'JDownloader', status: 'ONLINE' }];
   }
 
@@ -234,6 +242,52 @@ function createService(client: MyJDownloaderClient): MyJDownloaderService {
     client,
   );
 }
+
+describe('MyJDownloaderService authentication', () => {
+  it('normalizes copied email casing and whitespace before authentication', async () => {
+    const client = new FakeMyJDownloaderClient();
+    const service = new MyJDownloaderService(async () => null, client);
+
+    await service.authenticate({
+      email: '  USER@Example.INVALID  ',
+      password: 'password',
+    });
+
+    expect(client.listDeviceCalls[0]).toEqual({
+      email: 'user@example.invalid',
+      password: 'password',
+    });
+  });
+
+  it('maps MyJDownloader 403 responses to a clear login message', async () => {
+    class ForbiddenClient extends FakeMyJDownloaderClient {
+      override async listDevices(): Promise<RawDeviceInfo[]> {
+        throw new Error('403: Forbidden');
+      }
+    }
+    const service = new MyJDownloaderService(
+      async () => ({
+        deviceId: '',
+        email: 'user@example.invalid',
+        password: 'bad-password',
+      }),
+      new ForbiddenClient(),
+    );
+
+    await expect(
+      service.authenticate({
+        email: 'user@example.invalid',
+        password: 'bad-password',
+      }),
+    ).rejects.toThrow(/rejected the email or password/);
+    await expect(
+      service.getHealth({ forceRefresh: true }),
+    ).resolves.toMatchObject({
+      label: 'Authentication failed',
+      message: expect.stringMatching(/rejected the email or password/),
+    });
+  });
+});
 
 describe('MyJDownloaderService queueLinks', () => {
   it('adds links with deterministic queue options and no blank patch URL', async () => {
@@ -451,7 +505,9 @@ describe('MyJDownloaderService queueLinks', () => {
       [[502], []],
     ]);
     expect(
-      client.findAll('/extraction/startExtractionNow').map((call) => call.params),
+      client
+        .findAll('/extraction/startExtractionNow')
+        .map((call) => call.params),
     ).toEqual([
       [[501], []],
       [[502], []],
@@ -538,9 +594,8 @@ describe('MyJDownloaderService queueLinks', () => {
     expect(
       client
         .findAll('/linkgrabberv2/queryLinks')
-        .filter(
-          (call) =>
-            Array.isArray((call.params as { jobUUIDs?: number[] }).jobUUIDs),
+        .filter((call) =>
+          Array.isArray((call.params as { jobUUIDs?: number[] }).jobUUIDs),
         ),
     ).toHaveLength(1);
     expect(
@@ -599,7 +654,9 @@ describe('MyJDownloaderService queueLinks', () => {
       [[502], []],
     ]);
     expect(
-      client.findAll('/extraction/startExtractionNow').map((call) => call.params),
+      client
+        .findAll('/extraction/startExtractionNow')
+        .map((call) => call.params),
     ).toEqual([
       [[501], []],
       [[502], []],

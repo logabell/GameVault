@@ -4,7 +4,8 @@ import type { ParsedSourcePayload, SourceSnapshot } from '@vaulttrack/shared-typ
 import type { RefreshTrackedItemInput, SourceAdapter } from '../types.js';
 import { buildFingerprint, compactText, normalizeSlashDate, normalizeTitle } from '../utils.js';
 
-const STEAMRIP_HOST_RE = /https?:\/\/(?:www\.)?steamrip\.com\/.+-free-download\/?$/i;
+const STEAMRIP_DETAIL_SLUG_RE =
+  /^[a-z0-9][a-z0-9-]*-free-download(?:-[a-z0-9][a-z0-9-]*)?$/i;
 const VERSION_RE = /version[:\s]+(?<version>[0-9a-z.-]+)/i;
 const BUILD_RE = /build[:\s#]+(?<build>[0-9a-z.-]+)/i;
 const HOST_LABELS = new Map<string, string>([
@@ -13,8 +14,25 @@ const HOST_LABELS = new Map<string, string>([
   ['fileditchfiles.me', 'FileDitch'],
   ['gofile.io', 'GOFILE'],
   ['mediafire.com', 'MediaFire'],
+  ['megadb.net', 'MegaDB'],
   ['pixeldrain.com', 'PixelDrain'],
 ]);
+
+function isSteamRipDetailPage(url: string): boolean {
+  try {
+    const parsedUrl = new URL(url);
+    const hostname = parsedUrl.hostname.replace(/^www\./i, '').toLowerCase();
+    const pathSegments = parsedUrl.pathname.split('/').filter(Boolean);
+    return (
+      /^https?:$/.test(parsedUrl.protocol) &&
+      hostname === 'steamrip.com' &&
+      pathSegments.length === 1 &&
+      STEAMRIP_DETAIL_SLUG_RE.test(pathSegments[0] ?? '')
+    );
+  } catch {
+    return false;
+  }
+}
 
 function cleanSteamRipTitle(rawTitle: string): string {
   return compactText(
@@ -123,7 +141,7 @@ function collectDownloadAnchors(
 export const steamRipAdapter: SourceAdapter = {
   kind: 'steamrip',
   detectPage(url) {
-    return STEAMRIP_HOST_RE.test(url);
+    return isSteamRipDetailPage(url);
   },
   parsePage(url, html) {
     const $ = load(html);

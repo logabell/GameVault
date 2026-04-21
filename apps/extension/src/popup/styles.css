@@ -320,6 +320,9 @@ select option {
   border: 1px dashed var(--border);
   border-radius: var(--radius-md);
 }
+.steamdb-backfill-status {
+  min-height: 28px;
+}
 .spinner {
   width: 16px;
   height: 16px;
@@ -505,6 +508,20 @@ select option {
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
+.manual-patch-chip {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 7px;
+  border-radius: 999px;
+  background: rgba(210, 139, 22, 0.16);
+  color: var(--warning);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
 .likely-match-icon {
   width: 12px;
   height: 12px;
@@ -550,6 +567,38 @@ select option {
 }
 .library-detail-grid span {
   overflow-wrap: anywhere;
+}
+
+.library-detail-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+}
+
+.inline-icon-button {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--muted);
+}
+
+.inline-icon-button:hover,
+.inline-icon-button:focus-visible {
+  color: var(--ink);
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+  outline: none;
+}
+
+.inline-icon-button svg {
+  width: 14px;
+  height: 14px;
 }
 
 .progress-block {
@@ -607,6 +656,52 @@ select option {
   border: 1px solid var(--border);
   background: var(--panel-strong);
   box-shadow: var(--shadow);
+}
+
+.patch-modal {
+  width: min(520px, 100%);
+}
+
+.source-patch-editor-modal {
+  max-height: min(680px, calc(100vh - 28px));
+}
+
+.source-patch-editor-list {
+  max-height: 300px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.source-patch-editor-error {
+  color: var(--warning);
+}
+
+.confirmation-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.confirmation-grid div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.confirmation-grid strong {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.confirmation-grid span {
+  overflow-wrap: anywhere;
+}
+
+.patch-choice-actions {
+  justify-content: flex-start;
 }
 
 .retry-modal.is-single-choice {

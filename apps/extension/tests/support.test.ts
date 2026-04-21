@@ -10,9 +10,32 @@ describe('supported detail pages', () => {
       ),
     ).toBe(true);
     expect(
-      isSupportedDetailPage('https://steamrip.com/mouse-p-i-for-hire-free-download/'),
+      isSupportedDetailPage(
+        'https://elamigos.site/data/Ziggurat_2_MULTi11_-_ElAmigos.html',
+      ),
     ).toBe(true);
+    expect(
+      isSupportedDetailPage(
+        'https://www.elamigos.site/data/Ziggurat_2_MULTi11_-_ElAmigos.html',
+      ),
+    ).toBe(true);
+
+    for (const url of [
+      'https://steamrip.com/mouse-p-i-for-hire-free-download',
+      'https://steamrip.com/mouse-p-i-for-hire-free-download/',
+      'https://steamrip.com/ziggurat-2-free-download-1r/',
+      'https://www.steamrip.com/example-game-free-download-alt-release/?ref=homepage',
+    ]) {
+      expect(isSupportedDetailPage(url)).toBe(true);
+    }
+
     expect(isSupportedDetailPage('https://steamrip.com/updated-games/')).toBe(false);
+    expect(isSupportedDetailPage('https://steamrip.com/category/action/')).toBe(false);
+    expect(
+      isSupportedDetailPage(
+        'https://steamrip.com/category/example-game-free-download/',
+      ),
+    ).toBe(false);
   });
 
   it('only triggers clipboard add when the copied url matches the current page', () => {

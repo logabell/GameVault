@@ -1,7 +1,14 @@
 import { access, mkdir, readdir, rename, rm, stat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { execFile } from 'node:child_process';
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+} from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -98,20 +105,24 @@ foreach ($imagePath in $imagePaths) {
   }
 }
 `;
-  const { stdout } = await execFileAsync('powershell.exe', [
-    '-NoProfile',
-    '-NonInteractive',
-    '-ExecutionPolicy',
-    'Bypass',
-    '-Command',
-    script,
-  ], {
-    env: {
-      ...process.env,
-      VAULTTRACK_ISO_PATHS: JSON.stringify(isoPaths),
+  const { stdout } = await execFileAsync(
+    'powershell.exe',
+    [
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-Command',
+      script,
+    ],
+    {
+      env: {
+        ...process.env,
+        VAULTTRACK_ISO_PATHS: JSON.stringify(isoPaths),
+      },
+      windowsHide: true,
     },
-    windowsHide: true,
-  });
+  );
   return stdout
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -122,7 +133,10 @@ export async function dismountIsoImagesUnderPath(params: {
   rootPath: string;
   runDismount?: (isoPaths: string[]) => Promise<string[]>;
 }): Promise<string[]> {
-  const isoPaths = await findFilesWithExtension(resolve(params.rootPath), '.iso');
+  const isoPaths = await findFilesWithExtension(
+    resolve(params.rootPath),
+    '.iso',
+  );
   return (params.runDismount ?? dismountIsoImages)(isoPaths);
 }
 
@@ -138,7 +152,9 @@ export async function planLibraryPaths(params: {
   stageRootPath: string;
 }> {
   const safeTitle = sanitizePathSegment(params.canonicalTitle);
-  const safeStageName = sanitizePathSegment(`${params.canonicalTitle}_${params.releaseSuffix}`);
+  const safeStageName = sanitizePathSegment(
+    `${params.canonicalTitle}_${params.releaseSuffix}`,
+  );
   const stageRootPath = resolve(join(params.rootLibraryPath, '_STAGING'));
   const stagePath = resolve(join(stageRootPath, safeStageName));
   const finalPath = resolve(join(params.rootLibraryPath, safeTitle));
@@ -154,7 +170,9 @@ export function planSteamRipExtractPathFromJob(params: {
   finalPath: string;
   stagePath: string;
 }): string {
-  return resolve(join(dirname(params.stagePath), basename(params.finalPath), 'contents'));
+  return resolve(
+    join(dirname(params.stagePath), basename(params.finalPath), 'contents'),
+  );
 }
 
 export async function ensureDirectory(target: string): Promise<void> {
@@ -171,12 +189,19 @@ export async function stageMove(params: {
 
 function assertPathInside(parentPath: string, targetPath: string): void {
   const relativePath = relative(resolve(parentPath), resolve(targetPath));
-  if (relativePath === '' || relativePath.startsWith('..') || isAbsolute(relativePath)) {
+  if (
+    relativePath === '' ||
+    relativePath.startsWith('..') ||
+    isAbsolute(relativePath)
+  ) {
     throw new Error(`Refusing to operate outside ${parentPath}`);
   }
 }
 
-async function moveDirectoryContents(sourcePath: string, targetPath: string): Promise<void> {
+async function moveDirectoryContents(
+  sourcePath: string,
+  targetPath: string,
+): Promise<void> {
   await ensureDirectory(targetPath);
   const entries = await readdir(sourcePath, { withFileTypes: true });
 
@@ -225,6 +250,15 @@ function isSteamRipExtraFolder(folderName: string): boolean {
   return ['_commonredist', '__macosx'].includes(folderName.toLowerCase());
 }
 
+function isSteamRipExtraFile(fileName: string): boolean {
+  const lower = fileName.toLowerCase();
+  const stem = lower.replace(/\.[^.]+$/, '');
+  return (
+    lower.endsWith('.url') ||
+    (lower.endsWith('.txt') && /(?:read[\s_-]*me|instruction)/i.test(stem))
+  );
+}
+
 async function collectDirectories(params: {
   depth: number;
   maxDepth: number;
@@ -255,10 +289,92 @@ async function collectDirectories(params: {
   return results;
 }
 
+async function collectSteamRipPayloadGameFolders(params: {
+  depth: number;
+  maxDepth: number;
+  rootPath: string;
+}): Promise<Array<{ depth: number; name: string; path: string }>> {
+  if (params.depth > params.maxDepth) {
+    return [];
+  }
+
+  const entries = await readdir(params.rootPath, { withFileTypes: true });
+  const nonExtraDirectories = entries.filter(
+    (entry) => entry.isDirectory() && !isSteamRipExtraFolder(entry.name),
+  );
+  const unexpectedFiles = entries.filter(
+    (entry) => entry.isFile() && !isSteamRipExtraFile(entry.name),
+  );
+  const hasSteamRipExtra = entries.some((entry) =>
+    entry.isDirectory()
+      ? isSteamRipExtraFolder(entry.name)
+      : entry.isFile() && isSteamRipExtraFile(entry.name),
+  );
+
+  const results: Array<{ depth: number; name: string; path: string }> = [];
+  if (
+    hasSteamRipExtra &&
+    nonExtraDirectories.length === 1 &&
+    unexpectedFiles.length === 0
+  ) {
+    const gameDirectory = nonExtraDirectories[0]!;
+    return [
+      {
+        depth: params.depth + 1,
+        name: gameDirectory.name,
+        path: resolve(join(params.rootPath, gameDirectory.name)),
+      },
+    ];
+  }
+
+  for (const entry of nonExtraDirectories) {
+    results.push(
+      ...(await collectSteamRipPayloadGameFolders({
+        depth: params.depth + 1,
+        maxDepth: params.maxDepth,
+        rootPath: resolve(join(params.rootPath, entry.name)),
+      })),
+    );
+  }
+
+  return results;
+}
+
+function isSteamRipVersionedTitleFolder(
+  folderName: string,
+  expectedTitle: string,
+): boolean {
+  const normalizedName = normalizeTitle(folderName);
+  if (!normalizedName.startsWith(`${expectedTitle} `)) {
+    return false;
+  }
+
+  const suffix = normalizedName.slice(expectedTitle.length).trim();
+  return /^(?:v\s*\d|version\s+\d|build\s+\d|update\s+\d|patch\s+\d)/i.test(
+    suffix,
+  );
+}
+
 async function findSteamRipContentFolder(params: {
   canonicalTitle: string;
   extractPath: string;
 }): Promise<string> {
+  const payloadGameFolders = await collectSteamRipPayloadGameFolders({
+    depth: 0,
+    maxDepth: 4,
+    rootPath: params.extractPath,
+  });
+  if (payloadGameFolders.length === 1) {
+    return payloadGameFolders[0]!.path;
+  }
+  if (payloadGameFolders.length > 1) {
+    throw new Error(
+      `Found multiple plausible SteamRIP game folders for ${params.canonicalTitle}: ${payloadGameFolders
+        .map((entry) => entry.path)
+        .join(', ')}`,
+    );
+  }
+
   const directories = await collectDirectories({
     depth: 0,
     maxDepth: 4,
@@ -272,7 +388,23 @@ async function findSteamRipContentFolder(params: {
     return exactMatch.path;
   }
 
-  throw new Error(`Unable to find extracted SteamRIP game folder for ${params.canonicalTitle}.`);
+  const versionedMatches = directories.filter((entry) =>
+    isSteamRipVersionedTitleFolder(entry.name, expectedTitle),
+  );
+  if (versionedMatches.length === 1) {
+    return versionedMatches[0]!.path;
+  }
+  if (versionedMatches.length > 1) {
+    throw new Error(
+      `Found multiple plausible SteamRIP game folders for ${params.canonicalTitle}: ${versionedMatches
+        .map((entry) => entry.path)
+        .join(', ')}`,
+    );
+  }
+
+  throw new Error(
+    `Unable to find extracted SteamRIP game folder for ${params.canonicalTitle}.`,
+  );
 }
 
 export async function finalizeSteamRipExtraction(params: {
@@ -282,10 +414,14 @@ export async function finalizeSteamRipExtraction(params: {
   stageRootPath: string;
 }): Promise<void> {
   const safeTitle = sanitizePathSegment(params.canonicalTitle);
-  const expectedFinalPath = resolve(join(resolve(params.stageRootPath, '..'), safeTitle));
+  const expectedFinalPath = resolve(
+    join(resolve(params.stageRootPath, '..'), safeTitle),
+  );
   const finalPath = resolve(params.finalPath);
   if (finalPath !== expectedFinalPath) {
-    throw new Error(`Unexpected final SteamRIP library path: ${params.finalPath}`);
+    throw new Error(
+      `Unexpected final SteamRIP library path: ${params.finalPath}`,
+    );
   }
 
   const extractWorkspacePath = resolve(join(params.extractPath, '..'));
@@ -323,8 +459,39 @@ export async function removeKnownLibraryPaths(params: {
     candidates.add(resolve(`${stagePath}_update`));
 
     if (params.finalPath) {
-      candidates.add(resolve(join(dirname(stagePath), basename(params.finalPath))));
+      candidates.add(
+        resolve(join(dirname(stagePath), basename(params.finalPath))),
+      );
     }
+  }
+
+  const deletedPaths: string[] = [];
+  for (const candidate of candidates) {
+    assertPathInside(rootLibraryPath, candidate);
+    await rm(candidate, { force: true, recursive: true });
+    deletedPaths.push(candidate);
+  }
+
+  return deletedPaths;
+}
+
+export async function removeKnownStagingPaths(params: {
+  extractionPath?: string | null;
+  rootLibraryPath: string;
+  stagePath?: string | null;
+}): Promise<string[]> {
+  const rootLibraryPath = resolve(params.rootLibraryPath);
+  const candidates = new Set<string>();
+
+  if (params.stagePath) {
+    const stagePath = resolve(params.stagePath);
+    candidates.add(stagePath);
+    candidates.add(resolve(`${stagePath}_full`));
+    candidates.add(resolve(`${stagePath}_update`));
+  }
+
+  if (params.extractionPath) {
+    candidates.add(resolve(join(params.extractionPath, '..')));
   }
 
   const deletedPaths: string[] = [];
@@ -345,7 +512,9 @@ export async function scanImportFolders(params: {
     params.listDirectoryNames ??
     (async (rootLibraryPath: string) => {
       const entries = await readdir(rootLibraryPath, { withFileTypes: true });
-      return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+      return entries
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name);
     });
 
   const names = await listDirectoryNames(params.rootLibraryPath);

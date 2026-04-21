@@ -196,4 +196,63 @@ describe('derivePatchLag', () => {
       versionsBehindLatest: null,
     });
   });
+
+  it('reports unknown lag for manually added patches', () => {
+    expect(
+      derivePatchLag({
+        feedEntries: [
+          {
+            appId: 123,
+            buildId: '3',
+            link: 'https://steamdb.info/patchnotes/3/',
+            patchDate: '04/20/2026',
+            patchTitle: 'Build 3',
+            publishedAt: '2026-04-20T12:00:00.000Z',
+            title: 'Build 3',
+            trackedItemId: 'item',
+          },
+        ],
+        selectedPatch: {
+          appId: 123,
+          buildId: '1',
+          link: 'manual:test',
+          patchDate: '',
+          patchTitle: 'Manual build 1',
+          publishedAt: '1970-01-01T00:00:00.000Z',
+          selectionSource: 'manual',
+          title: 'Manual build 1',
+          trackedItemId: 'item',
+        },
+      }),
+    ).toEqual({
+      selectedPatchMissingFromFeed: false,
+      versionsBehindLatest: null,
+    });
+  });
+
+  it('counts versions behind from captured SteamDB build-table rows', () => {
+    const feedEntries = Array.from({ length: 30 }, (_value, index) => ({
+      appId: 123,
+      buildId: String(30 - index),
+      link: `https://steamdb.info/patchnotes/${30 - index}/`,
+      patchDate: '04/20/2026',
+      patchTitle: `Build ${30 - index}`,
+      publishedAt: new Date(
+        Date.UTC(2026, 3, 20, 12, 0 - index),
+      ).toISOString(),
+      selectionSource: 'steamdb_builds' as const,
+      title: `Build ${30 - index}`,
+      trackedItemId: 'item',
+    }));
+
+    expect(
+      derivePatchLag({
+        feedEntries,
+        selectedPatch: feedEntries[28],
+      }),
+    ).toEqual({
+      selectedPatchMissingFromFeed: false,
+      versionsBehindLatest: 28,
+    });
+  });
 });

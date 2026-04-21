@@ -14,12 +14,14 @@ import type {
 import { parseSupportedPage } from '@vaulttrack/source-core';
 
 import { isSupportedDetailPage } from '../support.js';
+import { buildSteamDbPatchnotesUrl } from '../steamdb-builds.js';
 
 const CACHE_TTL_MS = 15 * 60 * 1000;
 const BRIDGE_URL = 'http://127.0.0.1:47615/native-message';
 const BRIDGE_HTTP_TIMEOUT_MS = 2500;
-const NATIVE_MESSAGE_TIMEOUT_MS = 35000;
+const NATIVE_MESSAGE_TIMEOUT_MS = 75000;
 const ADD_TRACKED_ITEM_TIMEOUT_MS = 90000;
+const MYJD_AUTH_TIMEOUT_MS = 75000;
 const STEAM_PATCH_RESOLVE_TIMEOUT_MS = 18000;
 const PREPARE_DRAFT_HEALTH_TIMEOUT_MS = 1500;
 const NATIVE_HOST_NAME = 'com.vaulttrack.desktop';
@@ -29,6 +31,12 @@ const CLIPBOARD_DRAFT_KEY = 'clipboardDraft';
 const STATUS_CACHE_TTL_MS = 30 * 1000;
 const PARSE_CACHE_PREFIX = 'parsedPage';
 const STATUS_CACHE_PREFIX = 'trackedStatus';
+const STEAMDB_SELECTION_CONTEXT_PREFIX = 'steamDbSelectionContext';
+const STEAMDB_BACKFILL_STATE_PREFIX = 'steamDbBackfill';
+const STEAMDB_PENDING_CONFIRMATION_KEY = 'steamDbPendingConfirmation';
+const STEAMDB_SELECTION_TTL_MS = 30 * 60 * 1000;
+const STEAMDB_BACKFILL_TIMEOUT_MS = 22000;
+const STEAMDB_BACKFILL_TTL_MS = 30 * 60 * 1000;
 
 interface CachedParsedPage {
   canonicalUrl: string;
@@ -70,6 +78,41 @@ interface DraftStatusContext {
   sourceUrl: string | null;
   trackedStatus: TrackedItemView | null;
   trackedStatusPending: boolean;
+}
+
+type SteamDbSelectionMode = 'select' | 'backfill';
+type SteamDbBackfillStatus = 'pending' | 'complete' | 'failed';
+
+interface SteamDbSelectionContext {
+  appId: number;
+  createdAt: number;
+  mode: 'active' | 'clipboard';
+  selectionMode: SteamDbSelectionMode;
+  selectedAppId: number;
+  selectedDownloads?: {
+    fullUrl: string;
+    patchUrl?: string | null;
+  };
+  selectedSteamCandidate?: SteamCandidate | null;
+  sourceUrl?: string | null;
+  tabId?: number | null;
+}
+
+interface PendingSteamDbConfirmation {
+  context: SteamDbSelectionContext;
+  createdAt: number;
+  patches: SteamPatchCandidate[];
+  selectedPatch: SteamPatchCandidate;
+}
+
+interface SteamDbBackfillState {
+  appId: number;
+  createdAt: number;
+  expiresAt: number;
+  message?: string | null;
+  patches: SteamPatchCandidate[];
+  status: SteamDbBackfillStatus;
+  tabId?: number | null;
 }
 
 const hotParsedCache = new Map<string, CachedParsedPage>();
@@ -232,6 +275,38 @@ async function getSessionValue<T>(key: string): Promise<T | null> {
 
 async function setSessionValue(key: string, value: unknown): Promise<void> {
   await chrome.storage.session.set({ [key]: value });
+}
+
+function getSteamDbSelectionContextKey(appId: number): string {
+  return `${STEAMDB_SELECTION_CONTEXT_PREFIX}:${appId}`;
+}
+
+function getSteamDbBackfillStateKey(appId: number): string {
+  return `${STEAMDB_BACKFILL_STATE_PREFIX}:${appId}`;
+}
+
+function isFreshSteamDbContext(
+  context: SteamDbSelectionContext | PendingSteamDbConfirmation | null,
+): boolean {
+  return Boolean(
+    context && Date.now() - context.createdAt <= STEAMDB_SELECTION_TTL_MS,
+  );
+}
+
+function isFreshSteamDbBackfill(state: SteamDbBackfillState | null): boolean {
+  return Boolean(state && state.expiresAt > Date.now());
+}
+
+async function closeTabIfPresent(tabId: number | null | undefined) {
+  if (typeof tabId !== 'number') {
+    return;
+  }
+
+  try {
+    await chrome.tabs.remove(tabId);
+  } catch {
+    // The tab may already have been closed by the user or browser.
+  }
 }
 
 async function setActiveDraft(tabId: number, url: string): Promise<void> {
@@ -730,6 +805,124 @@ async function resolveSteamPatches(appId: number): Promise<{
   }
 }
 
+async function getSteamDbBackfillState(
+  appId: number,
+): Promise<SteamDbBackfillState | null> {
+  const key = getSteamDbBackfillStateKey(appId);
+  const state = await getSessionValue<SteamDbBackfillState>(key);
+  if (!state) {
+    return null;
+  }
+
+  if (!isFreshSteamDbBackfill(state)) {
+    await closeTabIfPresent(state.tabId);
+    await chrome.storage.session.remove([
+      key,
+      getSteamDbSelectionContextKey(appId),
+    ]);
+    return null;
+  }
+
+  if (
+    state.status === 'pending' &&
+    Date.now() - state.createdAt > STEAMDB_BACKFILL_TIMEOUT_MS
+  ) {
+    const expiredState: SteamDbBackfillState = {
+      ...state,
+      message: 'SteamDB build backfill timed out.',
+      patches: [],
+      status: 'failed',
+      tabId: null,
+    };
+    await closeTabIfPresent(state.tabId);
+    await setSessionValue(key, expiredState);
+    await chrome.storage.session.remove(getSteamDbSelectionContextKey(appId));
+    return expiredState;
+  }
+
+  return state;
+}
+
+function scheduleSteamDbBackfillTimeout(appId: number): void {
+  setTimeout(() => {
+    void getSteamDbBackfillState(appId).catch(() => undefined);
+  }, STEAMDB_BACKFILL_TIMEOUT_MS + 500);
+}
+
+async function startSteamDbBackfill(
+  appId: number,
+): Promise<SteamDbBackfillState> {
+  const existing = await getSteamDbBackfillState(appId);
+  if (existing?.status === 'pending' || existing?.status === 'complete') {
+    return existing;
+  }
+
+  const createdAt = Date.now();
+  const baseState: SteamDbBackfillState = {
+    appId,
+    createdAt,
+    expiresAt: createdAt + STEAMDB_BACKFILL_TTL_MS,
+    message: null,
+    patches: [],
+    status: 'pending',
+    tabId: null,
+  };
+  const context: SteamDbSelectionContext = {
+    appId,
+    createdAt,
+    mode: 'active',
+    selectedAppId: appId,
+    selectedDownloads: {
+      fullUrl: '',
+      patchUrl: null,
+    },
+    selectedSteamCandidate: null,
+    selectionMode: 'backfill',
+    sourceUrl: null,
+    tabId: null,
+  };
+
+  await Promise.all([
+    setSessionValue(getSteamDbBackfillStateKey(appId), baseState),
+    setSessionValue(getSteamDbSelectionContextKey(appId), context),
+  ]);
+
+  try {
+    const tab = await chrome.tabs.create({
+      active: false,
+      url: buildSteamDbPatchnotesUrl(appId),
+    });
+    const tabId = tab.id ?? null;
+    const nextState: SteamDbBackfillState = {
+      ...baseState,
+      tabId,
+    };
+    await Promise.all([
+      setSessionValue(getSteamDbBackfillStateKey(appId), nextState),
+      setSessionValue(getSteamDbSelectionContextKey(appId), {
+        ...context,
+        tabId,
+      } satisfies SteamDbSelectionContext),
+    ]);
+    scheduleSteamDbBackfillTimeout(appId);
+    return nextState;
+  } catch (error) {
+    const failedState: SteamDbBackfillState = {
+      ...baseState,
+      message:
+        error instanceof Error
+          ? error.message
+          : 'Unable to open SteamDB for build backfill.',
+      status: 'failed',
+    };
+    await Promise.all([
+      setSessionValue(getSteamDbBackfillStateKey(appId), failedState),
+      chrome.storage.session.remove(getSteamDbSelectionContextKey(appId)),
+    ]);
+    return failedState;
+  }
+}
+
 async function resolveDraftTarget(params: {
   mode: 'active' | 'clipboard';
   sourceUrl?: string | null;
@@ -881,6 +1074,7 @@ async function completeDraft(params: {
   selectedAppId?: number | null;
   selectedSteamCandidate?: SteamCandidate | null;
   selectedSteamPatch?: SteamPatchCandidate | null;
+  steamPatchEntries?: SteamPatchCandidate[] | null;
   selectedDownloads: {
     fullUrl: string;
     patchUrl?: string | null;
@@ -926,6 +1120,9 @@ async function completeDraft(params: {
       'Selected SteamDB patch does not match the selected Steam app.',
     );
   }
+  const steamPatchEntries = (params.steamPatchEntries ?? []).filter(
+    (entry) => entry.appId === selectedCandidate!.appId,
+  );
 
   const steamMatch: ConfirmedSteamMatch = {
     appId: selectedCandidate.appId,
@@ -942,6 +1139,7 @@ async function completeDraft(params: {
         queueDownload: true,
         selectedDownloads: params.selectedDownloads,
         selectedSteamPatch: params.selectedSteamPatch,
+        steamPatchEntries,
         steamMatch,
       },
       type: 'addTrackedItem',
@@ -1247,13 +1445,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (message.type === 'vaulttrack:authenticate-myjd') {
       try {
-        const response = await sendDesktopRequest({
-          payload: {
-            email: message.email as string,
-            password: message.password as string,
+        const response = await sendDesktopRequest(
+          {
+            payload: {
+              email: message.email as string,
+              password: message.password as string,
+            },
+            type: 'authenticateMyJDownloader',
           },
-          type: 'authenticateMyJDownloader',
-        });
+          {
+            bridgeTimeoutMs: MYJD_AUTH_TIMEOUT_MS,
+            retryBridgeTimeoutMs: MYJD_AUTH_TIMEOUT_MS,
+          },
+        );
         sendResponse(
           response.ok ? { ok: true, payload: response.payload } : response,
         );
@@ -1271,10 +1475,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (message.type === 'vaulttrack:select-myjd-device') {
       try {
-        const response = await sendDesktopRequest({
-          payload: { deviceId: message.deviceId as string },
-          type: 'selectMyJDownloaderDevice',
-        });
+        const response = await sendDesktopRequest(
+          {
+            payload: { deviceId: message.deviceId as string },
+            type: 'selectMyJDownloaderDevice',
+          },
+          {
+            bridgeTimeoutMs: MYJD_AUTH_TIMEOUT_MS,
+            retryBridgeTimeoutMs: MYJD_AUTH_TIMEOUT_MS,
+          },
+        );
         sendResponse(
           response.ok ? { ok: true, payload: response.payload } : response,
         );
@@ -1370,6 +1580,254 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
+    if (message.type === 'vaulttrack:start-steamdb-build-backfill') {
+      const appId = typeof message.appId === 'number' ? message.appId : null;
+      if (!appId) {
+        sendResponse({
+          message: 'Select a Steam app before loading older SteamDB builds.',
+          ok: false,
+        });
+        return;
+      }
+
+      const state = await startSteamDbBackfill(appId);
+      sendResponse({ ok: true, payload: state });
+      return;
+    }
+
+    if (message.type === 'vaulttrack:get-steamdb-build-backfill') {
+      const appId = typeof message.appId === 'number' ? message.appId : null;
+      if (!appId) {
+        sendResponse({ ok: true, payload: null });
+        return;
+      }
+
+      sendResponse({
+        ok: true,
+        payload: await getSteamDbBackfillState(appId),
+      });
+      return;
+    }
+
+    if (message.type === 'vaulttrack:open-steamdb-patch-page') {
+      const appId = typeof message.appId === 'number' ? message.appId : null;
+      const fullUrl =
+        typeof message.selectedDownloads?.fullUrl === 'string'
+          ? String(message.selectedDownloads.fullUrl)
+          : '';
+      if (!appId || !fullUrl) {
+        sendResponse({
+          message:
+            'Choose a Steam app and download mirror before opening SteamDB.',
+          ok: false,
+        });
+        return;
+      }
+
+      const sourceTabId =
+        typeof message.tabId === 'number' ? (message.tabId as number) : null;
+      const draftSourceUrl =
+        typeof message.sourceUrl === 'string'
+          ? (message.sourceUrl as string)
+          : null;
+      const contextMode = (message.mode as 'active' | 'clipboard') ?? 'active';
+      const draftTarget = await resolveDraftTarget({
+        mode: contextMode,
+        sourceUrl: draftSourceUrl,
+        tabId: sourceTabId,
+      }).catch(() => ({
+        mode: contextMode,
+        tabId: sourceTabId ?? undefined,
+        url: draftSourceUrl,
+      }));
+      if (draftTarget.tabId && draftTarget.url) {
+        await setActiveDraft(draftTarget.tabId, draftTarget.url);
+      }
+
+      const context: SteamDbSelectionContext = {
+        appId,
+        createdAt: Date.now(),
+        mode: contextMode,
+        selectedAppId: appId,
+        selectedDownloads: {
+          fullUrl,
+          patchUrl:
+            typeof message.selectedDownloads?.patchUrl === 'string'
+              ? String(message.selectedDownloads.patchUrl)
+              : null,
+        },
+        selectedSteamCandidate:
+          typeof message.selectedSteamCandidate === 'object' &&
+          message.selectedSteamCandidate !== null
+            ? (message.selectedSteamCandidate as SteamCandidate)
+            : null,
+        selectionMode: 'select',
+        sourceUrl: draftTarget.url ?? draftSourceUrl,
+        tabId: draftTarget.tabId ?? sourceTabId,
+      };
+      await setSessionValue(getSteamDbSelectionContextKey(appId), context);
+      const tab = await chrome.tabs.create({
+        active: true,
+        url: buildSteamDbPatchnotesUrl(appId),
+      });
+      sendResponse({ ok: true, payload: { tabId: tab.id ?? null } });
+      return;
+    }
+
+    if (message.type === 'vaulttrack:get-steamdb-selection-context') {
+      const appId = typeof message.appId === 'number' ? message.appId : null;
+      const context = appId
+        ? await getSessionValue<SteamDbSelectionContext>(
+            getSteamDbSelectionContextKey(appId),
+          )
+        : null;
+      sendResponse({
+        ok: true,
+        payload: {
+          active: isFreshSteamDbContext(context),
+          mode: context?.selectionMode ?? 'select',
+        },
+      });
+      return;
+    }
+
+    if (message.type === 'vaulttrack:steamdb-patch-selected') {
+      const appId = typeof message.appId === 'number' ? message.appId : null;
+      const context = appId
+        ? await getSessionValue<SteamDbSelectionContext>(
+            getSteamDbSelectionContextKey(appId),
+          )
+        : null;
+      if (
+        !appId ||
+        !isFreshSteamDbContext(context) ||
+        context?.selectionMode === 'backfill' ||
+        !context?.selectedDownloads?.fullUrl
+      ) {
+        sendResponse({
+          message:
+            'VaultTrack no longer has a pending SteamDB selection for this page.',
+          ok: false,
+        });
+        return;
+      }
+
+      const selectedPatch =
+        typeof message.selectedPatch === 'object' &&
+        message.selectedPatch !== null
+          ? (message.selectedPatch as SteamPatchCandidate)
+          : null;
+      if (!selectedPatch || selectedPatch.appId !== appId) {
+        sendResponse({
+          message: 'The selected SteamDB patch row could not be read.',
+          ok: false,
+        });
+        return;
+      }
+
+      const patches = Array.isArray(message.patches)
+        ? (message.patches as SteamPatchCandidate[]).filter(
+            (patch) => patch.appId === appId,
+          )
+        : [];
+      await setSessionValue(STEAMDB_PENDING_CONFIRMATION_KEY, {
+        context: context!,
+        createdAt: Date.now(),
+        patches,
+        selectedPatch,
+      } satisfies PendingSteamDbConfirmation);
+
+      try {
+        if (chrome.action.openPopup) {
+          await chrome.action.openPopup({
+            windowId: sender.tab?.windowId,
+          });
+        }
+      } catch {
+        if (sender.tab?.id) {
+          await chrome.action.setBadgeBackgroundColor({
+            color: '#0f5cff',
+            tabId: sender.tab.id,
+          });
+          await chrome.action.setBadgeText({
+            tabId: sender.tab.id,
+            text: 'OK',
+          });
+        }
+      }
+
+      sendResponse({ ok: true });
+      return;
+    }
+
+    if (message.type === 'vaulttrack:steamdb-builds-backfilled') {
+      const appId = typeof message.appId === 'number' ? message.appId : null;
+      const context = appId
+        ? await getSessionValue<SteamDbSelectionContext>(
+            getSteamDbSelectionContextKey(appId),
+          )
+        : null;
+      if (
+        !appId ||
+        !isFreshSteamDbContext(context) ||
+        context?.selectionMode !== 'backfill'
+      ) {
+        await closeTabIfPresent(sender.tab?.id);
+        sendResponse({ ok: false });
+        return;
+      }
+
+      const patches = Array.isArray(message.patches)
+        ? (message.patches as SteamPatchCandidate[]).filter(
+            (patch) => patch.appId === appId,
+          )
+        : [];
+      const completedState: SteamDbBackfillState = {
+        appId,
+        createdAt: context.createdAt,
+        expiresAt: Date.now() + STEAMDB_BACKFILL_TTL_MS,
+        message: null,
+        patches,
+        status: 'complete',
+        tabId: null,
+      };
+      await setSessionValue(getSteamDbBackfillStateKey(appId), completedState);
+      await Promise.allSettled([
+        closeTabIfPresent(sender.tab?.id ?? context.tabId),
+        chrome.storage.session.remove(getSteamDbSelectionContextKey(appId)),
+      ]);
+
+      sendResponse({ ok: true, payload: completedState });
+      return;
+    }
+
+    if (message.type === 'vaulttrack:get-steamdb-pending-confirmation') {
+      const pending = await getSessionValue<PendingSteamDbConfirmation>(
+        STEAMDB_PENDING_CONFIRMATION_KEY,
+      );
+      if (!isFreshSteamDbContext(pending)) {
+        await chrome.storage.session.remove(STEAMDB_PENDING_CONFIRMATION_KEY);
+        sendResponse({ ok: true, payload: null });
+        return;
+      }
+      sendResponse({ ok: true, payload: pending });
+      return;
+    }
+
+    if (message.type === 'vaulttrack:clear-steamdb-pending-confirmation') {
+      const pending = await getSessionValue<PendingSteamDbConfirmation>(
+        STEAMDB_PENDING_CONFIRMATION_KEY,
+      );
+      await chrome.storage.session.remove(STEAMDB_PENDING_CONFIRMATION_KEY);
+      if (pending?.context.appId) {
+        await chrome.storage.session.remove(
+          getSteamDbSelectionContextKey(pending.context.appId),
+        );
+      }
+      sendResponse({ ok: true });
+      return;
+    }
+
     if (message.type === 'vaulttrack:complete-draft') {
       const result = await completeDraft({
         mode: (message.mode as 'active' | 'clipboard') ?? 'active',
@@ -1387,6 +1845,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           message.selectedSteamPatch !== null
             ? (message.selectedSteamPatch as SteamPatchCandidate)
             : null,
+        steamPatchEntries: Array.isArray(message.steamPatchEntries)
+          ? (message.steamPatchEntries as SteamPatchCandidate[])
+          : null,
         selectedDownloads: {
           fullUrl: String(message.selectedDownloads?.fullUrl ?? ''),
           patchUrl:
@@ -1476,6 +1937,46 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
+    if (message.type === 'vaulttrack:update-source-patch') {
+      try {
+        const selectedSteamPatch =
+          typeof message.selectedSteamPatch === 'object' &&
+          message.selectedSteamPatch !== null
+            ? (message.selectedSteamPatch as SteamPatchCandidate)
+            : null;
+        if (!selectedSteamPatch) {
+          sendResponse({
+            message: 'Choose a SteamDB patch before saving.',
+            ok: false,
+          });
+          return;
+        }
+
+        const response = await sendDesktopRequest({
+          payload: {
+            selectedSteamPatch,
+            steamPatchEntries: Array.isArray(message.steamPatchEntries)
+              ? (message.steamPatchEntries as SteamPatchCandidate[])
+              : null,
+            trackedItemId: String(message.trackedItemId ?? ''),
+          },
+          type: 'updateSourcePatch',
+        });
+        sendResponse(
+          response.ok ? { ok: true, payload: response.payload } : response,
+        );
+      } catch (error) {
+        sendResponse({
+          message:
+            error instanceof Error
+              ? error.message
+              : 'Unable to update source patch.',
+          ok: false,
+        });
+      }
+      return;
+    }
+
     if (message.type === 'vaulttrack:retry-download') {
       try {
         const response = await sendDesktopRequest({
@@ -1501,7 +2002,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       } catch (error) {
         sendResponse({
           message:
-            error instanceof Error ? error.message : 'Unable to retry download.',
+            error instanceof Error
+              ? error.message
+              : 'Unable to retry download.',
           ok: false,
         });
       }

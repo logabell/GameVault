@@ -42,6 +42,8 @@ const api = {
     ipcRenderer.invoke('vault:scanImportFolders', rootLibraryPath),
   updateInstallRecord: (payload: unknown) =>
     ipcRenderer.invoke('vault:updateInstallRecord', payload),
+  updateSourcePatch: (payload: unknown) =>
+    ipcRenderer.invoke('vault:updateSourcePatch', payload),
 };
 
 contextBridge.exposeInMainWorld('vaultTrackApi', api);

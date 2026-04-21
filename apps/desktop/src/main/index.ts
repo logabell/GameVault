@@ -190,6 +190,9 @@ async function bootstrap() {
   ipcMain.handle('vault:updateInstallRecord', (_event, payload) =>
     service.updateInstallRecord(payload),
   );
+  ipcMain.handle('vault:updateSourcePatch', (_event, payload) =>
+    service.updateSourcePatch(payload),
+  );
   ipcMain.handle('vault:resolveSteamMatch', (_event, payload) =>
     service.resolveSteamMatch(
       payload.title,

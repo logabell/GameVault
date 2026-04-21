@@ -7,7 +7,10 @@
   "host_permissions": [
     "http://127.0.0.1/*",
     "https://elamigos.site/*",
-    "https://steamrip.com/*"
+    "https://www.elamigos.site/*",
+    "https://steamdb.info/*",
+    "https://steamrip.com/*",
+    "https://www.steamrip.com/*"
   ],
   "action": {
     "default_popup": "popup.html"
@@ -20,10 +23,16 @@
     {
       "matches": [
         "https://elamigos.site/data/*.html",
-        "https://steamrip.com/*-free-download/*",
-        "https://steamrip.com/*-free-download"
+        "https://www.elamigos.site/data/*.html",
+        "https://steamrip.com/*-free-download*",
+        "https://www.steamrip.com/*-free-download*"
       ],
       "js": ["content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://steamdb.info/app/*/patchnotes/*"],
+      "js": ["steamdb-content.js"],
       "run_at": "document_idle"
     }
   ]

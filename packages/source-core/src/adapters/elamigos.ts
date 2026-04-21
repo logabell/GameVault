@@ -14,6 +14,8 @@ const UPDATE_LINE_RE =
   /update\s+(?<from>[0-9a-z.\- ]+?)\s*-\s*(?<version>[0-9a-z.\- ]+?)\s*\((?<date>\d{2}\.\d{2}\.\d{4})\)/i;
 const FULL_LINE_RE =
   /updated\s+to\s+version\s+(?<version>[0-9a-z.\- ]+?)\s*\((?<date>\d{2}\.\d{2}\.\d{4})\)/i;
+const UPDATED_TILL_LINE_RE =
+  /updated\s+till\s+(?<date>\d{2}\.\d{2}\.\d{4})/i;
 const MIRROR_HOST_LABELS = new Map<string, string>([
   ['1fichier.com', '1Fichier'],
   ['filecrypt.cc', 'FileCrypt'],
@@ -51,6 +53,17 @@ function parseReleaseLine(
       label: compactText(text),
       patchDate: ddmmyyyyToMmddyyyy(fullMatch.groups.date),
       version: fullMatch.groups.version.trim(),
+    };
+  }
+
+  const updatedTillMatch = text.match(UPDATED_TILL_LINE_RE);
+  if (updatedTillMatch?.groups) {
+    const patchDate = ddmmyyyyToMmddyyyy(updatedTillMatch.groups.date);
+    return {
+      isPatch: false,
+      label: compactText(text),
+      patchDate,
+      version: patchDate ? `Updated till ${patchDate}` : compactText(text),
     };
   }
 

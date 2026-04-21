@@ -111,17 +111,23 @@ export interface SourceSnapshot {
   observedPatchDate?: string | null;
   observedPatchLink?: string | null;
   observedPatchTitle?: string | null;
+  patchSelectionSource?: PatchSelectionSource | null;
   checkedAt: string;
 }
+
+export type PatchSelectionSource = 'rss' | 'steamdb_builds' | 'manual';
 
 export interface SteamPatchCandidate {
   appId: number;
   title: string;
   patchTitle: string;
+  description?: string | null;
+  version?: string | null;
   buildId?: string | null;
   patchDate: string;
   publishedAt: string;
   link: string;
+  selectionSource?: PatchSelectionSource | null;
 }
 
 export interface SteamPatchEntry extends SteamPatchCandidate {
@@ -290,6 +296,7 @@ export interface AddTrackedItemRequestPayload {
   parsedSource: ParsedSourcePayload;
   steamMatch: ConfirmedSteamMatch | null;
   selectedSteamPatch: SteamPatchCandidate | null;
+  steamPatchEntries?: SteamPatchCandidate[] | null;
   selectedDownloads: SelectedDownloads;
   queueDownload: boolean;
 }

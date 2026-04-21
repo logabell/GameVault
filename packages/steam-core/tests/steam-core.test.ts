@@ -237,6 +237,7 @@ describe('SteamDB RSS parsing', () => {
         patchDate: '04/20/2026',
         patchTitle: 'MOUSE: P.I. For Hire - Hotfix v1.0.5',
         publishedAt: '2026-04-20T07:07:27.000Z',
+        selectionSource: 'rss',
         title: 'MOUSE: P.I. For Hire update for 20 April 2026',
       },
     ]);
@@ -266,6 +267,7 @@ describe('SteamDB RSS parsing', () => {
         patchDate: '04/19/2026',
         patchTitle: 'Patch released - BuildID 123456',
         publishedAt: '2026-04-19T12:00:00.000Z',
+        selectionSource: 'rss',
         title: 'Patch released - BuildID 123456',
         trackedItemId: 'item-1',
       },
@@ -291,6 +293,7 @@ describe('SteamDB RSS parsing', () => {
       buildId: '22674175',
       patchDate: '04/07/2026',
       patchTitle: 'Early Access Launch',
+      selectionSource: 'rss',
       title: 'Road to Vostok update for 7 April 2026',
     });
   });
@@ -332,6 +335,7 @@ describe('SteamDB RSS parsing', () => {
       buildId: null,
       patchTitle: 'Small update',
       publishedAt: '2026-04-19T07:13:32.000Z',
+      selectionSource: 'rss',
     });
   });
 });

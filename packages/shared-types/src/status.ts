@@ -60,6 +60,13 @@ export function derivePatchLag(
     };
   }
 
+  if (input.selectedPatch.selectionSource === 'manual') {
+    return {
+      selectedPatchMissingFromFeed: false,
+      versionsBehindLatest: null,
+    };
+  }
+
   const feedEntries = (input.feedEntries ?? [])
     .slice()
     .sort((left, right) => patchTimestamp(right) - patchTimestamp(left));

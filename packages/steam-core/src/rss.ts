@@ -113,6 +113,7 @@ export function parseSteamDbPatchCandidates(
       patchDate,
       patchTitle,
       publishedAt,
+      selectionSource: 'rss',
       title,
     };
   });

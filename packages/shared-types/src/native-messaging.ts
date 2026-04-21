@@ -6,6 +6,7 @@ import type {
   RefreshResult,
   SelectedDownloads,
   SettingsView,
+  SteamPatchCandidate,
   SteamPatchFeedResult,
   TrackedItemView,
   SteamMatchResolutionPayload,
@@ -40,6 +41,14 @@ export type NativeMessageRequest =
   | {
       type: 'refreshTrackedItem';
       payload: { trackedItemId: string };
+    }
+  | {
+      type: 'updateSourcePatch';
+      payload: {
+        selectedSteamPatch: SteamPatchCandidate;
+        steamPatchEntries?: SteamPatchCandidate[] | null;
+        trackedItemId: string;
+      };
     }
   | {
       type: 'markDownloadFailed';
@@ -122,6 +131,11 @@ export type NativeMessageResponse =
       ok: true;
       type: 'refreshTrackedItem';
       payload: RefreshResult;
+    }
+  | {
+      ok: true;
+      type: 'updateSourcePatch';
+      payload: TrackedItemView;
     }
   | {
       ok: true;

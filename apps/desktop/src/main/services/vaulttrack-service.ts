@@ -18,6 +18,7 @@ import type {
   SteamPatchEntry,
   SteamPatchFeedResult,
   SteamMatchResolutionPayload,
+  TrackedItemRecord,
   TrackedItemView,
 } from '@vaulttrack/shared-types';
 import {
@@ -26,7 +27,7 @@ import {
   deriveTrackedItemStatus,
   deriveTrackedItemTrackingStatus,
 } from '@vaulttrack/shared-types';
-import { parseSupportedPage } from '@vaulttrack/source-core';
+import { parseSupportedPageForKind } from '@vaulttrack/source-core';
 import {
   buildSteamDbPatchFeedUrl,
   compareSourceToUpstream,
@@ -34,7 +35,7 @@ import {
   parseSteamDbPatchCandidates,
   resolveSteamMatch as resolveSteamSearch,
 } from '@vaulttrack/steam-core';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 
 import { VaultTrackDatabase } from './database.js';
 import {
@@ -47,6 +48,7 @@ import {
   planSteamRipExtractPathFromJob,
   pathExists,
   removeKnownLibraryPaths,
+  removeKnownStagingPaths,
   sanitizePathSegment,
   scanImportFolders,
 } from './files.js';
@@ -65,7 +67,8 @@ function buildDownloadJobParts(params: {
   now: string;
 }): DownloadJobPartRecord[] {
   const splitElamigosPackages = Boolean(
-    params.sourceKind === 'elamigos' && params.selectedDownloads.patchUrl?.trim(),
+    params.sourceKind === 'elamigos' &&
+    params.selectedDownloads.patchUrl?.trim(),
   );
   const entries = [
     {
@@ -104,7 +107,10 @@ function buildDownloadJobParts(params: {
   }));
 }
 
-function mirrorUrlMatches(left: string | null | undefined, right: string): boolean {
+function mirrorUrlMatches(
+  left: string | null | undefined,
+  right: string,
+): boolean {
   return (left ?? '').trim() === right;
 }
 
@@ -118,7 +124,10 @@ function getElamigosPartStagePath(
   packageName: string,
   role: 'full' | 'patch',
 ): string {
-  return join(baseStagePath, `${packageName}_${role === 'patch' ? 'update' : 'full'}`);
+  return join(
+    baseStagePath,
+    `${packageName}_${role === 'patch' ? 'update' : 'full'}`,
+  );
 }
 
 function getElamigosFullStagePaths(job: DownloadJobRecord): string[] {
@@ -178,7 +187,9 @@ function getElamigosPartContentPaths(job: DownloadJobRecord): string[] {
   return Array.from(candidates);
 }
 
-function isCompletedDownloadStage(stage: DownloadJobPartRecord['stage']): boolean {
+function isCompletedDownloadStage(
+  stage: DownloadJobPartRecord['stage'],
+): boolean {
   return stage === 'complete' || stage === 'staged';
 }
 
@@ -217,8 +228,9 @@ function summarizeDownloadParts(
     .map((part) => part.etaSeconds)
     .filter((value): value is number => value != null);
   const firstActiveStatus =
-    parts.find((part) => !isCompletedDownloadStage(part.stage) && part.statusMessage)
-      ?.statusMessage ?? null;
+    parts.find(
+      (part) => !isCompletedDownloadStage(part.stage) && part.statusMessage,
+    )?.statusMessage ?? null;
   const firstStatus =
     firstActiveStatus ??
     parts.find((part) => part.statusMessage)?.statusMessage ??
@@ -296,8 +308,7 @@ export class VaultTrackService {
     ) => void,
     private readonly showWindow: (trackedItemId?: string) => void,
     private readonly pickDirectoryDialog: () => Promise<string | null>,
-    private readonly dismountIsoUnderPath: typeof dismountIsoImagesUnderPath =
-      dismountIsoImagesUnderPath,
+    private readonly dismountIsoUnderPath: typeof dismountIsoImagesUnderPath = dismountIsoImagesUnderPath,
   ) {}
 
   private appendEvent(
@@ -383,9 +394,15 @@ export class VaultTrackService {
     }
 
     const matchingEntry = sourceSnapshot.observedBuildId
-      ? patchEntries.find(
+      ? (patchEntries.find(
+          (entry) =>
+            entry.buildId === sourceSnapshot.observedBuildId &&
+            (!sourceSnapshot.patchSelectionSource ||
+              entry.selectionSource === sourceSnapshot.patchSelectionSource),
+        ) ??
+        patchEntries.find(
           (entry) => entry.buildId === sourceSnapshot.observedBuildId,
-        )
+        ))
       : null;
     if (matchingEntry) {
       return matchingEntry;
@@ -418,8 +435,10 @@ export class VaultTrackService {
       patchDate: sourceSnapshot.observedPatchDate ?? '',
       patchTitle,
       publishedAt,
+      selectionSource: sourceSnapshot.patchSelectionSource ?? null,
       title: patchTitle,
       trackedItemId,
+      version: sourceSnapshot.observedVersion,
     };
   }
 
@@ -439,7 +458,12 @@ export class VaultTrackService {
         : (parsedSource.latestSourceRelease.patchDate ?? null),
       observedPatchLink: selectedSteamPatch?.link ?? null,
       observedPatchTitle: selectedSteamPatch?.patchTitle ?? null,
-      observedVersion: parsedSource.latestSourceRelease.version,
+      observedVersion:
+        selectedSteamPatch?.version?.trim() ||
+        parsedSource.latestSourceRelease.version,
+      patchSelectionSource: selectedSteamPatch
+        ? (selectedSteamPatch.selectionSource ?? 'rss')
+        : null,
       sourceKind: parsedSource.sourceKind,
       sourceUrl: parsedSource.sourceUrl,
       trackedItemId,
@@ -493,8 +517,8 @@ export class VaultTrackService {
       : null;
     const stagedElamigosContentExists = Boolean(
       storedDownload &&
-        item.sourceKind === 'elamigos' &&
-        (await this.elamigosStagedContentExists(storedDownload)),
+      item.sourceKind === 'elamigos' &&
+      (await this.elamigosStagedContentExists(storedDownload)),
     );
     const recoveredDownload =
       storedDownload &&
@@ -525,7 +549,9 @@ export class VaultTrackService {
         ? fallbackFinalPath
         : (recoveredDownload?.finalPath ?? fallbackFinalPath);
     const currentDownload =
-      recoveredDownload && finalPath && recoveredDownload.finalPath !== finalPath
+      recoveredDownload &&
+      finalPath &&
+      recoveredDownload.finalPath !== finalPath
         ? {
             ...recoveredDownload,
             finalPath,
@@ -644,6 +670,7 @@ export class VaultTrackService {
     this.database.upsertPatchEntries([
       {
         ...selectedSteamPatch,
+        selectionSource: selectedSteamPatch.selectionSource ?? 'rss',
         trackedItemId,
       },
     ]);
@@ -745,6 +772,7 @@ export class VaultTrackService {
       const feed = await this.fetchSteamPatchFeed(steamMatch.appId);
       const entries = feed.patches.map((entry) => ({
         ...entry,
+        selectionSource: entry.selectionSource ?? 'rss',
         trackedItemId,
       }));
       this.database.upsertPatchEntries(entries);
@@ -846,7 +874,9 @@ export class VaultTrackService {
       }
 
       const now = new Date().toISOString();
-      const jobId = existingMatchesRequest ? existingJob!.id : crypto.randomUUID();
+      const jobId = existingMatchesRequest
+        ? existingJob!.id
+        : crypto.randomUUID();
       const placeholderParts = buildDownloadJobParts({
         jobId,
         now,
@@ -889,7 +919,10 @@ export class VaultTrackService {
       await ensureDirectory(paths.stageRootPath);
       await ensureDirectory(paths.stagePath);
       await ensureDirectory(paths.extractPath);
-      if (parsedSource.sourceKind === 'elamigos' && selectedDownloads.patchUrl) {
+      if (
+        parsedSource.sourceKind === 'elamigos' &&
+        selectedDownloads.patchUrl
+      ) {
         await ensureDirectory(
           getElamigosPartStagePath(paths.stagePath, packageName, 'full'),
         );
@@ -962,7 +995,9 @@ export class VaultTrackService {
       if (placeholderJob) {
         const updatedAt = new Date().toISOString();
         const errorMessage =
-          error instanceof Error ? error.message : 'Unknown download queue error';
+          error instanceof Error
+            ? error.message
+            : 'Unknown download queue error';
         this.database.upsertDownloadJob({
           ...placeholderJob,
           errorMessage,
@@ -1016,6 +1051,17 @@ export class VaultTrackService {
     this.database.upsertSourceSnapshot(snapshot);
     this.database.setRawParsedSourcePayload(item.id, payload.parsedSource);
     this.syncMirrorsFromParsedSource(item.id, payload.parsedSource);
+    if (payload.steamPatchEntries?.length) {
+      this.database.upsertPatchEntries(
+        payload.steamPatchEntries
+          .filter((entry) => entry.appId === payload.selectedSteamPatch?.appId)
+          .map((entry) => ({
+            ...entry,
+            selectionSource: entry.selectionSource ?? 'steamdb_builds',
+            trackedItemId: item.id,
+          })),
+      );
+    }
     this.upsertSelectedSteamPatch(item.id, payload.selectedSteamPatch);
     this.database.selectDownloadMirror(
       item.id,
@@ -1081,7 +1127,11 @@ export class VaultTrackService {
     }
 
     const html = await response.text();
-    const parsedSource = parseSupportedPage(item.sourceUrl, html);
+    const parsedSource = parseSupportedPageForKind(
+      item.sourceKind,
+      item.sourceUrl,
+      html,
+    );
     let snapshot = this.buildSnapshotFromParsedSource(
       trackedItemId,
       parsedSource,
@@ -1107,6 +1157,8 @@ export class VaultTrackService {
         this.reconcileSteamPatchWatch(trackedItemId);
       }
     }
+
+    await this.reconcileLocalInstallAfterRefresh(trackedItemId);
 
     const latestPatch = this.getLatestPatch(trackedItemId);
     const view = await this.buildTrackedItemView(trackedItemId);
@@ -1242,12 +1294,198 @@ export class VaultTrackService {
     }
   }
 
+  private getExpectedFinalInstallPath(item: TrackedItemRecord): string | null {
+    const settings = this.database.getSettings();
+    if (settings.rootLibraryPath) {
+      const steamMatch = this.database.getSteamMatch(item.id);
+      return resolve(
+        join(
+          settings.rootLibraryPath,
+          sanitizePathSegment(steamMatch?.title ?? item.title),
+        ),
+      );
+    }
+
+    return this.database.getDownloadJob(item.id)?.finalPath ?? null;
+  }
+
+  private upsertInstallRecordFromSnapshot(
+    trackedItemId: string,
+    sourceSnapshot: SourceSnapshot,
+    now: Date,
+  ): void {
+    this.database.upsertInstallRecord({
+      installedAt:
+        sourceSnapshot.observedPatchDate ??
+        now.toLocaleDateString('en-US', {
+          day: '2-digit',
+          month: '2-digit',
+          year: 'numeric',
+        }),
+      installedBuildId: sourceSnapshot.observedBuildId ?? null,
+      installedVersion: sourceSnapshot.observedVersion,
+      trackedItemId,
+      updatedAt: now.toISOString(),
+    });
+  }
+
+  private completeDownloadJobFromLocalInstall(params: {
+    finalPath: string;
+    job: DownloadJobRecord;
+    nowIso: string;
+  }): void {
+    const parts = (params.job.parts ?? []).map((part) => ({
+      ...part,
+      errorMessage: null,
+      etaSeconds: 0,
+      stage: 'complete' as const,
+      statusMessage: null,
+      updatedAt: params.nowIso,
+    }));
+    const totalParts =
+      parts.length > 0 ? parts.length : (params.job.totalParts ?? null);
+
+    this.database.upsertDownloadJob({
+      ...params.job,
+      completedParts: totalParts,
+      errorMessage: null,
+      etaSeconds: 0,
+      finalPath: params.finalPath,
+      parts,
+      stage: 'complete',
+      statusMessage: null,
+      totalParts,
+      updatedAt: params.nowIso,
+    });
+  }
+
+  private async cleanupStaleDownloadAfterLocalInstall(params: {
+    finalPath: string;
+    item: TrackedItemRecord;
+    job: DownloadJobRecord;
+  }): Promise<void> {
+    await this.removeJDownloaderPackagesForJob(
+      params.job,
+      params.item.id,
+      'Unable to remove JDownloader package while reconciling local install',
+    );
+
+    const ejectedIsoPaths: string[] = [];
+    if (params.item.sourceKind === 'elamigos') {
+      for (const rootPath of getElamigosFullStagePaths(params.job)) {
+        if (!(await pathExists(rootPath))) {
+          continue;
+        }
+        ejectedIsoPaths.push(
+          ...(await this.dismountIsoUnderPath({
+            rootPath,
+          })),
+        );
+      }
+    }
+
+    const settings = this.database.getSettings();
+    if (!settings.rootLibraryPath) {
+      this.appendEvent(
+        'warn',
+        'Root library path is not configured; staged files were not deleted after local install reconciliation',
+        { ejectedIsoPaths, trackedItemId: params.item.id },
+      );
+      return;
+    }
+
+    const extractionPath =
+      params.item.sourceKind === 'steamrip'
+        ? planSteamRipExtractPathFromJob({
+            finalPath: params.finalPath,
+            stagePath: params.job.stagePath,
+          })
+        : null;
+    await removeKnownStagingPaths({
+      extractionPath,
+      rootLibraryPath: settings.rootLibraryPath,
+      stagePath: params.job.stagePath,
+    })
+      .then((deletedPaths) => {
+        this.appendEvent(
+          'info',
+          'Deleted staged files after local install reconciliation',
+          {
+            deletedPaths,
+            ejectedIsoPaths,
+            trackedItemId: params.item.id,
+          },
+        );
+      })
+      .catch((error) => {
+        this.appendEvent(
+          'warn',
+          'Unable to delete staged files after local install reconciliation',
+          {
+            error:
+              error instanceof Error
+                ? error.message
+                : 'Unknown staging cleanup error',
+            trackedItemId: params.item.id,
+          },
+        );
+      });
+  }
+
+  private async reconcileLocalInstallAfterRefresh(
+    trackedItemId: string,
+  ): Promise<void> {
+    const item = this.database.findTrackedItemById(trackedItemId);
+    const sourceSnapshot = this.database.getSourceSnapshot(trackedItemId);
+    if (!item || !sourceSnapshot) {
+      return;
+    }
+
+    const finalPath = this.getExpectedFinalInstallPath(item);
+    if (!finalPath || !(await directoryHasEntries(finalPath))) {
+      return;
+    }
+
+    const job = this.database.getDownloadJob(trackedItemId);
+    const shouldCompleteStaleJob = Boolean(
+      job && ['failed', 'staged'].includes(job.stage),
+    );
+    const installRecord = this.database.getInstallRecord(trackedItemId);
+    if (!shouldCompleteStaleJob && installRecord) {
+      return;
+    }
+
+    const now = new Date();
+    this.upsertInstallRecordFromSnapshot(trackedItemId, sourceSnapshot, now);
+    this.clearFailedStateForSelectedMirrors(trackedItemId);
+
+    if (job && shouldCompleteStaleJob) {
+      await this.cleanupStaleDownloadAfterLocalInstall({
+        finalPath,
+        item,
+        job,
+      });
+      this.completeDownloadJobFromLocalInstall({
+        finalPath,
+        job,
+        nowIso: now.toISOString(),
+      });
+    }
+
+    this.appendEvent('info', 'Reconciled local install during refresh', {
+      finalPath,
+      trackedItemId,
+    });
+  }
+
   async markDownloadFailed(trackedItemId: string): Promise<TrackedItemView> {
     const job = this.database.getDownloadJob(trackedItemId);
     if (!job) {
       throw new Error('No download job is available to mark failed.');
     }
-    if (!['queued', 'downloading', 'extracting', 'staged'].includes(job.stage)) {
+    if (
+      !['queued', 'downloading', 'extracting', 'staged'].includes(job.stage)
+    ) {
       throw new Error('Only active or staged downloads can be marked failed.');
     }
 
@@ -1368,11 +1606,15 @@ export class VaultTrackService {
                 })
               : false;
           if (normalizedNestedFolder) {
-            this.appendEvent('info', 'Normalized nested ElAmigos extraction folder', {
-              packageName: part.packageName,
-              rootPath: partStagePath,
-              trackedItemId: item.id,
-            });
+            this.appendEvent(
+              'info',
+              'Normalized nested ElAmigos extraction folder',
+              {
+                packageName: part.packageName,
+                rootPath: partStagePath,
+                trackedItemId: item.id,
+              },
+            );
           }
           const stagedPartHasFiles =
             item.sourceKind === 'elamigos' &&
@@ -1421,34 +1663,27 @@ export class VaultTrackService {
             const canonicalTitle = sanitizePathSegment(
               job.finalPath.split(/[\\/]/).filter(Boolean).at(-1) ?? item.title,
             );
-            try {
-              await finalizeSteamRipExtraction({
-                canonicalTitle,
-                extractPath: extractDirectory,
-                finalPath: job.finalPath,
-                stageRootPath: job.stagePath
-                  .split(/[\\/]/)
-                  .slice(0, -1)
-                  .join('\\'),
-              });
-              if (extractionErrorWithStagedFiles) {
-                nextJob.statusMessage =
-                  'JDownloader reported Extraction error; staged files are present';
-              }
-              nextJob.stage = 'complete';
-              nextJob.parts = updatedParts.map((part) => ({
-                ...part,
-                stage: 'complete',
-                statusMessage:
-                  extractionErrorWithStagedFiles && part.statusMessage
-                    ? nextJob.statusMessage
-                    : part.statusMessage,
-              }));
-            } catch (error) {
-              if (!extractionErrorWithStagedFiles) {
-                throw error;
-              }
+            await finalizeSteamRipExtraction({
+              canonicalTitle,
+              extractPath: extractDirectory,
+              finalPath: job.finalPath,
+              stageRootPath: dirname(job.stagePath),
+            });
+            if (extractionErrorWithStagedFiles) {
+              nextJob.statusMessage =
+                'JDownloader reported Extraction error; staged files are present';
             }
+            nextJob.errorMessage = null;
+            nextJob.stage = 'complete';
+            nextJob.parts = updatedParts.map((part) => ({
+              ...part,
+              errorMessage: null,
+              stage: 'complete',
+              statusMessage:
+                extractionErrorWithStagedFiles && part.statusMessage
+                  ? nextJob.statusMessage
+                  : part.statusMessage,
+            }));
 
             const sourceSnapshot = this.database.getSourceSnapshot(item.id);
             if (sourceSnapshot && nextJob.stage === 'complete') {
@@ -1466,6 +1701,45 @@ export class VaultTrackService {
                 updatedAt: new Date().toISOString(),
               });
               this.clearFailedStateForSelectedMirrors(item.id);
+            }
+
+            await this.removeJDownloaderPackagesForJob(
+              nextJob,
+              item.id,
+              'Unable to remove JDownloader package after SteamRIP install completion',
+            );
+
+            const settings = this.database.getSettings();
+            if (settings.rootLibraryPath) {
+              await removeKnownLibraryPaths({
+                rootLibraryPath: settings.rootLibraryPath,
+                stagePath: job.stagePath,
+              })
+                .then((deletedPaths) => {
+                  this.appendEvent('info', 'Deleted staged SteamRIP files', {
+                    deletedPaths,
+                    trackedItemId: item.id,
+                  });
+                })
+                .catch((error) => {
+                  this.appendEvent(
+                    'warn',
+                    'Unable to delete staged SteamRIP files after install completion',
+                    {
+                      error:
+                        error instanceof Error
+                          ? error.message
+                          : 'Unknown SteamRIP cleanup error',
+                      trackedItemId: item.id,
+                    },
+                  );
+                });
+            } else {
+              this.appendEvent(
+                'warn',
+                'Root library path is not configured; staged SteamRIP files were not deleted',
+                { trackedItemId: item.id },
+              );
             }
           }
         }
@@ -1594,11 +1868,12 @@ export class VaultTrackService {
     email: string,
     password: string,
   ): Promise<ConnectionHealthSummary> {
+    const normalizedEmail = email.trim().toLowerCase();
     const snapshot = await this.myJDownloader.authenticate({
-      email,
+      email: normalizedEmail,
       password,
     });
-    this.database.setSetting('myjd.email', email);
+    this.database.setSetting('myjd.email', normalizedEmail);
     this.database.setSetting('myjd.password', this.secrets.encrypt(password));
     this.database.setSetting(
       'myjd.deviceId',
@@ -1646,7 +1921,7 @@ export class VaultTrackService {
 
     return {
       deviceId: settings.myJDownloaderDeviceId ?? '',
-      email: settings.myJDownloaderEmail,
+      email: settings.myJDownloaderEmail.trim().toLowerCase(),
       password: this.secrets.decrypt(settings.encryptedPassword),
     };
   }
@@ -1683,6 +1958,69 @@ export class VaultTrackService {
       trackedItemId,
     });
     return this.buildTrackedItemView(trackedItemId);
+  }
+
+  async updateSourcePatch(params: {
+    selectedSteamPatch: SteamPatchCandidate;
+    steamPatchEntries?: SteamPatchCandidate[] | null;
+    trackedItemId: string;
+  }): Promise<TrackedItemView> {
+    const item = this.database.findTrackedItemById(params.trackedItemId);
+    if (!item) {
+      throw new Error(`Tracked item ${params.trackedItemId} not found`);
+    }
+
+    const steamMatch = this.database.getSteamMatch(params.trackedItemId);
+    if (!steamMatch) {
+      throw new Error('Apply a Steam match before editing the source patch.');
+    }
+
+    if (params.selectedSteamPatch.appId !== steamMatch.appId) {
+      throw new Error(
+        'Selected SteamDB patch does not match the applied Steam app.',
+      );
+    }
+
+    const sourceSnapshot = this.database.getSourceSnapshot(
+      params.trackedItemId,
+    );
+    if (!sourceSnapshot) {
+      throw new Error('No source snapshot is available for this item.');
+    }
+
+    const selectionSource = params.selectedSteamPatch.selectionSource ?? 'rss';
+    const patchEntries = [
+      ...(params.steamPatchEntries ?? []),
+      params.selectedSteamPatch,
+    ].filter((entry) => entry.appId === steamMatch.appId);
+    this.database.upsertPatchEntries(
+      patchEntries.map((entry) => ({
+        ...entry,
+        selectionSource:
+          entry === params.selectedSteamPatch
+            ? selectionSource
+            : (entry.selectionSource ?? 'rss'),
+        trackedItemId: params.trackedItemId,
+      })),
+    );
+    this.database.upsertSourceSnapshot({
+      ...sourceSnapshot,
+      observedBuildId: params.selectedSteamPatch.buildId ?? null,
+      observedPatchDate: params.selectedSteamPatch.patchDate,
+      observedPatchLink: params.selectedSteamPatch.link,
+      observedPatchTitle: params.selectedSteamPatch.patchTitle,
+      observedVersion:
+        params.selectedSteamPatch.version?.trim() ||
+        sourceSnapshot.observedVersion,
+      patchSelectionSource: selectionSource,
+    });
+    this.reconcileSteamPatchWatch(params.trackedItemId);
+
+    this.appendEvent('info', 'Updated source patch selection', {
+      buildId: params.selectedSteamPatch.buildId ?? null,
+      trackedItemId: params.trackedItemId,
+    });
+    return this.buildTrackedItemView(params.trackedItemId);
   }
 
   async updateInstallRecord(params: {

@@ -8,7 +8,7 @@ import type {
 } from '@vaulttrack/shared-types';
 
 const BRIDGE_URL = 'http://127.0.0.1:47615/native-message';
-const BRIDGE_POST_TIMEOUT_MS = 10000;
+const BRIDGE_POST_TIMEOUT_MS = 75000;
 const require = createRequire(__filename);
 
 function encodeMessage(message: NativeMessageResponse): Buffer {
@@ -42,14 +42,20 @@ function getElectronExecutable(): string {
   const packageJsonPath = require.resolve('electron/package.json', {
     paths: [getDesktopRoot()],
   });
-  return join(dirname(packageJsonPath), 'dist', process.platform === 'win32' ? 'electron.exe' : 'electron');
+  return join(
+    dirname(packageJsonPath),
+    'dist',
+    process.platform === 'win32' ? 'electron.exe' : 'electron',
+  );
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
-async function postBridge(request: NativeMessageRequest): Promise<NativeMessageResponse> {
+async function postBridge(
+  request: NativeMessageRequest,
+): Promise<NativeMessageResponse> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), BRIDGE_POST_TIMEOUT_MS);
 
@@ -63,7 +69,9 @@ async function postBridge(request: NativeMessageRequest): Promise<NativeMessageR
       signal: controller.signal,
     });
     if (!bridgeResponse.ok) {
-      throw new Error(`VaultTrack desktop bridge returned ${bridgeResponse.status}.`);
+      throw new Error(
+        `VaultTrack desktop bridge returned ${bridgeResponse.status}.`,
+      );
     }
     return (await bridgeResponse.json()) as NativeMessageResponse;
   } catch (error) {
@@ -77,14 +85,20 @@ async function postBridge(request: NativeMessageRequest): Promise<NativeMessageR
 }
 
 function startDesktopInBackground(): void {
-  const child = spawn(getElectronExecutable(), [getDesktopRoot(), '--background'], {
-    detached: true,
-    stdio: 'ignore',
-  });
+  const child = spawn(
+    getElectronExecutable(),
+    [getDesktopRoot(), '--background'],
+    {
+      detached: true,
+      stdio: 'ignore',
+    },
+  );
   child.unref();
 }
 
-async function ensureBridge(request: NativeMessageRequest): Promise<NativeMessageResponse> {
+async function ensureBridge(
+  request: NativeMessageRequest,
+): Promise<NativeMessageResponse> {
   try {
     return await postBridge(request);
   } catch {
@@ -102,7 +116,9 @@ async function ensureBridge(request: NativeMessageRequest): Promise<NativeMessag
     }
   }
 
-  throw lastError instanceof Error ? lastError : new Error('VaultTrack desktop bridge is unavailable');
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('VaultTrack desktop bridge is unavailable');
 }
 
 async function main() {

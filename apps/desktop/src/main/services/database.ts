@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS source_snapshots (
   observed_patch_date TEXT,
   observed_patch_title TEXT,
   observed_patch_link TEXT,
+  patch_selection_source TEXT,
   raw_payload_json TEXT NOT NULL,
   checked_at TEXT NOT NULL
 );
@@ -61,7 +62,10 @@ CREATE TABLE IF NOT EXISTS steam_patch_entries (
   build_id TEXT,
   patch_date TEXT NOT NULL,
   published_at TEXT,
-  link TEXT NOT NULL
+  link TEXT NOT NULL,
+  version TEXT,
+  description TEXT,
+  selection_source TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_patch_dedupe
@@ -182,7 +186,11 @@ function applyMigrations(db: SqlJsDatabase): void {
     `ALTER TABLE download_jobs ADD COLUMN total_parts INTEGER`,
     `ALTER TABLE source_snapshots ADD COLUMN observed_patch_title TEXT`,
     `ALTER TABLE source_snapshots ADD COLUMN observed_patch_link TEXT`,
+    `ALTER TABLE source_snapshots ADD COLUMN patch_selection_source TEXT`,
     `ALTER TABLE steam_patch_entries ADD COLUMN published_at TEXT`,
+    `ALTER TABLE steam_patch_entries ADD COLUMN version TEXT`,
+    `ALTER TABLE steam_patch_entries ADD COLUMN description TEXT`,
+    `ALTER TABLE steam_patch_entries ADD COLUMN selection_source TEXT`,
     `ALTER TABLE steam_feed_checks ADD COLUMN feed_url TEXT`,
   ];
 
@@ -461,6 +469,7 @@ export class VaultTrackDatabase {
       observed_patch_date: string | null;
       observed_patch_link: string | null;
       observed_patch_title: string | null;
+      patch_selection_source: SourceSnapshot['patchSelectionSource'] | null;
       raw_payload_json: string;
       checked_at: string;
     }>(
@@ -479,6 +488,7 @@ export class VaultTrackDatabase {
       observedPatchDate: row.observed_patch_date,
       observedPatchLink: row.observed_patch_link,
       observedPatchTitle: row.observed_patch_title,
+      patchSelectionSource: row.patch_selection_source,
       observedVersion: row.observed_version,
       sourceKind: row.source_kind,
       sourceUrl: row.source_url,
@@ -494,8 +504,9 @@ export class VaultTrackDatabase {
     this.exec(
       `INSERT INTO source_snapshots (
          tracked_item_id, source_kind, source_url, fingerprint, observed_version, observed_build_id,
-         observed_patch_date, observed_patch_title, observed_patch_link, raw_payload_json, checked_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         observed_patch_date, observed_patch_title, observed_patch_link, patch_selection_source,
+         raw_payload_json, checked_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(tracked_item_id) DO UPDATE SET
          source_kind = excluded.source_kind,
          source_url = excluded.source_url,
@@ -505,6 +516,7 @@ export class VaultTrackDatabase {
          observed_patch_date = excluded.observed_patch_date,
          observed_patch_title = excluded.observed_patch_title,
          observed_patch_link = excluded.observed_patch_link,
+         patch_selection_source = excluded.patch_selection_source,
          raw_payload_json = excluded.raw_payload_json,
          checked_at = excluded.checked_at`,
       [
@@ -517,6 +529,7 @@ export class VaultTrackDatabase {
         snapshot.observedPatchDate ?? null,
         snapshot.observedPatchTitle ?? null,
         snapshot.observedPatchLink ?? null,
+        snapshot.patchSelectionSource ?? null,
         rawPayloadJson ?? JSON.stringify(null),
         snapshot.checkedAt,
       ],
@@ -704,23 +717,30 @@ export class VaultTrackDatabase {
       app_id: number;
       patch_title: string;
       build_id: string | null;
+      description: string | null;
       patch_date: string;
       published_at: string | null;
+      selection_source: SteamPatchEntry['selectionSource'] | null;
+      version: string | null;
       link: string;
     }>(
-      `SELECT tracked_item_id, app_id, patch_title, build_id, patch_date, published_at, link
+      `SELECT tracked_item_id, app_id, patch_title, build_id, patch_date, published_at, link,
+              version, description, selection_source
        FROM steam_patch_entries WHERE tracked_item_id = ?
        ORDER BY COALESCE(published_at, patch_date) DESC`,
       [trackedItemId],
     ).map((row) => ({
       appId: Number(row.app_id),
       buildId: row.build_id,
+      description: row.description,
       link: row.link,
       patchDate: row.patch_date,
       patchTitle: row.patch_title,
       publishedAt: normalizePublishedAt(row.published_at, row.patch_date),
+      selectionSource: row.selection_source,
       title: row.patch_title,
       trackedItemId: row.tracked_item_id,
+      version: row.version,
     }));
   }
 
@@ -728,8 +748,9 @@ export class VaultTrackDatabase {
     for (const entry of entries) {
       this.exec(
         `INSERT OR IGNORE INTO steam_patch_entries (
-           id, tracked_item_id, app_id, patch_title, build_id, patch_date, published_at, link
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+           id, tracked_item_id, app_id, patch_title, build_id, patch_date, published_at,
+           link, version, description, selection_source
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           randomId(),
           entry.trackedItemId,
@@ -739,11 +760,15 @@ export class VaultTrackDatabase {
           entry.patchDate,
           entry.publishedAt,
           entry.link,
+          entry.version ?? null,
+          entry.description ?? null,
+          entry.selectionSource ?? 'rss',
         ],
       );
       this.exec(
         `UPDATE steam_patch_entries
-         SET app_id = ?, patch_title = ?, build_id = ?, patch_date = ?, published_at = ?
+         SET app_id = ?, patch_title = ?, build_id = ?, patch_date = ?, published_at = ?,
+             version = ?, description = ?, selection_source = ?
          WHERE tracked_item_id = ? AND link = ?`,
         [
           entry.appId,
@@ -751,6 +776,9 @@ export class VaultTrackDatabase {
           entry.buildId ?? null,
           entry.patchDate,
           entry.publishedAt,
+          entry.version ?? null,
+          entry.description ?? null,
+          entry.selectionSource ?? 'rss',
           entry.trackedItemId,
           entry.link,
         ],

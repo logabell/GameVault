@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { parseSupportedPage } from '../src/service.js';
+import {
+  getAdapterForUrl,
+  parseSupportedPage,
+  parseSupportedPageForKind,
+} from '../src/service.js';
 
 describe('source parsers', () => {
   it('parses ElAmigos pages and promotes the latest update block', () => {
@@ -125,6 +129,38 @@ describe('source parsers', () => {
     ]);
   });
 
+  it('parses ElAmigos pages that only expose an updated-till date', () => {
+    const html = `
+      <html>
+        <head>
+          <title>Ziggurat 2 - ElAmigos official site</title>
+        </head>
+        <body>
+          <h2>Ziggurat 2 (2021), 0.94GB</h2>
+          <h3>ElAmigos release, game is already cracked after installation. Updated till 01.02.2023.</h3>
+          <h2>DDOWNLOAD</h2>
+          <h3><a href="https://www.filecrypt.cc/Container/C69312C786.html">https://www.filecrypt.cc/Container/C69312C786.html</a></h3>
+          <h3><a href="https://www.keeplinks.org/p16/618da47ded065">https://www.keeplinks.org/p16/618da47ded065</a></h3>
+          <h2>RAPIDGATOR</h2>
+          <h3><a href="https://www.filecrypt.cc/Container/2C3E0D8A2B.html">https://www.filecrypt.cc/Container/2C3E0D8A2B.html</a></h3>
+          <h3><a href="https://www.keeplinks.org/p16/618da4727bfb6">https://www.keeplinks.org/p16/618da4727bfb6</a></h3>
+        </body>
+      </html>
+    `;
+
+    const parsed = parseSupportedPage(
+      'https://elamigos.site/data/Ziggurat_2_MULTi11_-_ElAmigos.html',
+      html,
+    );
+
+    expect(parsed.sourceKind).toBe('elamigos');
+    expect(parsed.title).toBe('Ziggurat 2');
+    expect(parsed.fullRelease?.version).toBe('Updated till 02/01/2023');
+    expect(parsed.fullRelease?.patchDate).toBe('02/01/2023');
+    expect(parsed.latestSourceRelease.version).toBe('Updated till 02/01/2023');
+    expect(parsed.fullDownloadUrls).toHaveLength(4);
+  });
+
   it('parses SteamRIP pages and keeps the full release as the latest source release', () => {
     const html = `
       <html>
@@ -144,7 +180,7 @@ describe('source parsers', () => {
     `;
 
     const parsed = parseSupportedPage(
-      'https://steamrip.com/mouse-p-i-for-hire-free-download/',
+      'https://steamrip.com/ziggurat-2-free-download-1r/',
       html,
     );
 
@@ -161,6 +197,59 @@ describe('source parsers', () => {
     expect(parsed.patchDownloadUrls).toEqual([]);
   });
 
+  it('parses tracked SteamRIP refreshes by saved source kind', () => {
+    const html = `
+      <html>
+        <body>
+          <h1>Ziggurat 2</h1>
+          <div class="entry-content">
+            <p>Game Info</p>
+            <p>Version: 15.12.2021</p>
+            <p>Build: 7873732</p>
+            <a href="https://megadb.net/example">DOWNLOAD HERE</a>
+          </div>
+        </body>
+      </html>
+    `;
+
+    const parsed = parseSupportedPageForKind(
+      'steamrip',
+      'https://steamrip.com/ziggurat-2-free-download-1/',
+      html,
+    );
+
+    expect(parsed.sourceKind).toBe('steamrip');
+    expect(parsed.title).toBe('Ziggurat 2');
+    expect(parsed.latestSourceRelease.version).toBe('15.12.2021');
+    expect(parsed.latestSourceRelease.buildId).toBe('7873732');
+    expect(parsed.fullDownloadUrls).toEqual([
+      {
+        kind: 'full',
+        label: 'MegaDB',
+        url: 'https://megadb.net/example',
+      },
+    ]);
+  });
+
+  it('detects SteamRIP detail slug variants without accepting listing paths', () => {
+    for (const url of [
+      'https://steamrip.com/mouse-p-i-for-hire-free-download',
+      'https://steamrip.com/mouse-p-i-for-hire-free-download/',
+      'https://steamrip.com/ziggurat-2-free-download-1r/',
+      'https://www.steamrip.com/example-game-free-download-alt-release/?ref=homepage',
+    ]) {
+      expect(getAdapterForUrl(url, '')?.kind).toBe('steamrip');
+    }
+
+    expect(getAdapterForUrl('https://steamrip.com/updated-games/', '')).toBeNull();
+    expect(
+      getAdapterForUrl(
+        'https://steamrip.com/category/example-game-free-download/',
+        '',
+      ),
+    ).toBeNull();
+  });
+
   it('derives recognizable SteamRIP mirror labels from host names', () => {
     const html = `
       <html>
@@ -171,6 +260,7 @@ describe('source parsers', () => {
             GOFILE <a href="https://gofile.io/d/example">DOWNLOAD HERE</a>
             Buzzheavier <a href="https://bzzhr.to/example">DOWNLOAD HERE</a>
             FileDitch <a href="https://fileditchfiles.me/file/example">DOWNLOAD HERE</a>
+            MegaDB <a href="https://megadb.net/example">DOWNLOAD HERE</a>
           </div>
         </body>
       </html>
@@ -196,6 +286,11 @@ describe('source parsers', () => {
         kind: 'full',
         label: 'FileDitch',
         url: 'https://fileditchfiles.me/file/example',
+      },
+      {
+        kind: 'full',
+        label: 'MegaDB',
+        url: 'https://megadb.net/example',
       },
     ]);
     expect(parsed.patchDownloadUrls).toEqual([]);

@@ -10,9 +10,10 @@ export interface SteamPatchSuggestion {
 }
 
 export function getSteamPatchKey(patch: SteamPatchCandidate): string {
-  return (
+  const source = patch.selectionSource ?? 'rss';
+  return `${source}:${
     patch.buildId ?? patch.link ?? `${patch.patchDate}:${patch.patchTitle}`
-  );
+  }`;
 }
 
 function normalizePatchDateKey(

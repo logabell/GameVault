@@ -14,6 +14,12 @@ export function getAdapterForUrl(url: string, html: string): SourceAdapter | nul
   return adapters.find((adapter) => adapter.detectPage(url, html)) ?? null;
 }
 
+export function getAdapterForKind(
+  sourceKind: SupportedSourceKind,
+): SourceAdapter | null {
+  return adapters.find((adapter) => adapter.kind === sourceKind) ?? null;
+}
+
 export function parseSupportedPage(url: string, html: string): ParsedSourcePayload {
   const adapter = getAdapterForUrl(url, html);
   if (!adapter) {
@@ -23,11 +29,24 @@ export function parseSupportedPage(url: string, html: string): ParsedSourcePaylo
   return adapter.parsePage(url, html);
 }
 
+export function parseSupportedPageForKind(
+  sourceKind: SupportedSourceKind,
+  url: string,
+  html: string,
+): ParsedSourcePayload {
+  const adapter = getAdapterForKind(sourceKind);
+  if (!adapter) {
+    throw new Error(`No source adapter found for ${sourceKind}`);
+  }
+
+  return adapter.parsePage(url, html);
+}
+
 export function refreshTrackedItemFromHtml(
   item: RefreshTrackedItemInput,
   html: string,
 ): SourceSnapshot {
-  const adapter = adapters.find((entry) => entry.kind === item.sourceKind);
+  const adapter = getAdapterForKind(item.sourceKind);
   if (!adapter) {
     throw new Error(`No source adapter found for ${item.sourceKind}`);
   }

@@ -102,6 +102,27 @@ function rss(items: SteamPatchCandidate[]): string {
   `;
 }
 
+function steamRipSourceHtml(params: {
+  buildId: string;
+  mirrorUrl: string;
+  title: string;
+  version: string;
+}): string {
+  return `
+    <html>
+      <body>
+        <h1>${params.title}</h1>
+        <div class="entry-content">
+          <p>Game Info</p>
+          <p>Version: ${params.version}</p>
+          <p>Build: ${params.buildId}</p>
+          <a href="${params.mirrorUrl}">DOWNLOAD HERE</a>
+        </div>
+      </body>
+    </html>
+  `;
+}
+
 function createService(
   database: VaultTrackDatabase,
   queueLinks: unknown = vi.fn(async () => ({
@@ -118,8 +139,9 @@ function createService(
     stage: 'queued',
     statusMessage: null,
   })),
-  dismountIsoUnderPath: (params: { rootPath: string }) => Promise<string[]> =
-    vi.fn(async () => []),
+  dismountIsoUnderPath: (params: {
+    rootPath: string;
+  }) => Promise<string[]> = vi.fn(async () => []),
 ): VaultTrackService {
   const myJDownloader = {
     getHealth: async () => ({
@@ -215,6 +237,191 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       });
       expect(view.selectedPatch?.buildId).toBe('22852168');
       expect(view.versionsBehindLatest).toBe(0);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('uses a manual patch version as the tracked source version', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+
+      const view = await createService(database).addTrackedItem({
+        parsedSource,
+        queueDownload: false,
+        selectedDownloads: { fullUrl: 'https://gofile.io/d/full' },
+        selectedSteamPatch: {
+          appId: steamMatch.appId,
+          buildId: '8015416',
+          link: 'manual:test',
+          patchDate: '01/13/2022',
+          patchTitle: 'Manual version 1.0.8',
+          publishedAt: '2022-01-13T00:00:00.000Z',
+          selectionSource: 'manual',
+          title: 'Manual version 1.0.8',
+          version: '1.0.8',
+        },
+        steamMatch,
+      });
+
+      expect(view.sourceSnapshot).toMatchObject({
+        observedBuildId: '8015416',
+        observedVersion: '1.0.8',
+        patchSelectionSource: 'manual',
+      });
+      expect(view.selectedPatch).toMatchObject({
+        buildId: '8015416',
+        selectionSource: 'manual',
+        version: '1.0.8',
+      });
+      expect(view.versionsBehindLatest).toBeNull();
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('updates the selected source patch after tracking', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const correctedPatch: SteamPatchCandidate = {
+        ...selectedPatch,
+        buildId: '22899999',
+        link: 'https://steamdb.info/patchnotes/22899999/?utm_source=rss',
+        patchDate: '04/20/2026',
+        patchTitle: 'MOUSE: P.I. For Hire update for 20 April 2026',
+        publishedAt: '2026-04-20T07:13:32.000Z',
+        title: 'MOUSE: P.I. For Hire update for 20 April 2026',
+        version: '1.0.5',
+      };
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(
+          async () =>
+            new Response(rss([correctedPatch, selectedPatch]), {
+              status: 200,
+            }),
+        ),
+      );
+      const service = createService(database);
+      const view = await service.addTrackedItem({
+        parsedSource,
+        queueDownload: false,
+        selectedDownloads: { fullUrl: 'https://gofile.io/d/full' },
+        selectedSteamPatch: selectedPatch,
+        steamMatch,
+      });
+
+      const updated = await service.updateSourcePatch({
+        selectedSteamPatch: correctedPatch,
+        trackedItemId: view.item.id,
+      });
+
+      expect(updated.sourceSnapshot).toMatchObject({
+        observedBuildId: '22899999',
+        observedPatchDate: '04/20/2026',
+        observedPatchLink:
+          'https://steamdb.info/patchnotes/22899999/?utm_source=rss',
+        observedPatchTitle: 'MOUSE: P.I. For Hire update for 20 April 2026',
+        observedVersion: '1.0.5',
+        patchSelectionSource: 'rss',
+      });
+      expect(updated.selectedPatch).toMatchObject({
+        buildId: '22899999',
+        version: '1.0.5',
+      });
+      expect(updated.versionsBehindLatest).toBe(0);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('uses supplemental SteamDB build rows when updating source patch lag', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response(rss([selectedPatch]), { status: 200 })),
+      );
+      const service = createService(database);
+      const view = await service.addTrackedItem({
+        parsedSource,
+        queueDownload: false,
+        selectedDownloads: { fullUrl: 'https://gofile.io/d/full' },
+        selectedSteamPatch: selectedPatch,
+        steamMatch,
+      });
+      const steamPatchEntries = Array.from({ length: 24 }, (_value, index) => ({
+        appId: steamMatch.appId,
+        buildId: String(9300 - index),
+        link: `https://steamdb.info/patchnotes/${9300 - index}/`,
+        patchDate: '04/20/2026',
+        patchTitle: `Build ${9300 - index}`,
+        publishedAt: new Date(
+          Date.UTC(2026, 3, 20, 14, 30 - index),
+        ).toISOString(),
+        selectionSource: 'steamdb_builds' as const,
+        title: `Build ${9300 - index}`,
+      }));
+
+      const updated = await service.updateSourcePatch({
+        selectedSteamPatch: steamPatchEntries[17]!,
+        steamPatchEntries,
+        trackedItemId: view.item.id,
+      });
+
+      expect(updated.selectedPatch).toMatchObject({
+        buildId: '9283',
+        selectionSource: 'steamdb_builds',
+      });
+      expect(updated.selectedPatchMissingFromFeed).toBe(false);
+      expect(updated.versionsBehindLatest).toBe(17);
+      expect(updated.latestPatch).toMatchObject({
+        buildId: '9300',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('counts lag from supplemental SteamDB build rows for old manual overrides', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const steamPatchEntries = Array.from({ length: 30 }, (_value, index) => ({
+        appId: steamMatch.appId,
+        buildId: String(9000 - index),
+        link: `https://steamdb.info/patchnotes/${9000 - index}/`,
+        patchDate: '01/13/2022',
+        patchTitle: `Build ${9000 - index}`,
+        publishedAt: new Date(
+          Date.UTC(2022, 0, 13, 16, 30 - index),
+        ).toISOString(),
+        selectionSource: 'steamdb_builds' as const,
+        title: `Build ${9000 - index}`,
+      }));
+
+      const view = await createService(database).addTrackedItem({
+        parsedSource,
+        queueDownload: false,
+        selectedDownloads: { fullUrl: 'https://gofile.io/d/full' },
+        selectedSteamPatch: steamPatchEntries[28],
+        steamMatch,
+        steamPatchEntries,
+      });
+
+      expect(view.selectedPatch).toMatchObject({
+        buildId: '8972',
+        selectionSource: 'steamdb_builds',
+      });
+      expect(view.selectedPatchMissingFromFeed).toBe(false);
+      expect(view.versionsBehindLatest).toBe(28);
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
@@ -438,6 +645,229 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       ).toEqual(expect.any(String));
       expect(existsSync(stagePath!)).toBe(false);
       expect(existsSync(finalPath!)).toBe(true);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('refreshes a failed SteamRIP item to installed when the final folder is present', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      const zigguratSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fullDownloadUrls: [
+          {
+            kind: 'full',
+            label: 'MegaDB',
+            url: 'https://megadb.net/example',
+          },
+        ],
+        latestSourceRelease: {
+          buildId: '7873732',
+          isPatch: false,
+          label: 'Version 15.12.2021',
+          patchDate: '12/15/2021',
+          version: '15.12.2021',
+        },
+        normalizedTitle: 'ziggurat 2',
+        patchDownloadUrls: [],
+        sourceKind: 'steamrip',
+        sourceUrl: 'https://steamrip.com/ziggurat-2-free-download-1/',
+        title: 'Ziggurat 2',
+      };
+      const zigguratMatch: ConfirmedSteamMatch = {
+        ...steamMatch,
+        appId: 1159560,
+        normalizedTitle: 'ziggurat 2',
+        title: 'Ziggurat 2',
+      };
+      const zigguratPatch: SteamPatchCandidate = {
+        ...selectedPatch,
+        appId: zigguratMatch.appId,
+        buildId: '7873732',
+        patchDate: '12/15/2021',
+        patchTitle: 'Ziggurat 2 update for 15 December 2021',
+        publishedAt: '2021-12-15T12:00:00.000Z',
+        title: 'Ziggurat 2 update for 15 December 2021',
+        version: '15.12.2021',
+      };
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: string | URL | Request) => {
+          const url = String(input);
+          return new Response(
+            url === zigguratSource.sourceUrl
+              ? steamRipSourceHtml({
+                  buildId: '7873732',
+                  mirrorUrl: 'https://megadb.net/example',
+                  title: 'Ziggurat 2',
+                  version: '15.12.2021',
+                })
+              : rss([zigguratPatch]),
+            { status: 200 },
+          );
+        }),
+      );
+      const removePackage = vi.fn(async (_params: unknown) => undefined);
+      const service = createService(database, undefined, removePackage);
+      const queued = await service.addTrackedItem({
+        parsedSource: zigguratSource,
+        queueDownload: true,
+        selectedDownloads: { fullUrl: 'https://megadb.net/example' },
+        selectedSteamPatch: zigguratPatch,
+        steamMatch: zigguratMatch,
+      });
+      const stagePath = queued.currentDownload?.stagePath;
+      const finalPath = queued.currentDownload?.finalPath;
+      expect(stagePath).toEqual(expect.any(String));
+      expect(finalPath).toEqual(expect.any(String));
+      await mkdir(finalPath!, { recursive: true });
+      await writeFile(join(finalPath!, 'Ziggurat2.exe'), 'game');
+      await service.markDownloadFailed(queued.item.id);
+      removePackage.mockClear();
+
+      const extractWorkspacePath = join(
+        tempRoot,
+        'Library',
+        '_STAGING',
+        'Ziggurat 2',
+      );
+      await mkdir(stagePath!, { recursive: true });
+      await mkdir(join(extractWorkspacePath, 'contents'), { recursive: true });
+      await writeFile(join(stagePath!, 'leftover.rar'), 'archive');
+      await writeFile(
+        join(extractWorkspacePath, 'contents', 'leftover.tmp'),
+        'leftover',
+      );
+
+      const refreshed = await service.refreshTrackedItem(queued.item.id);
+
+      expect(refreshed.status).toBe('installed');
+      expect(removePackage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          packageId: 9001,
+          packageName: 'Ziggurat 2_7873732',
+          stagePath,
+        }),
+      );
+      expect(existsSync(join(finalPath!, 'Ziggurat2.exe'))).toBe(true);
+      expect(existsSync(stagePath!)).toBe(false);
+      expect(existsSync(extractWorkspacePath)).toBe(false);
+      expect(database.getInstallRecord(queued.item.id)).toMatchObject({
+        installedBuildId: '7873732',
+        installedVersion: '15.12.2021',
+      });
+      expect(
+        database
+          .listDownloadMirrors(queued.item.id)
+          .find((mirror) => mirror.url === 'https://megadb.net/example')
+          ?.manuallyFailedAt,
+      ).toBeNull();
+      const view = await service.getTrackedItemStatusBySourceUrl(
+        zigguratSource.sourceUrl,
+      );
+      expect(view).toMatchObject({
+        currentDownload: {
+          errorMessage: null,
+          stage: 'complete',
+        },
+        fileState: {
+          finalPath,
+          finalPathExists: true,
+        },
+        status: 'installed',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('keeps a failed SteamRIP item failed when refresh cannot find the final folder', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      const zigguratSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fullDownloadUrls: [
+          {
+            kind: 'full',
+            label: 'MegaDB',
+            url: 'https://megadb.net/example',
+          },
+        ],
+        latestSourceRelease: {
+          buildId: '7873732',
+          isPatch: false,
+          label: 'Version 15.12.2021',
+          patchDate: '12/15/2021',
+          version: '15.12.2021',
+        },
+        normalizedTitle: 'ziggurat 2',
+        patchDownloadUrls: [],
+        sourceKind: 'steamrip',
+        sourceUrl: 'https://steamrip.com/ziggurat-2-free-download-1/',
+        title: 'Ziggurat 2',
+      };
+      const zigguratMatch: ConfirmedSteamMatch = {
+        ...steamMatch,
+        appId: 1159560,
+        normalizedTitle: 'ziggurat 2',
+        title: 'Ziggurat 2',
+      };
+      const zigguratPatch: SteamPatchCandidate = {
+        ...selectedPatch,
+        appId: zigguratMatch.appId,
+        buildId: '7873732',
+        patchDate: '12/15/2021',
+        patchTitle: 'Ziggurat 2 update for 15 December 2021',
+        publishedAt: '2021-12-15T12:00:00.000Z',
+        title: 'Ziggurat 2 update for 15 December 2021',
+        version: '15.12.2021',
+      };
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: string | URL | Request) => {
+          const url = String(input);
+          return new Response(
+            url === zigguratSource.sourceUrl
+              ? steamRipSourceHtml({
+                  buildId: '7873732',
+                  mirrorUrl: 'https://megadb.net/example',
+                  title: 'Ziggurat 2',
+                  version: '15.12.2021',
+                })
+              : rss([zigguratPatch]),
+            { status: 200 },
+          );
+        }),
+      );
+      const removePackage = vi.fn(async (_params: unknown) => undefined);
+      const service = createService(database, undefined, removePackage);
+      const queued = await service.addTrackedItem({
+        parsedSource: zigguratSource,
+        queueDownload: true,
+        selectedDownloads: { fullUrl: 'https://megadb.net/example' },
+        selectedSteamPatch: zigguratPatch,
+        steamMatch: zigguratMatch,
+      });
+      await service.markDownloadFailed(queued.item.id);
+      removePackage.mockClear();
+
+      const refreshed = await service.refreshTrackedItem(queued.item.id);
+
+      expect(refreshed.status).toBe('failed');
+      expect(removePackage).not.toHaveBeenCalled();
+      expect(database.getInstallRecord(queued.item.id)).toBeNull();
+      const view = await service.getTrackedItemStatusBySourceUrl(
+        zigguratSource.sourceUrl,
+      );
+      expect(view).toMatchObject({
+        currentDownload: {
+          stage: 'failed',
+        },
+        status: 'failed',
+      });
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
@@ -865,6 +1295,143 @@ describe('VaultTrackService SteamDB patch workflow', () => {
     }
   });
 
+  it('promotes and cleans up completed SteamRIP extraction during polling', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const zigguratSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fullDownloadUrls: [
+          {
+            kind: 'full',
+            label: 'GOFILE',
+            url: 'https://gofile.io/d/ziggurat',
+          },
+        ],
+        latestSourceRelease: {
+          isPatch: false,
+          label: 'v15.12.2021',
+          patchDate: '12/15/2021',
+          version: '15.12.2021',
+        },
+        normalizedTitle: 'ziggurat 2',
+        patchDownloadUrls: [],
+        sourceKind: 'steamrip',
+        sourceUrl: 'https://steamrip.com/ziggurat-2-free-download-1r/',
+        title: 'Ziggurat 2',
+      };
+      const zigguratMatch: ConfirmedSteamMatch = {
+        ...steamMatch,
+        appId: 1159560,
+        normalizedTitle: 'ziggurat 2',
+        title: 'Ziggurat 2',
+      };
+      const zigguratPatch: SteamPatchCandidate = {
+        ...selectedPatch,
+        appId: zigguratMatch.appId,
+        buildId: '7873732',
+        patchDate: '12/15/2021',
+        patchTitle: 'Ziggurat 2 update for 15 December 2021',
+        publishedAt: '2021-12-15T12:00:00.000Z',
+        title: 'Ziggurat 2 update for 15 December 2021',
+        version: '15.12.2021',
+      };
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9001,
+        packageName: 'Ziggurat 2_7873732',
+        parts: [
+          {
+            mirrorUrl: 'https://gofile.io/d/ziggurat',
+            packageId: 9001,
+            packageName: 'Ziggurat 2_7873732',
+            role: 'full' as const,
+          },
+        ],
+      }));
+      const removePackage = vi.fn(async () => undefined);
+      const getPackageProgress = vi.fn(async () => ({
+        bytesLoaded: 100,
+        bytesTotal: 100,
+        etaSeconds: 0,
+        packageId: 9001,
+        speed: null,
+        stage: 'complete' as const,
+        statusMessage: null,
+      }));
+      const service = createService(
+        database,
+        queueLinks,
+        removePackage,
+        getPackageProgress,
+      );
+      const queued = await service.addTrackedItem({
+        parsedSource: zigguratSource,
+        queueDownload: true,
+        selectedDownloads: { fullUrl: 'https://gofile.io/d/ziggurat' },
+        selectedSteamPatch: zigguratPatch,
+        steamMatch: zigguratMatch,
+      });
+      const stagePath = queued.currentDownload?.stagePath;
+      expect(stagePath).toEqual(expect.any(String));
+      const extractWorkspacePath = join(
+        tempRoot,
+        'Library',
+        '_STAGING',
+        'Ziggurat 2',
+      );
+      const releasePath = join(
+        extractWorkspacePath,
+        'contents',
+        'Ziggurat 2_7873732',
+      );
+      const gameFolderPath = join(releasePath, 'Actual Extracted Game Folder');
+      const finalPath = join(tempRoot, 'Library', 'Ziggurat 2');
+      await writeFile(join(stagePath!, 'download.rar'), 'archive');
+      await mkdir(join(releasePath, '_CommonRedist'), { recursive: true });
+      await mkdir(gameFolderPath, { recursive: true });
+      await writeFile(join(releasePath, 'Read_Me_Instructions.txt'), 'readme');
+      await writeFile(join(releasePath, 'STEAMRIP.url'), 'url');
+      await writeFile(join(gameFolderPath, 'Ziggurat2.exe'), 'game');
+
+      await service.pollDownloadJobs();
+
+      expect(removePackage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          packageId: 9001,
+          packageName: 'Ziggurat 2_7873732',
+          stagePath,
+        }),
+      );
+      expect(existsSync(join(finalPath, 'Ziggurat2.exe'))).toBe(true);
+      expect(existsSync(join(finalPath, '_CommonRedist'))).toBe(false);
+      expect(existsSync(stagePath!)).toBe(false);
+      expect(existsSync(extractWorkspacePath)).toBe(false);
+      expect(database.getInstallRecord(queued.item.id)).toMatchObject({
+        installedBuildId: '7873732',
+        installedVersion: '15.12.2021',
+      });
+      const completed = await service.getTrackedItemStatusBySourceUrl(
+        zigguratSource.sourceUrl,
+      );
+      expect(completed).toMatchObject({
+        currentDownload: {
+          stage: 'complete',
+        },
+        fileState: {
+          finalPath,
+          finalPathExists: true,
+        },
+        status: 'installed',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('summarizes partial full and update download progress', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -1027,15 +1594,17 @@ describe('VaultTrackService SteamDB patch workflow', () => {
           },
         ],
       }));
-      const getPackageProgress = vi.fn(async (params: { packageId: number }) => ({
-        bytesLoaded: 100,
-        bytesTotal: 100,
-        etaSeconds: 0,
-        packageId: params.packageId,
-        speed: null,
-        stage: 'staged',
-        statusMessage: 'Extraction error',
-      }));
+      const getPackageProgress = vi.fn(
+        async (params: { packageId: number }) => ({
+          bytesLoaded: 100,
+          bytesTotal: 100,
+          etaSeconds: 0,
+          packageId: params.packageId,
+          speed: null,
+          stage: 'staged',
+          statusMessage: 'Extraction error',
+        }),
+      );
       const service = createService(
         database,
         queueLinks,
@@ -1088,9 +1657,9 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         statusMessage:
           'JDownloader reported Extraction error; staged files are present',
       });
-      await expect(readFile(join(updatePartPath, 'update.exe'), 'utf8')).resolves.toBe(
-        'update',
-      );
+      await expect(
+        readFile(join(updatePartPath, 'update.exe'), 'utf8'),
+      ).resolves.toBe('update');
       expect(existsSync(duplicateUpdatePath)).toBe(false);
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);

@@ -75,10 +75,102 @@ describe('finalizeSteamRipExtraction', () => {
         stageRootPath,
       });
 
-      await expect(readFile(join(finalPath, 'game.exe'), 'utf8')).resolves.toBe('game');
-      await expect(pathExists(join(finalPath, '_CommonRedist'))).resolves.toBe(false);
-      await expect(pathExists(join(finalPath, 'Read_Me_Instructions.txt'))).resolves.toBe(false);
-      await expect(pathExists(join(stageRootPath, 'MOUSE P.I. For Hire'))).resolves.toBe(false);
+      await expect(readFile(join(finalPath, 'game.exe'), 'utf8')).resolves.toBe(
+        'game',
+      );
+      await expect(pathExists(join(finalPath, '_CommonRedist'))).resolves.toBe(
+        false,
+      );
+      await expect(
+        pathExists(join(finalPath, 'Read_Me_Instructions.txt')),
+      ).resolves.toBe(false);
+      await expect(
+        pathExists(join(stageRootPath, 'MOUSE P.I. For Hire')),
+      ).resolves.toBe(false);
+    } finally {
+      await rm(tempRoot, { force: true, recursive: true });
+    }
+  });
+
+  it('promotes a version-suffixed SteamRIP game folder from a release wrapper', async () => {
+    const tempRoot = await mkdtemp(
+      join(tmpdir(), 'vaulttrack-steamrip-version-'),
+    );
+    const rootLibraryPath = join(tempRoot, 'High Seas');
+    const stageRootPath = join(rootLibraryPath, '_STAGING');
+    const extractPath = join(stageRootPath, 'Ziggurat 2', 'contents');
+    const releasePath = join(extractPath, 'Ziggurat 2_7873732');
+    const gameFolderPath = join(releasePath, 'Ziggurat 2 v15.12.2021');
+    const finalPath = join(rootLibraryPath, 'Ziggurat 2');
+
+    try {
+      await mkdir(join(releasePath, '_CommonRedist'), { recursive: true });
+      await mkdir(gameFolderPath, { recursive: true });
+      await writeFile(join(gameFolderPath, 'Ziggurat2.exe'), 'game');
+      await writeFile(join(releasePath, 'Read_Me_Instructions.txt'), 'readme');
+      await writeFile(join(releasePath, 'STEAMRIP.url'), 'url');
+
+      await finalizeSteamRipExtraction({
+        canonicalTitle: 'Ziggurat 2',
+        extractPath,
+        finalPath,
+        stageRootPath,
+      });
+
+      await expect(
+        readFile(join(finalPath, 'Ziggurat2.exe'), 'utf8'),
+      ).resolves.toBe('game');
+      await expect(pathExists(join(finalPath, '_CommonRedist'))).resolves.toBe(
+        false,
+      );
+      await expect(
+        pathExists(join(finalPath, 'Read_Me_Instructions.txt')),
+      ).resolves.toBe(false);
+      await expect(pathExists(join(stageRootPath, 'Ziggurat 2'))).resolves.toBe(
+        false,
+      );
+    } finally {
+      await rm(tempRoot, { force: true, recursive: true });
+    }
+  });
+
+  it('promotes the sole non-extra SteamRIP folder even when its name differs from the Steam title', async () => {
+    const tempRoot = await mkdtemp(
+      join(tmpdir(), 'vaulttrack-steamrip-arbitrary-'),
+    );
+    const rootLibraryPath = join(tempRoot, 'High Seas');
+    const stageRootPath = join(rootLibraryPath, '_STAGING');
+    const extractPath = join(stageRootPath, 'Ziggurat 2', 'contents');
+    const releasePath = join(extractPath, 'Ziggurat 2_7873732');
+    const gameFolderPath = join(releasePath, 'Actual Extracted Game Folder');
+    const finalPath = join(rootLibraryPath, 'Ziggurat 2');
+
+    try {
+      await mkdir(join(releasePath, '_CommonRedist'), { recursive: true });
+      await mkdir(gameFolderPath, { recursive: true });
+      await writeFile(join(gameFolderPath, 'Ziggurat2.exe'), 'game');
+      await writeFile(join(releasePath, 'Read_Me_Instructions.txt'), 'readme');
+      await writeFile(join(releasePath, 'STEAMRIP.url'), 'url');
+
+      await finalizeSteamRipExtraction({
+        canonicalTitle: 'Ziggurat 2',
+        extractPath,
+        finalPath,
+        stageRootPath,
+      });
+
+      await expect(
+        readFile(join(finalPath, 'Ziggurat2.exe'), 'utf8'),
+      ).resolves.toBe('game');
+      await expect(pathExists(join(finalPath, '_CommonRedist'))).resolves.toBe(
+        false,
+      );
+      await expect(pathExists(join(finalPath, 'STEAMRIP.url'))).resolves.toBe(
+        false,
+      );
+      await expect(pathExists(join(stageRootPath, 'Ziggurat 2'))).resolves.toBe(
+        false,
+      );
     } finally {
       await rm(tempRoot, { force: true, recursive: true });
     }
@@ -138,7 +230,11 @@ describe('removeKnownLibraryPaths', () => {
     const tempRoot = await mkdtemp(join(tmpdir(), 'vaulttrack-cleanup-'));
     const rootLibraryPath = join(tempRoot, 'High Seas');
     const finalPath = join(rootLibraryPath, 'MOUSE P.I. For Hire');
-    const stagePath = join(rootLibraryPath, '_STAGING', 'MOUSE P.I. For Hire_1.0.3.8157');
+    const stagePath = join(
+      rootLibraryPath,
+      '_STAGING',
+      'MOUSE P.I. For Hire_1.0.3.8157',
+    );
     const fullStagePath = join(
       stagePath,
       'MOUSE P.I. For Hire_1.0.3.8157_full',
@@ -147,7 +243,11 @@ describe('removeKnownLibraryPaths', () => {
       stagePath,
       'MOUSE P.I. For Hire_1.0.3.8157_update',
     );
-    const steamRipWorkspace = join(rootLibraryPath, '_STAGING', 'MOUSE P.I. For Hire');
+    const steamRipWorkspace = join(
+      rootLibraryPath,
+      '_STAGING',
+      'MOUSE P.I. For Hire',
+    );
 
     try {
       await mkdir(finalPath, { recursive: true });
