@@ -16,6 +16,7 @@ import type {
 import type { MyJDownloaderService } from '../src/main/services/myjdownloader.js';
 import { VaultTrackDatabase } from '../src/main/services/database.js';
 import { VaultTrackService } from '../src/main/services/vaulttrack-service.js';
+import type { extractSingleStagedZipArchive } from '../src/main/services/files.js';
 
 function resolveSqlWasmPath(): string {
   const candidates = [
@@ -215,6 +216,10 @@ function createService(
   }) => Promise<string[]> = vi.fn(async () => []),
   sourceFetch: SourceFetch = fetch,
   renderAnkerGamesSignedDownloadPage?: AnkerGamesSignedDownloadPageRenderer,
+  restartExtraction: unknown = vi.fn(async () => false),
+  extractStagedZipArchive: typeof extractSingleStagedZipArchive = vi.fn(
+    async () => null,
+  ),
 ): VaultTrackService {
   const myJDownloader = {
     getHealth: async () => ({
@@ -227,6 +232,7 @@ function createService(
     getPackageProgress,
     queueLinks,
     removePackage,
+    restartExtraction,
   } as unknown as MyJDownloaderService;
 
   return new VaultTrackService(
@@ -242,6 +248,7 @@ function createService(
     dismountIsoUnderPath,
     sourceFetch,
     renderAnkerGamesSignedDownloadPage,
+    extractStagedZipArchive,
   );
 }
 
@@ -650,9 +657,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
           });
         }
 
-        if (
-          input === 'https://ankergames.net/generate-download-url/2557'
-        ) {
+        if (input === 'https://ankergames.net/generate-download-url/2557') {
           expect(init?.method).toBe('POST');
           return new Response(
             JSON.stringify({
@@ -717,6 +722,56 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       expect(view.downloadMirrors[0]).toMatchObject({
         kind: 'full',
         url: 'https://ankergames.net/generate-download-url/2557',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('renames Ankergames Direct mirrors to DataNodes when they point at DataNodes', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const directUrl =
+        'https://node42.datanodes.to:8443/d/token/Shape-Of-Dreams-AnkerGames.zip';
+      const view = await createService(database).addTrackedItem({
+        parsedSource: {
+          ...ankergamesSource,
+          fingerprint: 'ankergames-direct-label',
+          fullDownloadUrls: [
+            {
+              kind: 'full',
+              label: 'Direct',
+              url: directUrl,
+            },
+          ],
+        },
+        queueDownload: false,
+        selectedDownloads: { fullUrl: directUrl },
+        selectedSteamPatch: {
+          ...selectedPatch,
+          appId: 2444750,
+          buildId: '22630308',
+        },
+        steamMatch: {
+          ...steamMatch,
+          appId: 2444750,
+          normalizedTitle: 'shape of dreams',
+          title: 'Shape of Dreams',
+        },
+      });
+
+      expect(view.downloadMirrors[0]).toMatchObject({
+        kind: 'full',
+        label: 'DataNodes',
+        url: directUrl,
+      });
+      expect(view.selectedMirror).toMatchObject({
+        label: 'DataNodes',
+        url: directUrl,
       });
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
@@ -1970,6 +2025,444 @@ describe('VaultTrackService SteamDB patch workflow', () => {
           finalPathExists: true,
         },
         status: 'installed',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('promotes and cleans up completed AnkerGames extraction during polling', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const directUrl =
+        'https://node42.datanodes.to:8443/d/token/Shape-Of-Dreams-AnkerGames.zip';
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9001,
+        packageName: 'Shape of Dreams_22630308',
+        parts: [
+          {
+            mirrorUrl: directUrl,
+            packageId: 9001,
+            packageName: 'Shape of Dreams_22630308',
+            role: 'full' as const,
+          },
+        ],
+      }));
+      const removePackage = vi.fn(async () => undefined);
+      const getPackageProgress = vi.fn(async () => ({
+        bytesLoaded: 100,
+        bytesTotal: 100,
+        etaSeconds: 0,
+        packageId: 9001,
+        speed: null,
+        stage: 'complete' as const,
+        statusMessage: null,
+      }));
+      const service = createService(
+        database,
+        queueLinks,
+        removePackage,
+        getPackageProgress,
+      );
+      const queued = await service.addTrackedItem({
+        parsedSource: ankergamesSource,
+        queueDownload: true,
+        selectedDownloads: { fullUrl: directUrl },
+        selectedSteamPatch: {
+          ...selectedPatch,
+          appId: 2444750,
+          buildId: '22630308',
+        },
+        steamMatch: {
+          ...steamMatch,
+          appId: 2444750,
+          normalizedTitle: 'shape of dreams',
+          title: 'Shape of Dreams',
+        },
+      });
+      const stagePath = queued.currentDownload?.stagePath;
+      expect(stagePath).toEqual(expect.any(String));
+      const gameFolderPath = join(stagePath!, 'Shape of Dreams');
+      const finalPath = join(tempRoot, 'Library', 'Shape of Dreams');
+      await mkdir(gameFolderPath, { recursive: true });
+      await writeFile(join(gameFolderPath, 'ShapeOfDreams.exe'), 'game');
+      await writeFile(join(stagePath!, 'Read Me.txt'), 'readme');
+      await writeFile(
+        join(stagePath!, 'AnkerGames - Free Pre-installed PC Games.url'),
+        'url',
+      );
+      await writeFile(join(stagePath!, 'Run me!.bat'), 'bat');
+      await writeFile(
+        join(stagePath!, 'Shape-Of-Dreams-AnkerGames.zip'),
+        'zip',
+      );
+
+      await service.pollDownloadJobs();
+
+      expect(removePackage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          packageId: 9001,
+          packageName: 'Shape of Dreams_22630308',
+          stagePath,
+        }),
+      );
+      expect(existsSync(join(finalPath, 'ShapeOfDreams.exe'))).toBe(true);
+      expect(existsSync(join(finalPath, 'Run me!.bat'))).toBe(false);
+      expect(existsSync(stagePath!)).toBe(false);
+      expect(database.getInstallRecord(queued.item.id)).toMatchObject({
+        installedBuildId: '22630308',
+        installedVersion: 'V 1.2.1.7',
+      });
+      expect(database.getDownloadJob(queued.item.id)).toMatchObject({
+        stage: 'complete',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('finalizes AnkerGames extraction errors when staged game files exist', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const directUrl =
+        'https://node42.datanodes.to:8443/d/token/Shape-Of-Dreams-AnkerGames.zip';
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9001,
+        packageName: 'Shape of Dreams_22630308',
+        parts: [
+          {
+            mirrorUrl: directUrl,
+            packageId: 9001,
+            packageName: 'Shape of Dreams_22630308',
+            role: 'full' as const,
+          },
+        ],
+      }));
+      const getPackageProgress = vi.fn(async () => ({
+        bytesLoaded: 100,
+        bytesTotal: 100,
+        etaSeconds: 0,
+        packageId: 9001,
+        speed: null,
+        stage: 'complete' as const,
+        statusMessage: 'Extraction error',
+      }));
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        getPackageProgress,
+      );
+      const queued = await service.addTrackedItem({
+        parsedSource: ankergamesSource,
+        queueDownload: true,
+        selectedDownloads: { fullUrl: directUrl },
+        selectedSteamPatch: {
+          ...selectedPatch,
+          appId: 2444750,
+          buildId: '22630308',
+        },
+        steamMatch: {
+          ...steamMatch,
+          appId: 2444750,
+          normalizedTitle: 'shape of dreams',
+          title: 'Shape of Dreams',
+        },
+      });
+      const stagePath = queued.currentDownload?.stagePath;
+      expect(stagePath).toEqual(expect.any(String));
+      await mkdir(join(stagePath!, 'Shape of Dreams'), { recursive: true });
+      await writeFile(
+        join(stagePath!, 'Shape of Dreams', 'ShapeOfDreams.exe'),
+        'game',
+      );
+      await writeFile(join(stagePath!, 'Run me!.bat'), 'bat');
+
+      await service.pollDownloadJobs();
+
+      expect(database.getDownloadJob(queued.item.id)).toMatchObject({
+        stage: 'complete',
+        statusMessage:
+          'JDownloader reported Extraction error; staged files are present',
+      });
+      expect(
+        existsSync(
+          join(tempRoot, 'Library', 'Shape of Dreams', 'ShapeOfDreams.exe'),
+        ),
+      ).toBe(true);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('keeps empty AnkerGames extraction errors failed and staged for retry', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const directUrl =
+        'https://node42.datanodes.to:8443/d/token/Shape-Of-Dreams-AnkerGames.zip';
+      const removePackage = vi.fn(async () => undefined);
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9001,
+        packageName: 'Shape of Dreams_22630308',
+        parts: [
+          {
+            mirrorUrl: directUrl,
+            packageId: 9001,
+            packageName: 'Shape of Dreams_22630308',
+            role: 'full' as const,
+          },
+        ],
+      }));
+      const getPackageProgress = vi.fn(async () => ({
+        bytesLoaded: 100,
+        bytesTotal: 100,
+        etaSeconds: 0,
+        packageId: 9001,
+        speed: null,
+        stage: 'complete' as const,
+        statusMessage: 'Extraction error',
+      }));
+      const service = createService(
+        database,
+        queueLinks,
+        removePackage,
+        getPackageProgress,
+      );
+      const queued = await service.addTrackedItem({
+        parsedSource: ankergamesSource,
+        queueDownload: true,
+        selectedDownloads: { fullUrl: directUrl },
+        selectedSteamPatch: {
+          ...selectedPatch,
+          appId: 2444750,
+          buildId: '22630308',
+        },
+        steamMatch: {
+          ...steamMatch,
+          appId: 2444750,
+          normalizedTitle: 'shape of dreams',
+          title: 'Shape of Dreams',
+        },
+      });
+      const stagePath = queued.currentDownload?.stagePath;
+      expect(stagePath).toEqual(expect.any(String));
+      await mkdir(join(stagePath!, 'Shape of Dreams'), { recursive: true });
+      await writeFile(
+        join(stagePath!, 'Shape-Of-Dreams-AnkerGames.zip'),
+        'zip',
+      );
+
+      await service.pollDownloadJobs();
+
+      expect(removePackage).not.toHaveBeenCalled();
+      expect(existsSync(stagePath!)).toBe(true);
+      expect(database.getDownloadJob(queued.item.id)).toMatchObject({
+        errorMessage:
+          'JDownloader reported Extraction error and ZIP recovery did not extract game files. Retry will restart extraction from the staged archive.',
+        stage: 'failed',
+        statusMessage:
+          'JDownloader reported Extraction error and ZIP recovery did not extract game files. Retry will restart extraction from the staged archive.',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('recovers AnkerGames extraction errors from the staged ZIP fallback', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const directUrl =
+        'https://node42.datanodes.to:8443/d/token/Shape-Of-Dreams-AnkerGames.zip';
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9001,
+        packageName: 'Shape of Dreams_22630308',
+        parts: [
+          {
+            mirrorUrl: directUrl,
+            packageId: 9001,
+            packageName: 'Shape of Dreams_22630308',
+            role: 'full' as const,
+          },
+        ],
+      }));
+      const getPackageProgress = vi.fn(async () => ({
+        bytesLoaded: 100,
+        bytesTotal: 100,
+        etaSeconds: 0,
+        packageId: 9001,
+        speed: null,
+        stage: 'complete' as const,
+        statusMessage: 'Extraction error',
+      }));
+      const extractStagedZipArchive = vi.fn(
+        async (params: { extractPath: string }) => {
+          await mkdir(join(params.extractPath, 'Shape of Dreams'), {
+            recursive: true,
+          });
+          await writeFile(
+            join(params.extractPath, 'Shape of Dreams', 'ShapeOfDreams.exe'),
+            'game',
+          );
+          return join(params.extractPath, 'Shape-Of-Dreams-AnkerGames.zip');
+        },
+      );
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        getPackageProgress,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        extractStagedZipArchive,
+      );
+      const queued = await service.addTrackedItem({
+        parsedSource: ankergamesSource,
+        queueDownload: true,
+        selectedDownloads: { fullUrl: directUrl },
+        selectedSteamPatch: {
+          ...selectedPatch,
+          appId: 2444750,
+          buildId: '22630308',
+        },
+        steamMatch: {
+          ...steamMatch,
+          appId: 2444750,
+          normalizedTitle: 'shape of dreams',
+          title: 'Shape of Dreams',
+        },
+      });
+      const stagePath = queued.currentDownload?.stagePath;
+      expect(stagePath).toEqual(expect.any(String));
+      await mkdir(join(stagePath!, 'Shape of Dreams'), { recursive: true });
+      await writeFile(
+        join(stagePath!, 'Shape-Of-Dreams-AnkerGames.zip'),
+        'zip',
+      );
+
+      await service.pollDownloadJobs();
+
+      expect(extractStagedZipArchive).toHaveBeenCalledWith({
+        extractPath: stagePath,
+      });
+      expect(database.getDownloadJob(queued.item.id)).toMatchObject({
+        stage: 'complete',
+        statusMessage:
+          'JDownloader reported Extraction error; recovered from staged ZIP',
+      });
+      expect(
+        existsSync(
+          join(tempRoot, 'Library', 'Shape of Dreams', 'ShapeOfDreams.exe'),
+        ),
+      ).toBe(true);
+      expect(existsSync(stagePath!)).toBe(false);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('restarts failed AnkerGames extraction before requeueing', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const directUrl =
+        'https://node42.datanodes.to:8443/d/token/Shape-Of-Dreams-AnkerGames.zip';
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9001,
+        packageName: 'Shape of Dreams_22630308',
+        parts: [
+          {
+            mirrorUrl: directUrl,
+            packageId: 9001,
+            packageName: 'Shape of Dreams_22630308',
+            role: 'full' as const,
+          },
+        ],
+      }));
+      const getPackageProgress = vi.fn(async () => ({
+        bytesLoaded: 100,
+        bytesTotal: 100,
+        etaSeconds: 0,
+        packageId: 9001,
+        speed: null,
+        stage: 'complete' as const,
+        statusMessage: 'Extraction error',
+      }));
+      const restartExtraction = vi.fn(async () => true);
+      const removePackage = vi.fn(async () => undefined);
+      const service = createService(
+        database,
+        queueLinks,
+        removePackage,
+        getPackageProgress,
+        undefined,
+        undefined,
+        undefined,
+        restartExtraction,
+      );
+      const queued = await service.addTrackedItem({
+        parsedSource: ankergamesSource,
+        queueDownload: true,
+        selectedDownloads: { fullUrl: directUrl },
+        selectedSteamPatch: {
+          ...selectedPatch,
+          appId: 2444750,
+          buildId: '22630308',
+        },
+        steamMatch: {
+          ...steamMatch,
+          appId: 2444750,
+          normalizedTitle: 'shape of dreams',
+          title: 'Shape of Dreams',
+        },
+      });
+      const stagePath = queued.currentDownload?.stagePath;
+      expect(stagePath).toEqual(expect.any(String));
+      await writeFile(
+        join(stagePath!, 'Shape-Of-Dreams-AnkerGames.zip'),
+        'zip',
+      );
+      await service.pollDownloadJobs();
+
+      await service.retryDownload(queued.item.id);
+
+      expect(restartExtraction).toHaveBeenCalledWith({
+        extractDirectory: stagePath,
+        packageId: 9001,
+        packageName: 'Shape of Dreams_22630308',
+        sourceKind: 'ankergames',
+        stagePath,
+      });
+      expect(removePackage).not.toHaveBeenCalled();
+      expect(queueLinks).toHaveBeenCalledTimes(1);
+      expect(database.getDownloadJob(queued.item.id)).toMatchObject({
+        stage: 'extracting',
+        statusMessage: 'Restarted JDownloader extraction',
       });
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);

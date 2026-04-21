@@ -29,7 +29,7 @@ const AUTO_OPEN_PREFIX = 'autoOpen';
 const ACTIVE_DRAFT_KEY = 'activeDraft';
 const CLIPBOARD_DRAFT_KEY = 'clipboardDraft';
 const STATUS_CACHE_TTL_MS = 30 * 1000;
-const PARSE_CACHE_PREFIX = 'parsedPage';
+const PARSE_CACHE_PREFIX = 'parsedPage:v2';
 const STATUS_CACHE_PREFIX = 'trackedStatus';
 const STEAMDB_SELECTION_CONTEXT_PREFIX = 'steamDbSelectionContext';
 const STEAMDB_BACKFILL_STATE_PREFIX = 'steamDbBackfill';
@@ -1935,6 +1935,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             error instanceof Error
               ? error.message
               : 'Unable to mark download failed.',
+          ok: false,
+        });
+      }
+      return;
+    }
+
+    if (message.type === 'vaulttrack:complete-staged-install') {
+      try {
+        const response = await sendDesktopRequest({
+          payload: {
+            trackedItemId: String(message.trackedItemId ?? ''),
+          },
+          type: 'completeStagedInstall',
+        });
+        sendResponse(
+          response.ok ? { ok: true, payload: response.payload } : response,
+        );
+      } catch (error) {
+        sendResponse({
+          message:
+            error instanceof Error
+              ? error.message
+              : 'Unable to mark install complete.',
           ok: false,
         });
       }

@@ -24,6 +24,10 @@ type ResolvedTheme = 'light' | 'dark';
 type HealthSeverity = 'yellow' | 'red' | null;
 type SettingsSaveStatus = 'idle' | 'saving' | 'saved';
 type SteamDbBackfillStatus = 'idle' | 'loading' | 'loaded' | 'failed';
+type LibraryAction = {
+  kind: 'completeInstall';
+  trackedItemId: string;
+} | null;
 
 const STEAM_PATCH_MESSAGE_TIMEOUT_MS = 20000;
 const STEAMDB_BACKFILL_POLL_INTERVAL_MS = 750;
@@ -330,9 +334,7 @@ function normalizeSteamPatchCandidate(
   };
 }
 
-function isPatchSelectionSource(
-  value: unknown,
-): value is PatchSelectionSource {
+function isPatchSelectionSource(value: unknown): value is PatchSelectionSource {
   return value === 'rss' || value === 'steamdb_builds' || value === 'manual';
 }
 
@@ -412,29 +414,28 @@ function getSourceSnapshotPatchKey(
     !source || (patch.selectionSource ?? 'rss') === source;
 
   const buildMatch = snapshot.observedBuildId
-    ? patches.find(
+    ? (patches.find(
         (patch) =>
           patch.buildId === snapshot.observedBuildId && matchesSource(patch),
-      ) ??
-      patches.find((patch) => patch.buildId === snapshot.observedBuildId)
+      ) ?? patches.find((patch) => patch.buildId === snapshot.observedBuildId))
     : null;
   if (buildMatch) return getSteamPatchKey(buildMatch);
 
   const linkMatch = snapshot.observedPatchLink
-    ? patches.find(
+    ? (patches.find(
         (patch) =>
           patch.link === snapshot.observedPatchLink && matchesSource(patch),
-      ) ?? patches.find((patch) => patch.link === snapshot.observedPatchLink)
+      ) ?? patches.find((patch) => patch.link === snapshot.observedPatchLink))
     : null;
   if (linkMatch) return getSteamPatchKey(linkMatch);
 
   const titleMatch = snapshot.observedPatchTitle
-    ? patches.find(
+    ? (patches.find(
         (patch) =>
           patch.patchTitle === snapshot.observedPatchTitle &&
           matchesSource(patch),
       ) ??
-      patches.find((patch) => patch.patchTitle === snapshot.observedPatchTitle)
+      patches.find((patch) => patch.patchTitle === snapshot.observedPatchTitle))
     : null;
   return titleMatch ? getSteamPatchKey(titleMatch) : null;
 }
@@ -465,10 +466,14 @@ function hasActiveProgress(item: TrackedItemView): boolean {
 function canMarkDownloadFailed(item: TrackedItemView): boolean {
   return Boolean(
     item.currentDownload &&
-      ['queued', 'downloading', 'extracting', 'staged'].includes(
-        item.currentDownload.stage,
-      ),
+    ['queued', 'downloading', 'extracting', 'staged'].includes(
+      item.currentDownload.stage,
+    ),
   );
+}
+
+function canCompleteStagedInstall(item: TrackedItemView): boolean {
+  return item.item.sourceKind === 'elamigos' && item.status === 'staged';
 }
 
 function canRetryDownload(item: TrackedItemView): boolean {
@@ -811,6 +816,7 @@ function App() {
   const [patchLoading, setPatchLoading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [libraryAction, setLibraryAction] = useState<LibraryAction>(null);
   const [finishQueued, setFinishQueued] = useState(false);
   const [retrySelection, setRetrySelection] = useState<{
     fullUrl: string | null;
@@ -845,15 +851,15 @@ function App() {
     parsedSource?.latestSourceRelease.patchDate ?? 'Date unavailable';
   const sharedSourcePatchMirrors = Boolean(
     parsedSource &&
-      haveSharedMirrorUrls(
-        parsedSource.fullDownloadUrls,
-        parsedSource.patchDownloadUrls,
-      ),
+    haveSharedMirrorUrls(
+      parsedSource.fullDownloadUrls,
+      parsedSource.patchDownloadUrls,
+    ),
   );
   const requiresSourcePatchMirror = Boolean(
     parsedSource &&
-      parsedSource.patchDownloadUrls.length > 0 &&
-      !sharedSourcePatchMirrors,
+    parsedSource.patchDownloadUrls.length > 0 &&
+    !sharedSourcePatchMirrors,
   );
   const selectedSteamPatch =
     steamPatches.find(
@@ -947,6 +953,39 @@ function App() {
         )?.url ??
         null,
     );
+  }
+
+  function applyUpdatedTrackedItem(updated: TrackedItemView) {
+    setLibraryItems((current) => {
+      const hasExisting = current.some(
+        (entry) => entry.item.id === updated.item.id,
+      );
+      if (!hasExisting) {
+        return [updated, ...current];
+      }
+
+      return current.map((entry) =>
+        entry.item.id === updated.item.id ? updated : entry,
+      );
+    });
+    setDraftShell((current) => {
+      if (!current) {
+        return current;
+      }
+
+      const currentSourceUrl = normalizeComparableUrl(
+        current.trackedStatus?.item.sourceUrl ??
+          current.sourceUrl ??
+          parsedSource?.sourceUrl,
+      );
+      const updatedSourceUrl = normalizeComparableUrl(updated.item.sourceUrl);
+      const matchesCurrent =
+        current.trackedStatus?.item.id === updated.item.id ||
+        (Boolean(currentSourceUrl) && currentSourceUrl === updatedSourceUrl);
+
+      return matchesCurrent ? { ...current, trackedStatus: updated } : current;
+    });
+    syncTrackedStatus(updated);
   }
 
   async function refreshLibrary() {
@@ -1074,9 +1113,7 @@ function App() {
         return;
       }
       const updated = response.payload as TrackedItemView;
-      setLibraryItems((current) =>
-        current.map((entry) => (entry.item.id === updated.item.id ? updated : entry)),
-      );
+      applyUpdatedTrackedItem(updated);
       await Promise.allSettled([refreshLibrary(), refreshDraftStatus()]);
       const retryNow = window.confirm('Retry this download with another link?');
       if (retryNow) {
@@ -1099,6 +1136,36 @@ function App() {
       }
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function completeStagedInstall(item: TrackedItemView) {
+    setLibraryAction({
+      kind: 'completeInstall',
+      trackedItemId: item.item.id,
+    });
+    setBusy(true);
+    setMessage(`Completing install for ${item.item.title}...`);
+    try {
+      const response = await chrome.runtime.sendMessage({
+        trackedItemId: item.item.id,
+        type: 'vaulttrack:complete-staged-install',
+      });
+      if (!response.ok) {
+        setMessage(
+          response.message ??
+            response.error?.message ??
+            'Unable to mark install complete.',
+        );
+        return;
+      }
+      const updated = response.payload as TrackedItemView;
+      applyUpdatedTrackedItem(updated);
+      setMessage(`${updated.item.title} marked installed.`);
+      await Promise.allSettled([refreshLibrary(), refreshDraftStatus()]);
+    } finally {
+      setBusy(false);
+      setLibraryAction(null);
     }
   }
 
@@ -1181,7 +1248,9 @@ function App() {
       }
       const updated = response.payload as TrackedItemView;
       setLibraryItems((current) =>
-        current.map((entry) => (entry.item.id === updated.item.id ? updated : entry)),
+        current.map((entry) =>
+          entry.item.id === updated.item.id ? updated : entry,
+        ),
       );
       setRetrySelection((current) =>
         current ? { ...current, item: updated } : current,
@@ -1854,7 +1923,9 @@ function App() {
         return current;
       }
 
-      return findLikelySteamPatch(parsedSource, mergedPatchList)?.key ?? current;
+      return (
+        findLikelySteamPatch(parsedSource, mergedPatchList)?.key ?? current
+      );
     });
     setSteamDbBackfillStatus('loaded');
   }
@@ -2160,7 +2231,9 @@ function App() {
         const merged = mergeSteamPatches(current.patches, normalizedPatches);
         const selectedKey =
           current.selectedKey &&
-          merged.some((patch) => getSteamPatchKey(patch) === current.selectedKey)
+          merged.some(
+            (patch) => getSteamPatchKey(patch) === current.selectedKey,
+          )
             ? current.selectedKey
             : (getSourceSnapshotPatchKey(current.item, merged) ??
               (merged[0] ? getSteamPatchKey(merged[0]) : null));
@@ -2315,7 +2388,9 @@ function App() {
     }
   }
 
-  function getSteamPatchEntriesForSelectedPatch(): SteamPatchCandidate[] | null {
+  function getSteamPatchEntriesForSelectedPatch():
+    | SteamPatchCandidate[]
+    | null {
     if (!selectedSteamPatch) {
       return null;
     }
@@ -2377,8 +2452,7 @@ function App() {
         },
         sourceUrl: steamDbConfirmation?.context.sourceUrl ?? sourceUrl,
         tabId:
-          steamDbConfirmation?.context.tabId ??
-          (tabId ? Number(tabId) : null),
+          steamDbConfirmation?.context.tabId ?? (tabId ? Number(tabId) : null),
         type: 'vaulttrack:complete-draft',
       });
       if (!response.ok) {
@@ -2918,7 +2992,10 @@ function App() {
                       ) : null}
                       {!patchLoading && steamDbBackfillStatus === 'loading' ? (
                         <div className="inline-loader steamdb-backfill-status">
-                          <span className="spinner spinner-sm" aria-hidden="true" />
+                          <span
+                            className="spinner spinner-sm"
+                            aria-hidden="true"
+                          />
                           <span>Loading older SteamDB builds...</span>
                         </div>
                       ) : null}
@@ -3005,7 +3082,9 @@ function App() {
                                 <strong>Not listed / unknown</strong>
                               </div>
                               <div className="candidate-meta">
-                                <span>Add manually or check SteamDB builds</span>
+                                <span>
+                                  Add manually or check SteamDB builds
+                                </span>
                               </div>
                             </div>
                           </div>
@@ -3113,6 +3192,9 @@ function App() {
                   const fileState = getItemFileState(item);
                   const trackingStatus = getPrimaryStatus(item);
                   const lifecycleStatus = getLifecycleStatus(item);
+                  const isCompletingInstall =
+                    libraryAction?.kind === 'completeInstall' &&
+                    libraryAction.trackedItemId === item.item.id;
                   const patchSourceLabel = formatPatchSourceLabel(
                     item.selectedPatch?.selectionSource ??
                       item.sourceSnapshot?.patchSelectionSource,
@@ -3155,9 +3237,7 @@ function App() {
                                 aria-label={`Edit source patch for ${item.item.title}`}
                                 className="inline-icon-button"
                                 disabled={busy}
-                                onClick={() =>
-                                  void openSourcePatchEditor(item)
-                                }
+                                onClick={() => void openSourcePatchEditor(item)}
                                 title="Edit source patch"
                                 type="button"
                               >
@@ -3264,6 +3344,19 @@ function App() {
                             type="button"
                           >
                             Mark Failed
+                          </button>
+                        ) : null}
+                        {canCompleteStagedInstall(item) ? (
+                          <button
+                            className="primary-button"
+                            aria-busy={isCompletingInstall}
+                            disabled={busy}
+                            onClick={() => void completeStagedInstall(item)}
+                            type="button"
+                          >
+                            {isCompletingInstall
+                              ? 'Completing Install...'
+                              : 'Mark Install Complete'}
                           </button>
                         ) : null}
                         <button
@@ -3590,7 +3683,11 @@ function App() {
       </main>
       {steamDbConfirmation ? (
         <div className="modal-backdrop" role="presentation">
-          <div className="modal-panel patch-modal" role="dialog" aria-modal="true">
+          <div
+            className="modal-panel patch-modal"
+            role="dialog"
+            aria-modal="true"
+          >
             <div className="section-heading retry-modal__heading">
               <div>
                 <p className="section-title">Confirm SteamDB Patch</p>
@@ -3633,9 +3730,7 @@ function App() {
               </div>
             </div>
             <div className="chip-row">
-              <span className="manual-patch-chip">
-                SteamDB manual override
-              </span>
+              <span className="manual-patch-chip">SteamDB manual override</span>
             </div>
             <div className="action-row">
               <button
@@ -3660,7 +3755,11 @@ function App() {
       ) : null}
       {patchFallbackMode ? (
         <div className="modal-backdrop" role="presentation">
-          <div className="modal-panel patch-modal" role="dialog" aria-modal="true">
+          <div
+            className="modal-panel patch-modal"
+            role="dialog"
+            aria-modal="true"
+          >
             <div className="section-heading retry-modal__heading">
               <div>
                 <p className="section-title">
@@ -3906,7 +4005,8 @@ function App() {
             const fullRows = getRetryMirrorRows(retrySelection.item, 'full');
             const patchRows = getRetryMirrorRows(retrySelection.item, 'patch');
             const showPatchRows =
-              patchRows.length > 0 && !haveSharedMirrorUrls(fullRows, patchRows);
+              patchRows.length > 0 &&
+              !haveSharedMirrorUrls(fullRows, patchRows);
             return (
               <div className="modal-backdrop" role="presentation">
                 <div
@@ -3952,19 +4052,20 @@ function App() {
                     placeholder: 'Choose full mirror',
                     value: retrySelection.fullUrl,
                   })}
-                  {showPatchRows ? (
-                    renderRetryMirrorDropdown({
-                      label: 'Update download',
-                      mirrors: patchRows,
-                      onClearFailed: (url) => void clearRetryMirrorFailed(url),
-                      onChange: (url) =>
-                        setRetrySelection((current) =>
-                          current ? { ...current, patchUrl: url } : current,
-                        ),
-                      placeholder: 'Choose update mirror',
-                      value: retrySelection.patchUrl,
-                    })
-                  ) : null}
+                  {showPatchRows
+                    ? renderRetryMirrorDropdown({
+                        label: 'Update download',
+                        mirrors: patchRows,
+                        onClearFailed: (url) =>
+                          void clearRetryMirrorFailed(url),
+                        onChange: (url) =>
+                          setRetrySelection((current) =>
+                            current ? { ...current, patchUrl: url } : current,
+                          ),
+                        placeholder: 'Choose update mirror',
+                        value: retrySelection.patchUrl,
+                      })
+                    : null}
                   <div className="action-row">
                     <button
                       className="ghost-button"

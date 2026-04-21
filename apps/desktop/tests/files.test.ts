@@ -1,13 +1,17 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import {
+  extractSingleStagedZipArchive,
+  finalizePortableArchiveExtraction,
   finalizeSteamRipExtraction,
+  hasPortableArchiveContentFolder,
   normalizeDuplicateNestedFolder,
   pathExists,
   planLibraryPaths,
+  planPortableArchiveExtractPathFromJob,
   planSteamRipExtractPathFromJob,
   removeKnownLibraryPaths,
   scanImportFolders,
@@ -41,6 +45,23 @@ describe('planLibraryPaths', () => {
     expect(plan.extractPath).toBe('C:\\Games\\_STAGING\\Frostpunk 2_1.5.4.H2');
   });
 
+  it('extracts AnkerGames into the package staging folder', async () => {
+    const plan = await planLibraryPaths({
+      canonicalTitle: 'Shape of Dreams',
+      rootLibraryPath: 'C:/Games',
+      releaseSuffix: '22630308',
+      sourceKind: 'ankergames',
+    });
+
+    expect(plan.stagePath).toBe(
+      'C:\\Games\\_STAGING\\Shape of Dreams_22630308',
+    );
+    expect(plan.finalPath).toBe('C:\\Games\\Shape of Dreams');
+    expect(plan.extractPath).toBe(
+      'C:\\Games\\_STAGING\\Shape of Dreams_22630308',
+    );
+  });
+
   it('recreates SteamRIP extraction paths from persisted job paths', () => {
     expect(
       planSteamRipExtractPathFromJob({
@@ -48,6 +69,16 @@ describe('planLibraryPaths', () => {
         stagePath: 'C:/Games/_STAGING/Frostpunk 2_123456',
       }),
     ).toBe('C:\\Games\\_STAGING\\Frostpunk 2\\contents');
+  });
+
+  it('recreates AnkerGames extraction paths from persisted job paths', () => {
+    expect(
+      planPortableArchiveExtractPathFromJob({
+        finalPath: 'C:/Games/Shape of Dreams',
+        sourceKind: 'ankergames',
+        stagePath: 'C:/Games/_STAGING/Shape of Dreams_22630308',
+      }),
+    ).toBe('C:\\Games\\_STAGING\\Shape of Dreams_22630308');
   });
 });
 
@@ -171,6 +202,160 @@ describe('finalizeSteamRipExtraction', () => {
       await expect(pathExists(join(stageRootPath, 'Ziggurat 2'))).resolves.toBe(
         false,
       );
+    } finally {
+      await rm(tempRoot, { force: true, recursive: true });
+    }
+  });
+
+  it('promotes only the AnkerGames game folder and removes archive extras', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'vaulttrack-ankergames-'));
+    const rootLibraryPath = join(tempRoot, 'High Seas');
+    const stageRootPath = join(rootLibraryPath, '_STAGING');
+    const extractPath = join(stageRootPath, 'Shape of Dreams_22630308');
+    const gameFolderPath = join(extractPath, 'Shape of Dreams');
+    const finalPath = join(rootLibraryPath, 'Shape of Dreams');
+
+    try {
+      await mkdir(gameFolderPath, { recursive: true });
+      await writeFile(join(gameFolderPath, 'ShapeOfDreams.exe'), 'game');
+      await writeFile(join(extractPath, 'Read Me.txt'), 'readme');
+      await writeFile(
+        join(extractPath, 'AnkerGames - Free Pre-installed PC Games.url'),
+        'url',
+      );
+      await writeFile(join(extractPath, 'Run me!.bat'), 'bat');
+      await writeFile(
+        join(extractPath, 'Shape-Of-Dreams-AnkerGames.zip'),
+        'zip',
+      );
+
+      await finalizePortableArchiveExtraction({
+        canonicalTitle: 'Shape of Dreams',
+        extractPath,
+        finalPath,
+        sourceKind: 'ankergames',
+        stageRootPath,
+      });
+
+      await expect(
+        readFile(join(finalPath, 'ShapeOfDreams.exe'), 'utf8'),
+      ).resolves.toBe('game');
+      await expect(pathExists(join(finalPath, 'Read Me.txt'))).resolves.toBe(
+        false,
+      );
+      await expect(pathExists(join(finalPath, 'Run me!.bat'))).resolves.toBe(
+        false,
+      );
+      await expect(pathExists(extractPath)).resolves.toBe(false);
+    } finally {
+      await rm(tempRoot, { force: true, recursive: true });
+    }
+  });
+
+  it('does not treat an empty AnkerGames game folder as extracted content', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'vaulttrack-empty-anker-'));
+    const rootLibraryPath = join(tempRoot, 'High Seas');
+    const stageRootPath = join(rootLibraryPath, '_STAGING');
+    const extractPath = join(stageRootPath, 'Shape of Dreams_22630308');
+    const gameFolderPath = join(extractPath, 'Shape of Dreams');
+    const finalPath = join(rootLibraryPath, 'Shape of Dreams');
+
+    try {
+      await mkdir(gameFolderPath, { recursive: true });
+      await writeFile(join(extractPath, 'Read Me.txt'), 'readme');
+      await writeFile(join(extractPath, 'Run me!.bat'), 'bat');
+      await writeFile(
+        join(extractPath, 'Shape-Of-Dreams-AnkerGames.zip'),
+        'zip',
+      );
+
+      await expect(
+        hasPortableArchiveContentFolder({
+          canonicalTitle: 'Shape of Dreams',
+          extractPath,
+          sourceKind: 'ankergames',
+        }),
+      ).resolves.toBe(false);
+      await expect(
+        finalizePortableArchiveExtraction({
+          canonicalTitle: 'Shape of Dreams',
+          extractPath,
+          finalPath,
+          sourceKind: 'ankergames',
+          stageRootPath,
+        }),
+      ).rejects.toThrow(
+        'Unable to find extracted AnkerGames game folder for Shape of Dreams.',
+      );
+      await expect(pathExists(finalPath)).resolves.toBe(false);
+      await expect(pathExists(extractPath)).resolves.toBe(true);
+    } finally {
+      await rm(tempRoot, { force: true, recursive: true });
+    }
+  });
+
+  it('refuses to overwrite an existing non-empty install folder', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'vaulttrack-existing-'));
+    const rootLibraryPath = join(tempRoot, 'High Seas');
+    const stageRootPath = join(rootLibraryPath, '_STAGING');
+    const extractPath = join(stageRootPath, 'Shape of Dreams_22630308');
+    const gameFolderPath = join(extractPath, 'Shape of Dreams');
+    const finalPath = join(rootLibraryPath, 'Shape of Dreams');
+
+    try {
+      await mkdir(gameFolderPath, { recursive: true });
+      await writeFile(join(gameFolderPath, 'ShapeOfDreams.exe'), 'game');
+      await mkdir(finalPath, { recursive: true });
+      await writeFile(join(finalPath, 'existing.txt'), 'keep');
+
+      await expect(
+        finalizePortableArchiveExtraction({
+          canonicalTitle: 'Shape of Dreams',
+          extractPath,
+          finalPath,
+          sourceKind: 'ankergames',
+          stageRootPath,
+        }),
+      ).rejects.toThrow('Refusing to overwrite existing install');
+      await expect(
+        readFile(join(finalPath, 'existing.txt'), 'utf8'),
+      ).resolves.toBe('keep');
+    } finally {
+      await rm(tempRoot, { force: true, recursive: true });
+    }
+  });
+});
+
+describe('extractSingleStagedZipArchive', () => {
+  it('extracts the only top-level staged zip into the staging folder', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'vaulttrack-zip-'));
+    try {
+      const extractPath = join(tempRoot, 'Shape of Dreams_22630308');
+      await mkdir(extractPath, { recursive: true });
+      const zipPath = join(extractPath, 'Shape-Of-Dreams-AnkerGames.zip');
+      await writeFile(zipPath, 'zip');
+      const runExtract = vi.fn(
+        async (_zipPath: string, destination: string) => {
+          await mkdir(join(destination, 'Shape of Dreams'), {
+            recursive: true,
+          });
+          await writeFile(
+            join(destination, 'Shape of Dreams', 'ShapeOfDreams.exe'),
+            'game',
+          );
+        },
+      );
+
+      await expect(
+        extractSingleStagedZipArchive({ extractPath, runExtract }),
+      ).resolves.toBe(zipPath);
+      expect(runExtract).toHaveBeenCalledWith(zipPath, extractPath);
+      await expect(
+        readFile(
+          join(extractPath, 'Shape of Dreams', 'ShapeOfDreams.exe'),
+          'utf8',
+        ),
+      ).resolves.toBe('game');
     } finally {
       await rm(tempRoot, { force: true, recursive: true });
     }

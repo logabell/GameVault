@@ -77,6 +77,16 @@ class FakeMyJDownloaderClient implements MyJDownloaderClient {
     },
   ];
   downloadLinks: unknown[] = [];
+  archiveInfos: unknown[] = [
+    {
+      archiveId: 'archive-1',
+      controllerStatus: 'NA',
+      states: {
+        'archive.zip': 'COMPLETE',
+      },
+      type: 'ZIP_SINGLE',
+    },
+  ];
   private nextJobId = 9001;
 
   async callDevice<T>(
@@ -150,7 +160,7 @@ class FakeMyJDownloaderClient implements MyJDownloaderClient {
         }
         return projectQueryFields(this.downloadLinks, params) as T;
       case '/extraction/getArchiveInfo':
-        return [{ archiveId: 'archive-1', controllerStatus: 'NA' }] as T;
+        return this.archiveInfos as T;
       case '/linkgrabberv2/movetoNewPackage': {
         const [linkIds, packageIds, packageName, stagePath] = params as [
           number[],
@@ -532,10 +542,7 @@ describe('MyJDownloaderService queueLinks', () => {
       client
         .findAll('/extraction/startExtractionNow')
         .map((call) => call.params),
-    ).toEqual([
-      [[501], []],
-      [[502], []],
-    ]);
+    ).toEqual([]);
   });
 
   it('crawls a shared ElAmigos mirror once and splits child files by role', async () => {
@@ -681,10 +688,7 @@ describe('MyJDownloaderService queueLinks', () => {
       client
         .findAll('/extraction/startExtractionNow')
         .map((call) => call.params),
-    ).toEqual([
-      [[501], []],
-      [[502], []],
-    ]);
+    ).toEqual([]);
   });
 
   it('renames and moves the crawled LinkGrabber package into the download list', async () => {
@@ -817,10 +821,95 @@ describe('MyJDownloaderService queueLinks', () => {
         removeFilesAfterExtraction: true,
       },
     ]);
-    expect(client.find('/extraction/startExtractionNow').params).toEqual([
-      [],
-      [300],
+    expect(client.findAll('/extraction/startExtractionNow')).toHaveLength(0);
+  });
+
+  it('starts extraction only after JDownloader reports archive files complete', async () => {
+    const client = new FakeMyJDownloaderClient();
+    client.downloadPackages = [
+      {
+        bytesLoaded: 1024,
+        bytesTotal: 1024,
+        finished: true,
+        name: 'Shape of Dreams_22630308',
+        running: false,
+        saveTo: 'C:\\Games\\_STAGING\\Shape of Dreams_22630308',
+        uuid: 300,
+      },
+    ];
+    client.downloadLinks = [
+      {
+        packageUUID: 300,
+        uuid: 700,
+      },
+    ];
+    const service = createService(client);
+
+    await expect(
+      service.getPackageProgress({
+        extractDirectory: 'C:\\Games\\_STAGING\\Shape of Dreams_22630308',
+        packageId: 300,
+        packageName: 'Shape of Dreams_22630308',
+        sourceKind: 'ankergames',
+        stagePath: 'C:\\Games\\_STAGING\\Shape of Dreams_22630308',
+      }),
+    ).resolves.toMatchObject({
+      stage: 'extracting',
+    });
+
+    expect(client.find('/extraction/setArchiveSettings').params).toEqual([
+      'archive-1',
+      {
+        autoExtract: true,
+        extractPath: 'C:\\Games\\_STAGING\\Shape of Dreams_22630308',
+        removeDownloadLinksAfterExtraction: false,
+        removeFilesAfterExtraction: true,
+      },
     ]);
+    expect(client.find('/extraction/startExtractionNow').params).toEqual([
+      [700],
+      [],
+    ]);
+  });
+
+  it('does not force extraction while archive files are incomplete', async () => {
+    const client = new FakeMyJDownloaderClient();
+    client.archiveInfos = [
+      {
+        archiveId: 'archive-1',
+        controllerStatus: 'NA',
+        states: {
+          'archive.zip': 'INCOMPLETE',
+        },
+        type: 'ZIP_SINGLE',
+      },
+    ];
+    client.downloadPackages = [
+      {
+        bytesLoaded: 1024,
+        bytesTotal: 1024,
+        finished: true,
+        name: 'Shape of Dreams_22630308',
+        running: false,
+        saveTo: 'C:\\Games\\_STAGING\\Shape of Dreams_22630308',
+        uuid: 300,
+      },
+    ];
+    const service = createService(client);
+
+    await expect(
+      service.getPackageProgress({
+        extractDirectory: 'C:\\Games\\_STAGING\\Shape of Dreams_22630308',
+        packageId: 300,
+        packageName: 'Shape of Dreams_22630308',
+        sourceKind: 'ankergames',
+        stagePath: 'C:\\Games\\_STAGING\\Shape of Dreams_22630308',
+      }),
+    ).resolves.toMatchObject({
+      stage: 'extracting',
+    });
+
+    expect(client.findAll('/extraction/startExtractionNow')).toHaveLength(0);
   });
 
   it('removes matching packages from downloads and LinkGrabber', async () => {

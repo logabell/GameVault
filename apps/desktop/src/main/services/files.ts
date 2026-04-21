@@ -10,6 +10,7 @@ import {
   resolve,
 } from 'node:path';
 import { promisify } from 'node:util';
+import { path7z } from '7zip-bin-full';
 
 const execFileAsync = promisify(execFile);
 
@@ -159,20 +160,35 @@ export async function planLibraryPaths(params: {
   const stagePath = resolve(join(stageRootPath, safeStageName));
   const finalPath = resolve(join(params.rootLibraryPath, safeTitle));
   const extractPath =
-    params.sourceKind === 'elamigos'
-      ? stagePath
-      : resolve(join(stageRootPath, safeTitle, 'contents'));
+    params.sourceKind === 'steamrip'
+      ? resolve(join(stageRootPath, safeTitle, 'contents'))
+      : stagePath;
 
   return { extractPath, finalPath, stagePath, stageRootPath };
+}
+
+export function planPortableArchiveExtractPathFromJob(params: {
+  finalPath: string;
+  sourceKind: 'ankergames' | 'steamrip';
+  stagePath: string;
+}): string {
+  if (params.sourceKind === 'ankergames') {
+    return resolve(params.stagePath);
+  }
+
+  return resolve(
+    join(dirname(params.stagePath), basename(params.finalPath), 'contents'),
+  );
 }
 
 export function planSteamRipExtractPathFromJob(params: {
   finalPath: string;
   stagePath: string;
 }): string {
-  return resolve(
-    join(dirname(params.stagePath), basename(params.finalPath), 'contents'),
-  );
+  return planPortableArchiveExtractPathFromJob({
+    ...params,
+    sourceKind: 'steamrip',
+  });
 }
 
 export async function ensureDirectory(target: string): Promise<void> {
@@ -246,17 +262,78 @@ export async function normalizeDuplicateNestedFolder(params: {
   return true;
 }
 
-function isSteamRipExtraFolder(folderName: string): boolean {
+async function extractZipArchive(
+  zipPath: string,
+  destinationPath: string,
+): Promise<void> {
+  await ensureDirectory(destinationPath);
+  await execFileAsync(
+    path7z,
+    ['x', zipPath, `-o${destinationPath}`, '-y', '-bso0', '-bsp0'],
+    {
+      maxBuffer: 64 * 1024 * 1024,
+      windowsHide: true,
+    },
+  );
+}
+
+export async function extractSingleStagedZipArchive(params: {
+  extractPath: string;
+  runExtract?: (zipPath: string, destinationPath: string) => Promise<void>;
+}): Promise<string | null> {
+  const extractPath = resolve(params.extractPath);
+  const entries = await readdir(extractPath, { withFileTypes: true });
+  const zipEntries = entries.filter(
+    (entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.zip'),
+  );
+  if (zipEntries.length !== 1) {
+    return null;
+  }
+
+  const zipPath = resolve(join(extractPath, zipEntries[0]!.name));
+  assertPathInside(extractPath, zipPath);
+  await (params.runExtract ?? extractZipArchive)(zipPath, extractPath);
+  return zipPath;
+}
+
+function isPortableArchiveExtraFolder(folderName: string): boolean {
   return ['_commonredist', '__macosx'].includes(folderName.toLowerCase());
 }
 
-function isSteamRipExtraFile(fileName: string): boolean {
+function isPortableArchiveExtraFile(fileName: string): boolean {
   const lower = fileName.toLowerCase();
   const stem = lower.replace(/\.[^.]+$/, '');
   return (
+    lower.endsWith('.bat') ||
     lower.endsWith('.url') ||
+    lower.endsWith('.zip') ||
     (lower.endsWith('.txt') && /(?:read[\s_-]*me|instruction)/i.test(stem))
   );
+}
+
+async function directoryContainsPayloadFile(
+  rootPath: string,
+): Promise<boolean> {
+  let entries;
+  try {
+    entries = await readdir(rootPath, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+
+  for (const entry of entries) {
+    if (entry.isFile() && !isPortableArchiveExtraFile(entry.name)) {
+      return true;
+    }
+    if (entry.isDirectory() && !isPortableArchiveExtraFolder(entry.name)) {
+      const childPath = resolve(join(rootPath, entry.name));
+      if (await directoryContainsPayloadFile(childPath)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 async function collectDirectories(params: {
@@ -270,13 +347,15 @@ async function collectDirectories(params: {
 
   const entries = await readdir(params.rootPath, { withFileTypes: true });
   const directories = entries.filter(
-    (entry) => entry.isDirectory() && !isSteamRipExtraFolder(entry.name),
+    (entry) => entry.isDirectory() && !isPortableArchiveExtraFolder(entry.name),
   );
   const results: Array<{ depth: number; name: string; path: string }> = [];
 
   for (const entry of directories) {
     const childPath = resolve(join(params.rootPath, entry.name));
-    results.push({ depth: params.depth, name: entry.name, path: childPath });
+    if (await directoryContainsPayloadFile(childPath)) {
+      results.push({ depth: params.depth, name: entry.name, path: childPath });
+    }
     results.push(
       ...(await collectDirectories({
         depth: params.depth + 1,
@@ -289,7 +368,7 @@ async function collectDirectories(params: {
   return results;
 }
 
-async function collectSteamRipPayloadGameFolders(params: {
+async function collectPortableArchivePayloadGameFolders(params: {
   depth: number;
   maxDepth: number;
   rootPath: string;
@@ -300,36 +379,41 @@ async function collectSteamRipPayloadGameFolders(params: {
 
   const entries = await readdir(params.rootPath, { withFileTypes: true });
   const nonExtraDirectories = entries.filter(
-    (entry) => entry.isDirectory() && !isSteamRipExtraFolder(entry.name),
+    (entry) => entry.isDirectory() && !isPortableArchiveExtraFolder(entry.name),
   );
   const unexpectedFiles = entries.filter(
-    (entry) => entry.isFile() && !isSteamRipExtraFile(entry.name),
+    (entry) => entry.isFile() && !isPortableArchiveExtraFile(entry.name),
   );
-  const hasSteamRipExtra = entries.some((entry) =>
+  const hasPortableArchiveExtra = entries.some((entry) =>
     entry.isDirectory()
-      ? isSteamRipExtraFolder(entry.name)
-      : entry.isFile() && isSteamRipExtraFile(entry.name),
+      ? isPortableArchiveExtraFolder(entry.name)
+      : entry.isFile() && isPortableArchiveExtraFile(entry.name),
   );
 
   const results: Array<{ depth: number; name: string; path: string }> = [];
   if (
-    hasSteamRipExtra &&
+    hasPortableArchiveExtra &&
     nonExtraDirectories.length === 1 &&
     unexpectedFiles.length === 0
   ) {
     const gameDirectory = nonExtraDirectories[0]!;
-    return [
-      {
-        depth: params.depth + 1,
-        name: gameDirectory.name,
-        path: resolve(join(params.rootPath, gameDirectory.name)),
-      },
-    ];
+    const gameDirectoryPath = resolve(
+      join(params.rootPath, gameDirectory.name),
+    );
+    if (await directoryContainsPayloadFile(gameDirectoryPath)) {
+      return [
+        {
+          depth: params.depth + 1,
+          name: gameDirectory.name,
+          path: gameDirectoryPath,
+        },
+      ];
+    }
   }
 
   for (const entry of nonExtraDirectories) {
     results.push(
-      ...(await collectSteamRipPayloadGameFolders({
+      ...(await collectPortableArchivePayloadGameFolders({
         depth: params.depth + 1,
         maxDepth: params.maxDepth,
         rootPath: resolve(join(params.rootPath, entry.name)),
@@ -355,11 +439,12 @@ function isSteamRipVersionedTitleFolder(
   );
 }
 
-async function findSteamRipContentFolder(params: {
+async function findPortableArchiveContentFolder(params: {
   canonicalTitle: string;
   extractPath: string;
+  sourceLabel: string;
 }): Promise<string> {
-  const payloadGameFolders = await collectSteamRipPayloadGameFolders({
+  const payloadGameFolders = await collectPortableArchivePayloadGameFolders({
     depth: 0,
     maxDepth: 4,
     rootPath: params.extractPath,
@@ -369,7 +454,7 @@ async function findSteamRipContentFolder(params: {
   }
   if (payloadGameFolders.length > 1) {
     throw new Error(
-      `Found multiple plausible SteamRIP game folders for ${params.canonicalTitle}: ${payloadGameFolders
+      `Found multiple plausible ${params.sourceLabel} game folders for ${params.canonicalTitle}: ${payloadGameFolders
         .map((entry) => entry.path)
         .join(', ')}`,
     );
@@ -396,21 +481,40 @@ async function findSteamRipContentFolder(params: {
   }
   if (versionedMatches.length > 1) {
     throw new Error(
-      `Found multiple plausible SteamRIP game folders for ${params.canonicalTitle}: ${versionedMatches
+      `Found multiple plausible ${params.sourceLabel} game folders for ${params.canonicalTitle}: ${versionedMatches
         .map((entry) => entry.path)
         .join(', ')}`,
     );
   }
 
   throw new Error(
-    `Unable to find extracted SteamRIP game folder for ${params.canonicalTitle}.`,
+    `Unable to find extracted ${params.sourceLabel} game folder for ${params.canonicalTitle}.`,
   );
 }
 
-export async function finalizeSteamRipExtraction(params: {
+export async function hasPortableArchiveContentFolder(params: {
+  canonicalTitle: string;
+  extractPath: string;
+  sourceKind: 'ankergames' | 'steamrip';
+}): Promise<boolean> {
+  try {
+    await findPortableArchiveContentFolder({
+      canonicalTitle: params.canonicalTitle,
+      extractPath: params.extractPath,
+      sourceLabel:
+        params.sourceKind === 'ankergames' ? 'AnkerGames' : 'SteamRIP',
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function finalizePortableArchiveExtraction(params: {
   canonicalTitle: string;
   extractPath: string;
   finalPath: string;
+  sourceKind: 'ankergames' | 'steamrip';
   stageRootPath: string;
 }): Promise<void> {
   const safeTitle = sanitizePathSegment(params.canonicalTitle);
@@ -420,24 +524,45 @@ export async function finalizeSteamRipExtraction(params: {
   const finalPath = resolve(params.finalPath);
   if (finalPath !== expectedFinalPath) {
     throw new Error(
-      `Unexpected final SteamRIP library path: ${params.finalPath}`,
+      `Unexpected final ${params.sourceKind === 'ankergames' ? 'AnkerGames' : 'SteamRIP'} library path: ${params.finalPath}`,
     );
   }
 
-  const extractWorkspacePath = resolve(join(params.extractPath, '..'));
+  const extractWorkspacePath =
+    params.sourceKind === 'steamrip'
+      ? resolve(join(params.extractPath, '..'))
+      : resolve(params.extractPath);
   assertPathInside(params.stageRootPath, extractWorkspacePath);
   assertPathInside(dirname(finalPath), finalPath);
 
-  const contentFolderPath = await findSteamRipContentFolder({
+  const contentFolderPath = await findPortableArchiveContentFolder({
     canonicalTitle: params.canonicalTitle,
     extractPath: params.extractPath,
+    sourceLabel: params.sourceKind === 'ankergames' ? 'AnkerGames' : 'SteamRIP',
   });
   assertPathInside(params.extractPath, contentFolderPath);
 
   await ensureDirectory(dirname(finalPath));
-  await rm(finalPath, { force: true, recursive: true });
-  await rename(contentFolderPath, finalPath);
+  if (await pathExists(finalPath)) {
+    if (await directoryHasEntries(finalPath)) {
+      throw new Error(`Refusing to overwrite existing install: ${finalPath}`);
+    }
+    await rm(finalPath, { force: true, recursive: true });
+  }
+  await stageMove({ finalPath, stagePath: contentFolderPath });
   await rm(extractWorkspacePath, { force: true, recursive: true });
+}
+
+export async function finalizeSteamRipExtraction(params: {
+  canonicalTitle: string;
+  extractPath: string;
+  finalPath: string;
+  stageRootPath: string;
+}): Promise<void> {
+  await finalizePortableArchiveExtraction({
+    ...params,
+    sourceKind: 'steamrip',
+  });
 }
 
 export async function removeKnownLibraryPaths(params: {
@@ -491,7 +616,13 @@ export async function removeKnownStagingPaths(params: {
   }
 
   if (params.extractionPath) {
-    candidates.add(resolve(join(params.extractionPath, '..')));
+    const extractionPath = resolve(params.extractionPath);
+    const stagePath = params.stagePath ? resolve(params.stagePath) : null;
+    candidates.add(
+      stagePath && extractionPath === stagePath
+        ? extractionPath
+        : resolve(join(extractionPath, '..')),
+    );
   }
 
   const deletedPaths: string[] = [];

@@ -13,6 +13,7 @@
     "@vaulttrack/shared-types": "0.1.0",
     "@vaulttrack/source-core": "0.1.0",
     "@vaulttrack/steam-core": "0.1.0",
+    "7zip-bin-full": "^26.0.1",
     "electron": "^41.2.1",
     "jdownloader-connect": "^1.0.8",
     "react": "^19.1.0",

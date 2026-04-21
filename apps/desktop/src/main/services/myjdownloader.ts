@@ -130,7 +130,10 @@ interface LinkQueueRequestPaths {
 
 interface RawArchiveInfo {
   archiveId: string;
+  archiveName?: string;
   controllerStatus?: string;
+  states?: Record<string, string>;
+  type?: string;
 }
 
 interface RawSession {
@@ -148,6 +151,11 @@ interface ArchiveSettingsPayload {
   extractPath?: string;
   removeDownloadLinksAfterExtraction?: boolean | null;
   removeFilesAfterExtraction?: boolean | null;
+}
+
+interface ArchiveSettingsResult {
+  archives: RawArchiveInfo[];
+  extractionStarted: boolean;
 }
 
 const MYJD_API_ENDPOINT = 'https://api.jdownloader.org';
@@ -452,6 +460,11 @@ function statusPriority(value: string): number {
   return 4;
 }
 
+function isExtractionErrorStatus(value: string | null | undefined): boolean {
+  const lower = (value ?? '').toLowerCase();
+  return lower.includes('extraction') && lower.includes('error');
+}
+
 function buildStatusMessage(
   packageInfo: RawDeviceQueryPackage | undefined,
   links: RawDeviceQueryLink[],
@@ -472,6 +485,18 @@ function buildStatusMessage(
   return Array.from(new Set(messages)).sort(
     (left, right) => statusPriority(left) - statusPriority(right),
   )[0];
+}
+
+function archiveStatesAreComplete(archive: RawArchiveInfo): boolean {
+  const states = Object.values(archive.states ?? {});
+  return (
+    states.length > 0 &&
+    states.every((state) => state.toUpperCase() === 'COMPLETE')
+  );
+}
+
+function archivesAreReadyForExtraction(archives: RawArchiveInfo[]): boolean {
+  return archives.length > 0 && archives.every(archiveStatesAreComplete);
 }
 
 function bufferToHex(buffer: ArrayBuffer): string {
@@ -791,6 +816,7 @@ class MyJDownloaderRawClient implements MyJDownloaderClient {
 
 export class MyJDownloaderService {
   private readonly configuredArchiveKeys = new Set<string>();
+  private readonly startedArchiveKeys = new Set<string>();
   private healthSnapshot: {
     capturedAt: number;
     value: MyJDownloaderHealthSnapshot;
@@ -981,6 +1007,7 @@ export class MyJDownloaderService {
   async disconnect(): Promise<void> {
     await this.rawClient.disconnect().catch(() => undefined);
     this.configuredArchiveKeys.clear();
+    this.startedArchiveKeys.clear();
     this.invalidateHealthSnapshot();
   }
 
@@ -1493,16 +1520,15 @@ export class MyJDownloaderService {
     deviceId: string;
     email: string;
     extractPath: string;
+    forceStart?: boolean;
+    packageFinished?: boolean;
     packageId: number;
     password: string;
-  }): Promise<void> {
+  }): Promise<ArchiveSettingsResult> {
     const configKey = this.archiveConfigKey(
       params.packageId,
       params.extractPath,
     );
-    if (this.configuredArchiveKeys.has(configKey)) {
-      return;
-    }
 
     const packageLinkIds = (await this.queryDownloadLinks(params))
       .map((link) => link.uuid)
@@ -1513,24 +1539,35 @@ export class MyJDownloaderService {
       linkIds: packageLinkIds,
     });
     if (archives.length === 0) {
-      return;
+      return { archives, extractionStarted: false };
     }
 
-    const archiveSettings: ArchiveSettingsPayload = {
-      autoExtract: true,
-      extractPath: params.extractPath,
-      removeDownloadLinksAfterExtraction: false,
-      removeFilesAfterExtraction: true,
-    };
+    if (!this.configuredArchiveKeys.has(configKey)) {
+      const archiveSettings: ArchiveSettingsPayload = {
+        autoExtract: true,
+        extractPath: params.extractPath,
+        removeDownloadLinksAfterExtraction: false,
+        removeFilesAfterExtraction: true,
+      };
 
-    for (const archive of archives) {
-      await this.rawClient.callDevice<boolean>(
-        params.email,
-        params.password,
-        params.deviceId,
-        '/extraction/setArchiveSettings',
-        [archive.archiveId, archiveSettings],
-      );
+      for (const archive of archives) {
+        await this.rawClient.callDevice<boolean>(
+          params.email,
+          params.password,
+          params.deviceId,
+          '/extraction/setArchiveSettings',
+          [archive.archiveId, archiveSettings],
+        );
+      }
+      this.configuredArchiveKeys.add(configKey);
+    }
+
+    const shouldStartExtraction =
+      params.packageFinished === true &&
+      archivesAreReadyForExtraction(archives) &&
+      (params.forceStart === true || !this.startedArchiveKeys.has(configKey));
+    if (!shouldStartExtraction) {
+      return { archives, extractionStarted: false };
     }
 
     await this.rawClient.callDevice<Record<string, boolean | null>>(
@@ -1540,7 +1577,8 @@ export class MyJDownloaderService {
       '/extraction/startExtractionNow',
       [packageLinkIds, packageIds],
     );
-    this.configuredArchiveKeys.add(configKey);
+    this.startedArchiveKeys.add(configKey);
+    return { archives, extractionStarted: true };
   }
 
   async queueLinks(params: {
@@ -1705,6 +1743,7 @@ export class MyJDownloaderService {
           deviceId: device.deviceId,
           email: device.email,
           extractPath: requestPaths.extractDirectory,
+          packageFinished: false,
           packageId,
           password: device.password,
         }).catch(() => undefined);
@@ -1766,24 +1805,12 @@ export class MyJDownloaderService {
       };
     }
 
-    await this.ensureArchiveSettings({
-      deviceId: device.deviceId,
-      email: device.email,
-      extractPath: effectiveExtractDirectory,
-      packageId: resolvedPackageId,
-      password: device.password,
-    }).catch(() => undefined);
-
-    const [packages, links, archives] = await Promise.all([
+    const [packages, links] = await Promise.all([
       this.queryDownloadPackages(device),
       this.queryDownloadLinks({
         ...device,
         packageId: resolvedPackageId,
       }),
-      this.queryArchiveInfo({
-        ...device,
-        packageId: resolvedPackageId,
-      }).catch(() => []),
     ]);
 
     const packageInfo =
@@ -1794,7 +1821,26 @@ export class MyJDownloaderService {
           downloadPathsMatch(entry.saveTo, effectiveStagePath),
       );
 
+    const statusMessage = buildStatusMessage(packageInfo, links);
+    const archiveSettings = await this.ensureArchiveSettings({
+      deviceId: device.deviceId,
+      email: device.email,
+      extractPath: effectiveExtractDirectory,
+      packageFinished:
+        params.sourceKind !== 'elamigos' &&
+        packageInfo?.finished === true &&
+        !isExtractionErrorStatus(statusMessage),
+      packageId: resolvedPackageId,
+      password: device.password,
+    }).catch(
+      (): ArchiveSettingsResult => ({
+        archives: [],
+        extractionStarted: false,
+      }),
+    );
+    const archives = archiveSettings.archives;
     const hasActiveExtraction =
+      archiveSettings.extractionStarted ||
       archives.some((archive) =>
         ['QUEUED', 'RUNNING'].includes(
           (archive.controllerStatus ?? '').toUpperCase(),
@@ -1808,10 +1854,15 @@ export class MyJDownloaderService {
         );
       }) ||
       (packageInfo?.activeTask ?? '').toLowerCase().includes('extract');
-    const statusMessage = buildStatusMessage(packageInfo, links);
+    const waitingForArchiveReadiness =
+      params.sourceKind !== 'elamigos' &&
+      packageInfo?.finished === true &&
+      archives.length > 0 &&
+      !archivesAreReadyForExtraction(archives) &&
+      !isExtractionErrorStatus(statusMessage);
 
     let stage: DownloadStage = 'queued';
-    if (hasActiveExtraction) {
+    if (hasActiveExtraction || waitingForArchiveReadiness) {
       stage = 'extracting';
     } else if (packageInfo?.finished) {
       stage = params.sourceKind === 'elamigos' ? 'staged' : 'complete';
@@ -1830,6 +1881,55 @@ export class MyJDownloaderService {
       stage,
       statusMessage,
     };
+  }
+
+  async restartExtraction(params: {
+    extractDirectory: string;
+    packageId: number | null;
+    packageName: string;
+    sourceKind: ParsedSourcePayload['sourceKind'];
+    stagePath: string;
+  }): Promise<boolean> {
+    const device = await this.getSelectedDevice();
+    const effectiveStagePath = getPathForPackageName({
+      basePath: params.stagePath,
+      packageName: params.packageName,
+      sourceKind: params.sourceKind,
+    });
+    const effectiveExtractDirectory =
+      params.sourceKind === 'elamigos'
+        ? effectiveStagePath
+        : params.extractDirectory;
+    const resolvedPackageId =
+      params.packageId ??
+      (await this.resolvePackageId({
+        deviceId: device.deviceId,
+        email: device.email,
+        packageName: params.packageName,
+        password: device.password,
+        stagePath: effectiveStagePath,
+      }));
+
+    if (!resolvedPackageId) {
+      return false;
+    }
+
+    await this.enforceDownloadPackage({
+      ...device,
+      packageId: resolvedPackageId,
+      packageName: params.packageName,
+      stagePath: effectiveStagePath,
+    });
+    const result = await this.ensureArchiveSettings({
+      deviceId: device.deviceId,
+      email: device.email,
+      extractPath: effectiveExtractDirectory,
+      forceStart: true,
+      packageFinished: true,
+      packageId: resolvedPackageId,
+      password: device.password,
+    });
+    return result.archives.length > 0;
   }
 
   async removePackage(params: {

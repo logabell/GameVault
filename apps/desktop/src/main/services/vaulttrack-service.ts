@@ -50,10 +50,12 @@ import {
   directoryHasEntries,
   dismountIsoImagesUnderPath,
   ensureDirectory,
-  finalizeSteamRipExtraction,
+  extractSingleStagedZipArchive,
+  finalizePortableArchiveExtraction,
+  hasPortableArchiveContentFolder,
   normalizeDuplicateNestedFolder,
   planLibraryPaths,
-  planSteamRipExtractPathFromJob,
+  planPortableArchiveExtractPathFromJob,
   pathExists,
   removeKnownLibraryPaths,
   removeKnownStagingPaths,
@@ -70,6 +72,14 @@ function isPortableArchiveSourceKind(
   sourceKind: SourceKind | ParsedSourcePayload['sourceKind'] | null | undefined,
 ): boolean {
   return sourceKind === 'ankergames' || sourceKind === 'steamrip';
+}
+
+function getPortableArchiveExtractPath(params: {
+  finalPath: string;
+  sourceKind: 'ankergames' | 'steamrip';
+  stagePath: string;
+}): string {
+  return planPortableArchiveExtractPathFromJob(params);
 }
 
 function buildDownloadJobParts(params: {
@@ -325,6 +335,7 @@ export class VaultTrackService {
     private readonly dismountIsoUnderPath: typeof dismountIsoImagesUnderPath = dismountIsoImagesUnderPath,
     private readonly sourceFetch: SourceFetch = fetch,
     private readonly renderAnkerGamesSignedDownloadPage?: AnkerGamesSignedDownloadPageRenderer,
+    private readonly extractStagedZipArchive: typeof extractSingleStagedZipArchive = extractSingleStagedZipArchive,
   ) {}
 
   private appendEvent(
@@ -669,10 +680,23 @@ export class VaultTrackService {
     trackedItemId: string,
     parsedSource: ParsedSourcePayload,
   ): void {
-    this.database.syncDownloadMirrors(trackedItemId, [
+    const mirrors = [
       ...parsedSource.fullDownloadUrls,
       ...parsedSource.patchDownloadUrls,
-    ]);
+    ].map((mirror) => {
+      if (
+        parsedSource.sourceKind === 'ankergames' &&
+        /^direct$/i.test(mirror.label.trim()) &&
+        (isAnkerGamesGeneratedDownloadUrl(mirror.url) ||
+          isAnkerGamesDirectDownloadUrl(mirror.url))
+      ) {
+        return { ...mirror, label: 'DataNodes' };
+      }
+
+      return mirror;
+    });
+
+    this.database.syncDownloadMirrors(trackedItemId, mirrors);
   }
 
   private upsertSelectedSteamPatch(
@@ -1254,6 +1278,49 @@ export class VaultTrackService {
       );
     }
 
+    const existingJob = this.database.getDownloadJob(trackedItemId);
+    if (
+      !hasExplicitSelection &&
+      parsedSource.sourceKind === 'ankergames' &&
+      existingJob?.stage === 'failed'
+    ) {
+      const restarted = await this.myJDownloader
+        .restartExtraction({
+          extractDirectory: getPortableArchiveExtractPath({
+            finalPath: existingJob.finalPath,
+            sourceKind: 'ankergames',
+            stagePath: existingJob.stagePath,
+          }),
+          packageId: existingJob.packageId ?? null,
+          packageName: existingJob.packageName,
+          sourceKind: parsedSource.sourceKind,
+          stagePath: existingJob.stagePath,
+        })
+        .catch(() => false);
+      if (restarted) {
+        const now = new Date().toISOString();
+        const message = 'Restarted JDownloader extraction';
+        this.database.upsertDownloadJob({
+          ...existingJob,
+          completedParts: 0,
+          errorMessage: null,
+          parts: (existingJob.parts ?? []).map((part) => ({
+            ...part,
+            errorMessage: null,
+            stage: 'extracting',
+            statusMessage: message,
+            updatedAt: now,
+          })),
+          stage: 'extracting',
+          statusMessage: message,
+          updatedAt: now,
+        });
+        this.clearFailedStateForSelectedMirrors(trackedItemId);
+        this.appendEvent('info', message, { trackedItemId });
+        return this.buildTrackedItemView(trackedItemId);
+      }
+    }
+
     const mirrors = this.database.listDownloadMirrors(trackedItemId);
     const selectedFullMirror = hasExplicitSelection
       ? mirrors.find(
@@ -1276,7 +1343,6 @@ export class VaultTrackService {
           )
         : null
       : mirrors.find((mirror) => mirror.kind === 'patch' && mirror.selectedAt);
-    const existingJob = this.database.getDownloadJob(trackedItemId);
     if (existingJob) {
       await this.removeJDownloaderPackagesForJob(
         existingJob,
@@ -1450,9 +1516,11 @@ export class VaultTrackService {
     }
 
     const extractionPath =
-      isPortableArchiveSourceKind(params.item.sourceKind)
-        ? planSteamRipExtractPathFromJob({
+      params.item.sourceKind === 'ankergames' ||
+      params.item.sourceKind === 'steamrip'
+        ? getPortableArchiveExtractPath({
             finalPath: params.finalPath,
+            sourceKind: params.item.sourceKind,
             stagePath: params.job.stagePath,
           })
         : null;
@@ -1618,9 +1686,10 @@ export class VaultTrackService {
 
       try {
         const extractDirectory =
-          isPortableArchiveSourceKind(item.sourceKind)
-            ? planSteamRipExtractPathFromJob({
+          item.sourceKind === 'ankergames' || item.sourceKind === 'steamrip'
+            ? getPortableArchiveExtractPath({
                 finalPath: job.finalPath,
+                sourceKind: item.sourceKind,
                 stagePath: job.stagePath,
               })
             : job.stagePath;
@@ -1709,92 +1778,140 @@ export class VaultTrackService {
           totalParts: summary.totalParts,
           updatedAt: new Date().toISOString(),
         };
-        const extractionErrorWithStagedFiles =
+        const portableExtractionError =
           isPortableArchiveSourceKind(item.sourceKind) &&
           isExtractionErrorMessage(nextJob.statusMessage);
-        if (nextJob.stage === 'complete' || extractionErrorWithStagedFiles) {
+        if (nextJob.stage === 'complete' || portableExtractionError) {
           nextJob.etaSeconds = 0;
-          if (isPortableArchiveSourceKind(item.sourceKind)) {
+          if (
+            item.sourceKind === 'ankergames' ||
+            item.sourceKind === 'steamrip'
+          ) {
             const canonicalTitle = sanitizePathSegment(
               job.finalPath.split(/[\\/]/).filter(Boolean).at(-1) ?? item.title,
             );
-            await finalizeSteamRipExtraction({
+            let hasExtractedGameFolder = await hasPortableArchiveContentFolder({
               canonicalTitle,
               extractPath: extractDirectory,
-              finalPath: job.finalPath,
-              stageRootPath: dirname(job.stagePath),
+              sourceKind: item.sourceKind,
             });
-            if (extractionErrorWithStagedFiles) {
-              nextJob.statusMessage =
-                'JDownloader reported Extraction error; staged files are present';
-            }
-            nextJob.errorMessage = null;
-            nextJob.stage = 'complete';
-            nextJob.parts = updatedParts.map((part) => ({
-              ...part,
-              errorMessage: null,
-              stage: 'complete',
-              statusMessage:
-                extractionErrorWithStagedFiles && part.statusMessage
-                  ? nextJob.statusMessage
-                  : part.statusMessage,
-            }));
-
-            const sourceSnapshot = this.database.getSourceSnapshot(item.id);
-            if (sourceSnapshot && nextJob.stage === 'complete') {
-              this.database.upsertInstallRecord({
-                installedAt:
-                  sourceSnapshot.observedPatchDate ??
-                  new Date().toLocaleDateString('en-US', {
-                    day: '2-digit',
-                    month: '2-digit',
-                    year: 'numeric',
-                  }),
-                installedBuildId: sourceSnapshot.observedBuildId ?? null,
-                installedVersion: sourceSnapshot.observedVersion,
-                trackedItemId: item.id,
-                updatedAt: new Date().toISOString(),
-              });
-              this.clearFailedStateForSelectedMirrors(item.id);
-            }
-
-            await this.removeJDownloaderPackagesForJob(
-              nextJob,
-              item.id,
-              'Unable to remove JDownloader package after SteamRIP install completion',
-            );
-
-            const settings = this.database.getSettings();
-            if (settings.rootLibraryPath) {
-              await removeKnownLibraryPaths({
-                rootLibraryPath: settings.rootLibraryPath,
-                stagePath: job.stagePath,
-              })
-                .then((deletedPaths) => {
-                  this.appendEvent('info', 'Deleted staged SteamRIP files', {
-                    deletedPaths,
-                    trackedItemId: item.id,
-                  });
-                })
-                .catch((error) => {
-                  this.appendEvent(
-                    'warn',
-                    'Unable to delete staged SteamRIP files after install completion',
-                    {
-                      error:
-                        error instanceof Error
-                          ? error.message
-                          : 'Unknown SteamRIP cleanup error',
-                      trackedItemId: item.id,
-                    },
-                  );
+            let recoveredFromStagedZip = false;
+            if (
+              portableExtractionError &&
+              !hasExtractedGameFolder &&
+              item.sourceKind === 'ankergames'
+            ) {
+              recoveredFromStagedZip =
+                (await this.extractStagedZipArchive({
+                  extractPath: extractDirectory,
+                }).catch(() => null)) != null;
+              if (recoveredFromStagedZip) {
+                hasExtractedGameFolder = await hasPortableArchiveContentFolder({
+                  canonicalTitle,
+                  extractPath: extractDirectory,
+                  sourceKind: item.sourceKind,
                 });
+              }
+            }
+            if (portableExtractionError && !hasExtractedGameFolder) {
+              const message =
+                item.sourceKind === 'ankergames'
+                  ? 'JDownloader reported Extraction error and ZIP recovery did not extract game files. Retry will restart extraction from the staged archive.'
+                  : 'JDownloader reported Extraction error before extracting game files. Retry will restart extraction from the staged archive.';
+              nextJob.errorMessage = message;
+              nextJob.stage = 'failed';
+              nextJob.statusMessage = message;
+              nextJob.parts = updatedParts.map((part) => ({
+                ...part,
+                errorMessage: message,
+                stage: 'failed',
+                statusMessage: message,
+              }));
             } else {
-              this.appendEvent(
-                'warn',
-                'Root library path is not configured; staged SteamRIP files were not deleted',
-                { trackedItemId: item.id },
+              await finalizePortableArchiveExtraction({
+                canonicalTitle,
+                extractPath: extractDirectory,
+                finalPath: job.finalPath,
+                sourceKind: item.sourceKind,
+                stageRootPath: dirname(job.stagePath),
+              });
+              if (recoveredFromStagedZip) {
+                nextJob.statusMessage =
+                  'JDownloader reported Extraction error; recovered from staged ZIP';
+              } else if (portableExtractionError) {
+                nextJob.statusMessage =
+                  'JDownloader reported Extraction error; staged files are present';
+              }
+              nextJob.errorMessage = null;
+              nextJob.stage = 'complete';
+              nextJob.parts = updatedParts.map((part) => ({
+                ...part,
+                errorMessage: null,
+                stage: 'complete',
+                statusMessage:
+                  portableExtractionError && part.statusMessage
+                    ? nextJob.statusMessage
+                    : part.statusMessage,
+              }));
+            }
+
+            if (nextJob.stage === 'complete') {
+              const sourceSnapshot = this.database.getSourceSnapshot(item.id);
+              if (sourceSnapshot) {
+                this.database.upsertInstallRecord({
+                  installedAt:
+                    sourceSnapshot.observedPatchDate ??
+                    new Date().toLocaleDateString('en-US', {
+                      day: '2-digit',
+                      month: '2-digit',
+                      year: 'numeric',
+                    }),
+                  installedBuildId: sourceSnapshot.observedBuildId ?? null,
+                  installedVersion: sourceSnapshot.observedVersion,
+                  trackedItemId: item.id,
+                  updatedAt: new Date().toISOString(),
+                });
+                this.clearFailedStateForSelectedMirrors(item.id);
+              }
+
+              await this.removeJDownloaderPackagesForJob(
+                nextJob,
+                item.id,
+                'Unable to remove JDownloader package after archive install completion',
               );
+
+              const settings = this.database.getSettings();
+              if (settings.rootLibraryPath) {
+                await removeKnownLibraryPaths({
+                  rootLibraryPath: settings.rootLibraryPath,
+                  stagePath: job.stagePath,
+                })
+                  .then((deletedPaths) => {
+                    this.appendEvent('info', 'Deleted staged archive files', {
+                      deletedPaths,
+                      trackedItemId: item.id,
+                    });
+                  })
+                  .catch((error) => {
+                    this.appendEvent(
+                      'warn',
+                      'Unable to delete staged archive files after install completion',
+                      {
+                        error:
+                          error instanceof Error
+                            ? error.message
+                            : 'Unknown archive cleanup error',
+                        trackedItemId: item.id,
+                      },
+                    );
+                  });
+              } else {
+                this.appendEvent(
+                  'warn',
+                  'Root library path is not configured; staged archive files were not deleted',
+                  { trackedItemId: item.id },
+                );
+              }
             }
           }
         }

@@ -81,6 +81,47 @@ describe('source parsers', () => {
     expect(parsed.patchDownloadUrls).toEqual([]);
   });
 
+  it('labels Ankergames direct DataNodes mirrors as DataNodes', () => {
+    const parsed = parseSupportedPage(
+      'https://ankergames.net/game/shape-of-dreams',
+      ankerGamesHtml().replace('<div>DataNodes</div>', '<div>Direct</div>'),
+    );
+
+    expect(parsed.fullDownloadUrls).toEqual([
+      {
+        kind: 'full',
+        label: 'DataNodes',
+        url: 'https://ankergames.net/generate-download-url/2557',
+      },
+    ]);
+  });
+
+  it('parses Ankergames current build from the visible version status panel', () => {
+    const parsed = parseSupportedPage(
+      'https://ankergames.net/game/shape-of-dreams',
+      ankerGamesHtml().replace(
+        '<span class="animate-glow">V 1.2.1.7</span>',
+        `<div class="p-4 space-y-3">
+          <div class="flex justify-between items-center text-sm">
+            <span>Current Version</span>
+            <span>V 1.2.1.7</span>
+          </div>
+          <div class="flex justify-between items-center text-sm">
+            <span>Current Build</span>
+            <span>22630308</span>
+          </div>
+          <div class="flex justify-between items-center text-sm">
+            <span>Latest Build</span>
+            <span>99999999</span>
+          </div>
+        </div>`,
+      ),
+    );
+
+    expect(parsed.latestSourceRelease.version).toBe('V 1.2.1.7');
+    expect(parsed.latestSourceRelease.buildId).toBe('22630308');
+  });
+
   it('hydrates Ankergames current version and build from the Livewire status component', async () => {
     const fetchMock = vi.fn(async (input: string, init?: RequestInit) => {
       if (input === 'https://ankergames.net/csrf-token') {
@@ -92,7 +133,9 @@ describe('source parsers', () => {
       expect(input).toBe('https://ankergames.net/livewire/update');
       expect(init?.method).toBe('POST');
       const body = JSON.parse(String(init?.body)) as {
-        components: Array<{ calls: Array<{ method: string; params: string[] }> }>;
+        components: Array<{
+          calls: Array<{ method: string; params: string[] }>;
+        }>;
       };
       expect(body.components[0]?.calls[0]).toMatchObject({
         method: '__lazyLoad',
@@ -241,7 +284,9 @@ describe('source parsers', () => {
       }
 
       expect(input).toBe('https://ankergames.net/download/signed');
-      return new Response('<html><body>Countdown</body></html>', { status: 200 });
+      return new Response('<html><body>Countdown</body></html>', {
+        status: 200,
+      });
     });
 
     await expect(
@@ -276,7 +321,9 @@ describe('source parsers', () => {
         );
       }
 
-      return new Response('<html><body>Countdown</body></html>', { status: 200 });
+      return new Response('<html><body>Countdown</body></html>', {
+        status: 200,
+      });
     });
 
     await expect(
@@ -548,7 +595,9 @@ describe('source parsers', () => {
     expect(
       getAdapterForUrl('https://ankergames.net/game/shape-of-dreams', '')?.kind,
     ).toBe('ankergames');
-    expect(getAdapterForUrl('https://ankergames.net/games-list', '')).toBeNull();
+    expect(
+      getAdapterForUrl('https://ankergames.net/games-list', ''),
+    ).toBeNull();
 
     for (const url of [
       'https://steamrip.com/mouse-p-i-for-hire-free-download',
@@ -559,7 +608,9 @@ describe('source parsers', () => {
       expect(getAdapterForUrl(url, '')?.kind).toBe('steamrip');
     }
 
-    expect(getAdapterForUrl('https://steamrip.com/updated-games/', '')).toBeNull();
+    expect(
+      getAdapterForUrl('https://steamrip.com/updated-games/', ''),
+    ).toBeNull();
     expect(
       getAdapterForUrl(
         'https://steamrip.com/category/example-game-free-download/',

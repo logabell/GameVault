@@ -1,5 +1,8 @@
 import { load } from 'cheerio';
-import type { ParsedSourcePayload, SourceSnapshot } from '@vaulttrack/shared-types';
+import type {
+  ParsedSourcePayload,
+  SourceSnapshot,
+} from '@vaulttrack/shared-types';
 
 import type { RefreshTrackedItemInput, SourceAdapter } from '../types.js';
 import { buildFingerprint, compactText, normalizeTitle } from '../utils.js';
@@ -44,8 +47,34 @@ function findVisibleVersion($: ReturnType<typeof load>): string | null {
 
   const bodyText = compactText($('body').text());
   return (
-    bodyText.match(/Version\s+updated\s+to\s+(?<version>[vV]\s*[0-9][0-9a-z._-]*)/i)
+    bodyText
+      .match(/Version\s+updated\s+to\s+(?<version>[vV]\s*[0-9][0-9a-z._-]*)/i)
       ?.groups?.version?.trim() ?? null
+  );
+}
+
+function findVisibleCurrentBuild($: ReturnType<typeof load>): string | null {
+  const labelMatch =
+    $('span, div')
+      .toArray()
+      .map((element) => {
+        const label = compactText($(element).text());
+        const siblingText = compactText($(element).nextAll().first().text());
+        return { label, siblingText };
+      })
+      .find(
+        (entry) =>
+          /^Current Build$/i.test(entry.label) &&
+          /^\d{5,}$/.test(entry.siblingText),
+      )?.siblingText ?? null;
+  if (labelMatch) {
+    return labelMatch;
+  }
+
+  const bodyText = compactText($('body').text());
+  return (
+    bodyText.match(/\bCurrent\s+Build\s+(?<build>\d{5,})\b/i)?.groups?.build ??
+    null
   );
 }
 
@@ -57,12 +86,38 @@ function normalizeHref(href: string, baseUrl: string): string | null {
   }
 }
 
+function isDataNodesDownloadUrl(url: string): boolean {
+  try {
+    const parsedUrl = new URL(url);
+    return parsedUrl.hostname.toLowerCase().includes('datanodes.');
+  } catch {
+    return false;
+  }
+}
+
+function normalizeDownloadLabel(label: string, url: string): string {
+  const trimmedLabel = compactText(label);
+  const isGeneratedDataNodesEndpoint = /\/generate-download-url\/\d+\b/i.test(
+    new URL(url).pathname,
+  );
+  if (
+    /^direct$/i.test(trimmedLabel) &&
+    (isGeneratedDataNodesEndpoint || isDataNodesDownloadUrl(url))
+  ) {
+    return 'DataNodes';
+  }
+
+  return trimmedLabel || 'DataNodes';
+}
+
 function getDownloadAction(element: unknown): string {
   const attribs =
     (element as { attribs?: Record<string, string | undefined> }).attribs ?? {};
-  return Object.values(attribs)
-    .filter((value): value is string => typeof value === 'string')
-    .find((value) => DOWNLOAD_ACTION_RE.test(value)) ?? '';
+  return (
+    Object.values(attribs)
+      .filter((value): value is string => typeof value === 'string')
+      .find((value) => DOWNLOAD_ACTION_RE.test(value)) ?? ''
+  );
 }
 
 function collectDownloadUrls(
@@ -88,12 +143,14 @@ function collectDownloadUrls(
     seenIds.add(id);
     const label =
       compactText($(element).closest('li').children('div').first().text()) ||
-      compactText($(element).text()).replace(/\bdownload\b/gi, '').trim() ||
+      compactText($(element).text())
+        .replace(/\bdownload\b/gi, '')
+        .trim() ||
       'DataNodes';
 
     downloadUrls.push({
       kind: 'full',
-      label: label || 'DataNodes',
+      label: normalizeDownloadLabel(label, stableUrl),
       url: stableUrl,
     });
   });
@@ -110,7 +167,9 @@ export const ankerGamesAdapter: SourceAdapter = {
     const $ = load(html);
     const title =
       cleanAnkerGamesTitle($('h1').first().text()) ||
-      cleanAnkerGamesTitle($('meta[property="og:title"]').attr('content') ?? '') ||
+      cleanAnkerGamesTitle(
+        $('meta[property="og:title"]').attr('content') ?? '',
+      ) ||
       cleanAnkerGamesTitle($('title').text() || '');
     const normalizedTitle = normalizeTitle(title);
     const coverUrl =
@@ -119,6 +178,7 @@ export const ankerGamesAdapter: SourceAdapter = {
       $('img').first().attr('src') ??
       null;
     const version = findVisibleVersion($) ?? 'unknown';
+    const buildId = findVisibleCurrentBuild($);
     const fullDownloadUrls = collectDownloadUrls($, url);
 
     if (!title || fullDownloadUrls.length === 0) {
@@ -126,9 +186,10 @@ export const ankerGamesAdapter: SourceAdapter = {
     }
 
     const latestSourceRelease = {
-      buildId: null,
+      buildId,
       isPatch: false,
-      label: version === 'unknown' ? 'AnkerGames release' : `Version ${version}`,
+      label:
+        version === 'unknown' ? 'AnkerGames release' : `Version ${version}`,
       patchDate: null,
       version,
     };
@@ -140,6 +201,7 @@ export const ankerGamesAdapter: SourceAdapter = {
         url,
         title,
         version,
+        buildId,
         fullDownloadUrls.map((entry) => entry.url).join('|'),
       ]),
       fullRelease: latestSourceRelease,
@@ -151,7 +213,10 @@ export const ankerGamesAdapter: SourceAdapter = {
       title,
     };
   },
-  refreshTrackedItem(item: RefreshTrackedItemInput, html: string): SourceSnapshot {
+  refreshTrackedItem(
+    item: RefreshTrackedItemInput,
+    html: string,
+  ): SourceSnapshot {
     const parsed = this.parsePage(item.sourceUrl, html);
 
     return {

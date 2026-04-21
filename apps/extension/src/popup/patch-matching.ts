@@ -74,7 +74,7 @@ function scoreSteamPatchCandidate(
     patch.buildId &&
     sourceBuild === normalizePatchSignal(patch.buildId)
   ) {
-    score += 40;
+    score += 120;
     reasons.push('build');
   }
 

@@ -45,6 +45,37 @@ const frostpunkSource: ParsedSourcePayload = {
   title: 'Frostpunk 2 Deluxe Edition',
 };
 
+const ankergamesSource: ParsedSourcePayload = {
+  coverUrl: null,
+  fingerprint: 'shape-of-dreams',
+  fullDownloadUrls: [
+    {
+      kind: 'full',
+      label: 'DataNodes',
+      url: 'https://ankergames.net/generate-download-url/2557',
+    },
+  ],
+  fullRelease: {
+    buildId: '22630308',
+    isPatch: false,
+    label: 'Version V 1.2.1.7',
+    patchDate: null,
+    version: 'V 1.2.1.7',
+  },
+  latestSourceRelease: {
+    buildId: '22630308',
+    isPatch: false,
+    label: 'Version V 1.2.1.7',
+    patchDate: null,
+    version: 'V 1.2.1.7',
+  },
+  normalizedTitle: 'shape of dreams',
+  patchDownloadUrls: [],
+  sourceKind: 'ankergames',
+  sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+  title: 'Shape of Dreams',
+};
+
 function patchCandidate(
   patchTitle: string,
   patchDate: string,
@@ -96,5 +127,26 @@ describe('SteamDB patch matching', () => {
     ]);
 
     expect(suggestion).toBeNull();
+  });
+
+  it('uses Ankergames current build to select the matching SteamDB row', () => {
+    const matchingBuild = patchCandidate(
+      'Shape of Dreams update for 2 April 2026',
+      '04/02/2026',
+      '22630308',
+    );
+    const laterBuild = patchCandidate(
+      'Shape of Dreams update for 20 April 2026',
+      '04/20/2026',
+      '22888888',
+    );
+
+    const suggestion = findLikelySteamPatch(ankergamesSource, [
+      laterBuild,
+      matchingBuild,
+    ]);
+
+    expect(suggestion?.key).toBe(getSteamPatchKey(matchingBuild));
+    expect(suggestion?.label).toContain('build');
   });
 });

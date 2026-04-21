@@ -55,6 +55,10 @@ export type NativeMessageRequest =
       payload: { trackedItemId: string };
     }
   | {
+      type: 'completeStagedInstall';
+      payload: { trackedItemId: string };
+    }
+  | {
       type: 'retryDownload';
       payload: { selectedDownloads?: SelectedDownloads; trackedItemId: string };
     }
@@ -140,6 +144,11 @@ export type NativeMessageResponse =
   | {
       ok: true;
       type: 'markDownloadFailed';
+      payload: TrackedItemView;
+    }
+  | {
+      ok: true;
+      type: 'completeStagedInstall';
       payload: TrackedItemView;
     }
   | {

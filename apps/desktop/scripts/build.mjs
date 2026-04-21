@@ -15,7 +15,7 @@ await Promise.all([
   esbuild.build({
     bundle: true,
     entryPoints: [join(srcDir, 'main', 'index.ts')],
-    external: ['electron', 'sql.js', 'jdownloader-connect'],
+    external: ['electron', 'sql.js', 'jdownloader-connect', '7zip-bin-full'],
     format: 'cjs',
     outfile: join(distDir, 'main', 'index.cjs'),
     platform: 'node',

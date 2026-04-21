@@ -140,6 +140,14 @@ export class NativeBridgeServer {
             ),
             type: request.type,
           };
+        case 'completeStagedInstall':
+          return {
+            ok: true,
+            payload: await this.service.completeStagedInstall(
+              request.payload.trackedItemId,
+            ),
+            type: request.type,
+          };
         case 'retryDownload':
           return {
             ok: true,
