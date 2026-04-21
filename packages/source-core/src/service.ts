@@ -4,11 +4,20 @@ import type {
   SupportedSourceKind,
 } from '@vaulttrack/shared-types';
 
+import { ankerGamesAdapter } from './adapters/ankergames.js';
+import {
+  enrichAnkerGamesParsedSource,
+  type SourceFetch,
+} from './adapters/ankergames-client.js';
 import { elAmigosAdapter } from './adapters/elamigos.js';
 import { steamRipAdapter } from './adapters/steamrip.js';
 import type { RefreshTrackedItemInput, SourceAdapter } from './types.js';
 
-const adapters: SourceAdapter[] = [elAmigosAdapter, steamRipAdapter];
+const adapters: SourceAdapter[] = [
+  ankerGamesAdapter,
+  elAmigosAdapter,
+  steamRipAdapter,
+];
 
 export function getAdapterForUrl(url: string, html: string): SourceAdapter | null {
   return adapters.find((adapter) => adapter.detectPage(url, html)) ?? null;
@@ -40,6 +49,41 @@ export function parseSupportedPageForKind(
   }
 
   return adapter.parsePage(url, html);
+}
+
+export async function parseSupportedPageForKindWithNetwork(
+  sourceKind: SupportedSourceKind,
+  url: string,
+  html: string,
+  fetchFn: SourceFetch,
+): Promise<ParsedSourcePayload> {
+  const parsedSource = parseSupportedPageForKind(sourceKind, url, html);
+  if (parsedSource.sourceKind !== 'ankergames') {
+    return parsedSource;
+  }
+
+  return enrichAnkerGamesParsedSource({
+    fetch: fetchFn,
+    html,
+    parsedSource,
+  }).catch(() => parsedSource);
+}
+
+export async function parseSupportedPageWithNetwork(
+  url: string,
+  html: string,
+  fetchFn: SourceFetch,
+): Promise<ParsedSourcePayload> {
+  const parsedSource = parseSupportedPage(url, html);
+  if (parsedSource.sourceKind !== 'ankergames') {
+    return parsedSource;
+  }
+
+  return enrichAnkerGamesParsedSource({
+    fetch: fetchFn,
+    html,
+    parsedSource,
+  }).catch(() => parsedSource);
 }
 
 export function refreshTrackedItemFromHtml(

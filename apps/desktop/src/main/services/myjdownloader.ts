@@ -5,6 +5,7 @@ import type {
   ParsedSourcePayload,
   SelectedDownloads,
 } from '@vaulttrack/shared-types';
+import { isAnkerGamesDirectDownloadUrl } from '@vaulttrack/source-core';
 
 export interface MyJDownloaderCredentials {
   deviceId: string;
@@ -251,6 +252,15 @@ function buildLinkQueueRequests(
   selectedDownloads: SelectedDownloads,
   sourceKind: ParsedSourcePayload['sourceKind'],
 ): LinkQueueRequest[] {
+  if (
+    sourceKind === 'ankergames' &&
+    !isAnkerGamesDirectDownloadUrl(selectedDownloads.fullUrl)
+  ) {
+    throw new Error(
+      'AnkerGames queue request must use a DataNodes download URL.',
+    );
+  }
+
   const splitElamigosPackages = Boolean(
     sourceKind === 'elamigos' && selectedDownloads.patchUrl?.trim(),
   );
@@ -1804,7 +1814,7 @@ export class MyJDownloaderService {
     if (hasActiveExtraction) {
       stage = 'extracting';
     } else if (packageInfo?.finished) {
-      stage = params.sourceKind === 'steamrip' ? 'complete' : 'staged';
+      stage = params.sourceKind === 'elamigos' ? 'staged' : 'complete';
     } else if (packageInfo?.running) {
       stage = 'downloading';
     }

@@ -144,7 +144,7 @@ export async function planLibraryPaths(params: {
   canonicalTitle: string;
   rootLibraryPath: string;
   releaseSuffix: string;
-  sourceKind: 'elamigos' | 'steamrip';
+  sourceKind: 'ankergames' | 'elamigos' | 'steamrip';
 }): Promise<{
   extractPath: string;
   finalPath: string;
@@ -159,9 +159,9 @@ export async function planLibraryPaths(params: {
   const stagePath = resolve(join(stageRootPath, safeStageName));
   const finalPath = resolve(join(params.rootLibraryPath, safeTitle));
   const extractPath =
-    params.sourceKind === 'steamrip'
-      ? resolve(join(stageRootPath, safeTitle, 'contents'))
-      : stagePath;
+    params.sourceKind === 'elamigos'
+      ? stagePath
+      : resolve(join(stageRootPath, safeTitle, 'contents'));
 
   return { extractPath, finalPath, stagePath, stageRootPath };
 }

@@ -3,6 +3,7 @@ import { createServer, type Server } from 'node:http';
 import type {
   NativeMessageRequest,
   NativeMessageResponse,
+  SourceKind,
 } from '@vaulttrack/shared-types';
 
 import { VaultTrackService } from './vaulttrack-service.js';
@@ -103,7 +104,7 @@ export class NativeBridgeServer {
             ok: true,
             payload: await this.service.resolveSteamMatch(
               request.payload.title,
-              request.payload.sourceKind as 'elamigos' | 'steamrip' | 'manual',
+              request.payload.sourceKind as SourceKind,
               request.payload.sourceUrl,
               request.payload.queryTitle ?? request.payload.manualQuery ?? null,
             ),

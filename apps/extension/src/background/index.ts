@@ -11,7 +11,7 @@ import type {
   ThemeMode,
   TrackedItemView,
 } from '@vaulttrack/shared-types';
-import { parseSupportedPage } from '@vaulttrack/source-core';
+import { parseSupportedPageWithNetwork } from '@vaulttrack/source-core';
 
 import { isSupportedDetailPage } from '../support.js';
 import { buildSteamDbPatchnotesUrl } from '../steamdb-builds.js';
@@ -432,7 +432,11 @@ async function parseAndCachePage(params: {
   url: string;
 }): Promise<ParsedSourcePayload> {
   const canonicalUrl = canonicalizeSupportedUrl(params.url);
-  const parsedSource = parseSupportedPage(params.url, params.html);
+  const parsedSource = await parseSupportedPageWithNetwork(
+    params.url,
+    params.html,
+    fetch,
+  );
   await writeParsedCache({
     canonicalUrl,
     capturedAt: Date.now(),

@@ -6,6 +6,8 @@
   "permissions": ["activeTab", "nativeMessaging", "scripting", "storage", "tabs"],
   "host_permissions": [
     "http://127.0.0.1/*",
+    "https://ankergames.net/*",
+    "https://www.ankergames.net/*",
     "https://elamigos.site/*",
     "https://www.elamigos.site/*",
     "https://steamdb.info/*",
@@ -22,6 +24,8 @@
   "content_scripts": [
     {
       "matches": [
+        "https://ankergames.net/game/*",
+        "https://www.ankergames.net/game/*",
         "https://elamigos.site/data/*.html",
         "https://www.elamigos.site/data/*.html",
         "https://steamrip.com/*-free-download*",

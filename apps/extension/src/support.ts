@@ -1,4 +1,5 @@
 const EL_AMIGOS_RE = /^https:\/\/(?:www\.)?elamigos\.site\/data\/.+\.html$/i;
+const ANKERGAMES_RE = /^https:\/\/(?:www\.)?ankergames\.net\/game\/[a-z0-9][a-z0-9-]*\/?$/i;
 const STEAMRIP_DETAIL_SLUG_RE =
   /^[a-z0-9][a-z0-9-]*-free-download(?:-[a-z0-9][a-z0-9-]*)?$/i;
 
@@ -19,7 +20,7 @@ function isSteamRipDetailPage(url: string): boolean {
 }
 
 export function isSupportedDetailPage(url: string): boolean {
-  return EL_AMIGOS_RE.test(url) || isSteamRipDetailPage(url);
+  return ANKERGAMES_RE.test(url) || EL_AMIGOS_RE.test(url) || isSteamRipDetailPage(url);
 }
 
 export function copiedUrlMatchesPage(copiedText: string, pageUrl: string): boolean {

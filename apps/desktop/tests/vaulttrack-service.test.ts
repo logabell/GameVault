@@ -9,6 +9,10 @@ import type {
   ParsedSourcePayload,
   SteamPatchCandidate,
 } from '@vaulttrack/shared-types';
+import type {
+  AnkerGamesSignedDownloadPageRenderer,
+  SourceFetch,
+} from '@vaulttrack/source-core';
 import type { MyJDownloaderService } from '../src/main/services/myjdownloader.js';
 import { VaultTrackDatabase } from '../src/main/services/database.js';
 import { VaultTrackService } from '../src/main/services/vaulttrack-service.js';
@@ -123,6 +127,73 @@ function steamRipSourceHtml(params: {
   `;
 }
 
+function ankergamesSourceHtml(): string {
+  const snapshot = JSON.stringify({
+    data: {
+      isLoading: true,
+      post: [null, { class: 'App\\Models\\Post', key: 2951, s: 'mdl' }],
+      versionData: null,
+    },
+    memo: {
+      id: 'version-component',
+      name: 'version-status',
+      path: 'game/shape-of-dreams',
+    },
+  }).replaceAll('"', '&quot;');
+
+  return `
+    <html>
+      <head>
+        <meta property="og:image" content="https://ankergames.net/poster.png" />
+      </head>
+      <body>
+        <h1>Shape of Dreams</h1>
+        <span>V 1.2.1.7</span>
+        <div
+          wire:snapshot="${snapshot}"
+          wire:id="version-component"
+          x-intersect="$wire.__lazyLoad(&#039;lazy-version-token&#039;)"
+        ></div>
+        <ul>
+          <li>
+            <div>DataNodes</div>
+            <a href="#" @click.prevent="generateDownloadUrl(2557)">Download</a>
+          </li>
+        </ul>
+      </body>
+    </html>
+  `;
+}
+
+const ankergamesSource: ParsedSourcePayload = {
+  coverUrl: 'https://ankergames.net/poster.png',
+  fingerprint: 'ankergames-fingerprint',
+  fullDownloadUrls: [
+    {
+      kind: 'full',
+      label: 'DataNodes',
+      url: 'https://ankergames.net/generate-download-url/2557',
+    },
+  ],
+  fullRelease: {
+    buildId: '22630308',
+    isPatch: false,
+    label: 'Version V 1.2.1.7',
+    version: 'V 1.2.1.7',
+  },
+  latestSourceRelease: {
+    buildId: '22630308',
+    isPatch: false,
+    label: 'Version V 1.2.1.7',
+    version: 'V 1.2.1.7',
+  },
+  normalizedTitle: 'shape of dreams',
+  patchDownloadUrls: [],
+  sourceKind: 'ankergames',
+  sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+  title: 'Shape of Dreams',
+};
+
 function createService(
   database: VaultTrackDatabase,
   queueLinks: unknown = vi.fn(async () => ({
@@ -142,6 +213,8 @@ function createService(
   dismountIsoUnderPath: (params: {
     rootPath: string;
   }) => Promise<string[]> = vi.fn(async () => []),
+  sourceFetch: SourceFetch = fetch,
+  renderAnkerGamesSignedDownloadPage?: AnkerGamesSignedDownloadPageRenderer,
 ): VaultTrackService {
   const myJDownloader = {
     getHealth: async () => ({
@@ -167,6 +240,8 @@ function createService(
     () => undefined,
     async () => null,
     dismountIsoUnderPath,
+    sourceFetch,
+    renderAnkerGamesSignedDownloadPage,
   );
 }
 
@@ -557,6 +632,398 @@ describe('VaultTrackService SteamDB patch workflow', () => {
     }
   });
 
+  it('resolves Ankergames stable mirrors to direct links only when queueing', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootLibraryPath = join(tempRoot, 'Library');
+      const directUrl =
+        'https://node42.datanodes.to:8443/d/token/Shape-Of-Dreams-AnkerGames.zip';
+      database.setSetting('library.rootPath', rootLibraryPath);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const sourceFetch = vi.fn(async (input: string, init?: RequestInit) => {
+        if (input === 'https://ankergames.net/csrf-token') {
+          return new Response(JSON.stringify({ token: 'csrf-token' }), {
+            status: 200,
+          });
+        }
+
+        if (
+          input === 'https://ankergames.net/generate-download-url/2557'
+        ) {
+          expect(init?.method).toBe('POST');
+          return new Response(
+            JSON.stringify({
+              download_url: 'https://ankergames.net/download/signed',
+              success: true,
+            }),
+            { status: 200 },
+          );
+        }
+
+        expect(input).toBe('https://ankergames.net/download/signed');
+        return new Response(
+          `<div x-data="downloadPage('${encodeURIComponent(directUrl)}', null, false, null, null)"></div>`,
+          { status: 200 },
+        );
+      });
+      const queueLinks = vi.fn(async (_params: unknown) => ({
+        packageId: 9001,
+        packageName: 'Shape of Dreams_22630308',
+      }));
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      );
+
+      const view = await service.addTrackedItem({
+        parsedSource: ankergamesSource,
+        queueDownload: true,
+        selectedDownloads: {
+          fullUrl: 'https://ankergames.net/generate-download-url/2557',
+        },
+        selectedSteamPatch: {
+          ...selectedPatch,
+          appId: 2444750,
+          buildId: '22630308',
+        },
+        steamMatch: {
+          ...steamMatch,
+          appId: 2444750,
+          normalizedTitle: 'shape of dreams',
+          title: 'Shape of Dreams',
+        },
+      });
+
+      expect(queueLinks).toHaveBeenCalledTimes(1);
+      expect(queueLinks.mock.calls[0]?.[0]).toMatchObject({
+        selectedDownloads: {
+          fullUrl: directUrl,
+          patchUrl: null,
+        },
+        sourceKind: 'ankergames',
+      });
+      expect(view.currentDownload).toMatchObject({
+        finalPath: join(rootLibraryPath, 'Shape of Dreams'),
+        selectedMirrorUrl: 'https://ankergames.net/generate-download-url/2557',
+        stage: 'queued',
+      });
+      expect(view.downloadMirrors[0]).toMatchObject({
+        kind: 'full',
+        url: 'https://ankergames.net/generate-download-url/2557',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('uses rendered Ankergames countdown pages when the signed page has no static direct link', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootLibraryPath = join(tempRoot, 'Library');
+      const directUrl =
+        'https://node42.datanodes.to:8443/d/token/Shape-Of-Dreams-AnkerGames.zip';
+      database.setSetting('library.rootPath', rootLibraryPath);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const sourceFetch = vi.fn(async (input: string) => {
+        if (input === 'https://ankergames.net/csrf-token') {
+          return new Response(JSON.stringify({ token: 'csrf-token' }), {
+            status: 200,
+          });
+        }
+
+        if (input === 'https://ankergames.net/generate-download-url/2557') {
+          return new Response(
+            JSON.stringify({
+              download_url: 'https://ankergames.net/download/signed',
+              success: true,
+            }),
+            { status: 200 },
+          );
+        }
+
+        expect(input).toBe('https://ankergames.net/download/signed');
+        return new Response('<html><body>Countdown</body></html>', {
+          status: 200,
+        });
+      });
+      const renderSignedDownloadPage = vi.fn(async () => directUrl);
+      const queueLinks = vi.fn(async (_params: unknown) => ({
+        packageId: 9001,
+        packageName: 'Shape of Dreams_22630308',
+      }));
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+        renderSignedDownloadPage,
+      );
+
+      await service.addTrackedItem({
+        parsedSource: ankergamesSource,
+        queueDownload: true,
+        selectedDownloads: {
+          fullUrl: 'https://ankergames.net/generate-download-url/2557',
+        },
+        selectedSteamPatch: {
+          ...selectedPatch,
+          appId: 2444750,
+          buildId: '22630308',
+        },
+        steamMatch: {
+          ...steamMatch,
+          appId: 2444750,
+          normalizedTitle: 'shape of dreams',
+          title: 'Shape of Dreams',
+        },
+      });
+
+      expect(renderSignedDownloadPage).toHaveBeenCalledWith({
+        signedPageUrl: 'https://ankergames.net/download/signed',
+        sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+      });
+      expect(queueLinks).toHaveBeenCalledWith(
+        expect.objectContaining({
+          selectedDownloads: {
+            fullUrl: directUrl,
+            patchUrl: null,
+          },
+          sourceKind: 'ankergames',
+        }),
+      );
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('marks Ankergames queueing failed when no direct DataNodes link can be resolved', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const sourceFetch = vi.fn(async (input: string) => {
+        if (input === 'https://ankergames.net/csrf-token') {
+          return new Response(JSON.stringify({ token: 'csrf-token' }), {
+            status: 200,
+          });
+        }
+
+        if (input === 'https://ankergames.net/generate-download-url/2557') {
+          return new Response(
+            JSON.stringify({
+              download_url: 'https://ankergames.net/download/signed',
+              success: true,
+            }),
+            { status: 200 },
+          );
+        }
+
+        return new Response('<html><body>Countdown</body></html>', {
+          status: 200,
+        });
+      });
+      const queueLinks = vi.fn(async (_params: unknown) => ({
+        packageId: 9001,
+        packageName: 'Shape of Dreams_22630308',
+      }));
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+        async () => 'https://ankergames.net/build/assets/s.js',
+      );
+
+      await expect(
+        service.addTrackedItem({
+          parsedSource: ankergamesSource,
+          queueDownload: true,
+          selectedDownloads: {
+            fullUrl: 'https://ankergames.net/generate-download-url/2557',
+          },
+          selectedSteamPatch: {
+            ...selectedPatch,
+            appId: 2444750,
+            buildId: '22630308',
+          },
+          steamMatch: {
+            ...steamMatch,
+            appId: 2444750,
+            normalizedTitle: 'shape of dreams',
+            title: 'Shape of Dreams',
+          },
+        }),
+      ).rejects.toThrow('DataNodes download URL');
+
+      expect(queueLinks).not.toHaveBeenCalled();
+      const trackedItem = database.listTrackedItems()[0];
+      expect(trackedItem).toBeDefined();
+      const job = database.getDownloadJob(trackedItem!.id);
+      expect(job).toMatchObject({
+        selectedMirrorUrl: 'https://ankergames.net/generate-download-url/2557',
+        stage: 'failed',
+      });
+      expect(job?.parts?.[0]).toMatchObject({
+        mirrorUrl: 'https://ankergames.net/generate-download-url/2557',
+        stage: 'failed',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('refuses to queue non-DataNodes Ankergames links directly', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const sourceFetch = vi.fn(async () => {
+        throw new Error('source fetch should not run for invalid direct links');
+      });
+      const queueLinks = vi.fn(async (_params: unknown) => ({
+        packageId: 9001,
+        packageName: 'Shape of Dreams_22630308',
+      }));
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      );
+
+      await expect(
+        service.addTrackedItem({
+          parsedSource: ankergamesSource,
+          queueDownload: true,
+          selectedDownloads: {
+            fullUrl: 'https://ankergames.net/download/signed',
+          },
+          selectedSteamPatch: {
+            ...selectedPatch,
+            appId: 2444750,
+            buildId: '22630308',
+          },
+          steamMatch: {
+            ...steamMatch,
+            appId: 2444750,
+            normalizedTitle: 'shape of dreams',
+            title: 'Shape of Dreams',
+          },
+        }),
+      ).rejects.toThrow('DataNodes download URL');
+
+      expect(sourceFetch).not.toHaveBeenCalled();
+      expect(queueLinks).not.toHaveBeenCalled();
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('resolves Ankergames stable mirrors again when retrying downloads', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      let resolveCount = 0;
+      const sourceFetch = vi.fn(async (input: string) => {
+        if (input === 'https://ankergames.net/csrf-token') {
+          return new Response(JSON.stringify({ token: 'csrf-token' }), {
+            status: 200,
+          });
+        }
+
+        if (input === 'https://ankergames.net/generate-download-url/2557') {
+          resolveCount += 1;
+          return new Response(
+            JSON.stringify({
+              download_url: 'https://ankergames.net/download/signed',
+              success: true,
+            }),
+            { status: 200 },
+          );
+        }
+
+        return new Response(
+          `<div>${encodeURIComponent(
+            `https://node42.datanodes.to:8443/d/token-${resolveCount}/Shape-Of-Dreams-AnkerGames.zip`,
+          )}</div>`,
+          { status: 200 },
+        );
+      });
+      const queueLinks = vi.fn(async (_params: unknown) => ({
+        packageId: 9001,
+        packageName: 'Shape of Dreams_22630308',
+      }));
+      const removePackage = vi.fn(async (_params: unknown) => undefined);
+      const service = createService(
+        database,
+        queueLinks,
+        removePackage,
+        undefined,
+        undefined,
+        sourceFetch,
+      );
+
+      const view = await service.addTrackedItem({
+        parsedSource: ankergamesSource,
+        queueDownload: true,
+        selectedDownloads: {
+          fullUrl: 'https://ankergames.net/generate-download-url/2557',
+        },
+        selectedSteamPatch: {
+          ...selectedPatch,
+          appId: 2444750,
+          buildId: '22630308',
+        },
+        steamMatch: {
+          ...steamMatch,
+          appId: 2444750,
+          normalizedTitle: 'shape of dreams',
+          title: 'Shape of Dreams',
+        },
+      });
+
+      await service.retryDownload(view.item.id);
+
+      expect(queueLinks).toHaveBeenCalledTimes(2);
+      expect(queueLinks.mock.calls[1]?.[0]).toMatchObject({
+        selectedDownloads: {
+          fullUrl:
+            'https://node42.datanodes.to:8443/d/token-2/Shape-Of-Dreams-AnkerGames.zip',
+          patchUrl: null,
+        },
+      });
+      expect(removePackage).toHaveBeenCalled();
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('forces retry to requeue previously selected mirror links', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -645,6 +1112,83 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       ).toEqual(expect.any(String));
       expect(existsSync(stagePath!)).toBe(false);
       expect(existsSync(finalPath!)).toBe(true);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('refreshes Ankergames snapshots from current version and build', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'shape of dreams',
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+        title: 'Shape of Dreams',
+      });
+      const sourceFetch = vi.fn(async (input: string, init?: RequestInit) => {
+        if (input === 'https://ankergames.net/game/shape-of-dreams') {
+          return new Response(ankergamesSourceHtml(), { status: 200 });
+        }
+
+        if (input === 'https://ankergames.net/csrf-token') {
+          return new Response(JSON.stringify({ token: 'csrf-token' }), {
+            status: 200,
+          });
+        }
+
+        expect(input).toBe('https://ankergames.net/livewire/update');
+        expect(init?.method).toBe('POST');
+        return new Response(
+          JSON.stringify({
+            components: [
+              {
+                snapshot: JSON.stringify({
+                  data: {
+                    versionData: [
+                      {
+                        current_build: '22630308',
+                        current_version: 'V 1.2.1.7',
+                        latest_build: '99999999',
+                      },
+                      { s: 'arr' },
+                    ],
+                  },
+                }),
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      });
+      const service = createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      );
+
+      const refreshed = await service.refreshTrackedItem(item.id);
+
+      expect(refreshed.snapshot).toMatchObject({
+        observedBuildId: '22630308',
+        observedVersion: 'V 1.2.1.7',
+        sourceKind: 'ankergames',
+      });
+      expect(database.getRawParsedSourcePayload(item.id)).toMatchObject({
+        latestSourceRelease: {
+          buildId: '22630308',
+          version: 'V 1.2.1.7',
+        },
+      });
+      expect(database.listDownloadMirrors(item.id)).toEqual([
+        expect.objectContaining({
+          kind: 'full',
+          url: 'https://ankergames.net/generate-download-url/2557',
+        }),
+      ]);
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }

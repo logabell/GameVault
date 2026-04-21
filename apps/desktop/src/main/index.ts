@@ -2,6 +2,11 @@ import { join } from 'node:path';
 
 import type { ConfirmedSteamMatch } from '@vaulttrack/shared-types';
 import {
+  extractAnkerGamesDirectDownloadUrl,
+  isAnkerGamesDirectDownloadUrl,
+} from '@vaulttrack/source-core';
+import type { DownloadItem, Event as ElectronEvent } from 'electron';
+import {
   app,
   BrowserWindow,
   Menu,
@@ -9,6 +14,7 @@ import {
   Tray,
   dialog,
   ipcMain,
+  net,
   nativeImage,
   safeStorage,
   shell,
@@ -26,6 +32,8 @@ let bridge: NativeBridgeServer | null = null;
 let scheduler: VaultTrackScheduler | null = null;
 let quitting = false;
 const backgroundLaunch = process.argv.includes('--background');
+const ANKERGAMES_RENDER_TIMEOUT_MS = 75000;
+const ANKERGAMES_RENDER_POLL_MS = 1000;
 
 function createTrayIcon() {
   return nativeImage.createFromDataURL(
@@ -70,6 +78,169 @@ function createWindow(options?: { showOnReady?: boolean }) {
   }
 
   return mainWindow;
+}
+
+async function renderAnkerGamesSignedDownloadPage(params: {
+  signedPageUrl: string;
+  sourceUrl: string;
+}): Promise<string | null> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let pollTimer: NodeJS.Timeout | null = null;
+    let timeoutTimer: NodeJS.Timeout | null = null;
+
+    const downloadWindow = new BrowserWindow({
+      height: 480,
+      show: false,
+      title: 'VaultTrack Download Resolver',
+      webPreferences: {
+        backgroundThrottling: false,
+        contextIsolation: true,
+        javascript: true,
+        nodeIntegration: false,
+        sandbox: true,
+      },
+      width: 640,
+    });
+    downloadWindow.setMenu(null);
+    downloadWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+
+    const downloadSession = downloadWindow.webContents.session;
+
+    const cleanup = () => {
+      if (pollTimer) {
+        clearTimeout(pollTimer);
+      }
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+      }
+      downloadSession.removeListener('will-download', onWillDownload);
+      if (!downloadWindow.isDestroyed()) {
+        downloadWindow.destroy();
+      }
+    };
+
+    const settle = (error: Error | null, directUrl?: string) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      if (error) {
+        reject(error);
+      } else {
+        resolve(directUrl ?? null);
+      }
+    };
+
+    const acceptCandidate = (candidate: string | null | undefined): boolean => {
+      if (candidate && isAnkerGamesDirectDownloadUrl(candidate)) {
+        settle(null, candidate);
+        return true;
+      }
+      return false;
+    };
+
+    function onWillDownload(
+      event: ElectronEvent,
+      item: DownloadItem,
+    ): void {
+      const downloadCandidates = [
+        ...item.getURLChain(),
+        item.getURL(),
+      ].reverse();
+      event.preventDefault();
+      item.cancel();
+      for (const candidate of downloadCandidates) {
+        if (acceptCandidate(candidate)) {
+          return;
+        }
+      }
+    }
+
+    const acceptNavigation = (event: ElectronEvent, url: string) => {
+      if (acceptCandidate(url)) {
+        event.preventDefault();
+      }
+    };
+
+    const pollPage = async () => {
+      if (settled || downloadWindow.isDestroyed()) {
+        return;
+      }
+
+      try {
+        const pageText = await downloadWindow.webContents.executeJavaScript(
+          `(() => {
+            const values = [document.documentElement?.outerHTML || ''];
+            for (const element of document.querySelectorAll('*')) {
+              values.push(element.textContent || '');
+              if ('value' in element && typeof element.value === 'string') {
+                values.push(element.value);
+              }
+              for (const attribute of Array.from(element.attributes || [])) {
+                values.push(attribute.value);
+              }
+            }
+            return values.join('\\n');
+          })()`,
+          true,
+        );
+        if (acceptCandidate(extractAnkerGamesDirectDownloadUrl(String(pageText)))) {
+          return;
+        }
+      } catch {
+        // The countdown page can navigate while we poll; keep waiting until timeout.
+      }
+
+      pollTimer = setTimeout(pollPage, ANKERGAMES_RENDER_POLL_MS);
+    };
+
+    timeoutTimer = setTimeout(() => {
+      settle(
+        new Error('AnkerGames did not expose a DataNodes download URL.'),
+      );
+    }, ANKERGAMES_RENDER_TIMEOUT_MS);
+
+    downloadSession.on('will-download', onWillDownload);
+    downloadWindow.webContents.on('did-finish-load', () => {
+      void pollPage();
+    });
+    downloadWindow.webContents.on('did-navigate', () => {
+      void pollPage();
+    });
+    downloadWindow.webContents.on('will-navigate', acceptNavigation);
+    downloadWindow.webContents.on('did-start-navigation', (_event, url) => {
+      acceptCandidate(url);
+    });
+    downloadWindow.webContents.on(
+      'did-fail-load',
+      (_event, errorCode, errorDescription, _validatedUrl, isMainFrame) => {
+        if (isMainFrame) {
+          settle(
+            new Error(
+              `AnkerGames signed page failed to render: ${
+                errorDescription || errorCode
+              }`,
+            ),
+          );
+        }
+      },
+    );
+
+    void downloadWindow
+      .loadURL(params.signedPageUrl, {
+        httpReferrer: params.sourceUrl,
+      })
+      .then(() => pollPage())
+      .catch((error: unknown) => {
+        settle(
+          error instanceof Error
+            ? error
+            : new Error('AnkerGames signed page failed to render.'),
+        );
+      });
+  });
 }
 
 async function bootstrap() {
@@ -136,6 +307,9 @@ async function bootstrap() {
       });
       return result.canceled ? null : (result.filePaths[0] ?? null);
     },
+    undefined,
+    (input, init) => net.fetch(input, init),
+    renderAnkerGamesSignedDownloadPage,
   );
   serviceRef.current = service;
 

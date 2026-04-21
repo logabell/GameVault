@@ -5,6 +5,13 @@ import { copiedUrlMatchesPage, isSupportedDetailPage } from '../src/support.js';
 describe('supported detail pages', () => {
   it('recognizes supported elamigos and steamrip detail urls', () => {
     expect(
+      isSupportedDetailPage('https://ankergames.net/game/shape-of-dreams'),
+    ).toBe(true);
+    expect(isSupportedDetailPage('https://ankergames.net/games-list')).toBe(
+      false,
+    );
+
+    expect(
       isSupportedDetailPage(
         'https://elamigos.site/data/Frostpunk_2_MULTi14_-_ElAmigos.html',
       ),

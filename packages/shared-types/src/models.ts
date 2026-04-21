@@ -1,4 +1,4 @@
-export type SupportedSourceKind = 'elamigos' | 'steamrip';
+export type SupportedSourceKind = 'ankergames' | 'elamigos' | 'steamrip';
 export type SourceKind = SupportedSourceKind | 'manual';
 
 export type ItemActionStatus = 'idle' | 'pending' | 'complete' | 'failed';

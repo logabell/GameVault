@@ -1,4 +1,4 @@
-import { ensureDir, readFileIfExists, writeBinaryFile } from './io.js';
+import { ensureDir, readFileIfExists, writeBinaryFileSync } from './io.js';
 
 import type {
   ConfirmedSteamMatch,
@@ -345,7 +345,7 @@ export class VaultTrackDatabase {
 
   private save(): void {
     const binary = this.db.export();
-    void writeBinaryFile(this.filePath, binary);
+    writeBinaryFileSync(this.filePath, binary);
   }
 
   private exec(sql: string, params: SqlScalar[] = []): void {
@@ -461,7 +461,7 @@ export class VaultTrackDatabase {
   getSourceSnapshot(trackedItemId: string): SourceSnapshot | null {
     const row = this.queryOne<{
       tracked_item_id: string;
-      source_kind: 'elamigos' | 'steamrip';
+      source_kind: 'ankergames' | 'elamigos' | 'steamrip';
       source_url: string;
       fingerprint: string;
       observed_version: string;

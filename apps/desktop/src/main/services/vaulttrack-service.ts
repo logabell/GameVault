@@ -11,6 +11,7 @@ import type {
   RemoveTrackedItemPayload,
   RemoveTrackedItemResult,
   SelectedDownloads,
+  SourceKind,
   SettingsView,
   SourceSnapshot,
   ThemeMode,
@@ -27,7 +28,14 @@ import {
   deriveTrackedItemStatus,
   deriveTrackedItemTrackingStatus,
 } from '@vaulttrack/shared-types';
-import { parseSupportedPageForKind } from '@vaulttrack/source-core';
+import {
+  isAnkerGamesDirectDownloadUrl,
+  isAnkerGamesGeneratedDownloadUrl,
+  parseSupportedPageForKindWithNetwork,
+  resolveAnkerGamesDownloadUrl,
+  type AnkerGamesSignedDownloadPageRenderer,
+  type SourceFetch,
+} from '@vaulttrack/source-core';
 import {
   buildSteamDbPatchFeedUrl,
   compareSourceToUpstream,
@@ -57,6 +65,12 @@ import { MyJDownloaderService } from './myjdownloader.js';
 export type RendererSettingsView = SettingsView;
 
 const STEAMDB_RSS_TIMEOUT_MS = 15000;
+
+function isPortableArchiveSourceKind(
+  sourceKind: SourceKind | ParsedSourcePayload['sourceKind'] | null | undefined,
+): boolean {
+  return sourceKind === 'ankergames' || sourceKind === 'steamrip';
+}
 
 function buildDownloadJobParts(params: {
   jobId: string;
@@ -246,7 +260,7 @@ function summarizeDownloadParts(
   } else if (parts.some((part) => part.stage === 'downloading')) {
     stage = 'downloading';
   } else if (totalParts > 0 && completedParts === totalParts) {
-    stage = sourceKind === 'steamrip' ? 'complete' : 'staged';
+    stage = sourceKind === 'elamigos' ? 'staged' : 'complete';
   }
 
   return {
@@ -309,6 +323,8 @@ export class VaultTrackService {
     private readonly showWindow: (trackedItemId?: string) => void,
     private readonly pickDirectoryDialog: () => Promise<string | null>,
     private readonly dismountIsoUnderPath: typeof dismountIsoImagesUnderPath = dismountIsoImagesUnderPath,
+    private readonly sourceFetch: SourceFetch = fetch,
+    private readonly renderAnkerGamesSignedDownloadPage?: AnkerGamesSignedDownloadPageRenderer,
   ) {}
 
   private appendEvent(
@@ -632,7 +648,7 @@ export class VaultTrackService {
 
   async resolveSteamMatch(
     title: string,
-    sourceKind: 'elamigos' | 'steamrip' | 'manual',
+    sourceKind: SourceKind,
     sourceUrl: string | null,
     queryTitle?: string | null,
   ): Promise<SteamMatchResolutionPayload> {
@@ -801,6 +817,35 @@ export class VaultTrackService {
     }
   }
 
+  private async resolveSelectedDownloadsForQueue(
+    parsedSource: ParsedSourcePayload,
+    selectedDownloads: SelectedDownloads,
+  ): Promise<SelectedDownloads> {
+    if (parsedSource.sourceKind !== 'ankergames') {
+      return selectedDownloads;
+    }
+
+    const fullUrl = selectedDownloads.fullUrl.trim();
+    const resolvedFullUrl = isAnkerGamesGeneratedDownloadUrl(fullUrl)
+      ? await resolveAnkerGamesDownloadUrl({
+          fetch: this.sourceFetch,
+          renderSignedDownloadPage: this.renderAnkerGamesSignedDownloadPage,
+          sourceUrl: parsedSource.sourceUrl,
+          stableDownloadUrl: fullUrl,
+        })
+      : fullUrl;
+    if (!isAnkerGamesDirectDownloadUrl(resolvedFullUrl)) {
+      throw new Error(
+        'AnkerGames download did not resolve to a DataNodes download URL.',
+      );
+    }
+
+    return {
+      fullUrl: resolvedFullUrl,
+      patchUrl: null,
+    };
+  }
+
   private async queueDownload(
     trackedItemId: string,
     parsedSource: ParsedSourcePayload,
@@ -896,10 +941,9 @@ export class VaultTrackService {
         createdAt: existingMatchesRequest ? existingJob!.createdAt : now,
         errorMessage: placeholderSummary.errorMessage,
         etaSeconds: placeholderSummary.etaSeconds,
-        finalPath:
-          parsedSource.sourceKind === 'steamrip'
-            ? paths.finalPath
-            : paths.extractPath,
+        finalPath: isPortableArchiveSourceKind(parsedSource.sourceKind)
+          ? paths.finalPath
+          : paths.extractPath,
         id: jobId,
         packageId: placeholderSummary.packageId,
         packageName: primaryQueuePackageName,
@@ -930,11 +974,16 @@ export class VaultTrackService {
           getElamigosPartStagePath(paths.stagePath, packageName, 'patch'),
         );
       }
+      const queueSelectedDownloads =
+        await this.resolveSelectedDownloadsForQueue(
+          parsedSource,
+          selectedDownloads,
+        );
       const queued = await this.myJDownloader.queueLinks({
         extractDirectory: paths.extractPath,
         packageName,
         parsedSource,
-        selectedDownloads,
+        selectedDownloads: queueSelectedDownloads,
         sourceKind: parsedSource.sourceKind,
         targetDirectory: paths.stagePath,
       });
@@ -954,7 +1003,10 @@ export class VaultTrackService {
               return queuedPart
                 ? {
                     ...part,
-                    mirrorUrl: queuedPart.mirrorUrl,
+                    mirrorUrl:
+                      parsedSource.sourceKind === 'ankergames'
+                        ? part.mirrorUrl
+                        : queuedPart.mirrorUrl,
                     packageId: queuedPart.packageId,
                     packageName: queuedPart.packageName,
                     updatedAt: new Date().toISOString(),
@@ -1116,22 +1168,25 @@ export class VaultTrackService {
       throw new Error('This item does not have a refreshable source');
     }
 
-    const response = await fetch(item.sourceUrl, {
-      headers: {
-        'User-Agent': 'VaultTrack/0.1 (+https://example.invalid/vaulttrack)',
-      },
-    });
+    const response = await this.sourceFetch(item.sourceUrl);
 
     if (!response.ok) {
       throw new Error(`Source refresh failed with ${response.status}`);
     }
 
     const html = await response.text();
-    const parsedSource = parseSupportedPageForKind(
+    const parsedSource = await parseSupportedPageForKindWithNetwork(
       item.sourceKind,
       item.sourceUrl,
       html,
+      this.sourceFetch,
     );
+    if (
+      parsedSource.sourceKind === 'ankergames' &&
+      !parsedSource.latestSourceRelease.buildId
+    ) {
+      throw new Error('AnkerGames refresh did not return the current build.');
+    }
     let snapshot = this.buildSnapshotFromParsedSource(
       trackedItemId,
       parsedSource,
@@ -1395,7 +1450,7 @@ export class VaultTrackService {
     }
 
     const extractionPath =
-      params.item.sourceKind === 'steamrip'
+      isPortableArchiveSourceKind(params.item.sourceKind)
         ? planSteamRipExtractPathFromJob({
             finalPath: params.finalPath,
             stagePath: params.job.stagePath,
@@ -1563,7 +1618,7 @@ export class VaultTrackService {
 
       try {
         const extractDirectory =
-          item.sourceKind === 'steamrip'
+          isPortableArchiveSourceKind(item.sourceKind)
             ? planSteamRipExtractPathFromJob({
                 finalPath: job.finalPath,
                 stagePath: job.stagePath,
@@ -1655,11 +1710,11 @@ export class VaultTrackService {
           updatedAt: new Date().toISOString(),
         };
         const extractionErrorWithStagedFiles =
-          item.sourceKind === 'steamrip' &&
+          isPortableArchiveSourceKind(item.sourceKind) &&
           isExtractionErrorMessage(nextJob.statusMessage);
         if (nextJob.stage === 'complete' || extractionErrorWithStagedFiles) {
           nextJob.etaSeconds = 0;
-          if (item.sourceKind === 'steamrip') {
+          if (isPortableArchiveSourceKind(item.sourceKind)) {
             const canonicalTitle = sanitizePathSegment(
               job.finalPath.split(/[\\/]/).filter(Boolean).at(-1) ?? item.title,
             );

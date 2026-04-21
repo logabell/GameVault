@@ -272,6 +272,7 @@ function formatSourceKind(
   value: ParsedSourcePayload['sourceKind'] | undefined,
 ): string {
   if (!value) return 'Source unavailable';
+  if (value === 'ankergames') return 'AnkerGames';
   return value === 'steamrip' ? 'SteamRIP' : 'ElAmigos';
 }
 

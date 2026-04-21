@@ -318,6 +318,30 @@ describe('MyJDownloaderService queueLinks', () => {
     });
   });
 
+  it('rejects Ankergames queue requests that are not direct DataNodes links', async () => {
+    const client = new FakeMyJDownloaderClient();
+    const service = createService(client);
+
+    await expect(
+      service.queueLinks({
+        extractDirectory: 'C:\\Games\\_STAGING\\Shape of Dreams\\contents',
+        packageName: 'Shape of Dreams_22630308',
+        parsedSource: {
+          ...parsedSource,
+          sourceKind: 'ankergames',
+          sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+          title: 'Shape of Dreams',
+        },
+        selectedDownloads: {
+          fullUrl: 'https://ankergames.net/download/signed',
+        },
+        sourceKind: 'ankergames',
+        targetDirectory: 'C:\\Games\\_STAGING\\Shape of Dreams_22630308',
+      }),
+    ).rejects.toThrow('DataNodes download URL');
+    expect(client.calls).toEqual([]);
+  });
+
   it('queues full and update mirror links as separate crawler jobs', async () => {
     const client = new FakeMyJDownloaderClient();
     client.crawledLinksByJob.set(9001, [
