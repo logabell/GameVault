@@ -671,6 +671,11 @@ describe('VaultTrackService import workflow', () => {
         patches: [{ appId: 444 }],
         status: 'complete',
       });
+      expect(createService(database).requestSteamDbBuildLookup(444)).toMatchObject({
+        appId: 444,
+        patches: [{ appId: 444 }],
+        status: 'complete',
+      });
 
       const failed = service.requestSteamDbBuildLookup(445);
       expect(

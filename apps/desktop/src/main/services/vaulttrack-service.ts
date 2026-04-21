@@ -1,5 +1,6 @@
 import type {
   AddTrackedItemRequestPayload,
+  CacheSteamDbBuildLookupPayload,
   CompleteSteamDbBuildLookupPayload,
   ConnectionHealthSummary,
   ConfirmedSteamMatch,
@@ -83,7 +84,7 @@ export type RendererSettingsView = SettingsView;
 
 const STEAMDB_RSS_TIMEOUT_MS = 15000;
 const IMPORT_STEAM_MATCH_CONCURRENCY = 3;
-const STEAMDB_BUILD_LOOKUP_TTL_MS = 5 * 60 * 1000;
+const STEAMDB_BUILD_LOOKUP_TTL_MS = 60 * 60 * 1000;
 
 function dateStamp(): string {
   return new Date().toLocaleDateString('en-US', {
@@ -896,6 +897,37 @@ export class VaultTrackService {
     return this.fetchSteamPatchFeed(appId);
   }
 
+  private normalizeSteamDbBuildCachePatches(
+    appId: number,
+    patches: SteamPatchCandidate[] | null | undefined,
+  ): SteamPatchCandidate[] {
+    return (patches ?? []).filter((patch) => patch.appId === appId);
+  }
+
+  private upsertSteamDbBuildCache(
+    appId: number,
+    patches: SteamPatchCandidate[] | null | undefined,
+    capturedAt = new Date().toISOString(),
+  ): SteamPatchCandidate[] {
+    const normalizedPatches = this.normalizeSteamDbBuildCachePatches(
+      appId,
+      patches,
+    );
+    if (normalizedPatches.length === 0) {
+      return normalizedPatches;
+    }
+
+    this.database.upsertSteamDbBuildCache({
+      appId,
+      capturedAt,
+      expiresAt: new Date(
+        new Date(capturedAt).getTime() + STEAMDB_BUILD_LOOKUP_TTL_MS,
+      ).toISOString(),
+      patches: normalizedPatches,
+    });
+    return normalizedPatches;
+  }
+
   private pruneSteamDbBuildLookups(): void {
     const now = Date.now();
     for (const [id, lookup] of this.steamDbBuildLookups) {
@@ -920,6 +952,23 @@ export class VaultTrackService {
     );
     if (existing) {
       return existing;
+    }
+
+    const cached = this.database.getSteamDbBuildCache(appId, now);
+    if (cached) {
+      const lookup: SteamDbBuildLookupState = {
+        attentionKind: null,
+        appId,
+        completedAt: cached.capturedAt,
+        createdAt: cached.capturedAt,
+        id: crypto.randomUUID(),
+        needsUserAttention: false,
+        patches: cached.patches,
+        status: 'complete',
+        updatedAt: cached.capturedAt,
+      };
+      this.steamDbBuildLookups.set(lookup.id, lookup);
+      return lookup;
     }
 
     const lookup: SteamDbBuildLookupState = {
@@ -980,7 +1029,38 @@ export class VaultTrackService {
       updatedAt: now,
     };
     this.steamDbBuildLookups.set(next.id, next);
+    if (next.status === 'complete') {
+      next.patches = this.upsertSteamDbBuildCache(
+        next.appId,
+        next.patches,
+        now,
+      );
+    }
     return next;
+  }
+
+  cacheSteamDbBuildLookup(
+    payload: CacheSteamDbBuildLookupPayload,
+  ): SteamDbBuildLookupState {
+    const now = new Date().toISOString();
+    const patches = this.upsertSteamDbBuildCache(
+      payload.appId,
+      payload.patches,
+      now,
+    );
+    const lookup: SteamDbBuildLookupState = {
+      attentionKind: null,
+      appId: payload.appId,
+      completedAt: now,
+      createdAt: now,
+      id: crypto.randomUUID(),
+      needsUserAttention: false,
+      patches,
+      status: 'complete',
+      updatedAt: now,
+    };
+    this.steamDbBuildLookups.set(lookup.id, lookup);
+    return lookup;
   }
 
   updateSteamDbBuildLookup(

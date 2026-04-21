@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { VaultTrackDatabase } from '../src/main/services/database.js';
+import type { SteamPatchCandidate } from '@vaulttrack/shared-types';
 
 function resolveSqlWasmPath(): string {
   const candidates = [
@@ -33,6 +34,40 @@ async function removeTempRootAfterPendingSave(tempRoot: string): Promise<void> {
 }
 
 describe('VaultTrackDatabase cleanup metadata', () => {
+  it('caches SteamDB build-table history until expiry', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const patch: SteamPatchCandidate = {
+        appId: 2416450,
+        buildId: '22852168',
+        link: 'https://steamdb.info/patchnotes/22852168/',
+        patchDate: '04/19/2026',
+        patchTitle: 'MOUSE: P.I. For Hire update for 19 April 2026',
+        publishedAt: '2026-04-19T07:13:32.000Z',
+        title: 'MOUSE: P.I. For Hire update for 19 April 2026',
+      };
+
+      database.upsertSteamDbBuildCache({
+        appId: 2416450,
+        capturedAt: '2026-04-21T12:00:00.000Z',
+        expiresAt: '2026-04-21T13:00:00.000Z',
+        patches: [patch],
+      });
+
+      expect(
+        database.getSteamDbBuildCache(2416450, '2026-04-21T12:30:00.000Z'),
+      ).toMatchObject({
+        appId: 2416450,
+        patches: [{ buildId: '22852168' }],
+      });
+      expect(
+        database.getSteamDbBuildCache(2416450, '2026-04-21T13:00:01.000Z'),
+      ).toBeNull();
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('records per-game SteamDB feed check success and failure state', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {

@@ -421,6 +421,11 @@ export interface CompleteSteamDbBuildLookupPayload {
   retryAfterMs?: number | null;
 }
 
+export interface CacheSteamDbBuildLookupPayload {
+  appId: number;
+  patches: SteamPatchCandidate[];
+}
+
 export interface UpdateSteamDbBuildLookupPayload {
   attentionKind?: SteamDbBuildLookupAttentionKind | null;
   appId: number;

@@ -130,6 +130,12 @@ export class NativeBridgeServer {
             payload: this.service.completeSteamDbBuildLookup(request.payload),
             type: request.type,
           };
+        case 'cacheSteamDbBuildLookup':
+          return {
+            ok: true,
+            payload: this.service.cacheSteamDbBuildLookup(request.payload),
+            type: request.type,
+          };
         case 'updateSteamDbBuildLookup':
           return {
             ok: true,

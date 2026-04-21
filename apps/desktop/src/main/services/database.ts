@@ -16,6 +16,7 @@ import type {
   SteamFeedCheckRecord,
   SourceWatch,
   SteamPatchEntry,
+  SteamPatchCandidate,
   TrackedItemRecord,
 } from '@vaulttrack/shared-types';
 import initSqlJs, { type Database as SqlJsDatabase, type SqlJsStatic } from 'sql.js';
@@ -81,6 +82,13 @@ CREATE TABLE IF NOT EXISTS steam_feed_checks (
   last_successful_at TEXT,
   last_error TEXT,
   updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS steamdb_build_cache (
+  app_id INTEGER PRIMARY KEY,
+  patches_json TEXT NOT NULL,
+  captured_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS install_records (
@@ -403,6 +411,13 @@ function migrateDownloadMirrorsPrimaryKey(db: SqlJsDatabase): void {
 }
 
 type SqlScalar = string | number | null;
+
+interface SteamDbBuildCacheRecord {
+  appId: number;
+  capturedAt: string;
+  expiresAt: string;
+  patches: SteamPatchCandidate[];
+}
 
 export class VaultTrackDatabase {
   private constructor(
@@ -870,6 +885,58 @@ export class VaultTrackDatabase {
         ],
       );
     }
+  }
+
+  getSteamDbBuildCache(
+    appId: number,
+    nowIso = new Date().toISOString(),
+  ): SteamDbBuildCacheRecord | null {
+    const row = this.queryOne<{
+      app_id: number;
+      captured_at: string;
+      expires_at: string;
+      patches_json: string;
+    }>(
+      `SELECT app_id, patches_json, captured_at, expires_at
+       FROM steamdb_build_cache
+       WHERE app_id = ? AND expires_at > ?`,
+      [appId, nowIso],
+    );
+    if (!row) {
+      return null;
+    }
+
+    const patches = parseJsonArray<SteamPatchCandidate>(
+      row.patches_json,
+    ).filter((patch) => patch.appId === appId);
+    if (patches.length === 0) {
+      return null;
+    }
+
+    return {
+      appId: Number(row.app_id),
+      capturedAt: row.captured_at,
+      expiresAt: row.expires_at,
+      patches,
+    };
+  }
+
+  upsertSteamDbBuildCache(record: SteamDbBuildCacheRecord): void {
+    this.exec(
+      `INSERT INTO steamdb_build_cache (
+         app_id, patches_json, captured_at, expires_at
+       ) VALUES (?, ?, ?, ?)
+       ON CONFLICT(app_id) DO UPDATE SET
+         patches_json = excluded.patches_json,
+         captured_at = excluded.captured_at,
+         expires_at = excluded.expires_at`,
+      [
+        record.appId,
+        JSON.stringify(record.patches),
+        record.capturedAt,
+        record.expiresAt,
+      ],
+    );
   }
 
   getSteamFeedCheck(trackedItemId: string): SteamFeedCheckRecord | null {

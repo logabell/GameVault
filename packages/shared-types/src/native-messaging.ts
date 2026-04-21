@@ -1,5 +1,6 @@
 import type {
   AddTrackedItemRequestPayload,
+  CacheSteamDbBuildLookupPayload,
   CompleteSteamDbBuildLookupPayload,
   ConnectionHealthSummary,
   RemoveTrackedItemPayload,
@@ -48,6 +49,10 @@ export type NativeMessageRequest =
   | {
       type: 'completeSteamDbBuildLookup';
       payload: CompleteSteamDbBuildLookupPayload;
+    }
+  | {
+      type: 'cacheSteamDbBuildLookup';
+      payload: CacheSteamDbBuildLookupPayload;
     }
   | {
       type: 'updateSteamDbBuildLookup';
@@ -156,6 +161,11 @@ export type NativeMessageResponse =
   | {
       ok: true;
       type: 'completeSteamDbBuildLookup';
+      payload: SteamDbBuildLookupState;
+    }
+  | {
+      ok: true;
+      type: 'cacheSteamDbBuildLookup';
       payload: SteamDbBuildLookupState;
     }
   | {

@@ -468,6 +468,31 @@ async function updateDesktopSteamDbLookup(
   }
 }
 
+async function cacheDesktopSteamDbBuildLookup(
+  appId: number,
+  patches: SteamPatchCandidate[],
+): Promise<void> {
+  const filteredPatches = patches.filter((patch) => patch.appId === appId);
+  if (filteredPatches.length === 0) {
+    return;
+  }
+
+  try {
+    await sendDesktopRequest(
+      {
+        payload: {
+          appId,
+          patches: filteredPatches,
+        },
+        type: 'cacheSteamDbBuildLookup',
+      },
+      { bridgeTimeoutMs: 1000, retryBridgeTimeoutMs: 2500 },
+    );
+  } catch {
+    // Desktop may be closed; the extension flow can still finish normally.
+  }
+}
+
 async function setActiveDraft(tabId: number, url: string): Promise<void> {
   await setSessionValue(ACTIVE_DRAFT_KEY, {
     tabId,
@@ -2093,6 +2118,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         patches,
         selectedPatch,
       } satisfies PendingSteamDbConfirmation);
+      void cacheDesktopSteamDbBuildLookup(appId, patches);
 
       try {
         if (chrome.action.openPopup) {
@@ -2154,6 +2180,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         closeTabIfPresent(sender.tab?.id ?? context.tabId),
         chrome.storage.session.remove(getSteamDbSelectionContextKey(appId)),
       ]);
+      void cacheDesktopSteamDbBuildLookup(appId, patches);
       void completeDesktopSteamDbLookup(completedState);
 
       sendResponse({ ok: true, payload: completedState });
