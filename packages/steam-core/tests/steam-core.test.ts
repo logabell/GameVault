@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  isSteamLibraryCoverUrl,
+  resolveSteamLibraryCoverUrl,
+} from '../src/covers.js';
+import {
   buildSteamSearchQueries,
   rankSteamCandidates,
   shouldAutoSelect,
@@ -20,8 +24,15 @@ interface MockStoreSearchItem {
   tiny_image?: string;
 }
 
+interface MockStoreAsset {
+  assetUrlFormat?: string;
+  libraryCapsule?: string;
+  libraryCapsule2x?: string;
+}
+
 function createSteamSearchFetchMock(params: {
   appTypes: Record<number, string>;
+  coverAssets?: Record<number, MockStoreAsset>;
   releaseDates?: Record<number, string>;
   storeResults: Record<string, MockStoreSearchItem[]>;
 }): typeof fetch {
@@ -76,11 +87,169 @@ function createSteamSearchFetchMock(params: {
       );
     }
 
+    if (
+      url.hostname === 'api.steampowered.com' &&
+      url.pathname === '/IStoreBrowseService/GetItems/v1/'
+    ) {
+      const inputJson = JSON.parse(url.searchParams.get('input_json') ?? '{}');
+      const appId = Number(inputJson.ids?.[0]?.appid);
+      const assets = params.coverAssets?.[appId];
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            response: {
+              store_items: [
+                {
+                  appid: appId,
+                  assets: assets
+                    ? {
+                        asset_url_format:
+                          assets.assetUrlFormat ??
+                          `steam/apps/${appId}/\${FILENAME}?t=1234`,
+                        library_capsule: assets.libraryCapsule,
+                        library_capsule_2x: assets.libraryCapsule2x,
+                      }
+                    : {},
+                },
+              ],
+            },
+          }),
+          { status: 200 },
+        ),
+      );
+    }
+
     throw new Error(`Unexpected Steam mock request: ${url.toString()}`);
   }) as typeof fetch;
 }
 
 describe('steam matching', () => {
+  it('resolves Steam library capsule 2x cover URLs from Store Browse assets', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      expect(url.pathname).toBe('/IStoreBrowseService/GetItems/v1/');
+      return new Response(
+        JSON.stringify({
+          response: {
+            store_items: [
+              {
+                appid: 2807960,
+                assets: {
+                  asset_url_format:
+                    'steam/apps/2807960/${FILENAME}?t=1776359117',
+                  library_capsule:
+                    '64fffd4bdc67e07b180cc695edcbcb8d1e96f1a6/library_capsule.jpg',
+                  library_capsule_2x:
+                    '64fffd4bdc67e07b180cc695edcbcb8d1e96f1a6/library_capsule_2x.jpg',
+                },
+              },
+            ],
+          },
+        }),
+        { status: 200 },
+      );
+    });
+
+    await expect(
+      resolveSteamLibraryCoverUrl(2807960, fetchMock as typeof fetch),
+    ).resolves.toBe(
+      'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2807960/64fffd4bdc67e07b180cc695edcbcb8d1e96f1a6/library_capsule_2x.jpg?t=1776359117',
+    );
+  });
+
+  it('falls back to the 1x Store Browse library capsule', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          response: {
+            store_items: [
+              {
+                appid: 2807960,
+                assets: {
+                  asset_url_format:
+                    'steam/apps/2807960/${FILENAME}?t=1776359117',
+                  library_capsule:
+                    '64fffd4bdc67e07b180cc695edcbcb8d1e96f1a6/library_capsule.jpg',
+                },
+              },
+            ],
+          },
+        }),
+        { status: 200 },
+      ),
+    );
+
+    await expect(
+      resolveSteamLibraryCoverUrl(2807960, fetchMock as typeof fetch),
+    ).resolves.toBe(
+      'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2807960/64fffd4bdc67e07b180cc695edcbcb8d1e96f1a6/library_capsule.jpg?t=1776359117',
+    );
+  });
+
+  it('uses legacy Steam library cover URLs when Store Browse is unavailable', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'api.steampowered.com') {
+        return new Response('', { status: 503 });
+      }
+
+      return new Response('', {
+        headers: {
+          'content-length': url.pathname.endsWith('_2x.jpg') ? '0' : '52021',
+          'content-type': 'image/jpeg',
+        },
+        status: url.pathname.endsWith('_2x.jpg') ? 404 : 200,
+      });
+    });
+
+    await expect(
+      resolveSteamLibraryCoverUrl(1245620, fetchMock as typeof fetch),
+    ).resolves.toBe(
+      'https://cdn.cloudflare.steamstatic.com/steam/apps/1245620/library_600x900.jpg',
+    );
+  });
+
+  it('rejects tiny or non-image legacy fallback responses', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'api.steampowered.com') {
+        return new Response('', { status: 503 });
+      }
+
+      return new Response('', {
+        headers: {
+          'content-length': url.pathname.endsWith('_2x.jpg') ? '4584' : '52021',
+          'content-type': url.pathname.endsWith('_2x.jpg')
+            ? 'image/jpeg'
+            : 'text/html',
+        },
+        status: 200,
+      });
+    });
+
+    await expect(
+      resolveSteamLibraryCoverUrl(2807960, fetchMock as typeof fetch),
+    ).resolves.toBeNull();
+  });
+
+  it('identifies saved Steam library cover URLs', () => {
+    expect(
+      isSteamLibraryCoverUrl(
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2807960/hash/library_capsule_2x.jpg?t=1776359117',
+      ),
+    ).toBe(true);
+    expect(
+      isSteamLibraryCoverUrl(
+        'https://cdn.cloudflare.steamstatic.com/steam/apps/1245620/library_600x900.jpg',
+      ),
+    ).toBe(true);
+    expect(
+      isSteamLibraryCoverUrl(
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2807960/hash/capsule_231x87.jpg',
+      ),
+    ).toBe(false);
+  });
+
   it('builds base-title Steam search variants before the raw source title', () => {
     expect(buildSteamSearchQueries('Frostpunk 2 Deluxe Edition')).toEqual([
       'Frostpunk 2',
@@ -110,6 +279,11 @@ describe('steam matching', () => {
         1601580: 'game',
         4065430: 'dlc',
       },
+      coverAssets: {
+        1601580: {
+          libraryCapsule2x: 'cover-hash/library_capsule_2x.jpg',
+        },
+      },
       storeResults: {
         'Frostpunk 2': [
           {
@@ -135,6 +309,9 @@ describe('steam matching', () => {
 
     expect(result.queryTitle).toBe('Frostpunk 2');
     expect(result.candidates[0]?.appId).toBe(1601580);
+    expect(result.candidates[0]?.coverUrl).toBe(
+      'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1601580/cover-hash/library_capsule_2x.jpg?t=1234',
+    );
     expect(result.candidates.map((candidate) => candidate.appId)).not.toContain(
       4065430,
     );
@@ -204,6 +381,65 @@ describe('steam matching', () => {
       appId: 1601580,
       releaseDate: 'Sep 20, 2024',
     });
+  });
+
+  it('falls back to Steam Community app search when Store search is blocked', async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url,
+      );
+      if (url.hostname === 'store.steampowered.com') {
+        return Promise.resolve(new Response('Access Denied', { status: 403 }));
+      }
+
+      if (url.hostname === 'steamcommunity.com') {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify([
+              {
+                appid: '1145360',
+                logo:
+                  'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1145360/capsule_184x69.jpg',
+                name: 'Hades',
+              },
+            ]),
+            { status: 200 },
+          ),
+        );
+      }
+
+      if (
+        url.hostname === 'api.steampowered.com' &&
+        url.pathname === '/IStoreBrowseService/GetItems/v1/'
+      ) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ response: { store_items: [] } }), {
+            status: 200,
+          }),
+        );
+      }
+
+      return Promise.resolve(new Response('', { status: 404 }));
+    });
+
+    const result = await resolveSteamMatch('Hades', fetchMock);
+
+    expect(result.candidates[0]).toMatchObject({
+      appId: 1145360,
+      title: 'Hades',
+    });
+  });
+
+  it('returns no Steam candidates instead of throwing when all search endpoints are blocked', async () => {
+    const fetchMock = vi.fn(() =>
+      Promise.resolve(new Response('Access Denied', { status: 403 })),
+    );
+
+    await expect(searchSteamStore('Hades', fetchMock)).resolves.toEqual([]);
   });
 });
 

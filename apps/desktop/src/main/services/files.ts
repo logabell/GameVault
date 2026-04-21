@@ -203,6 +203,31 @@ export async function stageMove(params: {
   await rename(params.stagePath, params.finalPath);
 }
 
+export async function renameLibraryFolder(params: {
+  currentPath: string;
+  rootLibraryPath: string;
+  targetPath: string;
+}): Promise<string> {
+  const rootLibraryPath = resolve(params.rootLibraryPath);
+  const currentPath = resolve(params.currentPath);
+  const targetPath = resolve(params.targetPath);
+
+  assertPathInside(rootLibraryPath, currentPath);
+  assertPathInside(rootLibraryPath, targetPath);
+
+  if (currentPath.toLowerCase() === targetPath.toLowerCase()) {
+    return targetPath;
+  }
+
+  if (await pathExists(targetPath)) {
+    throw new Error(`Refusing to overwrite existing import folder: ${targetPath}`);
+  }
+
+  await ensureDirectory(dirname(targetPath));
+  await rename(currentPath, targetPath);
+  return targetPath;
+}
+
 function assertPathInside(parentPath: string, targetPath: string): void {
   const relativePath = relative(resolve(parentPath), resolve(targetPath));
   if (

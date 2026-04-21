@@ -6,7 +6,9 @@ import type {
   DownloadJobRecord,
   DownloadMirrorRecord,
   EventLogRecord,
+  IgnoredImportFolderRecord,
   InstallRecord,
+  LibraryRootRecord,
   ParsedSourcePayload,
   SettingsRecord,
   SourceKind,
@@ -17,6 +19,7 @@ import type {
   TrackedItemRecord,
 } from '@vaulttrack/shared-types';
 import initSqlJs, { type Database as SqlJsDatabase, type SqlJsStatic } from 'sql.js';
+import { basename } from 'node:path';
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS tracked_items (
@@ -85,6 +88,7 @@ CREATE TABLE IF NOT EXISTS install_records (
   installed_version TEXT,
   installed_build_id TEXT,
   installed_at TEXT,
+  install_path TEXT,
   updated_at TEXT NOT NULL
 );
 
@@ -173,6 +177,80 @@ function normalizePublishedAt(value: string | null, patchDate: string): string {
   return Number.isNaN(parsed.getTime()) ? new Date(0).toISOString() : parsed.toISOString();
 }
 
+function parseJsonArray<T>(value: string | null | undefined): T[] {
+  if (!value) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function normalizeLibraryRootRecord(
+  value: Partial<LibraryRootRecord>,
+  index: number,
+): LibraryRootRecord | null {
+  const path = typeof value.path === 'string' ? value.path.trim() : '';
+  if (!path) {
+    return null;
+  }
+
+  const label =
+    typeof value.label === 'string' && value.label.trim()
+      ? value.label.trim()
+      : basename(path) || path;
+
+  return {
+    id:
+      typeof value.id === 'string' && value.id.trim()
+        ? value.id.trim()
+        : `library-root-${index}`,
+    isPrimary: Boolean(value.isPrimary),
+    label,
+    path,
+  };
+}
+
+function normalizeLibraryRoots(
+  storedRoots: LibraryRootRecord[],
+  legacyRootPath: string | null,
+): LibraryRootRecord[] {
+  const normalized = storedRoots
+    .map((root, index) => normalizeLibraryRootRecord(root, index))
+    .filter((root): root is LibraryRootRecord => root != null);
+
+  if (normalized.length === 0 && legacyRootPath?.trim()) {
+    normalized.push({
+      id: 'library-root-primary',
+      isPrimary: true,
+      label: basename(legacyRootPath) || legacyRootPath,
+      path: legacyRootPath,
+    });
+  }
+
+  if (normalized.length > 0 && !normalized.some((root) => root.isPrimary)) {
+    normalized[0] = { ...normalized[0]!, isPrimary: true };
+  }
+
+  const primarySeen = { value: false };
+  return normalized.map((root) => {
+    if (!root.isPrimary) {
+      return root;
+    }
+
+    if (primarySeen.value) {
+      return { ...root, isPrimary: false };
+    }
+
+    primarySeen.value = true;
+    return root;
+  });
+}
+
 function applyMigrations(db: SqlJsDatabase): void {
   const statements = [
     `ALTER TABLE download_jobs ADD COLUMN selected_mirror_url TEXT`,
@@ -192,6 +270,7 @@ function applyMigrations(db: SqlJsDatabase): void {
     `ALTER TABLE steam_patch_entries ADD COLUMN description TEXT`,
     `ALTER TABLE steam_patch_entries ADD COLUMN selection_source TEXT`,
     `ALTER TABLE steam_feed_checks ADD COLUMN feed_url TEXT`,
+    `ALTER TABLE install_records ADD COLUMN install_path TEXT`,
   ];
 
   for (const statement of statements) {
@@ -426,10 +505,11 @@ export class VaultTrackDatabase {
   }): TrackedItemRecord {
     const now = new Date().toISOString();
     const existing =
-      (record.sourceUrl ? this.findTrackedItemBySourceUrl(record.sourceUrl) : null) ??
-      (record.sourceKind === 'manual'
+      record.sourceUrl
+        ? this.findTrackedItemBySourceUrl(record.sourceUrl)
+        : record.sourceKind === 'manual'
         ? this.findManualTrackedItemByNormalizedTitle(record.normalizedTitle)
-        : null);
+        : null;
     const id = existing?.id ?? record.id ?? randomId();
 
     this.exec(
@@ -461,7 +541,7 @@ export class VaultTrackDatabase {
   getSourceSnapshot(trackedItemId: string): SourceSnapshot | null {
     const row = this.queryOne<{
       tracked_item_id: string;
-      source_kind: 'ankergames' | 'elamigos' | 'steamrip';
+      source_kind: SourceKind;
       source_url: string;
       fingerprint: string;
       observed_version: string;
@@ -689,6 +769,12 @@ export class VaultTrackDatabase {
     }));
   }
 
+  findSteamMatchByAppId(
+    appId: number,
+  ): (ConfirmedSteamMatch & { trackedItemId: string }) | null {
+    return this.listSteamMatches().find((match) => match.appId === appId) ?? null;
+  }
+
   upsertSteamMatch(trackedItemId: string, match: ConfirmedSteamMatch): void {
     this.exec(
       `INSERT INTO steam_matches (
@@ -839,6 +925,7 @@ export class VaultTrackDatabase {
       installed_version: string | null;
       installed_build_id: string | null;
       installed_at: string | null;
+      install_path: string | null;
       updated_at: string;
     }>(
       `SELECT * FROM install_records WHERE tracked_item_id = ?`,
@@ -848,6 +935,7 @@ export class VaultTrackDatabase {
       ? {
           installedAt: row.installed_at,
           installedBuildId: row.installed_build_id,
+          installPath: row.install_path,
           installedVersion: row.installed_version,
           trackedItemId: row.tracked_item_id,
           updatedAt: row.updated_at,
@@ -858,21 +946,41 @@ export class VaultTrackDatabase {
   upsertInstallRecord(record: InstallRecord): void {
     this.exec(
       `INSERT INTO install_records (
-         tracked_item_id, installed_version, installed_build_id, installed_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?)
+         tracked_item_id, installed_version, installed_build_id, installed_at, install_path, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT(tracked_item_id) DO UPDATE SET
          installed_version = excluded.installed_version,
          installed_build_id = excluded.installed_build_id,
          installed_at = excluded.installed_at,
+         install_path = excluded.install_path,
          updated_at = excluded.updated_at`,
       [
         record.trackedItemId,
         record.installedVersion ?? null,
         record.installedBuildId ?? null,
         record.installedAt ?? null,
+        record.installPath ?? null,
         record.updatedAt,
       ],
     );
+  }
+
+  listInstallRecords(): InstallRecord[] {
+    return this.queryAll<{
+      tracked_item_id: string;
+      installed_version: string | null;
+      installed_build_id: string | null;
+      installed_at: string | null;
+      install_path: string | null;
+      updated_at: string;
+    }>(`SELECT * FROM install_records`).map((row) => ({
+      installPath: row.install_path,
+      installedAt: row.installed_at,
+      installedBuildId: row.installed_build_id,
+      installedVersion: row.installed_version,
+      trackedItemId: row.tracked_item_id,
+      updatedAt: row.updated_at,
+    }));
   }
 
   getWatch(trackedItemId: string): SourceWatch | null {
@@ -1170,13 +1278,31 @@ export class VaultTrackDatabase {
   } {
     const rows = this.queryAll<{ key: string; value: string | null }>(`SELECT * FROM settings`);
     const map = new Map(rows.map((row) => [row.key, row.value]));
+    const legacyRootPath = map.get('library.rootPath') ?? null;
+    const libraryRoots = normalizeLibraryRoots(
+      parseJsonArray<LibraryRootRecord>(map.get('library.roots')),
+      legacyRootPath,
+    );
+    const primaryRoot = libraryRoots.find((root) => root.isPrimary) ?? null;
+    const ignoredImportFolders = parseJsonArray<IgnoredImportFolderRecord>(
+      map.get('import.ignoredFolders'),
+    ).filter(
+      (entry) =>
+        typeof entry.id === 'string' &&
+        typeof entry.rootPath === 'string' &&
+        typeof entry.folderName === 'string',
+    );
     return {
       encryptedPassword: map.get('myjd.password') ?? null,
+      ignoredImportFolders,
       lastDailyPollAt: map.get('scheduler.lastDailyPollAt') ?? null,
+      libraryRoots,
       myJDownloaderDeviceId: map.get('myjd.deviceId') ?? null,
       myJDownloaderEmail: map.get('myjd.email') ?? null,
       pollDailyHourLocal: Number(map.get('scheduler.pollDailyHourLocal') ?? 9),
-      rootLibraryPath: map.get('library.rootPath') ?? null,
+      renameGameFoldersOnImport:
+        map.get('import.renameGameFoldersOnImport') !== 'false',
+      rootLibraryPath: primaryRoot?.path ?? legacyRootPath,
       themeMode: (map.get('appearance.themeMode') as SettingsRecord['themeMode']) ?? 'system',
     };
   }

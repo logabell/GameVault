@@ -10,7 +10,8 @@
   },
   "references": [
     { "path": "../../packages/shared-types" },
-    { "path": "../../packages/source-core" }
+    { "path": "../../packages/source-core" },
+    { "path": "../../packages/steam-core" }
   ],
   "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts"]
 }

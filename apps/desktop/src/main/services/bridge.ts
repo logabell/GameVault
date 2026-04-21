@@ -118,6 +118,24 @@ export class NativeBridgeServer {
             ),
             type: request.type,
           };
+        case 'listPendingSteamDbBuildLookups':
+          return {
+            ok: true,
+            payload: this.service.listPendingSteamDbBuildLookups(),
+            type: request.type,
+          };
+        case 'completeSteamDbBuildLookup':
+          return {
+            ok: true,
+            payload: this.service.completeSteamDbBuildLookup(request.payload),
+            type: request.type,
+          };
+        case 'updateSteamDbBuildLookup':
+          return {
+            ok: true,
+            payload: this.service.updateSteamDbBuildLookup(request.payload),
+            type: request.type,
+          };
         case 'refreshTrackedItem':
           return {
             ok: true,
@@ -232,6 +250,17 @@ export class NativeBridgeServer {
             payload: await this.service.pickDirectory(),
             type: request.type,
           };
+        default: {
+          const unsupportedRequest = request as { type?: string };
+          return {
+            error: {
+              code: 'NATIVE_MESSAGE_ERROR',
+              message: `Unsupported native message type: ${unsupportedRequest.type ?? 'unknown'}`,
+            },
+            ok: false,
+            type: unsupportedRequest.type as NativeMessageRequest['type'],
+          };
+        }
       }
     } catch (error) {
       return {

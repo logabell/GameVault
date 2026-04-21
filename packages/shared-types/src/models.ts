@@ -98,12 +98,13 @@ export interface InstallRecord {
   installedVersion?: string | null;
   installedBuildId?: string | null;
   installedAt?: string | null;
+  installPath?: string | null;
   updatedAt: string;
 }
 
 export interface SourceSnapshot {
   trackedItemId: string;
-  sourceKind: SupportedSourceKind;
+  sourceKind: SourceKind;
   sourceUrl: string;
   fingerprint: string;
   observedVersion: string;
@@ -221,8 +222,25 @@ export interface DownloadMirrorRecord {
 
 export type ThemeMode = 'system' | 'light' | 'dark';
 
+export interface LibraryRootRecord {
+  id: string;
+  path: string;
+  label: string;
+  isPrimary: boolean;
+}
+
+export interface IgnoredImportFolderRecord {
+  id: string;
+  folderName: string;
+  ignoredAt: string;
+  rootPath: string;
+}
+
 export interface SettingsRecord {
   rootLibraryPath?: string | null;
+  libraryRoots?: LibraryRootRecord[];
+  renameGameFoldersOnImport?: boolean;
+  ignoredImportFolders?: IgnoredImportFolderRecord[];
   myJDownloaderEmail?: string | null;
   myJDownloaderDeviceId?: string | null;
   pollDailyHourLocal?: number;
@@ -308,6 +326,107 @@ export interface SteamMatchResolutionPayload {
   candidates: SteamCandidate[];
   autoSelected: boolean;
   searchQueries?: string[];
+}
+
+export interface ImportCandidateDuplicate {
+  trackedItemId: string;
+  title: string;
+  installPath?: string | null;
+}
+
+export interface ImportCandidate {
+  autoSelectedSteamMatch?: ConfirmedSteamMatch | null;
+  duplicateSteamMatch?: ImportCandidateDuplicate | null;
+  folderName: string;
+  folderPath: string;
+  id: string;
+  ignored: boolean;
+  normalizedTitle: string;
+  rootId: string;
+  rootLabel: string;
+  rootPath: string;
+  steamCandidates: SteamCandidate[];
+  title: string;
+}
+
+export interface ImportScanPayload {
+  includeIgnored?: boolean;
+  rootIds?: string[] | null;
+}
+
+export interface IgnoreImportFolderPayload {
+  folderName: string;
+  rootPath: string;
+}
+
+export interface RestoreImportFolderPayload {
+  id: string;
+}
+
+export interface SaveImportBatchRow {
+  allowDuplicateSteamApp?: boolean;
+  folderName: string;
+  folderPath: string;
+  installedAt?: string | null;
+  installedBuildId?: string | null;
+  installedVersion?: string | null;
+  renameFolder?: boolean;
+  rootId?: string | null;
+  rootPath: string;
+  selectedSteamPatch: SteamPatchCandidate;
+  steamMatch: ConfirmedSteamMatch;
+  steamPatchEntries?: SteamPatchCandidate[] | null;
+}
+
+export interface SaveImportBatchPayload {
+  rows: SaveImportBatchRow[];
+}
+
+export interface SaveImportBatchResult {
+  imported: TrackedItemView[];
+}
+
+export type SteamDbBuildLookupStatus = 'pending' | 'complete' | 'failed';
+export type SteamDbBuildLookupFailureKind =
+  | 'cloudflare'
+  | 'load_failed'
+  | 'rate_limited'
+  | 'timeout'
+  | 'unknown';
+export type SteamDbBuildLookupAttentionKind = 'cloudflare';
+
+export interface SteamDbBuildLookupState {
+  attentionKind?: SteamDbBuildLookupAttentionKind | null;
+  appId: number;
+  completedAt?: string | null;
+  createdAt: string;
+  errorKind?: SteamDbBuildLookupFailureKind | null;
+  errorMessage?: string | null;
+  id: string;
+  needsUserAttention?: boolean | null;
+  patches: SteamPatchCandidate[];
+  retryAfterMs?: number | null;
+  status: SteamDbBuildLookupStatus;
+  updatedAt: string;
+}
+
+export interface CompleteSteamDbBuildLookupPayload {
+  attentionKind?: SteamDbBuildLookupAttentionKind | null;
+  appId: number;
+  errorKind?: SteamDbBuildLookupFailureKind | null;
+  errorMessage?: string | null;
+  lookupId: string;
+  needsUserAttention?: boolean | null;
+  patches?: SteamPatchCandidate[] | null;
+  retryAfterMs?: number | null;
+}
+
+export interface UpdateSteamDbBuildLookupPayload {
+  attentionKind?: SteamDbBuildLookupAttentionKind | null;
+  appId: number;
+  errorMessage?: string | null;
+  lookupId: string;
+  needsUserAttention?: boolean | null;
 }
 
 export interface RefreshResult {

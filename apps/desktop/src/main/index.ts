@@ -310,8 +310,14 @@ async function bootstrap() {
     undefined,
     (input, init) => net.fetch(input, init),
     renderAnkerGamesSignedDownloadPage,
+    undefined,
+    (input, init) =>
+      net.fetch(input instanceof URL ? input.toString() : input, init),
   );
   serviceRef.current = service;
+  void service.ensureSteamLibraryCoversBackfilled().catch((error) => {
+    console.warn('Steam library cover backfill failed', error);
+  });
 
   bridge = new NativeBridgeServer(service);
   await bridge.start();
@@ -358,8 +364,23 @@ async function bootstrap() {
   ipcMain.handle('vault:saveSettings', (_event, payload) =>
     service.saveSettings(payload),
   );
-  ipcMain.handle('vault:scanImportFolders', (_event, rootLibraryPath: string) =>
-    service.importRootLibrary(rootLibraryPath),
+  ipcMain.handle('vault:scanImportCandidates', (_event, payload) =>
+    service.scanImportCandidates(payload),
+  );
+  ipcMain.handle('vault:ignoreImportFolder', (_event, payload) =>
+    service.ignoreImportFolder(payload),
+  );
+  ipcMain.handle('vault:restoreImportFolder', (_event, payload) =>
+    service.restoreImportFolder(payload),
+  );
+  ipcMain.handle('vault:saveImportBatch', (_event, payload) =>
+    service.saveImportBatch(payload),
+  );
+  ipcMain.handle('vault:requestSteamDbBuildLookup', (_event, appId: number) =>
+    service.requestSteamDbBuildLookup(appId),
+  );
+  ipcMain.handle('vault:getSteamDbBuildLookup', (_event, lookupId: string) =>
+    service.getSteamDbBuildLookup(lookupId),
   );
   ipcMain.handle('vault:updateInstallRecord', (_event, payload) =>
     service.updateInstallRecord(payload),

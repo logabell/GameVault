@@ -6,6 +6,9 @@ import type {
   ParsedSourcePayload,
   SettingsView,
   SteamCandidate,
+  SteamDbBuildLookupAttentionKind,
+  SteamDbBuildLookupFailureKind,
+  SteamDbBuildLookupState,
   SteamMatchResolutionPayload,
   SteamPatchCandidate,
   ThemeMode,
@@ -14,7 +17,10 @@ import type {
 import { parseSupportedPageWithNetwork } from '@vaulttrack/source-core';
 
 import { isSupportedDetailPage } from '../support.js';
-import { buildSteamDbPatchnotesUrl } from '../steamdb-builds.js';
+import {
+  buildSteamDbPatchnotesUrl,
+  parseSteamDbAppIdFromUrl,
+} from '@vaulttrack/steam-core';
 
 const CACHE_TTL_MS = 15 * 60 * 1000;
 const BRIDGE_URL = 'http://127.0.0.1:47615/native-message';
@@ -34,9 +40,13 @@ const STATUS_CACHE_PREFIX = 'trackedStatus';
 const STEAMDB_SELECTION_CONTEXT_PREFIX = 'steamDbSelectionContext';
 const STEAMDB_BACKFILL_STATE_PREFIX = 'steamDbBackfill';
 const STEAMDB_PENDING_CONFIRMATION_KEY = 'steamDbPendingConfirmation';
+const DESKTOP_STEAMDB_LOOKUP_ALARM = 'desktopSteamDbBuildLookups';
 const STEAMDB_SELECTION_TTL_MS = 30 * 60 * 1000;
 const STEAMDB_BACKFILL_TIMEOUT_MS = 22000;
+const STEAMDB_MANUAL_BACKFILL_TIMEOUT_MS = 5 * 60 * 1000;
 const STEAMDB_BACKFILL_TTL_MS = 30 * 60 * 1000;
+const DESKTOP_STEAMDB_LOOKUP_FAST_POLL_MS = 2500;
+const STEAMDB_RETRY_AFTER_HINT_TTL_MS = 10 * 60 * 1000;
 
 interface CachedParsedPage {
   canonicalUrl: string;
@@ -96,6 +106,7 @@ interface SteamDbSelectionContext {
   selectedSteamCandidate?: SteamCandidate | null;
   sourceUrl?: string | null;
   tabId?: number | null;
+  desktopLookupId?: string | null;
 }
 
 interface PendingSteamDbConfirmation {
@@ -108,11 +119,16 @@ interface PendingSteamDbConfirmation {
 interface SteamDbBackfillState {
   appId: number;
   createdAt: number;
+  errorKind?: SteamDbBuildLookupFailureKind | null;
   expiresAt: number;
   message?: string | null;
   patches: SteamPatchCandidate[];
+  retryAfterMs?: number | null;
   status: SteamDbBackfillStatus;
   tabId?: number | null;
+  desktopLookupId?: string | null;
+  attentionKind?: SteamDbBuildLookupAttentionKind | null;
+  userAttention?: boolean;
 }
 
 const hotParsedCache = new Map<string, CachedParsedPage>();
@@ -127,6 +143,12 @@ let lastKnownHealthSnapshot: {
   capturedAt: number;
   value: ConnectionHealthSummary;
 } | null = null;
+let desktopSteamDbLookupPollInFlight = false;
+let desktopSteamDbLookupPollTimer: ReturnType<typeof setTimeout> | null = null;
+const steamDbRetryAfterHints = new Map<
+  number,
+  { capturedAt: number; retryAfterMs: number }
+>();
 
 function fallbackConnectionHealth(message: string): ConnectionHealthSummary {
   const desktopStarting =
@@ -297,6 +319,67 @@ function isFreshSteamDbBackfill(state: SteamDbBackfillState | null): boolean {
   return Boolean(state && state.expiresAt > Date.now());
 }
 
+function parseRetryAfterHeader(
+  value: string | null | undefined,
+  now = Date.now(),
+): number | null {
+  if (!value) {
+    return null;
+  }
+
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds > 0) {
+    return Math.round(seconds * 1000);
+  }
+
+  const dateMs = new Date(value).getTime();
+  if (!Number.isNaN(dateMs) && dateMs > now) {
+    return Math.round(dateMs - now);
+  }
+
+  return null;
+}
+
+function getSteamDbRetryAfterHint(appId: number): number | null {
+  const hint = steamDbRetryAfterHints.get(appId);
+  if (!hint) {
+    return null;
+  }
+
+  if (Date.now() - hint.capturedAt > STEAMDB_RETRY_AFTER_HINT_TTL_MS) {
+    steamDbRetryAfterHints.delete(appId);
+    return null;
+  }
+
+  return hint.retryAfterMs;
+}
+
+function observeSteamDbRetryAfter(
+  details: chrome.webRequest.WebResponseHeadersDetails,
+): void {
+  if (details.statusCode !== 429) {
+    return;
+  }
+
+  const appId = parseSteamDbAppIdFromUrl(details.url);
+  if (!appId) {
+    return;
+  }
+
+  const retryAfterHeader = details.responseHeaders?.find(
+    (header) => header.name.toLowerCase() === 'retry-after',
+  )?.value;
+  const retryAfterMs = parseRetryAfterHeader(retryAfterHeader);
+  if (!retryAfterMs) {
+    return;
+  }
+
+  steamDbRetryAfterHints.set(appId, {
+    capturedAt: Date.now(),
+    retryAfterMs,
+  });
+}
+
 async function closeTabIfPresent(tabId: number | null | undefined) {
   if (typeof tabId !== 'number') {
     return;
@@ -306,6 +389,82 @@ async function closeTabIfPresent(tabId: number | null | undefined) {
     await chrome.tabs.remove(tabId);
   } catch {
     // The tab may already have been closed by the user or browser.
+  }
+}
+
+async function focusTabIfPresent(tabId: number | null | undefined) {
+  if (typeof tabId !== 'number') {
+    return;
+  }
+
+  try {
+    const tab = await chrome.tabs.update(tabId, { active: true });
+    if (typeof tab?.windowId === 'number') {
+      await chrome.windows.update(tab.windowId, { focused: true });
+    }
+  } catch {
+    // The user may have closed the tab or window before we could focus it.
+  }
+}
+
+async function completeDesktopSteamDbLookup(
+  state: SteamDbBackfillState,
+  lookupId: string | null | undefined = state.desktopLookupId,
+): Promise<void> {
+  if (!lookupId) {
+    return;
+  }
+
+  try {
+    await sendDesktopRequest(
+      {
+        payload: {
+          attentionKind: state.attentionKind ?? null,
+          appId: state.appId,
+          errorKind:
+            state.status === 'failed'
+              ? (state.errorKind ?? 'unknown')
+              : null,
+          errorMessage: state.status === 'failed' ? state.message : null,
+          lookupId,
+          needsUserAttention: Boolean(state.userAttention),
+          patches: state.status === 'complete' ? state.patches : [],
+          retryAfterMs:
+            state.status === 'failed' ? (state.retryAfterMs ?? null) : null,
+        },
+        type: 'completeSteamDbBuildLookup',
+      },
+      { bridgeTimeoutMs: 1000, retryBridgeTimeoutMs: 2500 },
+    );
+  } catch {
+    // Desktop may be closed; its in-memory lookup will time out.
+  }
+}
+
+async function updateDesktopSteamDbLookup(
+  state: SteamDbBackfillState,
+  lookupId: string | null | undefined = state.desktopLookupId,
+): Promise<void> {
+  if (!lookupId) {
+    return;
+  }
+
+  try {
+    await sendDesktopRequest(
+      {
+        payload: {
+          attentionKind: state.attentionKind ?? null,
+          appId: state.appId,
+          errorMessage: state.message ?? null,
+          lookupId,
+          needsUserAttention: Boolean(state.userAttention),
+        },
+        type: 'updateSteamDbBuildLookup',
+      },
+      { bridgeTimeoutMs: 1000, retryBridgeTimeoutMs: 2500 },
+    );
+  } catch {
+    // Desktop may be closed; its in-memory lookup can still time out.
   }
 }
 
@@ -827,12 +986,13 @@ async function getSteamDbBackfillState(
     return null;
   }
 
-  if (
-    state.status === 'pending' &&
-    Date.now() - state.createdAt > STEAMDB_BACKFILL_TIMEOUT_MS
-  ) {
+  const timeoutMs = state.userAttention
+    ? STEAMDB_MANUAL_BACKFILL_TIMEOUT_MS
+    : STEAMDB_BACKFILL_TIMEOUT_MS;
+  if (state.status === 'pending' && Date.now() - state.createdAt > timeoutMs) {
     const expiredState: SteamDbBackfillState = {
       ...state,
+      errorKind: 'timeout',
       message: 'SteamDB build backfill timed out.',
       patches: [],
       status: 'failed',
@@ -841,6 +1001,7 @@ async function getSteamDbBackfillState(
     await closeTabIfPresent(state.tabId);
     await setSessionValue(key, expiredState);
     await chrome.storage.session.remove(getSteamDbSelectionContextKey(appId));
+    void completeDesktopSteamDbLookup(expiredState);
     return expiredState;
   }
 
@@ -853,11 +1014,47 @@ function scheduleSteamDbBackfillTimeout(appId: number): void {
   }, STEAMDB_BACKFILL_TIMEOUT_MS + 500);
 }
 
+function normalizeSteamDbBuildLookupFailureKind(
+  value: unknown,
+): SteamDbBuildLookupFailureKind {
+  return value === 'cloudflare' ||
+    value === 'load_failed' ||
+    value === 'rate_limited' ||
+    value === 'timeout'
+    ? value
+    : 'unknown';
+}
+
 async function startSteamDbBackfill(
   appId: number,
+  options: { desktopLookupId?: string | null } = {},
 ): Promise<SteamDbBackfillState> {
   const existing = await getSteamDbBackfillState(appId);
   if (existing?.status === 'pending' || existing?.status === 'complete') {
+    if (options.desktopLookupId) {
+      if (existing.status === 'complete') {
+        void completeDesktopSteamDbLookup(existing, options.desktopLookupId);
+      } else if (existing.desktopLookupId !== options.desktopLookupId) {
+        const nextState: SteamDbBackfillState = {
+          ...existing,
+          desktopLookupId: options.desktopLookupId,
+        };
+        const existingContext =
+          await getSessionValue<SteamDbSelectionContext>(
+            getSteamDbSelectionContextKey(appId),
+          );
+        await Promise.all([
+          setSessionValue(getSteamDbBackfillStateKey(appId), nextState),
+          existingContext
+            ? setSessionValue(getSteamDbSelectionContextKey(appId), {
+                ...existingContext,
+                desktopLookupId: options.desktopLookupId,
+              } satisfies SteamDbSelectionContext)
+            : Promise.resolve(),
+        ]);
+        return nextState;
+      }
+    }
     return existing;
   }
 
@@ -870,6 +1067,8 @@ async function startSteamDbBackfill(
     patches: [],
     status: 'pending',
     tabId: null,
+    desktopLookupId: options.desktopLookupId ?? null,
+    userAttention: false,
   };
   const context: SteamDbSelectionContext = {
     appId,
@@ -884,6 +1083,7 @@ async function startSteamDbBackfill(
     selectionMode: 'backfill',
     sourceUrl: null,
     tabId: null,
+    desktopLookupId: options.desktopLookupId ?? null,
   };
 
   await Promise.all([
@@ -913,6 +1113,7 @@ async function startSteamDbBackfill(
   } catch (error) {
     const failedState: SteamDbBackfillState = {
       ...baseState,
+      errorKind: 'load_failed',
       message:
         error instanceof Error
           ? error.message
@@ -923,8 +1124,143 @@ async function startSteamDbBackfill(
       setSessionValue(getSteamDbBackfillStateKey(appId), failedState),
       chrome.storage.session.remove(getSteamDbSelectionContextKey(appId)),
     ]);
+    void completeDesktopSteamDbLookup(failedState);
     return failedState;
   }
+}
+
+async function listPendingDesktopSteamDbBuildLookups(): Promise<
+  SteamDbBuildLookupState[]
+> {
+  try {
+    const response = await sendDesktopRequest(
+      {
+        payload: {},
+        type: 'listPendingSteamDbBuildLookups',
+      },
+      { bridgeTimeoutMs: 1000, retryBridgeTimeoutMs: 2500 },
+    );
+    if (!response.ok || response.type !== 'listPendingSteamDbBuildLookups') {
+      return [];
+    }
+
+    return response.payload.filter((lookup) => lookup.status === 'pending');
+  } catch {
+    return [];
+  }
+}
+
+async function findPendingDesktopSteamDbBuildLookup(
+  appId: number,
+): Promise<SteamDbBuildLookupState | null> {
+  const lookups = await listPendingDesktopSteamDbBuildLookups();
+  return lookups.find((lookup) => lookup.appId === appId) ?? null;
+}
+
+async function attachManualSteamDbBackfillTab(
+  appId: number,
+  tabId: number | null | undefined,
+  existingContext?: SteamDbSelectionContext | null,
+): Promise<SteamDbSelectionContext | null> {
+  if (typeof tabId !== 'number') {
+    return existingContext ?? null;
+  }
+
+  const existingState = await getSessionValue<SteamDbBackfillState>(
+    getSteamDbBackfillStateKey(appId),
+  );
+  const desktopLookupId =
+    existingContext?.desktopLookupId ??
+    existingState?.desktopLookupId ??
+    (await findPendingDesktopSteamDbBuildLookup(appId))?.id ??
+    null;
+  if (!desktopLookupId) {
+    return existingContext ?? null;
+  }
+
+  const createdAt = Date.now();
+  const context: SteamDbSelectionContext = {
+    appId,
+    createdAt,
+    mode: 'active',
+    selectedAppId: appId,
+    selectedDownloads: {
+      fullUrl: '',
+      patchUrl: null,
+    },
+    selectedSteamCandidate: existingContext?.selectedSteamCandidate ?? null,
+    selectionMode: 'backfill',
+    sourceUrl: existingContext?.sourceUrl ?? null,
+    tabId,
+    desktopLookupId,
+  };
+  const state: SteamDbBackfillState = {
+    appId,
+    createdAt,
+    expiresAt: createdAt + STEAMDB_BACKFILL_TTL_MS,
+    message: null,
+    patches: existingState?.patches ?? [],
+    status: 'pending',
+    tabId,
+    desktopLookupId,
+    userAttention: true,
+  };
+
+  await Promise.all([
+    existingState?.tabId && existingState.tabId !== tabId
+      ? closeTabIfPresent(existingState.tabId)
+      : Promise.resolve(),
+    setSessionValue(getSteamDbSelectionContextKey(appId), context),
+    setSessionValue(getSteamDbBackfillStateKey(appId), state),
+  ]);
+  return context;
+}
+
+function scheduleDesktopSteamDbLookupPoll(
+  delayMs = DESKTOP_STEAMDB_LOOKUP_FAST_POLL_MS,
+): void {
+  if (desktopSteamDbLookupPollTimer) {
+    return;
+  }
+
+  desktopSteamDbLookupPollTimer = setTimeout(() => {
+    desktopSteamDbLookupPollTimer = null;
+    void pollDesktopSteamDbBuildLookups().catch(() => undefined);
+  }, delayMs);
+}
+
+async function pollDesktopSteamDbBuildLookups(): Promise<void> {
+  if (desktopSteamDbLookupPollInFlight) {
+    scheduleDesktopSteamDbLookupPoll();
+    return;
+  }
+
+  desktopSteamDbLookupPollInFlight = true;
+  try {
+    const [lookup] = await listPendingDesktopSteamDbBuildLookups();
+    if (!lookup) {
+      return;
+    }
+
+    const existing = await getSteamDbBackfillState(lookup.appId);
+    if (existing?.status === 'complete' || existing?.status === 'failed') {
+      await completeDesktopSteamDbLookup(existing, lookup.id);
+      return;
+    }
+
+    await startSteamDbBackfill(lookup.appId, {
+      desktopLookupId: lookup.id,
+    });
+  } finally {
+    desktopSteamDbLookupPollInFlight = false;
+    scheduleDesktopSteamDbLookupPoll();
+  }
+}
+
+async function ensureDesktopSteamDbLookupAlarm(): Promise<void> {
+  await chrome.alarms.create(DESKTOP_STEAMDB_LOOKUP_ALARM, {
+    periodInMinutes: 1,
+  });
 }
 
 async function resolveDraftTarget(params: {
@@ -1680,11 +2016,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (message.type === 'vaulttrack:get-steamdb-selection-context') {
       const appId = typeof message.appId === 'number' ? message.appId : null;
-      const context = appId
+      const tabId = sender.tab?.id;
+      let context = appId
         ? await getSessionValue<SteamDbSelectionContext>(
             getSteamDbSelectionContextKey(appId),
           )
         : null;
+      if (appId && context?.selectionMode === 'backfill') {
+        if (!isFreshSteamDbContext(context)) {
+          context = await attachManualSteamDbBackfillTab(appId, tabId);
+        } else if (typeof tabId === 'number' && context.tabId !== tabId) {
+          context = await attachManualSteamDbBackfillTab(
+            appId,
+            tabId,
+            context,
+          );
+        }
+      } else if (appId && !isFreshSteamDbContext(context)) {
+        context = await attachManualSteamDbBackfillTab(
+          appId,
+          tabId,
+        );
+      }
       sendResponse({
         ok: true,
         payload: {
@@ -1789,6 +2142,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const completedState: SteamDbBackfillState = {
         appId,
         createdAt: context.createdAt,
+        desktopLookupId: context.desktopLookupId ?? null,
         expiresAt: Date.now() + STEAMDB_BACKFILL_TTL_MS,
         message: null,
         patches,
@@ -1800,8 +2154,112 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         closeTabIfPresent(sender.tab?.id ?? context.tabId),
         chrome.storage.session.remove(getSteamDbSelectionContextKey(appId)),
       ]);
+      void completeDesktopSteamDbLookup(completedState);
 
       sendResponse({ ok: true, payload: completedState });
+      return;
+    }
+
+    if (message.type === 'vaulttrack:steamdb-builds-challenge-required') {
+      const appId = typeof message.appId === 'number' ? message.appId : null;
+      const context = appId
+        ? await getSessionValue<SteamDbSelectionContext>(
+            getSteamDbSelectionContextKey(appId),
+          )
+        : null;
+      const existingState = appId
+        ? await getSessionValue<SteamDbBackfillState>(
+            getSteamDbBackfillStateKey(appId),
+          )
+        : null;
+      if (!appId || !existingState || !isFreshSteamDbBackfill(existingState)) {
+        sendResponse({ ok: false });
+        return;
+      }
+
+      const tabId = sender.tab?.id ?? existingState.tabId ?? context?.tabId ?? null;
+      const messageText =
+        typeof message.message === 'string' && message.message.trim()
+          ? message.message.trim()
+          : 'Cloudflare validation needed. Complete the browser check to continue.';
+      const createdAt = Date.now();
+      const nextState: SteamDbBackfillState = {
+        ...existingState,
+        attentionKind: 'cloudflare',
+        createdAt,
+        desktopLookupId:
+          context?.desktopLookupId ?? existingState.desktopLookupId ?? null,
+        errorKind: null,
+        message: messageText,
+        status: 'pending',
+        tabId,
+        userAttention: true,
+      };
+      await Promise.all([
+        setSessionValue(getSteamDbBackfillStateKey(appId), nextState),
+        context
+          ? setSessionValue(getSteamDbSelectionContextKey(appId), {
+              ...context,
+              createdAt,
+              tabId,
+            } satisfies SteamDbSelectionContext)
+          : Promise.resolve(),
+      ]);
+      await focusTabIfPresent(tabId);
+      void updateDesktopSteamDbLookup(nextState);
+
+      sendResponse({ ok: true, payload: nextState });
+      return;
+    }
+
+    if (message.type === 'vaulttrack:steamdb-builds-backfill-failed') {
+      const appId = typeof message.appId === 'number' ? message.appId : null;
+      const context = appId
+        ? await getSessionValue<SteamDbSelectionContext>(
+            getSteamDbSelectionContextKey(appId),
+          )
+        : null;
+      const existingState = appId
+        ? await getSessionValue<SteamDbBackfillState>(
+            getSteamDbBackfillStateKey(appId),
+          )
+        : null;
+      if (!appId || !existingState || !isFreshSteamDbBackfill(existingState)) {
+        await closeTabIfPresent(sender.tab?.id);
+        sendResponse({ ok: false });
+        return;
+      }
+
+      const messageText =
+        typeof message.message === 'string' && message.message.trim()
+          ? message.message.trim()
+          : 'SteamDB build-table lookup failed.';
+      const errorKind = normalizeSteamDbBuildLookupFailureKind(
+        message.errorKind,
+      );
+      const failedState: SteamDbBackfillState = {
+        appId,
+        createdAt: existingState.createdAt,
+        desktopLookupId:
+          context?.desktopLookupId ?? existingState.desktopLookupId ?? null,
+        errorKind,
+        expiresAt: Date.now() + STEAMDB_BACKFILL_TTL_MS,
+        message: messageText,
+        patches: [],
+        retryAfterMs:
+          errorKind === 'rate_limited' ? getSteamDbRetryAfterHint(appId) : null,
+        status: 'failed',
+        tabId: null,
+        userAttention: false,
+      };
+      await setSessionValue(getSteamDbBackfillStateKey(appId), failedState);
+      await Promise.allSettled([
+        closeTabIfPresent(sender.tab?.id ?? existingState.tabId),
+        chrome.storage.session.remove(getSteamDbSelectionContextKey(appId)),
+      ]);
+      void completeDesktopSteamDbLookup(failedState);
+
+      sendResponse({ ok: true, payload: failedState });
       return;
     }
 
@@ -2103,8 +2561,31 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   void handleSupportedTab(tabId, tab.url, Boolean(tab.active));
 });
 
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== DESKTOP_STEAMDB_LOOKUP_ALARM) {
+    return;
+  }
+
+  void pollDesktopSteamDbBuildLookups().catch(() => undefined);
+});
+
+chrome.webRequest.onHeadersReceived.addListener(
+  observeSteamDbRetryAfter,
+  { urls: ['https://steamdb.info/app/*/patchnotes/*'] },
+  ['responseHeaders', 'extraHeaders'],
+);
+
 chrome.runtime.onInstalled.addListener(() => {
+  void ensureDesktopSteamDbLookupAlarm().catch(() => undefined);
+  void pollDesktopSteamDbBuildLookups().catch(() => undefined);
   void primeCurrentTab().catch(() => undefined);
 });
 
+chrome.runtime.onStartup.addListener(() => {
+  void ensureDesktopSteamDbLookupAlarm().catch(() => undefined);
+  void pollDesktopSteamDbBuildLookups().catch(() => undefined);
+});
+
+void ensureDesktopSteamDbLookupAlarm().catch(() => undefined);
+void pollDesktopSteamDbBuildLookups().catch(() => undefined);
 void primeCurrentTab().catch(() => undefined);

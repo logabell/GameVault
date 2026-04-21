@@ -1,4 +1,4 @@
-import { startTransition, useEffect, useMemo, useState } from 'react';
+import { startTransition, useCallback, useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 
 import type {
@@ -6,17 +6,35 @@ import type {
   ConnectionHealthSummary,
   DownloadMirrorRecord,
   EventLogRecord,
+  IgnoredImportFolderRecord,
+  ImportCandidate,
+  ImportScanPayload,
+  LibraryRootRecord,
   MyJDownloaderDeviceSummary,
   PatchSelectionSource,
   RemoveTrackedItemMode,
+  SaveImportBatchPayload,
+  SaveImportBatchResult,
   SelectedDownloads,
   SettingsView,
   SteamCandidate,
+  SteamDbBuildLookupAttentionKind,
+  SteamDbBuildLookupFailureKind,
+  SteamDbBuildLookupState,
+  SteamMatchResolutionPayload,
   SteamPatchCandidate,
   SteamPatchFeedResult,
   ThemeMode,
   TrackedItemView,
 } from '@vaulttrack/shared-types';
+
+import {
+  getImportBuildLookupFailureTiming,
+  getImportBuildLookupSuccessCooldownMs,
+  getNextReadyImportBuildLookupRowId,
+  IMPORT_BUILD_LOOKUP_MAX_ATTEMPTS,
+  type ImportBuildLookupPauseReason,
+} from './import-queue-timing.js';
 
 type Section = 'library' | 'imports' | 'logs' | 'settings';
 type ResolvedTheme = 'light' | 'dark';
@@ -35,6 +53,57 @@ type RetryMirrorOption = Pick<
   DownloadMirrorRecord,
   'kind' | 'label' | 'manuallyFailedAt' | 'url'
 >;
+type ImportPatchHistoryStatus =
+  | 'gathering'
+  | 'idle'
+  | 'loaded'
+  | 'needs_attention'
+  | 'queued'
+  | 'retrying';
+type ImportRowState = {
+  attentionKind: SteamDbBuildLookupAttentionKind | null;
+  buildLookupId: string | null;
+  buildLookupStatus: SteamDbBuildLookupState['status'] | null;
+  buildLookupAttempts: number;
+  buildLookupErrorKind: SteamDbBuildLookupFailureKind | null;
+  buildTableLoaded: boolean;
+  candidates: SteamCandidate[];
+  duplicateOverride: boolean;
+  included: boolean;
+  installedAt: string;
+  installedBuildId: string;
+  installedVersion: string;
+  manualQuery: string;
+  needsUserAttention: boolean;
+  nextRetryAt: string | null;
+  patchHistoryErrorMessage: string | null;
+  patchHistoryStatus: ImportPatchHistoryStatus;
+  patches: SteamPatchCandidate[];
+  patchesLoading: boolean;
+  retryAfterMs: number | null;
+  rssErrorMessage: string | null;
+  selectedPatchKey: string | null;
+  steamMatch: ConfirmedSteamMatch | null;
+};
+type ImportSteamSearchModal = {
+  candidate: ImportCandidate;
+  candidates: SteamCandidate[];
+  error: string | null;
+  loading: boolean;
+  query: string;
+  selectedAppId: number | null;
+};
+type ImportPatchSelectorModal = {
+  candidate: ImportCandidate;
+  selectedKey: string | null;
+};
+type ImportManualPatchModal = {
+  buildId: string;
+  candidate: ImportCandidate;
+  error: string | null;
+  releaseDate: string;
+  version: string;
+};
 
 declare global {
   interface Window {
@@ -69,7 +138,7 @@ declare global {
       resolveSteamMatch(payload: {
         queryTitle?: string | null;
         title: string;
-      }): Promise<{ candidates: SteamCandidate[] }>;
+      }): Promise<SteamMatchResolutionPayload>;
       resolveSteamPatches(payload: {
         appId: number;
       }): Promise<SteamPatchFeedResult>;
@@ -79,11 +148,31 @@ declare global {
         trackedItemId: string;
       }): Promise<TrackedItemView>;
       saveSettings(payload: {
+        libraryRoots?: LibraryRootRecord[];
         pollDailyHourLocal?: number;
+        renameGameFoldersOnImport?: boolean;
         rootLibraryPath?: string | null;
         themeMode?: ThemeMode | null;
       }): Promise<SettingsView>;
-      scanImportFolders(rootLibraryPath: string): Promise<TrackedItemView[]>;
+      scanImportCandidates(
+        payload?: ImportScanPayload,
+      ): Promise<ImportCandidate[]>;
+      ignoreImportFolder(payload: {
+        folderName: string;
+        rootPath: string;
+      }): Promise<IgnoredImportFolderRecord[]>;
+      restoreImportFolder(payload: {
+        id: string;
+      }): Promise<IgnoredImportFolderRecord[]>;
+      saveImportBatch(
+        payload: SaveImportBatchPayload,
+      ): Promise<SaveImportBatchResult>;
+      requestSteamDbBuildLookup(
+        appId: number,
+      ): Promise<SteamDbBuildLookupState>;
+      getSteamDbBuildLookup(
+        lookupId: string,
+      ): Promise<SteamDbBuildLookupState | null>;
       selectMyJDownloaderDevice(
         deviceId: string,
       ): Promise<ConnectionHealthSummary>;
@@ -201,6 +290,246 @@ function mergePatchCandidates(
     merged.push(patch);
   }
   return merged;
+}
+
+function todayDateInput(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function makeLocalId(): string {
+  return globalThis.crypto?.randomUUID?.() ?? String(Date.now());
+}
+
+function libraryRootFallbackLabel(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  return parts.at(-1) ?? 'Library root';
+}
+
+function normalizeSettingsLibraryRoots(
+  loadedSettings: SettingsView,
+): LibraryRootRecord[] {
+  if (loadedSettings.libraryRoots?.length) {
+    return loadedSettings.libraryRoots.map((root, index) => ({
+      ...root,
+      isPrimary: loadedSettings.libraryRoots?.some(
+        (candidate) => candidate.isPrimary,
+      )
+        ? root.isPrimary
+        : index === 0,
+    }));
+  }
+
+  const rootPath = loadedSettings.rootLibraryPath?.trim();
+  return rootPath
+    ? [
+        {
+          id: makeLocalId(),
+          isPrimary: true,
+          label: libraryRootFallbackLabel(rootPath),
+          path: rootPath,
+        },
+      ]
+    : [];
+}
+
+function sanitizeFolderName(value: string): string {
+  const withoutControlCharacters = Array.from(value, (character) =>
+    character.charCodeAt(0) < 32 ? ' ' : character,
+  ).join('');
+  return (
+    withoutControlCharacters
+      .replace(/[<>:"/\\|?*]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .replace(/[. ]+$/g, '') || 'Untitled'
+  );
+}
+
+function importRenameTarget(
+  candidate: ImportCandidate,
+  row: ImportRowState | undefined,
+  renameEnabled = true,
+): string {
+  if (!renameEnabled || !row?.steamMatch) {
+    return candidate.folderName;
+  }
+  return sanitizeFolderName(row.steamMatch.title);
+}
+
+function buildSteamDbPatchnotesUrl(appId: number): string {
+  return `https://steamdb.info/app/${encodeURIComponent(String(appId))}/patchnotes/`;
+}
+
+function isSteamDbRateLimitMessage(message: string | null | undefined): boolean {
+  return Boolean(message && /(?:HTTP\s*)?429|rate limit/i.test(message));
+}
+
+function classifySteamDbBuildLookupFailure(
+  lookup: Pick<SteamDbBuildLookupState, 'errorKind' | 'errorMessage'> | null,
+): SteamDbBuildLookupFailureKind {
+  if (lookup?.errorKind) return lookup.errorKind;
+  const message = lookup?.errorMessage ?? null;
+  if (isSteamDbRateLimitMessage(message)) return 'rate_limited';
+  if (message && /timed out|expired/i.test(message)) return 'timeout';
+  if (message && /cloudflare|challenge/i.test(message)) return 'cloudflare';
+  if (message && /failed to load|servererror|unable to open/i.test(message)) {
+    return 'load_failed';
+  }
+  return 'unknown';
+}
+
+function getImportPatchHistoryLabel(row: ImportRowState | undefined): string {
+  if (!row?.steamMatch) return 'Match Steam app first';
+  if (row.needsUserAttention && row.attentionKind === 'cloudflare') {
+    return 'Cloudflare validation needed';
+  }
+  switch (row.patchHistoryStatus) {
+    case 'gathering':
+      return 'Gathering Patch History';
+    case 'loaded':
+      return 'Patch history loaded';
+    case 'needs_attention':
+      return 'Needs attention';
+    case 'queued':
+    case 'retrying':
+      return 'Queued';
+    case 'idle':
+    default:
+      return 'Queued';
+  }
+}
+
+function getImportPatchHistoryFailureLabel(
+  errorKind: SteamDbBuildLookupFailureKind | null,
+): string {
+  if (errorKind === 'rate_limited') return 'SteamDB rate limit';
+  if (errorKind === 'timeout') return 'Timed out';
+  if (errorKind === 'cloudflare') return 'Browser challenge';
+  if (errorKind === 'load_failed') return 'Load failed';
+  return 'Lookup issue';
+}
+
+function formatDurationShort(milliseconds: number): string {
+  const seconds = Math.max(0, Math.ceil(milliseconds / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
+}
+
+function isManualImportPatch(patch: SteamPatchCandidate | null): boolean {
+  return patch?.selectionSource === 'manual';
+}
+
+function isImportPatchHistoryComplete(row: ImportRowState | undefined): boolean {
+  return Boolean(row?.buildTableLoaded || isManualImportPatch(getSelectedImportPatch(row)));
+}
+
+function canAutoQueueImportPatchHistory(
+  rowId: string,
+  row: ImportRowState | undefined,
+  activeRowId: string | null,
+): boolean {
+  return Boolean(
+    row?.included &&
+      row.steamMatch &&
+      rowId !== activeRowId &&
+      row.buildLookupStatus !== 'pending' &&
+      !row.needsUserAttention &&
+      row.patchHistoryStatus !== 'gathering' &&
+      row.patchHistoryStatus !== 'needs_attention' &&
+      row.buildLookupAttempts < IMPORT_BUILD_LOOKUP_MAX_ATTEMPTS &&
+      !isImportPatchHistoryComplete(row),
+  );
+}
+
+function getImportPatchHistoryRetryDetail(
+  row: ImportRowState | undefined,
+  now = Date.now(),
+): string | null {
+  if (!row || row.patchHistoryStatus !== 'retrying') {
+    return null;
+  }
+
+  const nextAttempt = Math.min(
+    row.buildLookupAttempts + 1,
+    IMPORT_BUILD_LOOKUP_MAX_ATTEMPTS,
+  );
+  const retryAt = row.nextRetryAt ? new Date(row.nextRetryAt).getTime() : null;
+  if (row.buildLookupErrorKind === 'rate_limited') {
+    return retryAt && !Number.isNaN(retryAt) && retryAt > now
+      ? `SteamDB rate limit, retry in ${formatDurationShort(retryAt - now)}`
+      : 'SteamDB rate limit, queued after cooldown';
+  }
+
+  const waitText =
+    retryAt && !Number.isNaN(retryAt) && retryAt > now
+      ? ` in ${formatDurationShort(retryAt - now)}`
+      : ' soon';
+
+  return `${getImportPatchHistoryFailureLabel(
+    row.buildLookupErrorKind,
+  )}, retry ${nextAttempt}/${IMPORT_BUILD_LOOKUP_MAX_ATTEMPTS}${waitText}`;
+}
+
+function confirmedSteamMatchFromCandidate(
+  candidate: SteamCandidate,
+): ConfirmedSteamMatch {
+  return {
+    appId: candidate.appId,
+    coverUrl: candidate.coverUrl,
+    matchedAt: new Date().toISOString(),
+    normalizedTitle: candidate.normalizedTitle,
+    title: candidate.title,
+  };
+}
+
+function getSelectedImportPatch(
+  row: ImportRowState | undefined,
+): SteamPatchCandidate | null {
+  if (!row?.selectedPatchKey) {
+    return null;
+  }
+  return (
+    row.patches.find((patch) => patchCandidateKey(patch) === row.selectedPatchKey) ??
+    null
+  );
+}
+
+function createManualImportPatch(
+  candidate: ImportCandidate,
+  row: ImportRowState,
+  metadata: {
+    buildId: string;
+    releaseDate: string;
+    version: string;
+  },
+): SteamPatchCandidate | null {
+  if (!row.steamMatch) {
+    return null;
+  }
+
+  const installedAt = metadata.releaseDate.trim() || todayDateInput();
+  const version = metadata.version.trim();
+  const buildId = metadata.buildId.trim();
+  const patchTitle = version
+    ? `Version ${version}`
+    : buildId
+      ? `Build ${buildId}`
+      : `Manual import ${installedAt}`;
+
+  return {
+    appId: row.steamMatch.appId,
+    buildId: buildId || null,
+    description: null,
+    link: `manual:import:${candidate.id}:${Date.now()}`,
+    patchDate: installedAt,
+    patchTitle,
+    publishedAt: new Date(`${installedAt}T00:00:00`).toISOString(),
+    selectionSource: 'manual',
+    title: row.steamMatch.title,
+    version: version || null,
+  };
 }
 
 function patchSummary(patch: SteamPatchCandidate): string {
@@ -489,17 +818,45 @@ function App() {
     useState<ConnectionHealthSummary | null>(null);
   const [settingsDraft, setSettingsDraft] = useState({
     pollDailyHourLocal: '9',
-    rootLibraryPath: '',
   });
+  const [libraryRootsDraft, setLibraryRootsDraft] = useState<
+    LibraryRootRecord[]
+  >([]);
+  const [renameOnImportDraft, setRenameOnImportDraft] = useState(true);
   const [authDraft, setAuthDraft] = useState({
     email: '',
     password: '',
     selectedDeviceId: '',
   });
-  const [importRoot, setImportRoot] = useState('');
-  const [candidateMap, setCandidateMap] = useState<
-    Record<string, SteamCandidate[]>
-  >({});
+  const [importCandidates, setImportCandidates] = useState<ImportCandidate[]>(
+    [],
+  );
+  const [importRows, setImportRows] = useState<Record<string, ImportRowState>>(
+    {},
+  );
+  const [importSteamSearch, setImportSteamSearch] =
+    useState<ImportSteamSearchModal | null>(null);
+  const [importPatchSelector, setImportPatchSelector] =
+    useState<ImportPatchSelectorModal | null>(null);
+  const [importManualPatch, setImportManualPatch] =
+    useState<ImportManualPatchModal | null>(null);
+  const [importBuildLookupQueue, setImportBuildLookupQueue] = useState<
+    string[]
+  >([]);
+  const [activeImportBuildLookupRowId, setActiveImportBuildLookupRowId] =
+    useState<string | null>(null);
+  const [importBuildLookupPausedUntil, setImportBuildLookupPausedUntil] =
+    useState<number | null>(null);
+  const [importBuildLookupPauseReason, setImportBuildLookupPauseReason] =
+    useState<ImportBuildLookupPauseReason | null>(null);
+  const [importBuildLookupStopped, setImportBuildLookupStopped] =
+    useState(false);
+  const [importRateLimitStrikeCount, setImportRateLimitStrikeCount] =
+    useState(0);
+  const [importBuildLookupClock, setImportBuildLookupClock] = useState(0);
+  const [importBusy, setImportBusy] = useState(false);
+  const [includeIgnoredImports, setIncludeIgnoredImports] = useState(false);
+  const [importMessage, setImportMessage] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<ItemBusyAction | null>(null);
   const [authBusy, setAuthBusy] = useState(false);
@@ -553,6 +910,40 @@ function App() {
       : settingsSaveStatus === 'saving'
         ? 'Saving...'
         : 'Save Settings';
+  const selectedImportCandidates = useMemo(
+    () =>
+      importCandidates.filter((candidate) => importRows[candidate.id]?.included),
+    [importCandidates, importRows],
+  );
+  const importRowsReady =
+    selectedImportCandidates.length > 0 &&
+    selectedImportCandidates.every((candidate) => {
+      const row = importRows[candidate.id];
+      return Boolean(
+        row?.steamMatch &&
+          getSelectedImportPatch(row) &&
+          (!candidate.duplicateSteamMatch || row.duplicateOverride),
+      );
+    });
+  const importPatchHistoryProgress = useMemo(() => {
+    const matchedRows = selectedImportCandidates
+      .map((candidate) => importRows[candidate.id])
+      .filter((row): row is ImportRowState => Boolean(row?.steamMatch));
+    const completed = matchedRows.filter((row) =>
+      isImportPatchHistoryComplete(row),
+    ).length;
+    const unmatched = selectedImportCandidates.length - matchedRows.length;
+    const total = matchedRows.length;
+    return {
+      completed,
+      percent: total ? Math.round((completed / total) * 100) : 0,
+      total,
+      unmatched,
+    };
+  }, [importRows, selectedImportCandidates]);
+  const nextImportBuildLookupRowId = activeImportBuildLookupRowId
+    ? null
+    : getNextReadyImportBuildLookupRowId(importBuildLookupQueue, importRows);
 
   async function refreshItems() {
     const [trackedItems, loadedLogs] = await Promise.all([
@@ -579,15 +970,15 @@ function App() {
     setSettings(nextSettings);
     setSettingsDraft({
       pollDailyHourLocal: String(nextSettings.pollDailyHourLocal ?? 9),
-      rootLibraryPath: nextSettings.rootLibraryPath ?? '',
     });
+    setLibraryRootsDraft(normalizeSettingsLibraryRoots(nextSettings));
+    setRenameOnImportDraft(nextSettings.renameGameFoldersOnImport ?? true);
     setAuthDraft((current) => ({
       ...current,
       email: nextSettings.myJDownloaderEmail ?? '',
       selectedDeviceId:
         nextSettings.myJDownloaderDeviceId ?? current.selectedDeviceId,
     }));
-    setImportRoot(nextSettings.rootLibraryPath ?? '');
   }
 
   async function saveTheme(themeMode: ThemeMode) {
@@ -605,8 +996,9 @@ function App() {
     try {
       setSettings(
         await window.vaultTrackApi.saveSettings({
+          libraryRoots: libraryRootsDraft,
           pollDailyHourLocal: Number(settingsDraft.pollDailyHourLocal),
-          rootLibraryPath: settingsDraft.rootLibraryPath,
+          renameGameFoldersOnImport: renameOnImportDraft,
           themeMode: settings.themeMode,
         }),
       );
@@ -618,11 +1010,1048 @@ function App() {
     }
   }
 
+  function updateLibraryRoot(
+    id: string,
+    patch: Partial<LibraryRootRecord>,
+  ): void {
+    setLibraryRootsDraft((current) =>
+      current.map((root) => (root.id === id ? { ...root, ...patch } : root)),
+    );
+    setSettingsSaveStatus('idle');
+  }
+
+  function setPrimaryLibraryRoot(id: string): void {
+    setLibraryRootsDraft((current) =>
+      current.map((root) => ({ ...root, isPrimary: root.id === id })),
+    );
+    setSettingsSaveStatus('idle');
+  }
+
+  function removeLibraryRoot(id: string): void {
+    setLibraryRootsDraft((current) => {
+      const next = current.filter((root) => root.id !== id);
+      if (next.length > 0 && !next.some((root) => root.isPrimary)) {
+        return next.map((root, index) => ({
+          ...root,
+          isPrimary: index === 0,
+        }));
+      }
+      return next;
+    });
+    setSettingsSaveStatus('idle');
+  }
+
+  function updateImportRow(
+    rowId: string,
+    updater: (row: ImportRowState) => ImportRowState,
+  ): void {
+    setImportRows((current) => {
+      const row = current[rowId];
+      if (!row) {
+        return current;
+      }
+
+      return {
+        ...current,
+        [rowId]: updater(row),
+      };
+    });
+  }
+
+  const enqueueImportBuildLookup = useCallback((rowId: string): void => {
+    setImportBuildLookupQueue((current) => {
+      if (current.includes(rowId)) {
+        return current;
+      }
+      return [...current, rowId];
+    });
+  }, []);
+
+  function removeImportBuildLookup(rowId: string): void {
+    setImportBuildLookupQueue((current) =>
+      current.filter((queuedRowId) => queuedRowId !== rowId),
+    );
+    setActiveImportBuildLookupRowId((current) =>
+      current === rowId ? null : current,
+    );
+  }
+
+  const releaseImportBuildLookup = useCallback(
+    (
+      rowId: string,
+      delayMs: number,
+      pauseReason: ImportBuildLookupPauseReason = 'success',
+    ): void => {
+      setActiveImportBuildLookupRowId((current) =>
+        current === rowId ? null : current,
+      );
+      setImportBuildLookupPausedUntil(delayMs > 0 ? Date.now() + delayMs : null);
+      setImportBuildLookupPauseReason(delayMs > 0 ? pauseReason : null);
+    },
+    [],
+  );
+
+  const retryImportBuildLookup = useCallback(
+    (
+      rowId: string,
+      errorKind: SteamDbBuildLookupFailureKind,
+      errorMessage: string,
+      retryAfterMs?: number | null,
+      attemptedCount?: number,
+    ): void => {
+      const currentRow = importRows[rowId];
+      if (!currentRow) return;
+      const attemptCount = Math.max(
+        currentRow.buildLookupAttempts,
+        attemptedCount ?? currentRow.buildLookupAttempts,
+      );
+      const rateLimitStrikeCount =
+        errorKind === 'rate_limited' ? importRateLimitStrikeCount + 1 : 0;
+      const timing = getImportBuildLookupFailureTiming({
+        attemptCount,
+        errorKind,
+        rateLimitStrikeCount,
+        retryAfterMs,
+      });
+      const nextRetryAt = timing.rowRetryDelayMs
+        ? new Date(Date.now() + timing.rowRetryDelayMs).toISOString()
+        : null;
+
+      setImportRows((current) => {
+        const row = current[rowId];
+        if (!row) return current;
+        return {
+          ...current,
+          [rowId]: {
+            ...row,
+            attentionKind: null,
+            buildLookupAttempts: Math.max(row.buildLookupAttempts, attemptCount),
+            buildLookupErrorKind: errorKind,
+            buildLookupId: null,
+            buildLookupStatus: timing.shouldRetry ? null : 'failed',
+            needsUserAttention: false,
+            nextRetryAt,
+            patchHistoryErrorMessage: errorMessage,
+            patchHistoryStatus: timing.shouldRetry
+              ? 'retrying'
+              : 'needs_attention',
+            retryAfterMs: retryAfterMs ?? null,
+          },
+        };
+      });
+
+      if (errorKind === 'rate_limited') {
+        setImportRateLimitStrikeCount(rateLimitStrikeCount);
+        if (rateLimitStrikeCount >= 3) {
+          setImportBuildLookupStopped(true);
+          setImportMessage(
+            'SteamDB rate limit reached. Patch history queue paused; retry later from the top of the table.',
+          );
+        }
+      }
+      enqueueImportBuildLookup(rowId);
+      releaseImportBuildLookup(
+        rowId,
+        timing.queueCooldownMs,
+        timing.pauseReason,
+      );
+    },
+    [
+      enqueueImportBuildLookup,
+      importRateLimitStrikeCount,
+      importRows,
+      releaseImportBuildLookup,
+    ],
+  );
+
+  const markImportBuildLookupNeedsAttention = useCallback(
+    (rowId: string, lookup: SteamDbBuildLookupState): void => {
+      updateImportRow(rowId, (row) => ({
+        ...row,
+        attentionKind: lookup.attentionKind ?? null,
+        buildLookupErrorKind: lookup.errorKind ?? 'timeout',
+        buildLookupId: lookup.id,
+        buildLookupStatus: 'failed',
+        needsUserAttention: false,
+        nextRetryAt: null,
+        patchHistoryErrorMessage:
+          lookup.errorMessage ??
+          'SteamDB validation timed out. Use the row action to try again.',
+        patchHistoryStatus: 'needs_attention',
+        retryAfterMs: lookup.retryAfterMs ?? null,
+      }));
+      releaseImportBuildLookup(rowId, 0);
+    },
+    [releaseImportBuildLookup],
+  );
+
+  function initializeImportRows(candidates: ImportCandidate[]) {
+    const defaults: Record<string, ImportRowState> = {};
+    for (const candidate of candidates) {
+      defaults[candidate.id] = {
+        attentionKind: null,
+        buildLookupId: null,
+        buildLookupStatus: null,
+        buildLookupAttempts: 0,
+        buildLookupErrorKind: null,
+        buildTableLoaded: false,
+        candidates: candidate.steamCandidates,
+        duplicateOverride: false,
+        included: !candidate.ignored,
+        installedAt: '',
+        installedBuildId: '',
+        installedVersion: '',
+        manualQuery: candidate.title,
+        needsUserAttention: false,
+        nextRetryAt: null,
+        patchHistoryErrorMessage: null,
+        patchHistoryStatus: candidate.autoSelectedSteamMatch ? 'queued' : 'idle',
+        patches: [],
+        patchesLoading: Boolean(candidate.autoSelectedSteamMatch),
+        retryAfterMs: null,
+        rssErrorMessage: null,
+        selectedPatchKey: null,
+        steamMatch: candidate.autoSelectedSteamMatch ?? null,
+      };
+    }
+
+    setImportCandidates(candidates);
+    setImportRows(defaults);
+    setImportBuildLookupQueue(
+      candidates
+        .filter((candidate) => candidate.autoSelectedSteamMatch)
+        .map((candidate) => candidate.id),
+    );
+    setActiveImportBuildLookupRowId(null);
+    setImportBuildLookupStopped(false);
+    setImportBuildLookupPausedUntil(null);
+    setImportBuildLookupPauseReason(null);
+    setImportRateLimitStrikeCount(0);
+    setImportBuildLookupClock((current) => current + 1);
+    for (const candidate of candidates) {
+      if (candidate.autoSelectedSteamMatch) {
+        void loadImportPatches(candidate.id, candidate.autoSelectedSteamMatch.appId);
+      }
+    }
+  }
+
+  async function scanImportCandidates() {
+    setImportBusy(true);
+    setImportMessage('Scanning library roots...');
+    try {
+      const candidates = await window.vaultTrackApi.scanImportCandidates({
+        includeIgnored: includeIgnoredImports,
+      });
+      initializeImportRows(candidates);
+      setImportMessage(
+        candidates.length
+          ? `${candidates.length} folders ready for review.`
+          : 'No untracked folders found.',
+      );
+    } catch (error) {
+      setImportMessage(
+        error instanceof Error ? error.message : 'Unable to scan import roots.',
+      );
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
+  async function loadImportPatches(rowId: string, appId: number) {
+    setImportRows((current) => {
+      const row = current[rowId];
+      if (!row) return current;
+      return {
+        ...current,
+        [rowId]: {
+          ...row,
+          patchesLoading: true,
+          rssErrorMessage: null,
+        },
+      };
+    });
+
+    try {
+      const feedResult = await window.vaultTrackApi.resolveSteamPatches({
+        appId,
+      });
+      const patches = mergePatchCandidates(feedResult.patches);
+      setImportRows((current) => {
+        const row = current[rowId];
+        if (!row) return current;
+        if (row.steamMatch?.appId !== appId) return current;
+        const mergedPatches = mergePatchCandidates([
+          ...row.patches,
+          ...patches,
+        ]);
+        return {
+          ...current,
+          [rowId]: {
+            ...row,
+            patches: mergedPatches,
+            patchesLoading: false,
+            rssErrorMessage: null,
+            selectedPatchKey: row.selectedPatchKey,
+          },
+        };
+      });
+    } catch (error) {
+      setImportRows((current) => {
+        const row = current[rowId];
+        if (!row) return current;
+        return {
+          ...current,
+          [rowId]: {
+            ...row,
+            rssErrorMessage:
+              error instanceof Error
+                ? error.message
+                : 'Unable to load SteamDB patches.',
+            patchesLoading: false,
+          },
+        };
+      });
+    }
+  }
+
+  async function openSteamDbBuildBackfillPage(candidate: ImportCandidate) {
+    const appId = importRows[candidate.id]?.steamMatch?.appId;
+    if (!appId) return;
+    const attemptedCount =
+      (importRows[candidate.id]?.buildLookupAttempts ?? 0) + 1;
+
+    updateImportRow(candidate.id, (row) => ({
+      ...row,
+      attentionKind: null,
+      buildLookupAttempts: attemptedCount,
+      buildLookupErrorKind: null,
+      patchHistoryErrorMessage: null,
+      patchHistoryStatus: 'gathering',
+      needsUserAttention: false,
+    }));
+
+    try {
+      const lookup = await window.vaultTrackApi.requestSteamDbBuildLookup(appId);
+      setActiveImportBuildLookupRowId((current) => current ?? candidate.id);
+      if (lookup.status === 'failed') {
+        if (lookup.attentionKind === 'cloudflare') {
+          markImportBuildLookupNeedsAttention(candidate.id, lookup);
+          return;
+        }
+        retryImportBuildLookup(
+          candidate.id,
+          classifySteamDbBuildLookupFailure(lookup),
+          lookup.errorMessage ?? 'Extension build-table lookup failed.',
+          lookup.retryAfterMs,
+          attemptedCount,
+        );
+        return;
+      }
+      updateImportRow(candidate.id, (row) => ({
+        ...row,
+        attentionKind: lookup.attentionKind ?? null,
+        buildLookupId: lookup.id,
+        buildLookupStatus: lookup.status,
+        buildTableLoaded: lookup.status === 'complete' ? true : row.buildTableLoaded,
+        needsUserAttention: Boolean(lookup.needsUserAttention),
+        patchHistoryErrorMessage: null,
+        patchHistoryStatus:
+          lookup.status === 'complete'
+            ? 'loaded'
+            : lookup.status === 'pending'
+              ? 'gathering'
+              : row.patchHistoryStatus,
+        patches: mergePatchCandidates([...row.patches, ...lookup.patches]),
+        retryAfterMs: lookup.retryAfterMs ?? null,
+      }));
+        if (lookup.status === 'complete') {
+          setImportRateLimitStrikeCount(0);
+          releaseImportBuildLookup(
+            candidate.id,
+            getImportBuildLookupSuccessCooldownMs(),
+          'success',
+        );
+        return;
+      }
+      await window.vaultTrackApi.openExternal(buildSteamDbPatchnotesUrl(appId));
+    } catch (error) {
+      updateImportRow(candidate.id, (row) => ({
+        ...row,
+        buildLookupErrorKind: 'load_failed',
+        patchHistoryErrorMessage:
+          error instanceof Error
+            ? error.message
+            : 'Unable to open SteamDB backfill page.',
+        patchHistoryStatus: 'needs_attention',
+      }));
+      releaseImportBuildLookup(candidate.id, 0);
+    }
+  }
+
+  function retryImportPatchHistory(candidate: ImportCandidate): void {
+    const appId = importRows[candidate.id]?.steamMatch?.appId;
+    if (!appId) return;
+
+    updateImportRow(candidate.id, (row) => ({
+      ...row,
+      attentionKind: null,
+      buildLookupAttempts: 0,
+      buildLookupErrorKind: null,
+      buildLookupId: null,
+      buildLookupStatus: null,
+      buildTableLoaded: false,
+      needsUserAttention: false,
+      nextRetryAt: null,
+      patchHistoryErrorMessage: null,
+      patchHistoryStatus: 'queued',
+      retryAfterMs: null,
+      selectedPatchKey: null,
+    }));
+    enqueueImportBuildLookup(candidate.id);
+    setImportBuildLookupClock((current) => current + 1);
+  }
+
+  function resumeImportPatchHistoryQueue(): void {
+    setImportRows((current) => {
+      const next: Record<string, ImportRowState> = {};
+      for (const [rowId, row] of Object.entries(current)) {
+        next[rowId] =
+          row.buildLookupErrorKind === 'rate_limited' &&
+          !isImportPatchHistoryComplete(row)
+            ? {
+                ...row,
+                buildLookupAttempts: 0,
+                buildLookupErrorKind: null,
+                buildLookupId: null,
+                buildLookupStatus: null,
+                nextRetryAt: null,
+                patchHistoryErrorMessage: null,
+                patchHistoryStatus: 'queued',
+                retryAfterMs: null,
+              }
+            : row;
+      }
+      return next;
+    });
+    setImportBuildLookupStopped(false);
+    setImportRateLimitStrikeCount(0);
+    setImportBuildLookupPausedUntil(null);
+    setImportBuildLookupPauseReason(null);
+    setImportMessage('Patch history queue restarted.');
+    setImportBuildLookupClock((current) => current + 1);
+  }
+
+  function openImportSteamSearch(candidate: ImportCandidate) {
+    const row = importRows[candidate.id];
+    setImportSteamSearch({
+      candidate,
+      candidates: row?.candidates ?? candidate.steamCandidates,
+      error: null,
+      loading: false,
+      query: row?.manualQuery || candidate.title,
+      selectedAppId:
+        row?.steamMatch?.appId ??
+        candidate.autoSelectedSteamMatch?.appId ??
+        candidate.steamCandidates[0]?.appId ??
+        null,
+    });
+  }
+
+  async function searchImportSteamMatch() {
+    const modal = importSteamSearch;
+    if (!modal) return;
+
+    const query = modal.query.trim();
+    if (!query) {
+      setImportSteamSearch((current) =>
+        current ? { ...current, error: 'Enter a Steam title to search.' } : current,
+      );
+      return;
+    }
+
+    setImportSteamSearch((current) =>
+      current ? { ...current, error: null, loading: true } : current,
+    );
+
+    try {
+      const result = await window.vaultTrackApi.resolveSteamMatch({
+        queryTitle: query,
+        title: modal.candidate.title,
+      });
+      setImportSteamSearch((current) => {
+        if (!current || current.candidate.id !== modal.candidate.id) {
+          return current;
+        }
+        const currentSelectionStillExists = result.candidates.some(
+          (candidate) => candidate.appId === current.selectedAppId,
+        );
+        return {
+          ...current,
+          candidates: result.candidates,
+          error: result.candidates.length ? null : 'No Steam matches found.',
+          loading: false,
+          selectedAppId: result.autoSelected
+            ? (result.candidates[0]?.appId ?? null)
+            : currentSelectionStillExists
+              ? current.selectedAppId
+              : (result.candidates[0]?.appId ?? null),
+        };
+      });
+      updateImportRow(modal.candidate.id, (row) => ({
+        ...row,
+        candidates: result.candidates,
+        manualQuery: query,
+      }));
+    } catch (error) {
+      setImportSteamSearch((current) =>
+        current
+          ? {
+              ...current,
+              error:
+                error instanceof Error
+                  ? error.message
+                  : 'Unable to load Steam candidates.',
+              loading: false,
+            }
+          : current,
+      );
+    }
+  }
+
+  function applyImportSteamSearchSelection() {
+    const modal = importSteamSearch;
+    if (!modal?.selectedAppId) {
+      return;
+    }
+
+    const selected = modal.candidates.find(
+      (steamCandidate) => steamCandidate.appId === modal.selectedAppId,
+    );
+    if (!selected) {
+      return;
+    }
+
+    updateImportRow(modal.candidate.id, (row) => ({
+      ...row,
+      attentionKind: null,
+      buildLookupId: null,
+      buildLookupStatus: null,
+      buildLookupAttempts: 0,
+      buildLookupErrorKind: null,
+      buildTableLoaded: false,
+      candidates: modal.candidates,
+      manualQuery: modal.query.trim() || row.manualQuery,
+      needsUserAttention: false,
+      nextRetryAt: null,
+      patchHistoryErrorMessage: null,
+      patchHistoryStatus: 'queued',
+      patches: [],
+      patchesLoading: true,
+      retryAfterMs: null,
+      rssErrorMessage: null,
+      selectedPatchKey: null,
+      steamMatch: confirmedSteamMatchFromCandidate(selected),
+    }));
+    removeImportBuildLookup(modal.candidate.id);
+    enqueueImportBuildLookup(modal.candidate.id);
+    setImportSteamSearch(null);
+    void loadImportPatches(modal.candidate.id, selected.appId);
+  }
+
+  function openImportPatchSelector(candidate: ImportCandidate) {
+    const row = importRows[candidate.id];
+    setImportPatchSelector({
+      candidate,
+      selectedKey:
+        row?.selectedPatchKey ??
+        (row?.patches[0] ? patchCandidateKey(row.patches[0]) : null),
+    });
+  }
+
+  function applyImportPatchSelection() {
+    const modal = importPatchSelector;
+    if (!modal?.selectedKey) {
+      return;
+    }
+
+    updateImportRow(modal.candidate.id, (row) => ({
+      ...row,
+      selectedPatchKey: modal.selectedKey,
+    }));
+    setImportPatchSelector(null);
+  }
+
+  function openManualImportPatch(candidate: ImportCandidate) {
+    const row = importRows[candidate.id];
+    setImportManualPatch({
+      buildId: row?.installedBuildId ?? '',
+      candidate,
+      error: null,
+      releaseDate: row?.installedAt ?? '',
+      version: row?.installedVersion ?? '',
+    });
+  }
+
+  function saveManualImportPatch() {
+    const modal = importManualPatch;
+    if (!modal) return;
+    const row = importRows[modal.candidate.id];
+    if (!row?.steamMatch) return;
+
+    if (
+      !modal.version.trim() &&
+      !modal.buildId.trim() &&
+      !modal.releaseDate.trim()
+    ) {
+      setImportManualPatch((current) =>
+        current
+          ? {
+              ...current,
+              error: 'Enter a version, build ID, or release date.',
+            }
+          : current,
+      );
+      return;
+    }
+
+    const patch = createManualImportPatch(modal.candidate, row, {
+      buildId: modal.buildId,
+      releaseDate: modal.releaseDate,
+      version: modal.version,
+    });
+    if (!patch) return;
+
+    updateImportRow(modal.candidate.id, (currentRow) => {
+      const patches = mergePatchCandidates([patch, ...currentRow.patches]);
+      return {
+        ...currentRow,
+        installedAt: modal.releaseDate.trim(),
+        installedBuildId: modal.buildId.trim(),
+        installedVersion: modal.version.trim(),
+        patches,
+        patchHistoryErrorMessage: null,
+        patchHistoryStatus: currentRow.buildTableLoaded
+          ? 'loaded'
+          : currentRow.patchHistoryStatus,
+        selectedPatchKey: patchCandidateKey(patch),
+      };
+    });
+    if (!row.buildTableLoaded) {
+      setImportBuildLookupQueue((current) =>
+        current.filter((rowId) => rowId !== modal.candidate.id),
+      );
+    }
+    setImportManualPatch(null);
+  }
+
+  async function ignoreImportCandidate(candidate: ImportCandidate) {
+    await window.vaultTrackApi.ignoreImportFolder({
+      folderName: candidate.folderName,
+      rootPath: candidate.rootPath,
+    });
+    await refreshSettings();
+    setImportCandidates((current) =>
+      current.filter((row) => row.id !== candidate.id),
+    );
+    setImportRows((current) => {
+      const next = { ...current };
+      delete next[candidate.id];
+      return next;
+    });
+    removeImportBuildLookup(candidate.id);
+  }
+
+  async function saveImportRows() {
+    setImportBusy(true);
+    setImportMessage('Saving selected imports...');
+    try {
+      const rows: SaveImportBatchPayload['rows'] = selectedImportCandidates.map(
+        (candidate) => {
+          const row = importRows[candidate.id]!;
+          const selectedPatch = getSelectedImportPatch(row)!;
+          return {
+            allowDuplicateSteamApp: row.duplicateOverride,
+            folderName: candidate.folderName,
+            folderPath: candidate.folderPath,
+            installedAt: row.installedAt || selectedPatch.patchDate,
+            installedBuildId:
+              row.installedBuildId.trim() || selectedPatch.buildId,
+            installedVersion:
+              row.installedVersion.trim() ||
+              selectedPatch.version ||
+              selectedPatch.patchTitle,
+            rootId: candidate.rootId,
+            rootPath: candidate.rootPath,
+            selectedSteamPatch: selectedPatch,
+            steamMatch: row.steamMatch!,
+            steamPatchEntries: row.patches,
+          };
+        },
+      );
+      const result = await window.vaultTrackApi.saveImportBatch({ rows });
+      setImportMessage(`${result.imported.length} imports saved.`);
+      setImportCandidates((current) =>
+        current.filter(
+          (candidate) =>
+            !selectedImportCandidates.some(
+              (selected) => selected.id === candidate.id,
+            ),
+        ),
+      );
+      setImportRows((current) => {
+        const next = { ...current };
+        for (const candidate of selectedImportCandidates) {
+          delete next[candidate.id];
+        }
+        return next;
+      });
+      setImportBuildLookupQueue((current) =>
+        current.filter(
+          (rowId) =>
+            !selectedImportCandidates.some(
+              (candidate) => candidate.id === rowId,
+            ),
+        ),
+      );
+      setActiveImportBuildLookupRowId((current) =>
+        selectedImportCandidates.some((candidate) => candidate.id === current)
+          ? null
+          : current,
+      );
+      await refreshItems();
+    } catch (error) {
+      setImportMessage(
+        error instanceof Error ? error.message : 'Unable to save imports.',
+      );
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
   useEffect(() => {
     if (settingsSaveStatus !== 'saved') return undefined;
     const timer = window.setTimeout(() => setSettingsSaveStatus('idle'), 1800);
     return () => window.clearTimeout(timer);
   }, [settingsSaveStatus]);
+
+  useEffect(() => {
+    const eligibleIds = importCandidates
+      .map((candidate) => candidate.id)
+      .filter((rowId) =>
+        canAutoQueueImportPatchHistory(
+          rowId,
+          importRows[rowId],
+          activeImportBuildLookupRowId,
+        ),
+      );
+
+    setImportBuildLookupQueue((current) => {
+      const eligibleSet = new Set(eligibleIds);
+      const normalEligibleIds = eligibleIds.filter(
+        (rowId) => importRows[rowId]?.patchHistoryStatus !== 'retrying',
+      );
+      const retryEligibleIds = current.filter(
+        (rowId) =>
+          eligibleSet.has(rowId) &&
+          importRows[rowId]?.patchHistoryStatus === 'retrying',
+      );
+      for (const rowId of eligibleIds) {
+        if (
+          importRows[rowId]?.patchHistoryStatus === 'retrying' &&
+          !retryEligibleIds.includes(rowId)
+        ) {
+          retryEligibleIds.push(rowId);
+        }
+      }
+      const next = [...normalEligibleIds, ...retryEligibleIds];
+      if (
+        next.length === current.length &&
+        next.every((rowId, index) => rowId === current[index])
+      ) {
+        return current;
+      }
+      return next;
+    });
+  }, [activeImportBuildLookupRowId, importCandidates, importRows]);
+
+  useEffect(() => {
+    const hasRetryingRows = Object.values(importRows).some(
+      (row) => row.patchHistoryStatus === 'retrying' && row.nextRetryAt,
+    );
+    if (!hasRetryingRows) return undefined;
+
+    const timer = window.setInterval(
+      () => setImportBuildLookupClock((current) => current + 1),
+      1000,
+    );
+    return () => window.clearInterval(timer);
+  }, [importRows]);
+
+  useEffect(() => {
+    const now = Date.now();
+    if (!importBuildLookupPausedUntil || importBuildLookupPausedUntil <= now) {
+      return undefined;
+    }
+
+    const timer = window.setInterval(
+      () => setImportBuildLookupClock((current) => current + 1),
+      1000,
+    );
+    return () => window.clearInterval(timer);
+  }, [importBuildLookupPausedUntil]);
+
+  useEffect(() => {
+    if (
+      importBuildLookupStopped ||
+      activeImportBuildLookupRowId ||
+      importBuildLookupQueue.length === 0
+    ) {
+      return;
+    }
+
+    const now = Date.now();
+    if (importBuildLookupPausedUntil && importBuildLookupPausedUntil > now) {
+      const timer = window.setTimeout(
+        () => setImportBuildLookupClock((current) => current + 1),
+        importBuildLookupPausedUntil - now,
+      );
+      return () => window.clearTimeout(timer);
+    }
+
+    const nextRowId = getNextReadyImportBuildLookupRowId(
+      importBuildLookupQueue,
+      importRows,
+      now,
+    );
+    if (!nextRowId) {
+      const nextRetryAt = importBuildLookupQueue
+        .map((rowId) => {
+          const value = importRows[rowId]?.nextRetryAt;
+          return value ? new Date(value).getTime() : null;
+        })
+        .filter((value): value is number => value !== null && value > now)
+        .sort((a, b) => a - b)[0];
+      if (nextRetryAt) {
+        const timer = window.setTimeout(
+          () => setImportBuildLookupClock((current) => current + 1),
+          nextRetryAt - now,
+        );
+        return () => window.clearTimeout(timer);
+      }
+      setImportBuildLookupQueue((current) =>
+        current.filter((rowId) => {
+          const row = importRows[rowId];
+          return canAutoQueueImportPatchHistory(
+            rowId,
+            row,
+            activeImportBuildLookupRowId,
+          );
+        }),
+      );
+      return;
+    }
+
+    const appId = importRows[nextRowId]?.steamMatch?.appId;
+    if (!appId) {
+      setImportBuildLookupQueue((current) =>
+        current.filter((rowId) => rowId !== nextRowId),
+      );
+      return;
+    }
+
+    const nextAttemptCount =
+      (importRows[nextRowId]?.buildLookupAttempts ?? 0) + 1;
+
+    setImportBuildLookupQueue((current) =>
+      current.filter((rowId) => rowId !== nextRowId),
+    );
+    setActiveImportBuildLookupRowId(nextRowId);
+    updateImportRow(nextRowId, (row) => ({
+      ...row,
+      attentionKind: null,
+      buildLookupAttempts: nextAttemptCount,
+      buildLookupErrorKind: null,
+      buildLookupId: null,
+      buildLookupStatus: 'pending',
+      needsUserAttention: false,
+      nextRetryAt: null,
+      patchHistoryErrorMessage: null,
+      patchHistoryStatus: 'gathering',
+      retryAfterMs: null,
+    }));
+
+    void window.vaultTrackApi
+      .requestSteamDbBuildLookup(appId)
+      .then((lookup) => {
+        if (lookup.status === 'failed') {
+          if (lookup.attentionKind === 'cloudflare') {
+            markImportBuildLookupNeedsAttention(nextRowId, lookup);
+            return;
+          }
+          retryImportBuildLookup(
+            nextRowId,
+            classifySteamDbBuildLookupFailure(lookup),
+            lookup.errorMessage ?? 'Extension build-table lookup failed.',
+            lookup.retryAfterMs,
+            nextAttemptCount,
+          );
+          return;
+        }
+        updateImportRow(nextRowId, (row) => {
+          const patches = mergePatchCandidates([
+            ...row.patches,
+            ...lookup.patches,
+          ]);
+          return {
+            ...row,
+            attentionKind: lookup.attentionKind ?? null,
+            buildLookupId: lookup.id,
+            buildLookupStatus: lookup.status,
+            buildTableLoaded: lookup.status === 'complete' ? true : row.buildTableLoaded,
+            needsUserAttention: Boolean(lookup.needsUserAttention),
+            patchHistoryStatus:
+              lookup.status === 'complete' ? 'loaded' : 'gathering',
+            patches,
+            retryAfterMs: lookup.retryAfterMs ?? null,
+          };
+        });
+        if (lookup.status === 'complete') {
+          setImportRateLimitStrikeCount(0);
+          releaseImportBuildLookup(
+            nextRowId,
+            getImportBuildLookupSuccessCooldownMs(),
+            'success',
+          );
+        }
+      })
+      .catch((error) => {
+        const statusMessage =
+          error instanceof Error
+            ? error.message
+            : 'Unable to start SteamDB build-table lookup.';
+        retryImportBuildLookup(
+          nextRowId,
+          classifySteamDbBuildLookupFailure({
+            errorKind: null,
+            errorMessage: statusMessage,
+          }),
+          statusMessage,
+          null,
+          nextAttemptCount,
+        );
+      });
+  }, [
+    activeImportBuildLookupRowId,
+    importBuildLookupClock,
+    importBuildLookupPausedUntil,
+    importBuildLookupStopped,
+    importBuildLookupQueue,
+    importRows,
+    markImportBuildLookupNeedsAttention,
+    releaseImportBuildLookup,
+    retryImportBuildLookup,
+  ]);
+
+  useEffect(() => {
+    const pendingLookups = Object.entries(importRows)
+      .filter(([, row]) => row.buildLookupId && row.buildLookupStatus === 'pending')
+      .map(([rowId, row]) => ({ lookupId: row.buildLookupId!, rowId }));
+    if (pendingLookups.length === 0) {
+      return undefined;
+    }
+
+    const poll = () => {
+      for (const pending of pendingLookups) {
+        void window.vaultTrackApi
+          .getSteamDbBuildLookup(pending.lookupId)
+          .then((lookup) => {
+            if (!lookup) {
+              const statusMessage = 'Extension build-table lookup expired.';
+              retryImportBuildLookup(pending.rowId, 'timeout', statusMessage);
+              return;
+            }
+            if (lookup.status === 'pending' && lookup.patches.length === 0) {
+              updateImportRow(pending.rowId, (row) => ({
+                ...row,
+                attentionKind: lookup.attentionKind ?? null,
+                buildLookupErrorKind: null,
+                buildLookupStatus: 'pending',
+                needsUserAttention: Boolean(lookup.needsUserAttention),
+                patchHistoryErrorMessage: lookup.needsUserAttention
+                  ? (lookup.errorMessage ?? null)
+                  : null,
+                patchHistoryStatus: 'gathering',
+              }));
+              return;
+            }
+            if (lookup.status === 'failed') {
+              if (lookup.attentionKind === 'cloudflare') {
+                markImportBuildLookupNeedsAttention(pending.rowId, lookup);
+                return;
+              }
+              retryImportBuildLookup(
+                pending.rowId,
+                classifySteamDbBuildLookupFailure(lookup),
+                lookup.errorMessage ?? 'Extension build-table lookup failed.',
+                lookup.retryAfterMs,
+              );
+              return;
+            }
+            setImportRows((current) => {
+              const row = current[pending.rowId];
+              if (!row) return current;
+              const patches = mergePatchCandidates([
+                ...row.patches,
+                ...lookup.patches,
+              ]);
+              return {
+                ...current,
+                [pending.rowId]: {
+                  ...row,
+                  attentionKind:
+                    lookup.status === 'complete'
+                      ? null
+                      : (lookup.attentionKind ?? null),
+                  buildLookupErrorKind: null,
+                  buildLookupStatus: lookup.status,
+                  buildTableLoaded:
+                    lookup.status === 'complete' ? true : row.buildTableLoaded,
+                  needsUserAttention:
+                    lookup.status === 'complete'
+                      ? false
+                      : Boolean(lookup.needsUserAttention),
+                  nextRetryAt: null,
+                  patchHistoryErrorMessage: null,
+                  patchHistoryStatus:
+                    lookup.status === 'complete' ? 'loaded' : row.patchHistoryStatus,
+                  patches,
+                  retryAfterMs: lookup.retryAfterMs ?? null,
+                  selectedPatchKey: row.selectedPatchKey,
+                },
+              };
+            });
+            if (lookup.status === 'complete') {
+              setImportRateLimitStrikeCount(0);
+              releaseImportBuildLookup(
+                pending.rowId,
+                getImportBuildLookupSuccessCooldownMs(),
+                'success',
+              );
+            }
+          })
+          .catch(() => undefined);
+      }
+    };
+
+    const timer = window.setInterval(poll, 2500);
+    poll();
+    return () => window.clearInterval(timer);
+  }, [
+    importRows,
+    markImportBuildLookupNeedsAttention,
+    releaseImportBuildLookup,
+    retryImportBuildLookup,
+  ]);
 
   useEffect(() => {
     const media = window.matchMedia('(prefers-color-scheme: dark)');
@@ -654,14 +2083,16 @@ function App() {
       setConnectionHealth(health);
       setSettingsDraft({
         pollDailyHourLocal: String(loadedSettings.pollDailyHourLocal ?? 9),
-        rootLibraryPath: loadedSettings.rootLibraryPath ?? '',
       });
+      setLibraryRootsDraft(normalizeSettingsLibraryRoots(loadedSettings));
+      setRenameOnImportDraft(
+        loadedSettings.renameGameFoldersOnImport ?? true,
+      );
       setAuthDraft({
         email: loadedSettings.myJDownloaderEmail ?? '',
         password: '',
         selectedDeviceId: health.selectedDeviceId ?? '',
       });
-      setImportRoot(loadedSettings.rootLibraryPath ?? '');
     });
   }, []);
 
@@ -1357,16 +2788,18 @@ function App() {
                             defaultValue={
                               item.installRecord?.installedVersion ?? ''
                             }
-                            onBlur={(event) =>
+                            onBlur={(event) => {
+                              const installedVersion =
+                                event.currentTarget.value;
                               void runItemAction(item.item.id, () =>
                                 window.vaultTrackApi.updateInstallRecord({
                                   installedBuildId:
                                     item.installRecord?.installedBuildId ?? '',
-                                  installedVersion: event.currentTarget.value,
+                                  installedVersion,
                                   trackedItemId: item.item.id,
                                 }),
-                              )
-                            }
+                              );
+                            }}
                             placeholder="1.5.4.H2"
                           />
                         </label>
@@ -1376,16 +2809,18 @@ function App() {
                             defaultValue={
                               item.installRecord?.installedBuildId ?? ''
                             }
-                            onBlur={(event) =>
+                            onBlur={(event) => {
+                              const installedBuildId =
+                                event.currentTarget.value;
                               void runItemAction(item.item.id, () =>
                                 window.vaultTrackApi.updateInstallRecord({
-                                  installedBuildId: event.currentTarget.value,
+                                  installedBuildId,
                                   installedVersion:
                                     item.installRecord?.installedVersion ?? '',
                                   trackedItemId: item.item.id,
                                 }),
-                              )
-                            }
+                              );
+                            }}
                             placeholder="123456"
                           />
                         </label>
@@ -1411,27 +2846,15 @@ function App() {
             </div>
             <div className="settings-grid">
               <label className="field">
-                <span className="field-label">Root library path</span>
-                <input
-                  onChange={(event) => {
-                    setSettingsDraft((current) => ({
-                      ...current,
-                      rootLibraryPath: event.currentTarget.value,
-                    }));
-                    setSettingsSaveStatus('idle');
-                  }}
-                  value={settingsDraft.rootLibraryPath}
-                />
-              </label>
-              <label className="field">
                 <span className="field-label">Daily SteamDB poll hour</span>
                 <input
                   max="23"
                   min="0"
                   onChange={(event) => {
+                    const pollDailyHourLocal = event.currentTarget.value;
                     setSettingsDraft((current) => ({
                       ...current,
-                      pollDailyHourLocal: event.currentTarget.value,
+                      pollDailyHourLocal,
                     }));
                     setSettingsSaveStatus('idle');
                   }}
@@ -1439,25 +2862,157 @@ function App() {
                   value={settingsDraft.pollDailyHourLocal}
                 />
               </label>
-            </div>
-            <div className="action-row">
-              <button
-                className="ghost-button"
-                disabled={settingsSaveStatus === 'saving'}
-                onClick={async () => {
-                  const picked = await window.vaultTrackApi.pickDirectory();
-                  if (picked) {
-                    setSettingsDraft((current) => ({
-                      ...current,
-                      rootLibraryPath: picked,
-                    }));
+              <label className="toggle-field">
+                <input
+                  checked={renameOnImportDraft}
+                  onChange={(event) => {
+                    const checked = event.currentTarget.checked;
+                    setRenameOnImportDraft(checked);
                     setSettingsSaveStatus('idle');
-                  }
-                }}
-                type="button"
-              >
-                Pick Folder
-              </button>
+                  }}
+                  type="checkbox"
+                />
+                <span>
+                  <strong>Rename Game Folders on Import</strong>
+                  <small>Use the sanitized Steam title when imports are saved.</small>
+                </span>
+              </label>
+            </div>
+            <div className="library-roots-panel">
+              <div className="panel-heading">
+                <div>
+                  <strong>Library roots</strong>
+                  <p className="muted-text">
+                    Scan one folder level under each root. The primary root is
+                    mirrored for extension downloads.
+                  </p>
+                </div>
+                <button
+                  className="ghost-button"
+                  disabled={settingsSaveStatus === 'saving'}
+                  onClick={async () => {
+                    const picked = await window.vaultTrackApi.pickDirectory();
+                    if (!picked) return;
+                    setLibraryRootsDraft((current) => [
+                      ...current,
+                      {
+                        id: makeLocalId(),
+                        isPrimary: current.length === 0,
+                        label: libraryRootFallbackLabel(picked),
+                        path: picked,
+                      },
+                    ]);
+                    setSettingsSaveStatus('idle');
+                  }}
+                  type="button"
+                >
+                  Add Root
+                </button>
+              </div>
+              {libraryRootsDraft.length ? (
+                <div className="library-roots-table">
+                  {libraryRootsDraft.map((root) => (
+                    <div className="library-root-row" key={root.id}>
+                      <label className="primary-radio">
+                        <input
+                          checked={root.isPrimary}
+                          name="primary-library-root"
+                          onChange={() => setPrimaryLibraryRoot(root.id)}
+                          type="radio"
+                        />
+                        Primary
+                      </label>
+                      <label className="field">
+                        <span className="field-label">Label</span>
+                        <input
+                          onChange={(event) => {
+                            const label = event.currentTarget.value;
+                            updateLibraryRoot(root.id, {
+                              label,
+                            });
+                          }}
+                          value={root.label}
+                        />
+                      </label>
+                      <label className="field">
+                        <span className="field-label">Path</span>
+                        <input
+                          onChange={(event) => {
+                            const path = event.currentTarget.value;
+                            updateLibraryRoot(root.id, {
+                              path,
+                            });
+                          }}
+                          value={root.path}
+                        />
+                      </label>
+                      <button
+                        className="ghost-button"
+                        onClick={async () => {
+                          const picked =
+                            await window.vaultTrackApi.pickDirectory();
+                          if (picked) {
+                            updateLibraryRoot(root.id, {
+                              label:
+                                root.label || libraryRootFallbackLabel(picked),
+                              path: picked,
+                            });
+                          }
+                        }}
+                        type="button"
+                      >
+                        Pick
+                      </button>
+                      <button
+                        className="danger-button"
+                        onClick={() => removeLibraryRoot(root.id)}
+                        type="button"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="muted-text">No library roots configured yet.</p>
+              )}
+            </div>
+            {settings.ignoredImportFolders?.length ? (
+              <div className="library-roots-panel">
+                <div className="panel-heading">
+                  <div>
+                    <strong>Ignored import folders</strong>
+                    <p className="muted-text">
+                      Restore a folder when you want it to appear in scans
+                      again.
+                    </p>
+                  </div>
+                </div>
+                <div className="ignored-list">
+                  {settings.ignoredImportFolders.map((ignored) => (
+                    <div className="ignored-row" key={ignored.id}>
+                      <span>
+                        <strong>{ignored.folderName}</strong>
+                        <small>{ignored.rootPath}</small>
+                      </span>
+                      <button
+                        className="ghost-button"
+                        onClick={async () => {
+                          await window.vaultTrackApi.restoreImportFolder({
+                            id: ignored.id,
+                          });
+                          await refreshSettings();
+                        }}
+                        type="button"
+                      >
+                        Restore
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            <div className="action-row">
               <button
                 className="primary-button"
                 disabled={settingsSaveStatus === 'saving'}
@@ -1501,12 +3056,13 @@ function App() {
               <label className="field">
                 <span className="field-label">MyJDownloader email</span>
                 <input
-                  onChange={(event) =>
+                  onChange={(event) => {
+                    const email = event.currentTarget.value;
                     setAuthDraft((current) => ({
                       ...current,
-                      email: event.currentTarget.value,
-                    }))
-                  }
+                      email,
+                    }));
+                  }}
                   value={authDraft.email}
                 />
               </label>
@@ -1518,12 +3074,13 @@ function App() {
                     : ''}
                 </span>
                 <input
-                  onChange={(event) =>
+                  onChange={(event) => {
+                    const password = event.currentTarget.value;
                     setAuthDraft((current) => ({
                       ...current,
-                      password: event.currentTarget.value,
-                    }))
-                  }
+                      password,
+                    }));
+                  }}
                   type="password"
                   value={authDraft.password}
                 />
@@ -1533,12 +3090,13 @@ function App() {
               <label className="field">
                 <span className="field-label">JDownloader device</span>
                 <select
-                  onChange={(event) =>
+                  onChange={(event) => {
+                    const selectedDeviceId = event.currentTarget.value;
                     setAuthDraft((current) => ({
                       ...current,
-                      selectedDeviceId: event.currentTarget.value,
-                    }))
-                  }
+                      selectedDeviceId,
+                    }));
+                  }}
                   value={authDraft.selectedDeviceId}
                 >
                   <option value="">Choose a device</option>
@@ -1628,113 +3186,326 @@ function App() {
         ) : null}
 
         {section === 'imports' ? (
-          <section className="surface-panel">
+          <section className="surface-panel import-surface">
             <div className="panel-heading">
               <div>
                 <p className="panel-title">Imports</p>
                 <p className="muted-text">
-                  Scan one level under your root library and apply Steam matches
-                  to imported folders.
+                  Scan configured library roots, review untracked folders, add
+                  Steam and patch metadata, then save selected rows.
                 </p>
               </div>
             </div>
-            <div className="settings-grid">
-              <label className="field">
-                <span className="field-label">Root library</span>
-                <input
-                  onChange={(event) => setImportRoot(event.currentTarget.value)}
-                  value={importRoot}
-                />
-              </label>
-            </div>
             <div className="action-row">
+              <label className="checkbox-line">
+                <input
+                  checked={includeIgnoredImports}
+                  onChange={(event) => {
+                    const checked = event.currentTarget.checked;
+                    setIncludeIgnoredImports(checked);
+                  }}
+                  type="checkbox"
+                />
+                Include ignored folders
+              </label>
               <button
                 className="ghost-button"
-                onClick={async () => {
-                  const picked = await window.vaultTrackApi.pickDirectory();
-                  if (picked) setImportRoot(picked);
-                }}
+                disabled={importBusy}
+                onClick={() => void scanImportCandidates()}
                 type="button"
               >
-                Pick Root
+                Scan Library Roots
               </button>
+              {importBuildLookupStopped ? (
+                <button
+                  className="ghost-button"
+                  disabled={
+                    importBusy ||
+                    Boolean(
+                      importBuildLookupPausedUntil &&
+                        importBuildLookupPausedUntil > Date.now(),
+                    )
+                  }
+                  onClick={resumeImportPatchHistoryQueue}
+                  type="button"
+                >
+                  Retry Patch History Queue
+                </button>
+              ) : null}
               <button
                 className="primary-button"
-                onClick={async () =>
-                  setItems(
-                    await window.vaultTrackApi.scanImportFolders(importRoot),
-                  )
-                }
+                disabled={importBusy || !importRowsReady}
+                onClick={() => void saveImportRows()}
                 type="button"
               >
-                Scan Root
+                Save Selected Imports
               </button>
             </div>
-            <div className="list-stack">
-              {items
-                .filter((item) => item.item.sourceKind === 'manual')
-                .map((item) => (
-                  <div className="list-card" key={item.item.id}>
-                    <div className="panel-heading">
-                      <div>
-                        <strong>{item.item.title}</strong>
-                        <p className="muted-text">
-                          {candidateMap[item.item.id]?.length
-                            ? `${candidateMap[item.item.id].length} Steam candidates loaded`
-                            : 'No Steam match applied yet'}
-                        </p>
-                      </div>
-                      <button
-                        className="ghost-button"
-                        onClick={async () => {
-                          const results =
-                            await window.vaultTrackApi.resolveSteamMatch({
-                              title: item.item.title,
-                            });
-                          setCandidateMap((current) => ({
-                            ...current,
-                            [item.item.id]: results.candidates,
-                          }));
-                        }}
-                        type="button"
-                      >
-                        Search Steam
-                      </button>
-                    </div>
-                    {(candidateMap[item.item.id] ?? [])
-                      .slice(0, 5)
-                      .map((candidate) => (
-                        <div className="candidate-row" key={candidate.appId}>
-                          <div>
-                            <strong>{candidate.title}</strong>
-                            <p className="muted-text">
-                              {candidate.releaseDate ??
-                                'Release date unavailable'}
-                            </p>
-                          </div>
-                          <button
-                            className="primary-button"
-                            onClick={async () => {
-                              await window.vaultTrackApi.applySteamMatch({
-                                match: {
-                                  appId: candidate.appId,
-                                  coverUrl: candidate.coverUrl,
-                                  matchedAt: new Date().toISOString(),
-                                  normalizedTitle: candidate.normalizedTitle,
-                                  title: candidate.title,
-                                },
-                                trackedItemId: item.item.id,
-                              });
-                              await refreshItems();
-                            }}
-                            type="button"
-                          >
-                            Apply Match
-                          </button>
-                        </div>
-                      ))}
-                  </div>
-                ))}
+            {importMessage ? (
+              <p className="muted-text import-message">{importMessage}</p>
+            ) : null}
+            <div className="import-summary-row">
+              <span>{selectedImportCandidates.length} selected</span>
+              <span>
+                Save requires a Steam match, patch/build metadata, and any
+                duplicate-app override.
+              </span>
+            </div>
+            <div className="import-progress">
+              <div className="import-progress__header">
+                <strong>
+                  Patch history {importPatchHistoryProgress.completed}/
+                  {importPatchHistoryProgress.total}
+                </strong>
+                <span>
+                  {importPatchHistoryProgress.unmatched
+                    ? `${importPatchHistoryProgress.unmatched} unmatched`
+                    : 'All selected rows matched'}
+                </span>
+              </div>
+              <div
+                aria-label="Import patch history progress"
+                aria-valuemax={100}
+                aria-valuemin={0}
+                aria-valuenow={importPatchHistoryProgress.percent}
+                className="import-progress__track"
+                role="progressbar"
+              >
+                <span
+                  className="import-progress__bar"
+                  style={{ width: `${importPatchHistoryProgress.percent}%` }}
+                />
+              </div>
+            </div>
+            <div className="import-table-wrap">
+              <table className="import-table">
+                <thead>
+                  <tr>
+                    <th>Use</th>
+                    <th>Root</th>
+                    <th>Folder</th>
+                    <th>Steam match</th>
+                    <th>Patch metadata</th>
+                    <th>Folder target</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {importCandidates.length ? (
+                    importCandidates.map((candidate) => {
+                      const row = importRows[candidate.id];
+                      const selectedPatch = getSelectedImportPatch(row);
+                      const now = Date.now();
+                      const retryDetail =
+                        getImportPatchHistoryRetryDetail(row, now);
+                      const attentionDetail =
+                        row?.needsUserAttention &&
+                        row.attentionKind === 'cloudflare'
+                          ? 'Complete the browser check to continue.'
+                          : null;
+                      const pauseRemainingMs =
+                        importBuildLookupPausedUntil &&
+                        importBuildLookupPausedUntil > now
+                          ? importBuildLookupPausedUntil - now
+                          : null;
+                      const globalCooldownDetail =
+                        row?.steamMatch &&
+                        !retryDetail &&
+                        pauseRemainingMs &&
+                        importBuildLookupPauseReason === 'rate_limited' &&
+                        row.patchHistoryStatus !== 'gathering' &&
+                        row.patchHistoryStatus !== 'needs_attention'
+                          ? `SteamDB cooldown: ${formatDurationShort(
+                              pauseRemainingMs,
+                            )}`
+                          : null;
+                      const nextSearchDetail =
+                        row &&
+                        !globalCooldownDetail &&
+                        candidate.id === nextImportBuildLookupRowId &&
+                        pauseRemainingMs
+                          ? `Searching in ${formatDurationShort(pauseRemainingMs)}`
+                          : null;
+                      return (
+                        <tr
+                          className={row?.included ? undefined : 'is-muted'}
+                          key={candidate.id}
+                        >
+                          <td>
+                            <input
+                              checked={Boolean(row?.included)}
+                              onChange={(event) => {
+                                const included = event.currentTarget.checked;
+                                updateImportRow(candidate.id, (currentRow) => ({
+                                  ...currentRow,
+                                  included,
+                                }));
+                              }}
+                              type="checkbox"
+                            />
+                          </td>
+                          <td>
+                            <strong>{candidate.rootLabel}</strong>
+                            <small>{candidate.rootPath}</small>
+                          </td>
+                          <td>
+                            <strong>{candidate.folderName}</strong>
+                            <small>{candidate.folderPath}</small>
+                          </td>
+                          <td>
+                            {row?.steamMatch ? (
+                              <>
+                                <strong>{row.steamMatch.title}</strong>
+                                <small>Steam app {row.steamMatch.appId}</small>
+                              </>
+                            ) : (
+                              <span className="muted-text">Needs review</span>
+                            )}
+                            <button
+                              className="ghost-button import-search-button"
+                              onClick={() => openImportSteamSearch(candidate)}
+                              type="button"
+                            >
+                              Search Steam
+                            </button>
+                            {candidate.duplicateSteamMatch ? (
+                              <label className="duplicate-warning">
+                                <input
+                                  checked={Boolean(row?.duplicateOverride)}
+                                  onChange={(event) => {
+                                    const duplicateOverride =
+                                      event.currentTarget.checked;
+                                    updateImportRow(
+                                      candidate.id,
+                                      (currentRow) => ({
+                                        ...currentRow,
+                                        duplicateOverride,
+                                      }),
+                                    );
+                                  }}
+                                  type="checkbox"
+                                />
+                                Already tracked as{' '}
+                                {candidate.duplicateSteamMatch.title}
+                              </label>
+                            ) : null}
+                          </td>
+                          <td>
+                            {selectedPatch ? (
+                              <>
+                                <strong>{selectedPatch.patchTitle}</strong>
+                                <small>{patchSummary(selectedPatch)}</small>
+                              </>
+                            ) : (
+                              <span
+                                className={`import-patch-status import-patch-status--${
+                                  row?.patchHistoryStatus ?? 'idle'
+                                }`}
+                              >
+                                {row?.patchHistoryStatus === 'gathering' ? (
+                                  <span
+                                    aria-hidden="true"
+                                    className="inline-spinner"
+                                  />
+                                ) : null}
+                                {getImportPatchHistoryLabel(row)}
+                              </span>
+                            )}
+                            {row?.patchHistoryStatus === 'needs_attention' &&
+                            row.patchHistoryErrorMessage ? (
+                              <small>{row.patchHistoryErrorMessage}</small>
+                            ) : null}
+                            {attentionDetail ? (
+                              <small>{attentionDetail}</small>
+                            ) : null}
+                            {retryDetail ? <small>{retryDetail}</small> : null}
+                            {!retryDetail && globalCooldownDetail ? (
+                              <small>{globalCooldownDetail}</small>
+                            ) : null}
+                            {!retryDetail && nextSearchDetail ? (
+                              <small>{nextSearchDetail}</small>
+                            ) : null}
+                            <div className="inline-controls">
+                              {row?.buildTableLoaded ? (
+                                <button
+                                  className="ghost-button"
+                                  disabled={!row?.steamMatch}
+                                  onClick={() => openImportPatchSelector(candidate)}
+                                  type="button"
+                                >
+                                  Select Patch
+                                </button>
+                              ) : null}
+                              <button
+                                className="ghost-button"
+                                disabled={!row?.steamMatch}
+                                onClick={() => openManualImportPatch(candidate)}
+                                type="button"
+                              >
+                                Use Manual
+                              </button>
+                              {row?.patchHistoryStatus === 'needs_attention' ? (
+                                <button
+                                  className="ghost-button"
+                                  disabled={!row?.steamMatch}
+                                  onClick={() => retryImportPatchHistory(candidate)}
+                                  type="button"
+                                >
+                                  Retry
+                                </button>
+                              ) : null}
+                              {row?.patchHistoryStatus === 'needs_attention' ? (
+                                <button
+                                  className="ghost-button"
+                                  disabled={!row?.steamMatch}
+                                  onClick={() =>
+                                    void openSteamDbBuildBackfillPage(candidate)
+                                  }
+                                  type="button"
+                                >
+                                  Open SteamDB Challenge
+                                </button>
+                              ) : null}
+                            </div>
+                          </td>
+                          <td>
+                            <strong>
+                              {importRenameTarget(
+                                candidate,
+                                row,
+                                settings.renameGameFoldersOnImport ?? true,
+                              )}
+                            </strong>
+                            <small>
+                              {settings.renameGameFoldersOnImport ?? true
+                                ? 'Uses Settings rename-on-import'
+                                : 'Keeps discovered folder name'}
+                            </small>
+                          </td>
+                          <td>
+                            <button
+                              className="danger-button"
+                              onClick={() =>
+                                void ignoreImportCandidate(candidate)
+                              }
+                              type="button"
+                            >
+                              Ignore
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  ) : (
+                    <tr>
+                      <td colSpan={7}>
+                        No scan results yet. Configure roots in Settings, then
+                        scan library roots.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
             </div>
           </section>
         ) : null}
@@ -1767,6 +3538,303 @@ function App() {
           </section>
         ) : null}
       </main>
+      {importSteamSearch ? (
+        <div className="modal-backdrop" role="presentation">
+          <div
+            className="modal-panel steam-search-modal"
+            role="dialog"
+            aria-modal="true"
+          >
+            <div className="panel-heading retry-modal__heading">
+              <div>
+                <p className="panel-title">Search Steam</p>
+                <p className="muted-text">
+                  {importSteamSearch.candidate.folderName}
+                </p>
+              </div>
+              <button
+                aria-label="Close Steam search"
+                className="modal-close-button"
+                onClick={() => setImportSteamSearch(null)}
+                type="button"
+              >
+                x
+              </button>
+            </div>
+            <form
+              className="steam-search-row"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void searchImportSteamMatch();
+              }}
+            >
+              <label className="field steam-search-field">
+                <span className="field-label">Steam title search</span>
+                <input
+                  onChange={(event) => {
+                    const query = event.currentTarget.value;
+                    setImportSteamSearch((current) =>
+                      current
+                        ? { ...current, query }
+                        : current,
+                    );
+                  }}
+                  value={importSteamSearch.query}
+                />
+              </label>
+              <button
+                className="ghost-button"
+                disabled={
+                  importSteamSearch.loading || !importSteamSearch.query.trim()
+                }
+                type="submit"
+              >
+                {importSteamSearch.loading ? 'Searching...' : 'Search'}
+              </button>
+            </form>
+            {importSteamSearch.error ? (
+              <p className="muted-text">{importSteamSearch.error}</p>
+            ) : null}
+            <div className="candidate-list import-candidate-list">
+              {importSteamSearch.loading ? (
+                <p className="muted-text">Loading Steam candidates...</p>
+              ) : null}
+              {!importSteamSearch.loading &&
+              importSteamSearch.candidates.length === 0 ? (
+                <p className="muted-text">
+                  Steam candidates will appear here after searching.
+                </p>
+              ) : null}
+              {!importSteamSearch.loading
+                ? importSteamSearch.candidates.slice(0, 8).map((candidate) => (
+                    <button
+                      aria-selected={
+                        importSteamSearch.selectedAppId === candidate.appId
+                      }
+                      className={`candidate-row selection-row ${
+                        importSteamSearch.selectedAppId === candidate.appId
+                          ? 'is-selected'
+                          : ''
+                      }`}
+                      key={candidate.appId}
+                      onClick={() =>
+                        setImportSteamSearch((current) =>
+                          current
+                            ? { ...current, selectedAppId: candidate.appId }
+                            : current,
+                        )
+                      }
+                      type="button"
+                    >
+                      <div className="candidate-choice">
+                        <div>
+                          <strong>{candidate.title}</strong>
+                          <div className="candidate-meta">
+                            <span>
+                              {candidate.releaseDate ??
+                                'Release date unavailable'}
+                            </span>
+                            <span>Steam app {candidate.appId}</span>
+                          </div>
+                        </div>
+                      </div>
+                    </button>
+                  ))
+                : null}
+            </div>
+            <div className="action-row">
+              <button
+                className="ghost-button"
+                onClick={() => setImportSteamSearch(null)}
+                type="button"
+              >
+                Cancel
+              </button>
+              <button
+                className="primary-button"
+                disabled={
+                  importSteamSearch.loading || !importSteamSearch.selectedAppId
+                }
+                onClick={applyImportSteamSearchSelection}
+                type="button"
+              >
+                Apply Match
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {importPatchSelector
+        ? (() => {
+            const row = importRows[importPatchSelector.candidate.id];
+            const patches = row?.patches ?? [];
+            return (
+              <div className="modal-backdrop" role="presentation">
+                <div
+                  className="modal-panel patch-modal"
+                  role="dialog"
+                  aria-modal="true"
+                >
+                  <div className="panel-heading retry-modal__heading">
+                    <div>
+                      <p className="panel-title">Select Patch</p>
+                      <p className="muted-text">
+                        {importPatchSelector.candidate.folderName}
+                      </p>
+                    </div>
+                    <button
+                      aria-label="Close patch selector"
+                      className="modal-close-button"
+                      onClick={() => setImportPatchSelector(null)}
+                      type="button"
+                    >
+                      x
+                    </button>
+                  </div>
+                  {row?.patchesLoading ? (
+                    <p className="muted-text">Loading SteamDB patches...</p>
+                  ) : null}
+                  {!row?.patchesLoading && patches.length === 0 ? (
+                    <p className="muted-text">
+                      No SteamDB patches are loaded for this app yet. You can
+                      still add metadata manually.
+                    </p>
+                  ) : null}
+                  <div className="patch-list" role="listbox">
+                    {patches.map((patch) => {
+                      const key = patchCandidateKey(patch);
+                      const selected = key === importPatchSelector.selectedKey;
+                      return (
+                        <button
+                          aria-selected={selected}
+                          className={`patch-option ${selected ? 'is-selected' : ''}`}
+                          key={key}
+                          onClick={() =>
+                            setImportPatchSelector((current) =>
+                              current ? { ...current, selectedKey: key } : current,
+                            )
+                          }
+                          role="option"
+                          type="button"
+                        >
+                          <span>{patch.patchTitle}</span>
+                          <small>{patchSummary(patch)}</small>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="action-row">
+                    <button
+                      className="ghost-button"
+                      onClick={() => setImportPatchSelector(null)}
+                      type="button"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      className="primary-button"
+                      disabled={
+                        !importPatchSelector.selectedKey || row?.patchesLoading
+                      }
+                      onClick={applyImportPatchSelection}
+                      type="button"
+                    >
+                      Apply Patch
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          })()
+        : null}
+      {importManualPatch ? (
+        <div className="modal-backdrop" role="presentation">
+          <div
+            className="modal-panel patch-modal"
+            role="dialog"
+            aria-modal="true"
+          >
+            <div className="panel-heading retry-modal__heading">
+              <div>
+                <p className="panel-title">Manual Patch Metadata</p>
+                <p className="muted-text">
+                  {importManualPatch.candidate.folderName}
+                </p>
+              </div>
+              <button
+                aria-label="Close manual metadata"
+                className="modal-close-button"
+                onClick={() => setImportManualPatch(null)}
+                type="button"
+              >
+                x
+              </button>
+            </div>
+            <div className="settings-grid">
+              <label className="field">
+                <span className="field-label">Version</span>
+                <input
+                  onChange={(event) => {
+                    const version = event.currentTarget.value;
+                    setImportManualPatch((current) =>
+                      current ? { ...current, error: null, version } : current,
+                    );
+                  }}
+                  placeholder="1.0.4"
+                  value={importManualPatch.version}
+                />
+              </label>
+              <label className="field">
+                <span className="field-label">Build ID</span>
+                <input
+                  onChange={(event) => {
+                    const buildId = event.currentTarget.value;
+                    setImportManualPatch((current) =>
+                      current ? { ...current, buildId, error: null } : current,
+                    );
+                  }}
+                  placeholder="22852168"
+                  value={importManualPatch.buildId}
+                />
+              </label>
+              <label className="field">
+                <span className="field-label">Release date</span>
+                <input
+                  onChange={(event) => {
+                    const releaseDate = event.currentTarget.value;
+                    setImportManualPatch((current) =>
+                      current
+                        ? { ...current, error: null, releaseDate }
+                        : current,
+                    );
+                  }}
+                  type="date"
+                  value={importManualPatch.releaseDate}
+                />
+              </label>
+            </div>
+            {importManualPatch.error ? (
+              <p className="muted-text">{importManualPatch.error}</p>
+            ) : null}
+            <div className="action-row">
+              <button
+                className="ghost-button"
+                onClick={() => setImportManualPatch(null)}
+                type="button"
+              >
+                Cancel
+              </button>
+              <button
+                className="primary-button"
+                onClick={saveManualImportPatch}
+                type="button"
+              >
+                Use Manual Metadata
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {retrySelection
         ? (() => {
             const fullRows = retrySelection.item.downloadMirrors.filter(

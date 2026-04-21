@@ -107,6 +107,103 @@ function rss(items: SteamPatchCandidate[]): string {
   `;
 }
 
+function steamCoverPayload(appId: number, fileName: string): string {
+  return JSON.stringify({
+    response: {
+      store_items: [
+        {
+          appid: appId,
+          assets: {
+            asset_url_format: `steam/apps/${appId}/\${FILENAME}?t=1234`,
+            library_capsule_2x: fileName,
+          },
+        },
+      ],
+    },
+  });
+}
+
+function mockSteamNetwork(
+  candidates: Array<{ appId: number; title: string; coverUrl?: string | null }>,
+) {
+  return vi.fn(async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    if (url.hostname === 'store.steampowered.com') {
+      if (url.pathname.includes('/api/storesearch')) {
+        const term = (url.searchParams.get('term') ?? '').toLowerCase();
+        const match = candidates.find(
+          (candidate) =>
+            candidate.title.toLowerCase() === term ||
+            candidate.title.toLowerCase().includes(term) ||
+            term.includes(candidate.title.toLowerCase()),
+        );
+        return new Response(
+          JSON.stringify({
+            items: match
+              ? [
+                  {
+                    id: match.appId,
+                    name: match.title,
+                    released: 'Apr 19, 2026',
+                    tiny_image: match.coverUrl ?? null,
+                  },
+                ]
+              : [],
+          }),
+          { status: 200 },
+        );
+      }
+
+      if (url.pathname.includes('/api/appdetails')) {
+        const appId = Number(url.searchParams.get('appids'));
+        return new Response(
+          JSON.stringify({
+            [appId]: {
+              data: {
+                release_date: { date: 'Apr 19, 2026' },
+                type: 'game',
+              },
+              success: true,
+            },
+          }),
+          { status: 200 },
+        );
+      }
+    }
+
+    if (url.hostname === 'api.steampowered.com') {
+      const inputJson = JSON.parse(
+        url.searchParams.get('input_json') ?? '{}',
+      ) as {
+        ids?: Array<{ appid?: number }>;
+      };
+      const appId = inputJson.ids?.[0]?.appid ?? 0;
+      return new Response(steamCoverPayload(appId, 'library_capsule_2x.jpg'), {
+        status: 200,
+      });
+    }
+
+    if (url.hostname === 'steamdb.info') {
+      const appId = Number(url.searchParams.get('appid'));
+      return new Response(
+        rss([
+          {
+            ...selectedPatch,
+            appId,
+            buildId: String(appId * 100),
+            link: `https://steamdb.info/patchnotes/${appId * 100}/?utm_source=rss`,
+            patchTitle: `App ${appId} update`,
+            title: `App ${appId} update`,
+          },
+        ]),
+        { status: 200 },
+      );
+    }
+
+    return new Response('', { status: 404 });
+  });
+}
+
 function steamRipSourceHtml(params: {
   buildId: string;
   mirrorUrl: string;
@@ -256,6 +353,351 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe('VaultTrackService import workflow', () => {
+  it('migrates a single root into library roots and mirrors the primary root', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const firstRoot = join(tempRoot, 'Library A');
+      const secondRoot = join(tempRoot, 'Library B');
+      database.setSetting('library.rootPath', firstRoot);
+
+      const service = createService(database);
+      expect(service.getSettings()).toMatchObject({
+        libraryRoots: [
+          {
+            isPrimary: true,
+            label: 'Library A',
+            path: firstRoot,
+          },
+        ],
+        renameGameFoldersOnImport: true,
+        rootLibraryPath: firstRoot,
+      });
+
+      const saved = service.saveSettings({
+        libraryRoots: [
+          {
+            id: 'root-a',
+            isPrimary: false,
+            label: 'Archive A',
+            path: firstRoot,
+          },
+          {
+            id: 'root-b',
+            isPrimary: true,
+            label: 'Archive B',
+            path: secondRoot,
+          },
+        ],
+        renameGameFoldersOnImport: false,
+      });
+
+      expect(saved).toMatchObject({
+        renameGameFoldersOnImport: false,
+        rootLibraryPath: secondRoot,
+      });
+      expect(service.getSettings().libraryRoots).toEqual([
+        {
+          id: 'root-a',
+          isPrimary: false,
+          label: 'Archive A',
+          path: firstRoot,
+        },
+        {
+          id: 'root-b',
+          isPrimary: true,
+          label: 'Archive B',
+          path: secondRoot,
+        },
+      ]);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('scans multiple roots while excluding staging, ignored folders, and tracked install paths', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootA = join(tempRoot, 'Library A');
+      const rootB = join(tempRoot, 'Library B');
+      await mkdir(join(rootA, 'Keep Game'), { recursive: true });
+      await mkdir(join(rootA, 'Ignored Game'), { recursive: true });
+      await mkdir(join(rootA, '_STAGING'), { recursive: true });
+      await mkdir(join(rootB, 'Tracked Game'), { recursive: true });
+      await mkdir(join(rootB, 'Duplicate Game'), { recursive: true });
+      database.setSetting(
+        'library.roots',
+        JSON.stringify([
+          {
+            id: 'root-a',
+            isPrimary: true,
+            label: 'A',
+            path: rootA,
+          },
+          {
+            id: 'root-b',
+            isPrimary: false,
+            label: 'B',
+            path: rootB,
+          },
+        ]),
+      );
+      database.setSetting(
+        'import.ignoredFolders',
+        JSON.stringify([
+          {
+            folderName: 'Ignored Game',
+            id: 'ignored-game',
+            ignoredAt: '2026-04-20T00:00:00.000Z',
+            rootPath: rootA,
+          },
+        ]),
+      );
+      const tracked = database.upsertTrackedItem({
+        normalizedTitle: 'tracked game',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:tracked',
+        title: 'Tracked Game',
+      });
+      database.upsertInstallRecord({
+        installPath: join(rootB, 'Tracked Game'),
+        installedAt: '2026-04-20',
+        installedBuildId: '1',
+        installedVersion: '1',
+        trackedItemId: tracked.id,
+        updatedAt: '2026-04-20T00:00:00.000Z',
+      });
+      const duplicate = database.upsertTrackedItem({
+        normalizedTitle: 'duplicate game',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:duplicate',
+        title: 'Duplicate Game',
+      });
+      database.upsertSteamMatch(duplicate.id, {
+        appId: 222,
+        coverUrl: null,
+        matchedAt: '2026-04-20T00:00:00.000Z',
+        normalizedTitle: 'duplicate game',
+        title: 'Duplicate Game',
+      });
+      vi.stubGlobal(
+        'fetch',
+        mockSteamNetwork([
+          { appId: 111, title: 'Keep Game' },
+          { appId: 222, title: 'Duplicate Game' },
+        ]),
+      );
+
+      const candidates = await createService(database).scanImportCandidates();
+
+      expect(candidates.map((candidate) => candidate.folderName).sort()).toEqual(
+        ['Duplicate Game', 'Keep Game'],
+      );
+      expect(
+        candidates.find((candidate) => candidate.folderName === 'Keep Game')
+          ?.autoSelectedSteamMatch?.appId,
+      ).toBe(111);
+      expect(
+        candidates.find(
+          (candidate) => candidate.folderName === 'Duplicate Game',
+        )?.duplicateSteamMatch,
+      ).toMatchObject({
+        trackedItemId: duplicate.id,
+        title: 'Duplicate Game',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('saves imports with manual snapshots, install paths, patches, and title-only rename', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootPath = join(tempRoot, 'Library');
+      const folderPath = join(rootPath, 'Odd Folder');
+      const finalPath = join(rootPath, 'Clean Game');
+      await mkdir(folderPath, { recursive: true });
+      await writeFile(join(folderPath, 'game.exe'), 'game');
+      database.setSetting('library.rootPath', rootPath);
+      vi.stubGlobal('fetch', mockSteamNetwork([]));
+      const service = createService(database);
+      const patch: SteamPatchCandidate = {
+        appId: 333,
+        buildId: '333999',
+        link: 'manual:patch',
+        patchDate: '2026-04-20',
+        patchTitle: 'Version 1.2.3',
+        publishedAt: '2026-04-20T00:00:00.000Z',
+        selectionSource: 'manual',
+        title: 'Clean Game patch',
+        version: '1.2.3',
+      };
+
+      const result = await service.saveImportBatch({
+        rows: [
+          {
+            folderName: 'Odd Folder',
+            folderPath,
+            installedAt: '2026-04-20',
+            installedBuildId: '333999',
+            installedVersion: '1.2.3',
+            renameFolder: true,
+            rootPath,
+            selectedSteamPatch: patch,
+            steamMatch: {
+              appId: 333,
+              coverUrl: null,
+              matchedAt: '2026-04-20T00:00:00.000Z',
+              normalizedTitle: 'clean game',
+              title: 'Clean: Game?',
+            },
+            steamPatchEntries: [patch],
+          },
+        ],
+      });
+
+      const imported = result.imported[0];
+      expect(imported.item.sourceKind).toBe('manual');
+      expect(imported.item.sourceUrl).toBe(
+        `manual:import:${imported.item.id}`,
+      );
+      expect(existsSync(folderPath)).toBe(false);
+      await expect(readFile(join(finalPath, 'game.exe'), 'utf8')).resolves.toBe(
+        'game',
+      );
+      expect(database.getSourceSnapshot(imported.item.id)).toMatchObject({
+        observedBuildId: '333999',
+        observedVersion: '1.2.3',
+        patchSelectionSource: 'manual',
+        sourceKind: 'manual',
+        sourceUrl: `manual:import:${imported.item.id}`,
+      });
+      expect(database.getInstallRecord(imported.item.id)).toMatchObject({
+        installPath: finalPath,
+        installedBuildId: '333999',
+        installedVersion: '1.2.3',
+      });
+      expect(database.listPatchEntries(imported.item.id)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            buildId: '333999',
+            selectionSource: 'manual',
+          }),
+        ]),
+      );
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('blocks rename collisions before writing import records', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootPath = join(tempRoot, 'Library');
+      const folderPath = join(rootPath, 'Odd Folder');
+      await mkdir(folderPath, { recursive: true });
+      await mkdir(join(rootPath, 'Clean Game'), { recursive: true });
+      vi.stubGlobal('fetch', mockSteamNetwork([]));
+      const service = createService(database);
+      const patch: SteamPatchCandidate = {
+        appId: 334,
+        buildId: '334999',
+        link: 'manual:patch',
+        patchDate: '2026-04-20',
+        patchTitle: 'Version 1.0',
+        publishedAt: '2026-04-20T00:00:00.000Z',
+        selectionSource: 'manual',
+        title: 'Clean Game patch',
+        version: '1.0',
+      };
+
+      await expect(
+        service.saveImportBatch({
+          rows: [
+            {
+              folderName: 'Odd Folder',
+              folderPath,
+              renameFolder: true,
+              rootPath,
+              selectedSteamPatch: patch,
+              steamMatch: {
+                appId: 334,
+                coverUrl: null,
+                matchedAt: '2026-04-20T00:00:00.000Z',
+                normalizedTitle: 'clean game',
+                title: 'Clean Game',
+              },
+            },
+          ],
+        }),
+      ).rejects.toThrow(/Import target already exists/);
+
+      expect(database.listTrackedItems()).toHaveLength(0);
+      expect(existsSync(folderPath)).toBe(true);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('tracks pending, completed, failed, and expired SteamDB build lookups', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const service = createService(database);
+      const pending = service.requestSteamDbBuildLookup(444);
+
+      expect(service.listPendingSteamDbBuildLookups()).toEqual([pending]);
+      expect(
+        service.updateSteamDbBuildLookup({
+          appId: 444,
+          attentionKind: 'cloudflare',
+          errorMessage: 'Cloudflare validation needed.',
+          lookupId: pending.id,
+          needsUserAttention: true,
+        }),
+      ).toMatchObject({
+        attentionKind: 'cloudflare',
+        errorMessage: 'Cloudflare validation needed.',
+        needsUserAttention: true,
+        status: 'pending',
+      });
+      expect(
+        service.completeSteamDbBuildLookup({
+          appId: 444,
+          lookupId: pending.id,
+          patches: [{ ...selectedPatch, appId: 444 }],
+        }),
+      ).toMatchObject({
+        appId: 444,
+        patches: [{ appId: 444 }],
+        status: 'complete',
+      });
+
+      const failed = service.requestSteamDbBuildLookup(445);
+      expect(
+        service.completeSteamDbBuildLookup({
+          appId: 445,
+          errorKind: 'rate_limited',
+          errorMessage: 'Extension unavailable',
+          lookupId: failed.id,
+          retryAfterMs: 120000,
+        }),
+      ).toMatchObject({
+        errorKind: 'rate_limited',
+        errorMessage: 'Extension unavailable',
+        retryAfterMs: 120000,
+        status: 'failed',
+      });
+
+      const expired = service.requestSteamDbBuildLookup(446);
+      expired.updatedAt = '2000-01-01T00:00:00.000Z';
+      expect(service.listPendingSteamDbBuildLookups()).not.toContain(expired);
+      expect(service.getSteamDbBuildLookup(expired.id)).toBeNull();
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+});
+
 describe('VaultTrackService SteamDB patch workflow', () => {
   it('resolves SteamDB patches from the selected app id feed URL', async () => {
     const { database, tempRoot } = await openTestDatabase();
@@ -319,6 +761,159 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       });
       expect(view.selectedPatch?.buildId).toBe('22852168');
       expect(view.versionsBehindLatest).toBe(0);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('stores the Steam library capsule when adding a matched item', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL) => {
+          const url = new URL(String(input));
+          if (url.hostname === 'api.steampowered.com') {
+            return new Response(
+              steamCoverPayload(
+                steamMatch.appId,
+                'cover-hash/library_capsule_2x.jpg',
+              ),
+              { status: 200 },
+            );
+          }
+
+          return new Response(rss([selectedPatch]), { status: 200 });
+        }),
+      );
+
+      const view = await createService(database).addTrackedItem({
+        parsedSource: {
+          ...parsedSource,
+          coverUrl: 'https://steamrip.com/cropped-source-cover.jpg',
+        },
+        queueDownload: false,
+        selectedDownloads: { fullUrl: 'https://gofile.io/d/full' },
+        selectedSteamPatch: selectedPatch,
+        steamMatch: {
+          ...steamMatch,
+          coverUrl: 'https://store.akamai.steamstatic.com/capsule_231x87.jpg',
+        },
+      });
+
+      expect(view.item.coverUrl).toBe(
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2416450/cover-hash/library_capsule_2x.jpg?t=1234',
+      );
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('stores the Steam library capsule when applying a Steam match', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        coverUrl: 'https://ankergames.net/poster.png',
+        normalizedTitle: parsedSource.normalizedTitle,
+        sourceKind: parsedSource.sourceKind,
+        sourceUrl: parsedSource.sourceUrl,
+        title: parsedSource.title,
+      });
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () =>
+          new Response(
+            steamCoverPayload(
+              steamMatch.appId,
+              'applied-cover/library_capsule_2x.jpg',
+            ),
+            { status: 200 },
+          ),
+        ),
+      );
+
+      const view = await createService(database).applySteamMatch(
+        item.id,
+        steamMatch,
+      );
+
+      expect(view.item.coverUrl).toBe(
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2416450/applied-cover/library_capsule_2x.jpg?t=1234',
+      );
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('backfills noncanonical Steam match covers without touching unmatched source covers', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const matched = database.upsertTrackedItem({
+        coverUrl: 'https://ankergames.net/source-poster.png',
+        normalizedTitle: 'matched game',
+        sourceKind: 'manual',
+        sourceUrl: null,
+        title: 'Matched Game',
+      });
+      const alreadyCanonical = database.upsertTrackedItem({
+        normalizedTitle: 'canonical game',
+        sourceKind: 'manual',
+        sourceUrl: null,
+        title: 'Canonical Game',
+      });
+      const unmatched = database.upsertTrackedItem({
+        coverUrl: 'https://ankergames.net/unmatched-poster.png',
+        normalizedTitle: 'unmatched game',
+        sourceKind: 'manual',
+        sourceUrl: null,
+        title: 'Unmatched Game',
+      });
+      database.upsertSteamMatch(matched.id, {
+        appId: 111,
+        coverUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/111/hash/capsule_231x87.jpg',
+        matchedAt: '2026-04-20T12:00:00.000Z',
+        normalizedTitle: 'matched game',
+        title: 'Matched Game',
+      });
+      database.upsertSteamMatch(alreadyCanonical.id, {
+        appId: 222,
+        coverUrl:
+          'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/222/hash/library_capsule_2x.jpg?t=1',
+        matchedAt: '2026-04-20T12:00:00.000Z',
+        normalizedTitle: 'canonical game',
+        title: 'Canonical Game',
+      });
+      const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+        const url = new URL(String(input));
+        const inputJson = JSON.parse(url.searchParams.get('input_json') ?? '{}');
+        return new Response(
+          steamCoverPayload(
+            Number(inputJson.ids?.[0]?.appid),
+            'backfill/library_capsule_2x.jpg',
+          ),
+          { status: 200 },
+        );
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const service = createService(database);
+      const views = await service.listTrackedItems();
+      const matchedView = views.find((view) => view.item.id === matched.id);
+      const canonicalView = views.find(
+        (view) => view.item.id === alreadyCanonical.id,
+      );
+      const unmatchedView = views.find((view) => view.item.id === unmatched.id);
+
+      expect(matchedView?.item.coverUrl).toBe(
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/111/backfill/library_capsule_2x.jpg?t=1234',
+      );
+      expect(canonicalView?.item.coverUrl).toBe(
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/222/hash/library_capsule_2x.jpg?t=1',
+      );
+      expect(unmatchedView?.item.coverUrl).toBe(
+        'https://ankergames.net/unmatched-poster.png',
+      );
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }

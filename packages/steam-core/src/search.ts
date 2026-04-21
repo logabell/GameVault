@@ -8,14 +8,20 @@ import {
   rankSteamCandidates,
   shouldAutoSelect,
 } from './matching.js';
+import { resolveSteamLibraryCoverUrl } from './covers.js';
 
 const STORE_SEARCH_URL = 'https://store.steampowered.com/search/';
 const STORE_SEARCH_API_URL = 'https://store.steampowered.com/api/storesearch/';
 const STORE_APP_DETAILS_API_URL =
   'https://store.steampowered.com/api/appdetails';
+const STEAM_COMMUNITY_APP_SEARCH_URL =
+  'https://steamcommunity.com/actions/SearchApps/';
 const MAX_CANDIDATES_PER_QUERY = 12;
 
-type SteamCandidateSource = 'steam_store_api' | 'steam_store_html';
+type SteamCandidateSource =
+  | 'steam_community_api'
+  | 'steam_store_api'
+  | 'steam_store_html';
 
 type RawSteamCandidate = Omit<
   SteamCandidate,
@@ -60,7 +66,10 @@ function buildSearchPlan(
 
 function steamHeaders(): HeadersInit {
   return {
-    'User-Agent': 'VaultTrack/0.1 (+https://example.invalid/vaulttrack)',
+    Accept: 'application/json, text/html;q=0.9, */*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 VaultTrack/0.1',
   };
 }
 
@@ -164,6 +173,46 @@ async function searchSteamStoreHtml(
   });
 
   return results.slice(0, MAX_CANDIDATES_PER_QUERY);
+}
+
+async function searchSteamCommunityApps(
+  query: string,
+  fetchImpl: typeof fetch,
+): Promise<RawSteamCandidate[]> {
+  const response = await fetchImpl(
+    `${STEAM_COMMUNITY_APP_SEARCH_URL}${encodeURIComponent(query)}`,
+    {
+      headers: steamHeaders(),
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(`Steam Community app search failed with ${response.status}`);
+  }
+
+  const payload = await response.json();
+  const items = Array.isArray(payload) ? payload : [];
+  return items.slice(0, MAX_CANDIDATES_PER_QUERY).flatMap((item) => {
+    const record = asRecord(item);
+    const appId =
+      numberOrNull(record?.appid) ??
+      (typeof record?.appid === 'string' ? Number(record.appid) : null);
+    const title = stringOrNull(record?.name);
+    if (!appId || !title) {
+      return [];
+    }
+
+    return [
+      {
+        appId,
+        coverUrl: stringOrNull(record?.logo) ?? stringOrNull(record?.icon),
+        matchedQuery: query,
+        releaseDate: null,
+        source: 'steam_community_api' as const,
+        title,
+      },
+    ];
+  });
 }
 
 async function fetchAppDetails(
@@ -270,14 +319,48 @@ function onlyBaseGames(candidates: RawSteamCandidate[]): RawSteamCandidate[] {
   });
 }
 
+async function attachSteamLibraryCovers(
+  candidates: SteamCandidate[],
+  fetchImpl: typeof fetch,
+): Promise<SteamCandidate[]> {
+  return Promise.all(
+    candidates.map(async (candidate) => ({
+      ...candidate,
+      coverUrl:
+        (await resolveSteamLibraryCoverUrl(
+          candidate.appId,
+          fetchImpl,
+        ).catch(() => null)) ?? null,
+    })),
+  );
+}
+
 async function fetchCandidatesForQuery(
   query: string,
   fetchImpl: typeof fetch,
 ): Promise<RawSteamCandidate[]> {
   try {
-    return await searchSteamStoreApi(query, fetchImpl);
+    const apiCandidates = await searchSteamStoreApi(query, fetchImpl);
+    if (apiCandidates.length > 0) {
+      return apiCandidates;
+    }
   } catch {
-    return searchSteamStoreHtml(query, fetchImpl);
+    // Try the next public Steam search surface.
+  }
+
+  try {
+    const communityCandidates = await searchSteamCommunityApps(query, fetchImpl);
+    if (communityCandidates.length > 0) {
+      return communityCandidates;
+    }
+  } catch {
+    // Fall back to scraping the store search page below.
+  }
+
+  try {
+    return await searchSteamStoreHtml(query, fetchImpl);
+  } catch {
+    return [];
   }
 }
 
@@ -300,9 +383,10 @@ export async function searchSteamStore(
     fetchImpl,
   );
   const baseGameCandidates = onlyBaseGames(typedCandidates);
-  return filterRelevantSteamCandidates(
+  const candidates = filterRelevantSteamCandidates(
     rankSteamCandidates(rankingQuery, baseGameCandidates),
   );
+  return attachSteamLibraryCovers(candidates, fetchImpl);
 }
 
 export async function resolveSteamMatch(

@@ -1,16 +1,19 @@
 import type {
   AddTrackedItemRequestPayload,
+  CompleteSteamDbBuildLookupPayload,
   ConnectionHealthSummary,
   RemoveTrackedItemPayload,
   RemoveTrackedItemResult,
   RefreshResult,
   SelectedDownloads,
   SettingsView,
+  SteamDbBuildLookupState,
   SteamPatchCandidate,
   SteamPatchFeedResult,
   TrackedItemView,
   SteamMatchResolutionPayload,
   ThemeMode,
+  UpdateSteamDbBuildLookupPayload,
 } from './models.js';
 
 type EmptyPayload = Record<string, never>;
@@ -37,6 +40,18 @@ export type NativeMessageRequest =
   | {
       type: 'resolveSteamPatches';
       payload: { appId: number };
+    }
+  | {
+      type: 'listPendingSteamDbBuildLookups';
+      payload: EmptyPayload;
+    }
+  | {
+      type: 'completeSteamDbBuildLookup';
+      payload: CompleteSteamDbBuildLookupPayload;
+    }
+  | {
+      type: 'updateSteamDbBuildLookup';
+      payload: UpdateSteamDbBuildLookupPayload;
     }
   | {
       type: 'refreshTrackedItem';
@@ -101,6 +116,8 @@ export type NativeMessageRequest =
   | {
       type: 'saveSettings';
       payload: {
+        libraryRoots?: SettingsView['libraryRoots'];
+        renameGameFoldersOnImport?: boolean;
         themeMode?: ThemeMode | null;
         rootLibraryPath?: string | null;
       };
@@ -130,6 +147,21 @@ export type NativeMessageResponse =
       ok: true;
       type: 'resolveSteamPatches';
       payload: SteamPatchFeedResult;
+    }
+  | {
+      ok: true;
+      type: 'listPendingSteamDbBuildLookups';
+      payload: SteamDbBuildLookupState[];
+    }
+  | {
+      ok: true;
+      type: 'completeSteamDbBuildLookup';
+      payload: SteamDbBuildLookupState;
+    }
+  | {
+      ok: true;
+      type: 'updateSteamDbBuildLookup';
+      payload: SteamDbBuildLookupState;
     }
   | {
       ok: true;

@@ -2,13 +2,22 @@ import {
   parseSteamDbAppIdFromUrl,
   parseSteamDbBuildRowText,
   parseSteamDbBuildRowsFromDocument,
-} from '../steamdb-builds.js';
+} from '@vaulttrack/steam-core';
+
+import { detectSteamDbChallenge } from '../steamdb-challenge.js';
 
 const BUTTON_CLASS = 'vaulttrack-steamdb-select';
 const STYLE_ID = 'vaulttrack-steamdb-style';
 const BACKFILL_DEBOUNCE_MS = 500;
 
 type SteamDbContextMode = 'select' | 'backfill';
+type SteamDbBackfillFailure = {
+  kind: 'load_failed' | 'rate_limited';
+  message: string;
+};
+type SteamDbBackfillChallenge = {
+  message: string;
+};
 
 function injectStyles(): void {
   if (document.getElementById(STYLE_ID)) {
@@ -119,8 +128,38 @@ function injectButtons(appId: number): void {
   }
 }
 
+function getSteamDbLoadFailure(): SteamDbBackfillFailure | null {
+  const pageText = document.body?.innerText ?? '';
+  if (/HTTP\s*429/i.test(pageText)) {
+    return {
+      kind: 'rate_limited',
+      message:
+        'SteamDB returned HTTP 429. Pausing build-table lookups before retrying.',
+    };
+  }
+
+  if (/Sorry,\s*failed to load/i.test(pageText) && /ServerError/i.test(pageText)) {
+    return {
+      kind: 'load_failed',
+      message:
+        'SteamDB failed to load the patch table. Try again from the row action.',
+    };
+  }
+
+  return null;
+}
+
+function getSteamDbChallenge(): SteamDbBackfillChallenge | null {
+  const challenge = detectSteamDbChallenge({
+    pageText: document.body?.innerText ?? '',
+    title: document.title ?? '',
+  });
+  return challenge ? { message: challenge.message } : null;
+}
+
 function observeBuildBackfill(appId: number): void {
   let sent = false;
+  let challengeSent = false;
   let observer: MutationObserver | null = null;
   let timer: number | null = null;
   let latestPatches = parseSteamDbBuildRowsFromDocument(document, appId);
@@ -142,8 +181,51 @@ function observeBuildBackfill(appId: number): void {
     });
   };
 
+  const sendFailure = (failure: SteamDbBackfillFailure) => {
+    if (sent) {
+      return;
+    }
+
+    sent = true;
+    if (timer != null) {
+      window.clearTimeout(timer);
+    }
+    observer?.disconnect();
+    void chrome.runtime.sendMessage({
+      appId,
+      errorKind: failure.kind,
+      message: failure.message,
+      type: 'vaulttrack:steamdb-builds-backfill-failed',
+    });
+  };
+
+  const sendChallenge = (challenge: SteamDbBackfillChallenge) => {
+    if (sent || challengeSent) {
+      return;
+    }
+
+    challengeSent = true;
+    void chrome.runtime.sendMessage({
+      appId,
+      message: challenge.message,
+      type: 'vaulttrack:steamdb-builds-challenge-required',
+    });
+  };
+
   const queueBackfill = () => {
     if (sent) {
+      return;
+    }
+
+    const challenge = getSteamDbChallenge();
+    if (challenge) {
+      sendChallenge(challenge);
+      return;
+    }
+
+    const failure = getSteamDbLoadFailure();
+    if (failure) {
+      sendFailure(failure);
       return;
     }
 

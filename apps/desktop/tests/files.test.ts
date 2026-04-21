@@ -14,6 +14,7 @@ import {
   planPortableArchiveExtractPathFromJob,
   planSteamRipExtractPathFromJob,
   removeKnownLibraryPaths,
+  renameLibraryFolder,
   scanImportFolders,
 } from '../src/main/services/files.js';
 
@@ -477,6 +478,35 @@ describe('removeKnownLibraryPaths', () => {
         }),
       ).rejects.toThrow(/Refusing to operate outside/);
       await expect(pathExists(rootLibraryPath)).resolves.toBe(true);
+    } finally {
+      await rm(tempRoot, { force: true, recursive: true });
+    }
+  });
+});
+
+describe('renameLibraryFolder', () => {
+  const itWindows = process.platform === 'win32' ? it : it.skip;
+
+  itWindows('treats case-only target differences as an existing folder no-op', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'vaulttrack-rename-case-'));
+    const rootLibraryPath = join(tempRoot, 'High Seas');
+    const currentPath = join(rootLibraryPath, 'A Little To The Left');
+    const targetPath = join(rootLibraryPath, 'A Little to the Left');
+
+    try {
+      await mkdir(currentPath, { recursive: true });
+      await writeFile(join(currentPath, 'game.exe'), 'game');
+
+      await expect(
+        renameLibraryFolder({
+          currentPath,
+          rootLibraryPath,
+          targetPath,
+        }),
+      ).resolves.toBe(targetPath);
+      await expect(readFile(join(currentPath, 'game.exe'), 'utf8')).resolves.toBe(
+        'game',
+      );
     } finally {
       await rm(tempRoot, { force: true, recursive: true });
     }

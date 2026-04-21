@@ -38,8 +38,18 @@ const api = {
     ipcRenderer.invoke('vault:selectMyJDownloaderDevice', deviceId),
   saveSettings: (payload: unknown) =>
     ipcRenderer.invoke('vault:saveSettings', payload),
-  scanImportFolders: (rootLibraryPath: string) =>
-    ipcRenderer.invoke('vault:scanImportFolders', rootLibraryPath),
+  scanImportCandidates: (payload: unknown) =>
+    ipcRenderer.invoke('vault:scanImportCandidates', payload),
+  ignoreImportFolder: (payload: unknown) =>
+    ipcRenderer.invoke('vault:ignoreImportFolder', payload),
+  restoreImportFolder: (payload: unknown) =>
+    ipcRenderer.invoke('vault:restoreImportFolder', payload),
+  saveImportBatch: (payload: unknown) =>
+    ipcRenderer.invoke('vault:saveImportBatch', payload),
+  requestSteamDbBuildLookup: (appId: number) =>
+    ipcRenderer.invoke('vault:requestSteamDbBuildLookup', appId),
+  getSteamDbBuildLookup: (lookupId: string) =>
+    ipcRenderer.invoke('vault:getSteamDbBuildLookup', lookupId),
   updateInstallRecord: (payload: unknown) =>
     ipcRenderer.invoke('vault:updateInstallRecord', payload),
   updateSourcePatch: (payload: unknown) =>

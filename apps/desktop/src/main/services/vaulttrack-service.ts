@@ -1,19 +1,29 @@
 import type {
   AddTrackedItemRequestPayload,
+  CompleteSteamDbBuildLookupPayload,
   ConnectionHealthSummary,
   ConfirmedSteamMatch,
   DownloadJobPartRecord,
   DownloadJobRecord,
   EventLogRecord,
+  IgnoreImportFolderPayload,
+  IgnoredImportFolderRecord,
   InstallRecord,
+  ImportCandidate,
+  ImportScanPayload,
+  LibraryRootRecord,
   ParsedSourcePayload,
   RefreshResult,
   RemoveTrackedItemPayload,
   RemoveTrackedItemResult,
+  RestoreImportFolderPayload,
+  SaveImportBatchPayload,
+  SaveImportBatchResult,
   SelectedDownloads,
   SourceKind,
   SettingsView,
   SourceSnapshot,
+  SteamDbBuildLookupState,
   ThemeMode,
   SteamPatchCandidate,
   SteamPatchEntry,
@@ -21,6 +31,7 @@ import type {
   SteamMatchResolutionPayload,
   TrackedItemRecord,
   TrackedItemView,
+  UpdateSteamDbBuildLookupPayload,
 } from '@vaulttrack/shared-types';
 import {
   TrackedItemTrackingStatus,
@@ -39,8 +50,11 @@ import {
 import {
   buildSteamDbPatchFeedUrl,
   compareSourceToUpstream,
+  confirmSteamMatch,
   createWatchWindow,
+  isSteamLibraryCoverUrl,
   parseSteamDbPatchCandidates,
+  resolveSteamLibraryCoverUrl,
   resolveSteamMatch as resolveSteamSearch,
 } from '@vaulttrack/steam-core';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -57,6 +71,7 @@ import {
   planLibraryPaths,
   planPortableArchiveExtractPathFromJob,
   pathExists,
+  renameLibraryFolder,
   removeKnownLibraryPaths,
   removeKnownStagingPaths,
   sanitizePathSegment,
@@ -67,6 +82,101 @@ import { MyJDownloaderService } from './myjdownloader.js';
 export type RendererSettingsView = SettingsView;
 
 const STEAMDB_RSS_TIMEOUT_MS = 15000;
+const IMPORT_STEAM_MATCH_CONCURRENCY = 3;
+const STEAMDB_BUILD_LOOKUP_TTL_MS = 5 * 60 * 1000;
+
+function dateStamp(): string {
+  return new Date().toLocaleDateString('en-US', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+  });
+}
+
+function pathKey(value: string): string {
+  return resolve(value).toLowerCase();
+}
+
+function ignoredImportKey(rootPath: string, folderName: string): string {
+  return `${pathKey(rootPath)}\u0000${folderName.toLowerCase()}`;
+}
+
+function libraryRootLabel(path: string): string {
+  return basename(path) || path;
+}
+
+function normalizeLibraryRootsForSave(
+  roots: LibraryRootRecord[],
+): LibraryRootRecord[] {
+  const normalized = roots
+    .map((root, index) => ({
+      id:
+        root.id?.trim() ||
+        `library-root-${Date.now().toString(36)}-${index.toString(36)}`,
+      isPrimary: Boolean(root.isPrimary),
+      label: root.label?.trim() || libraryRootLabel(root.path),
+      path: root.path.trim(),
+    }))
+    .filter((root) => root.path.length > 0);
+
+  if (normalized.length > 0 && !normalized.some((root) => root.isPrimary)) {
+    normalized[0] = { ...normalized[0]!, isPrimary: true };
+  }
+
+  let primarySeen = false;
+  return normalized.map((root) => {
+    if (!root.isPrimary) {
+      return root;
+    }
+
+    if (primarySeen) {
+      return { ...root, isPrimary: false };
+    }
+
+    primarySeen = true;
+    return root;
+  });
+}
+
+function manualImportSourceUrl(trackedItemId: string): string {
+  return `manual:import:${trackedItemId}`;
+}
+
+function buildImportFingerprint(params: {
+  folderPath: string;
+  selectedPatch: SteamPatchCandidate;
+  steamMatch: ConfirmedSteamMatch;
+}): string {
+  return [
+    'manual-import',
+    params.folderPath,
+    params.steamMatch.appId,
+    params.selectedPatch.buildId ?? '',
+    params.selectedPatch.patchDate,
+    params.selectedPatch.version ?? '',
+  ].join('|');
+}
+
+async function mapWithConcurrency<T, R>(
+  values: T[],
+  concurrency: number,
+  mapper: (value: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = [];
+  let nextIndex = 0;
+  const workers = Array.from(
+    { length: Math.min(concurrency, values.length) },
+    async () => {
+      while (nextIndex < values.length) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        results[currentIndex] = await mapper(values[currentIndex]!, currentIndex);
+      }
+    },
+  );
+  await Promise.all(workers);
+  return results;
+}
 
 function isPortableArchiveSourceKind(
   sourceKind: SourceKind | ParsedSourcePayload['sourceKind'] | null | undefined,
@@ -321,6 +431,11 @@ async function fetchWithTimeout(
 
 export class VaultTrackService {
   private readonly downloadQueueLocks = new Set<string>();
+  private readonly steamDbBuildLookups = new Map<
+    string,
+    SteamDbBuildLookupState
+  >();
+  private steamLibraryCoverBackfillPromise: Promise<number> | null = null;
 
   constructor(
     private readonly database: VaultTrackDatabase,
@@ -336,6 +451,7 @@ export class VaultTrackService {
     private readonly sourceFetch: SourceFetch = fetch,
     private readonly renderAnkerGamesSignedDownloadPage?: AnkerGamesSignedDownloadPageRenderer,
     private readonly extractStagedZipArchive: typeof extractSingleStagedZipArchive = extractSingleStagedZipArchive,
+    private readonly steamFetch: typeof fetch = fetch,
   ) {}
 
   private appendEvent(
@@ -345,6 +461,16 @@ export class VaultTrackService {
   ): void {
     this.database.appendEvent({ context, level, message });
     this.notify(level, message);
+  }
+
+  private async withCanonicalSteamCover(
+    match: ConfirmedSteamMatch,
+  ): Promise<ConfirmedSteamMatch> {
+    const coverUrl = await resolveSteamLibraryCoverUrl(
+      match.appId,
+      this.steamFetch,
+    ).catch(() => null);
+    return coverUrl ? { ...match, coverUrl } : match;
   }
 
   private async removeJDownloaderPackagesForJob(
@@ -537,11 +663,12 @@ export class VaultTrackService {
       steamFeedCheck?.feedUrl ??
       (steamMatch ? buildSteamDbPatchFeedUrl(steamMatch.appId) : null);
     const canonicalTitle = steamMatch?.title ?? item.title;
-    const fallbackFinalPath = settings.rootLibraryPath
+    const rootFallbackFinalPath = settings.rootLibraryPath
       ? resolve(
           join(settings.rootLibraryPath, sanitizePathSegment(canonicalTitle)),
         )
       : null;
+    const fallbackFinalPath = installRecord?.installPath ?? rootFallbackFinalPath;
     const stagedElamigosContentExists = Boolean(
       storedDownload &&
       item.sourceKind === 'elamigos' &&
@@ -643,6 +770,7 @@ export class VaultTrackService {
   }
 
   async listTrackedItems(): Promise<TrackedItemView[]> {
+    await this.ensureSteamLibraryCoversBackfilled();
     return Promise.all(
       this.database
         .listTrackedItems()
@@ -766,6 +894,124 @@ export class VaultTrackService {
 
   async resolveSteamPatches(appId: number): Promise<SteamPatchFeedResult> {
     return this.fetchSteamPatchFeed(appId);
+  }
+
+  private pruneSteamDbBuildLookups(): void {
+    const now = Date.now();
+    for (const [id, lookup] of this.steamDbBuildLookups) {
+      const updatedAt = new Date(lookup.updatedAt).getTime();
+      if (Number.isNaN(updatedAt)) {
+        continue;
+      }
+
+      if (now - updatedAt > STEAMDB_BUILD_LOOKUP_TTL_MS) {
+        this.steamDbBuildLookups.delete(id);
+      }
+    }
+  }
+
+  requestSteamDbBuildLookup(appId: number): SteamDbBuildLookupState {
+    this.pruneSteamDbBuildLookups();
+    const now = new Date().toISOString();
+    const existing = [...this.steamDbBuildLookups.values()].find(
+      (lookup) =>
+        lookup.appId === appId &&
+        (lookup.status === 'pending' || lookup.status === 'complete'),
+    );
+    if (existing) {
+      return existing;
+    }
+
+    const lookup: SteamDbBuildLookupState = {
+      attentionKind: null,
+      appId,
+      createdAt: now,
+      id: crypto.randomUUID(),
+      needsUserAttention: false,
+      patches: [],
+      status: 'pending',
+      updatedAt: now,
+    };
+    this.steamDbBuildLookups.set(lookup.id, lookup);
+    return lookup;
+  }
+
+  getSteamDbBuildLookup(id: string): SteamDbBuildLookupState | null {
+    this.pruneSteamDbBuildLookups();
+    return this.steamDbBuildLookups.get(id) ?? null;
+  }
+
+  listPendingSteamDbBuildLookups(): SteamDbBuildLookupState[] {
+    this.pruneSteamDbBuildLookups();
+    return [...this.steamDbBuildLookups.values()].filter(
+      (lookup) => lookup.status === 'pending',
+    );
+  }
+
+  completeSteamDbBuildLookup(
+    payload: CompleteSteamDbBuildLookupPayload,
+  ): SteamDbBuildLookupState {
+    const current =
+      this.steamDbBuildLookups.get(payload.lookupId) ??
+      ({
+        appId: payload.appId,
+        createdAt: new Date().toISOString(),
+        id: payload.lookupId,
+        patches: [],
+        status: 'pending',
+        updatedAt: new Date().toISOString(),
+      } satisfies SteamDbBuildLookupState);
+    const now = new Date().toISOString();
+    const next: SteamDbBuildLookupState = {
+      ...current,
+      attentionKind:
+        payload.needsUserAttention || payload.attentionKind
+          ? (payload.attentionKind ?? 'cloudflare')
+          : null,
+      appId: payload.appId,
+      completedAt: now,
+      errorKind: payload.errorMessage ? (payload.errorKind ?? 'unknown') : null,
+      errorMessage: payload.errorMessage ?? null,
+      id: payload.lookupId,
+      needsUserAttention: Boolean(payload.needsUserAttention),
+      patches: payload.patches ?? [],
+      retryAfterMs: payload.retryAfterMs ?? null,
+      status: payload.errorMessage ? 'failed' : 'complete',
+      updatedAt: now,
+    };
+    this.steamDbBuildLookups.set(next.id, next);
+    return next;
+  }
+
+  updateSteamDbBuildLookup(
+    payload: UpdateSteamDbBuildLookupPayload,
+  ): SteamDbBuildLookupState {
+    const now = new Date().toISOString();
+    const current =
+      this.steamDbBuildLookups.get(payload.lookupId) ??
+      ({
+        appId: payload.appId,
+        createdAt: now,
+        id: payload.lookupId,
+        patches: [],
+        status: 'pending',
+        updatedAt: now,
+      } satisfies SteamDbBuildLookupState);
+    const next: SteamDbBuildLookupState = {
+      ...current,
+      attentionKind:
+        payload.needsUserAttention || payload.attentionKind
+          ? (payload.attentionKind ?? 'cloudflare')
+          : null,
+      appId: payload.appId,
+      errorKind: null,
+      errorMessage: payload.errorMessage ?? null,
+      needsUserAttention: Boolean(payload.needsUserAttention),
+      status: 'pending',
+      updatedAt: now,
+    };
+    this.steamDbBuildLookups.set(next.id, next);
+    return next;
   }
 
   private reconcileSteamPatchWatch(trackedItemId: string): void {
@@ -1112,6 +1358,10 @@ export class VaultTrackService {
       );
     }
 
+    const steamMatch = payload.steamMatch
+      ? await this.withCanonicalSteamCover(payload.steamMatch)
+      : null;
+
     const item = this.database.upsertTrackedItem({
       coverUrl: payload.parsedSource.coverUrl ?? null,
       normalizedTitle: payload.parsedSource.normalizedTitle,
@@ -1152,23 +1402,21 @@ export class VaultTrackService {
       );
     }
 
-    if (payload.steamMatch) {
-      this.database.upsertSteamMatch(item.id, payload.steamMatch);
-      await this.syncSteamPatchFeed(item.id, payload.steamMatch).catch(
-        (error) => {
-          this.appendEvent(
-            'warn',
-            'SteamDB feed sync failed while adding title; continuing with selected patch',
-            {
-              error:
-                error instanceof Error
-                  ? error.message
-                  : 'Unknown SteamDB RSS error',
-              trackedItemId: item.id,
-            },
-          );
-        },
-      );
+    if (steamMatch) {
+      this.database.upsertSteamMatch(item.id, steamMatch);
+      await this.syncSteamPatchFeed(item.id, steamMatch).catch((error) => {
+        this.appendEvent(
+          'warn',
+          'SteamDB feed sync failed while adding title; continuing with selected patch',
+          {
+            error:
+              error instanceof Error
+                ? error.message
+                : 'Unknown SteamDB RSS error',
+            trackedItemId: item.id,
+          },
+        );
+      });
     }
 
     if (payload.queueDownload) {
@@ -1416,6 +1664,11 @@ export class VaultTrackService {
   }
 
   private getExpectedFinalInstallPath(item: TrackedItemRecord): string | null {
+    const installRecord = this.database.getInstallRecord(item.id);
+    if (installRecord?.installPath) {
+      return installRecord.installPath;
+    }
+
     const settings = this.database.getSettings();
     if (settings.rootLibraryPath) {
       const steamMatch = this.database.getSteamMatch(item.id);
@@ -1438,12 +1691,14 @@ export class VaultTrackService {
     this.database.upsertInstallRecord({
       installedAt:
         sourceSnapshot.observedPatchDate ??
-        now.toLocaleDateString('en-US', {
-          day: '2-digit',
-          month: '2-digit',
-          year: 'numeric',
-        }),
+        dateStamp(),
       installedBuildId: sourceSnapshot.observedBuildId ?? null,
+      installPath:
+        this.database.findTrackedItemById(trackedItemId)
+          ? this.getExpectedFinalInstallPath(
+              this.database.findTrackedItemById(trackedItemId)!,
+            )
+          : null,
       installedVersion: sourceSnapshot.observedVersion,
       trackedItemId,
       updatedAt: now.toISOString(),
@@ -1861,12 +2116,9 @@ export class VaultTrackService {
                 this.database.upsertInstallRecord({
                   installedAt:
                     sourceSnapshot.observedPatchDate ??
-                    new Date().toLocaleDateString('en-US', {
-                      day: '2-digit',
-                      month: '2-digit',
-                      year: 'numeric',
-                    }),
+                    dateStamp(),
                   installedBuildId: sourceSnapshot.observedBuildId ?? null,
+                  installPath: job.finalPath,
                   installedVersion: sourceSnapshot.observedVersion,
                   trackedItemId: item.id,
                   updatedAt: new Date().toISOString(),
@@ -1961,6 +2213,41 @@ export class VaultTrackService {
     );
   }
 
+  async backfillSteamLibraryCovers(): Promise<number> {
+    let updated = 0;
+    for (const match of this.database.listSteamMatches()) {
+      if (isSteamLibraryCoverUrl(match.coverUrl)) {
+        continue;
+      }
+
+      const coverUrl = await resolveSteamLibraryCoverUrl(
+        match.appId,
+        this.steamFetch,
+      ).catch(() => null);
+      if (!coverUrl || coverUrl === match.coverUrl) {
+        continue;
+      }
+
+      this.database.upsertSteamMatch(match.trackedItemId, {
+        ...match,
+        coverUrl,
+      });
+      updated += 1;
+    }
+
+    if (updated > 0) {
+      this.appendEvent('info', `Updated ${updated} Steam library covers`);
+    }
+
+    return updated;
+  }
+
+  ensureSteamLibraryCoversBackfilled(): Promise<number> {
+    this.steamLibraryCoverBackfillPromise ??=
+      this.backfillSteamLibraryCovers();
+    return this.steamLibraryCoverBackfillPromise;
+  }
+
   async processDueWatches(now = new Date()): Promise<void> {
     const dueWatches = this.database.listDueWatches(now.toISOString());
     for (const watch of dueWatches) {
@@ -1981,24 +2268,53 @@ export class VaultTrackService {
   getSettings(): RendererSettingsView {
     const settings = this.database.getSettings();
     return {
+      ignoredImportFolders: settings.ignoredImportFolders ?? [],
+      libraryRoots: settings.libraryRoots ?? [],
       myJDownloaderDeviceId: settings.myJDownloaderDeviceId,
       myJDownloaderEmail: settings.myJDownloaderEmail,
       myJDownloaderPasswordConfigured: Boolean(settings.encryptedPassword),
       pollDailyHourLocal: settings.pollDailyHourLocal,
+      renameGameFoldersOnImport: settings.renameGameFoldersOnImport ?? true,
       rootLibraryPath: settings.rootLibraryPath,
       themeMode: settings.themeMode ?? 'system',
     };
   }
 
   saveSettings(input: {
+    libraryRoots?: LibraryRootRecord[];
     myJDownloaderDeviceId?: string | null;
     myJDownloaderEmail?: string | null;
     myJDownloaderPassword?: string | null;
     pollDailyHourLocal?: number;
+    renameGameFoldersOnImport?: boolean;
     rootLibraryPath?: string | null;
     themeMode?: ThemeMode | null;
   }): RendererSettingsView {
-    if (input.rootLibraryPath !== undefined) {
+    if (input.libraryRoots !== undefined) {
+      const libraryRoots = normalizeLibraryRootsForSave(input.libraryRoots);
+      const primaryRoot = libraryRoots.find((root) => root.isPrimary) ?? null;
+      this.database.setSetting('library.roots', JSON.stringify(libraryRoots));
+      this.database.setSetting('library.rootPath', primaryRoot?.path ?? null);
+    } else if (input.rootLibraryPath !== undefined) {
+      const currentRoots = this.database.getSettings().libraryRoots ?? [];
+      const libraryRoots =
+        input.rootLibraryPath?.trim()
+          ? normalizeLibraryRootsForSave([
+              {
+                id: currentRoots[0]?.id ?? 'library-root-primary',
+                isPrimary: true,
+                label:
+                  currentRoots[0]?.label ??
+                  libraryRootLabel(input.rootLibraryPath),
+                path: input.rootLibraryPath,
+              },
+              ...currentRoots.slice(1).map((root) => ({
+                ...root,
+                isPrimary: false,
+              })),
+            ])
+          : [];
+      this.database.setSetting('library.roots', JSON.stringify(libraryRoots));
       this.database.setSetting('library.rootPath', input.rootLibraryPath);
     }
     if (input.myJDownloaderEmail !== undefined) {
@@ -2017,6 +2333,12 @@ export class VaultTrackService {
       this.database.setSetting(
         'scheduler.pollDailyHourLocal',
         String(input.pollDailyHourLocal),
+      );
+    }
+    if (input.renameGameFoldersOnImport !== undefined) {
+      this.database.setSetting(
+        'import.renameGameFoldersOnImport',
+        input.renameGameFoldersOnImport ? 'true' : 'false',
       );
     }
     if (input.themeMode !== undefined) {
@@ -2098,35 +2420,328 @@ export class VaultTrackService {
     };
   }
 
-  async importRootLibrary(rootLibraryPath: string): Promise<TrackedItemView[]> {
-    const imports = await scanImportFolders({ rootLibraryPath });
-    const views: TrackedItemView[] = [];
-    for (const entry of imports) {
-      const item = this.database.upsertTrackedItem({
-        normalizedTitle: entry.normalizedTitle,
-        sourceKind: 'manual',
-        sourceUrl: null,
-        title: entry.title,
-      });
-      views.push(await this.buildTrackedItemView(item.id));
+  private getTrackedInstallPathKeys(): Set<string> {
+    const keys = new Set<string>();
+    for (const installRecord of this.database.listInstallRecords()) {
+      if (installRecord.installPath) {
+        keys.add(pathKey(installRecord.installPath));
+      }
     }
-    this.appendEvent('info', `Imported ${views.length} folders from library`, {
-      rootLibraryPath,
-    });
-    return views;
+
+    for (const item of this.database.listTrackedItems()) {
+      const downloadJob = this.database.getDownloadJob(item.id);
+      if (downloadJob?.finalPath) {
+        keys.add(pathKey(downloadJob.finalPath));
+      }
+
+      const expectedPath = this.getExpectedFinalInstallPath(item);
+      if (expectedPath) {
+        keys.add(pathKey(expectedPath));
+      }
+    }
+
+    return keys;
+  }
+
+  private getDuplicateSteamMatch(
+    appId: number,
+  ): ImportCandidate['duplicateSteamMatch'] {
+    const existing = this.database.findSteamMatchByAppId(appId);
+    if (!existing) {
+      return null;
+    }
+
+    const item = this.database.findTrackedItemById(existing.trackedItemId);
+    return {
+      installPath: this.database.getInstallRecord(existing.trackedItemId)
+        ?.installPath,
+      title: item?.title ?? existing.title,
+      trackedItemId: existing.trackedItemId,
+    };
+  }
+
+  private getIgnoredImportFolders(): IgnoredImportFolderRecord[] {
+    return this.database.getSettings().ignoredImportFolders ?? [];
+  }
+
+  private setIgnoredImportFolders(entries: IgnoredImportFolderRecord[]): void {
+    this.database.setSetting('import.ignoredFolders', JSON.stringify(entries));
+  }
+
+  async scanImportCandidates(
+    payload: ImportScanPayload = {},
+  ): Promise<ImportCandidate[]> {
+    const settings = this.database.getSettings();
+    const selectedRootIds = new Set(payload.rootIds ?? []);
+    const roots = (settings.libraryRoots ?? []).filter(
+      (root) => selectedRootIds.size === 0 || selectedRootIds.has(root.id),
+    );
+    const ignoredFolders = this.getIgnoredImportFolders();
+    const ignoredKeys = new Set(
+      ignoredFolders.map((entry) =>
+        ignoredImportKey(entry.rootPath, entry.folderName),
+      ),
+    );
+    const trackedPathKeys = this.getTrackedInstallPathKeys();
+    const rawCandidates: Array<{
+      folderName: string;
+      folderPath: string;
+      ignored: boolean;
+      normalizedTitle: string;
+      root: LibraryRootRecord;
+      title: string;
+    }> = [];
+
+    for (const root of roots) {
+      const entries = await scanImportFolders({ rootLibraryPath: root.path });
+      for (const entry of entries) {
+        const ignored = ignoredKeys.has(
+          ignoredImportKey(root.path, entry.folderName),
+        );
+        if (ignored && !payload.includeIgnored) {
+          continue;
+        }
+
+        if (trackedPathKeys.has(pathKey(entry.rootPath))) {
+          continue;
+        }
+
+        rawCandidates.push({
+          folderName: entry.folderName,
+          folderPath: entry.rootPath,
+          ignored,
+          normalizedTitle: entry.normalizedTitle,
+          root,
+          title: entry.title,
+        });
+      }
+    }
+
+    return mapWithConcurrency(
+      rawCandidates,
+      IMPORT_STEAM_MATCH_CONCURRENCY,
+      async (entry): Promise<ImportCandidate> => {
+        const matchResolution = await this.resolveSteamMatch(
+          entry.title,
+          'manual',
+          null,
+        ).catch(() => ({
+          autoSelected: false,
+          candidates: [],
+          queryTitle: entry.title,
+          searchQueries: [entry.title],
+          sourceKind: 'manual' as const,
+          sourceUrl: null,
+        }));
+        const autoSelectedSteamMatch =
+          matchResolution.autoSelected && matchResolution.candidates[0]
+            ? confirmSteamMatch(matchResolution.candidates[0])
+            : null;
+
+        return {
+          autoSelectedSteamMatch,
+          duplicateSteamMatch: autoSelectedSteamMatch
+            ? this.getDuplicateSteamMatch(autoSelectedSteamMatch.appId)
+            : null,
+          folderName: entry.folderName,
+          folderPath: entry.folderPath,
+          id: `${entry.root.id}:${entry.folderName}`,
+          ignored: entry.ignored,
+          normalizedTitle: entry.normalizedTitle,
+          rootId: entry.root.id,
+          rootLabel: entry.root.label,
+          rootPath: entry.root.path,
+          steamCandidates: matchResolution.candidates,
+          title: entry.title,
+        };
+      },
+    );
+  }
+
+  ignoreImportFolder(payload: IgnoreImportFolderPayload): IgnoredImportFolderRecord[] {
+    const current = this.getIgnoredImportFolders();
+    const key = ignoredImportKey(payload.rootPath, payload.folderName);
+    if (
+      !current.some((entry) => ignoredImportKey(entry.rootPath, entry.folderName) === key)
+    ) {
+      current.push({
+        folderName: payload.folderName,
+        id: crypto.randomUUID(),
+        ignoredAt: new Date().toISOString(),
+        rootPath: payload.rootPath,
+      });
+      this.setIgnoredImportFolders(current);
+    }
+
+    return this.getIgnoredImportFolders();
+  }
+
+  restoreImportFolder(
+    payload: RestoreImportFolderPayload,
+  ): IgnoredImportFolderRecord[] {
+    this.setIgnoredImportFolders(
+      this.getIgnoredImportFolders().filter((entry) => entry.id !== payload.id),
+    );
+    return this.getIgnoredImportFolders();
+  }
+
+  async saveImportBatch(
+    payload: SaveImportBatchPayload,
+  ): Promise<SaveImportBatchResult> {
+    if (payload.rows.length === 0) {
+      return { imported: [] };
+    }
+
+    const settings = this.database.getSettings();
+    const now = new Date();
+    const validatedRows = await Promise.all(
+      payload.rows.map(async (row) => {
+        if (row.selectedSteamPatch.appId !== row.steamMatch.appId) {
+          throw new Error(
+            `Selected SteamDB patch does not match ${row.steamMatch.title}.`,
+          );
+        }
+
+        const duplicate = this.database.findSteamMatchByAppId(
+          row.steamMatch.appId,
+        );
+        if (duplicate && !row.allowDuplicateSteamApp) {
+          throw new Error(
+            `${row.steamMatch.title} is already tracked. Confirm duplicate import to continue.`,
+          );
+        }
+
+        const renameFolder =
+          row.renameFolder ?? settings.renameGameFoldersOnImport ?? true;
+        const finalPath = renameFolder
+          ? resolve(join(row.rootPath, sanitizePathSegment(row.steamMatch.title)))
+          : resolve(row.folderPath);
+        return {
+          ...row,
+          finalPath,
+          folderPath: resolve(row.folderPath),
+          renameFolder,
+          steamMatch: await this.withCanonicalSteamCover(row.steamMatch),
+        };
+      }),
+    );
+
+    const targetPaths = new Map<string, string>();
+    for (const row of validatedRows) {
+      const targetKey = pathKey(row.finalPath);
+      const sourceKey = pathKey(row.folderPath);
+      const existingSource = targetPaths.get(targetKey);
+      if (existingSource && existingSource !== sourceKey) {
+        throw new Error(`Multiple import rows target ${row.finalPath}.`);
+      }
+      targetPaths.set(targetKey, sourceKey);
+
+      if (row.renameFolder && targetKey !== sourceKey && (await pathExists(row.finalPath))) {
+        throw new Error(`Import target already exists: ${row.finalPath}`);
+      }
+    }
+
+    for (const row of validatedRows) {
+      if (row.renameFolder) {
+        await renameLibraryFolder({
+          currentPath: row.folderPath,
+          rootLibraryPath: row.rootPath,
+          targetPath: row.finalPath,
+        });
+      }
+    }
+
+    const imported: TrackedItemView[] = [];
+    for (const row of validatedRows) {
+      const itemId = crypto.randomUUID();
+      const item = this.database.upsertTrackedItem({
+        coverUrl: row.steamMatch.coverUrl ?? null,
+        id: itemId,
+        normalizedTitle: row.steamMatch.normalizedTitle,
+        sourceKind: 'manual',
+        sourceUrl: manualImportSourceUrl(itemId),
+        title: row.steamMatch.title,
+      });
+      const selectedPatch = row.selectedSteamPatch;
+      const observedVersion =
+        row.installedVersion?.trim() ||
+        selectedPatch.version?.trim() ||
+        selectedPatch.buildId ||
+        'unknown';
+      this.database.upsertSteamMatch(item.id, row.steamMatch);
+      const patchEntries = [
+        ...(row.steamPatchEntries ?? []),
+        selectedPatch,
+      ].filter((entry) => entry.appId === row.steamMatch.appId);
+      this.database.upsertPatchEntries(
+        patchEntries.map((entry) => ({
+          ...entry,
+          selectionSource:
+            entry === selectedPatch
+              ? (selectedPatch.selectionSource ?? 'rss')
+              : (entry.selectionSource ?? 'rss'),
+          trackedItemId: item.id,
+        })),
+      );
+      this.database.upsertSourceSnapshot({
+        checkedAt: now.toISOString(),
+        fingerprint: buildImportFingerprint({
+          folderPath: row.finalPath,
+          selectedPatch,
+          steamMatch: row.steamMatch,
+        }),
+        observedBuildId:
+          row.installedBuildId?.trim() || selectedPatch.buildId || null,
+        observedPatchDate:
+          row.installedAt?.trim() || selectedPatch.patchDate || null,
+        observedPatchLink: selectedPatch.link,
+        observedPatchTitle: selectedPatch.patchTitle,
+        observedVersion,
+        patchSelectionSource: selectedPatch.selectionSource ?? 'rss',
+        sourceKind: 'manual',
+        sourceUrl: manualImportSourceUrl(item.id),
+        trackedItemId: item.id,
+      });
+      this.database.upsertInstallRecord({
+        installPath: row.finalPath,
+        installedAt:
+          row.installedAt?.trim() || selectedPatch.patchDate || dateStamp(),
+        installedBuildId:
+          row.installedBuildId?.trim() || selectedPatch.buildId || null,
+        installedVersion: observedVersion,
+        trackedItemId: item.id,
+        updatedAt: now.toISOString(),
+      });
+      await this.syncSteamPatchFeed(item.id, row.steamMatch).catch((error) => {
+        this.appendEvent(
+          'warn',
+          'SteamDB feed sync failed while importing folder; continuing with selected patch',
+          {
+            error:
+              error instanceof Error ? error.message : 'Unknown SteamDB RSS error',
+            trackedItemId: item.id,
+          },
+        );
+      });
+      imported.push(await this.buildTrackedItemView(item.id));
+    }
+
+    this.appendEvent('info', `Imported ${imported.length} library folders`);
+    return { imported };
   }
 
   async applySteamMatch(
     trackedItemId: string,
     match: ConfirmedSteamMatch,
   ): Promise<TrackedItemView> {
-    this.database.upsertSteamMatch(trackedItemId, match);
+    const steamMatch = await this.withCanonicalSteamCover(match);
+    this.database.upsertSteamMatch(trackedItemId, steamMatch);
     const sourceSnapshot = this.database.getSourceSnapshot(trackedItemId);
     if (sourceSnapshot) {
-      await this.syncSteamPatchFeed(trackedItemId, match);
+      await this.syncSteamPatchFeed(trackedItemId, steamMatch);
     }
     this.appendEvent('info', 'Applied Steam match', {
-      appId: match.appId,
+      appId: steamMatch.appId,
       trackedItemId,
     });
     return this.buildTrackedItemView(trackedItemId);
@@ -2198,12 +2813,18 @@ export class VaultTrackService {
   async updateInstallRecord(params: {
     installedAt?: string | null;
     installedBuildId?: string | null;
+    installPath?: string | null;
     installedVersion?: string | null;
     trackedItemId: string;
   }): Promise<TrackedItemView> {
+    const existing = this.database.getInstallRecord(params.trackedItemId);
     const record: InstallRecord = {
       installedAt: params.installedAt ?? null,
       installedBuildId: params.installedBuildId ?? null,
+      installPath:
+        params.installPath !== undefined
+          ? params.installPath
+          : (existing?.installPath ?? null),
       installedVersion: params.installedVersion ?? null,
       trackedItemId: params.trackedItemId,
       updatedAt: new Date().toISOString(),
@@ -2282,12 +2903,9 @@ export class VaultTrackService {
     this.database.upsertInstallRecord({
       installedAt:
         sourceSnapshot.observedPatchDate ??
-        now.toLocaleDateString('en-US', {
-          day: '2-digit',
-          month: '2-digit',
-          year: 'numeric',
-        }),
+        dateStamp(),
       installedBuildId: sourceSnapshot.observedBuildId ?? null,
+      installPath: installedFinalPath ?? currentJob?.finalPath ?? null,
       installedVersion: sourceSnapshot.observedVersion,
       trackedItemId,
       updatedAt: now.toISOString(),
