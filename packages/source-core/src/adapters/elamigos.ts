@@ -16,6 +16,7 @@ const FULL_LINE_RE =
   /updated\s+to\s+version\s+(?<version>[0-9a-z.\- ]+?)\s*\((?<date>\d{2}\.\d{2}\.\d{4})\)/i;
 const UPDATED_TILL_LINE_RE =
   /updated\s+till\s+(?<date>\d{2}\.\d{2}\.\d{4})/i;
+const EXPLICIT_BUILD_RE = /\bbuild(?:\s*id)?\s*[:#]?\s*(?<build>\d{4,})\b/i;
 const MIRROR_HOST_LABELS = new Map<string, string>([
   ['1fichier.com', '1Fichier'],
   ['filecrypt.cc', 'FileCrypt'],
@@ -31,6 +32,7 @@ function parseReleaseLine(
   text: string,
   isPatch: boolean,
 ): ReleaseDescriptor | null {
+  const explicitBuildId = text.match(EXPLICIT_BUILD_RE)?.groups?.build ?? null;
   if (isPatch) {
     const updateMatch = text.match(UPDATE_LINE_RE);
     if (!updateMatch?.groups) {
@@ -38,7 +40,7 @@ function parseReleaseLine(
     }
 
     return {
-      buildId: updateMatch.groups.version.trim(),
+      buildId: explicitBuildId ?? null,
       isPatch: true,
       label: compactText(text),
       patchDate: ddmmyyyyToMmddyyyy(updateMatch.groups.date),
@@ -49,6 +51,7 @@ function parseReleaseLine(
   const fullMatch = text.match(FULL_LINE_RE);
   if (fullMatch?.groups) {
     return {
+      buildId: explicitBuildId ?? null,
       isPatch: false,
       label: compactText(text),
       patchDate: ddmmyyyyToMmddyyyy(fullMatch.groups.date),

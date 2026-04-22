@@ -225,6 +225,35 @@ function steamRipSourceHtml(params: {
   `;
 }
 
+function elamigosEldenRingHtml(params: {
+  title: string;
+  updateTo: string;
+}): string {
+  return `
+    <html>
+      <body>
+        <h2>${params.title} (2022), 62.44GB</h2>
+        <h3>ElAmigos release. Updated to version 1.12.0 (20.06.2023).</h3>
+        <h2>${params.title.replace(/ Deluxe Edition$/i, '')} update 1.12.0 - ${params.updateTo} (21.08.2025) & crack, 437MB</h2>
+        <a href="https://www.filecrypt.cc/Container/DBBE0ACC87.html">FileCrypt</a>
+      </body>
+    </html>
+  `;
+}
+
+function steamRipEldenRingHtml(params: {
+  buildId: string;
+  title: string;
+  version: string;
+}): string {
+  return steamRipSourceHtml({
+    buildId: params.buildId,
+    mirrorUrl: 'https://gofile.io/d/elden-ring',
+    title: params.title,
+    version: params.version,
+  });
+}
+
 function ankergamesSourceHtml(): string {
   const snapshot = JSON.stringify({
     data: {
@@ -291,6 +320,32 @@ const ankergamesSource: ParsedSourcePayload = {
   sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
   title: 'Shape of Dreams',
 };
+
+function eldenRingParsedSource(params: {
+  buildId?: string | null;
+  patchDate?: string | null;
+  sourceKind: 'ankergames' | 'elamigos' | 'steamrip';
+  sourceUrl: string;
+  version: string;
+}): ParsedSourcePayload {
+  return {
+    coverUrl: null,
+    fingerprint: `${params.sourceKind}-elden-ring`,
+    fullDownloadUrls: [],
+    latestSourceRelease: {
+      buildId: params.buildId ?? null,
+      isPatch: false,
+      label: params.version,
+      patchDate: params.patchDate ?? null,
+      version: params.version,
+    },
+    normalizedTitle: 'elden ring deluxe edition',
+    patchDownloadUrls: [],
+    sourceKind: params.sourceKind,
+    sourceUrl: params.sourceUrl,
+    title: 'Elden Ring Deluxe Edition',
+  };
+}
 
 function createService(
   database: VaultTrackDatabase,
@@ -3757,6 +3812,503 @@ describe('VaultTrackService SteamDB patch workflow', () => {
     }
   });
 
+  it('prefers the closest ElAmigos and SteamRIP fuzzy matches for Elden Ring', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'elden ring',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:elden-ring',
+        title: 'ELDEN RING',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 1245620,
+        coverUrl: null,
+        matchedAt: '2026-04-22T12:00:00.000Z',
+        normalizedTitle: 'elden ring',
+        title: 'ELDEN RING',
+      });
+
+      const sourceFetch = vi.fn(async (input: string) => {
+        if (input === 'https://ankergames.net/game/elden-ring') {
+          return new Response('', { status: 404 });
+        }
+        if (input.startsWith('https://ankergames.net/')) {
+          return new Response('', { status: 503 });
+        }
+        if (input === 'https://elamigos.site/') {
+          return new Response(
+            `
+              <h2>21.08.2025</h2>
+              <h3>Elden Ring Deluxe Edition ElAmigos [Update 1.12.0] +[Update 1.16.1] <a href="/data/Elden_Ring_Deluxe_Edition_MULTi14_-_ElAmigos.html">DOWNLOAD</a></h3>
+              <h3>Elden Ring Nightreign Deluxe Edition ElAmigos [Update 1.03.2] <a href="/data/Elden_Ring_Nightreign_Deluxe_Edition_MULTi14_-_ElAmigos.html">DOWNLOAD</a></h3>
+            `,
+            { status: 200 },
+          );
+        }
+        if (
+          input ===
+          'https://elamigos.site/data/Elden_Ring_Deluxe_Edition_MULTi14_-_ElAmigos.html'
+        ) {
+          return new Response(
+            elamigosEldenRingHtml({
+              title: 'Elden Ring Deluxe Edition',
+              updateTo: '1.16.1',
+            }),
+            { status: 200 },
+          );
+        }
+        if (
+          input ===
+          'https://elamigos.site/data/Elden_Ring_Nightreign_Deluxe_Edition_MULTi14_-_ElAmigos.html'
+        ) {
+          return new Response(
+            elamigosEldenRingHtml({
+              title: 'Elden Ring Nightreign Deluxe Edition',
+              updateTo: '1.03.2',
+            }),
+            { status: 200 },
+          );
+        }
+        if (input === 'https://steamrip.com/games-list-page/') {
+          return new Response(
+            `
+              <a href="https://steamrip.com/elden-ring-de-free-download-1gg/">Elden Ring Deluxe Edition Free Download (v1.16.1)</a>
+              <a href="https://steamrip.com/elden-ring-nightreign-free-download/">ELDEN RING NIGHTREIGN Free Download (v1.03.2 + Co-op)</a>
+            `,
+            { status: 200 },
+          );
+        }
+        if (input === 'https://steamrip.com/updated-games/') {
+          return new Response('', { status: 200 });
+        }
+        if (input === 'https://steamrip.com/elden-ring-de-free-download-1gg/') {
+          return new Response(
+            steamRipEldenRingHtml({
+              buildId: '19493300',
+              title: 'Elden Ring Deluxe Edition',
+              version: 'v1.16.1',
+            }),
+            { status: 200 },
+          );
+        }
+        if (input === 'https://steamrip.com/elden-ring-nightreign-free-download/') {
+          return new Response(
+            steamRipEldenRingHtml({
+              buildId: '19493301',
+              title: 'ELDEN RING NIGHTREIGN',
+              version: 'v1.03.2',
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response('', { status: 404 });
+      });
+
+      await createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      ).discoverSourceMatches(item.id, {
+        bypassBackoff: true,
+        forceCatalog: true,
+      });
+
+      expect(database.getSourceMatch(item.id, 'elamigos')).toMatchObject({
+        sourceTitle: 'Elden Ring Deluxe Edition',
+        sourceUrl:
+          'https://elamigos.site/data/Elden_Ring_Deluxe_Edition_MULTi14_-_ElAmigos.html',
+        status: 'probable',
+        usable: true,
+      });
+      expect(database.getSourceSnapshot(item.id, 'elamigos')).toMatchObject({
+        observedBuildId: null,
+        observedVersion: '1.16.1',
+      });
+      expect(database.getSourceMatch(item.id, 'steamrip')).toMatchObject({
+        sourceTitle: 'Elden Ring Deluxe Edition',
+        sourceUrl: 'https://steamrip.com/elden-ring-de-free-download-1gg/',
+        status: 'probable',
+        usable: true,
+      });
+      expect(database.getSourceSnapshot(item.id, 'steamrip')).toMatchObject({
+        observedBuildId: '19493300',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('aligns source snapshots to SteamDB patch history and computes per-source lag', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'elden ring',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:elden-ring',
+        title: 'ELDEN RING',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 1245620,
+        coverUrl: null,
+        matchedAt: '2026-04-22T12:00:00.000Z',
+        normalizedTitle: 'elden ring',
+        title: 'ELDEN RING',
+      });
+      database.upsertPatchEntries([
+        {
+          appId: 1245620,
+          buildId: '21034490',
+          link: 'https://steamdb.info/patchnotes/21034490/',
+          patchDate: '12/16/2025',
+          patchTitle: 'Release Note for 2025/12/16',
+          publishedAt: '2025-12-16T12:00:00.000Z',
+          title: 'Release Note for 2025/12/16',
+          trackedItemId: item.id,
+        },
+        {
+          appId: 1245620,
+          buildId: '19493300',
+          link: 'https://steamdb.info/patchnotes/19493300/',
+          patchDate: '08/21/2025',
+          patchTitle: 'ELDEN RING update for 21 August 2025',
+          publishedAt: '2025-08-21T12:00:00.000Z',
+          title: 'ELDEN RING update for 21 August 2025',
+          trackedItemId: item.id,
+        },
+        {
+          appId: 1245620,
+          buildId: '15950357',
+          link: 'https://steamdb.info/patchnotes/15950357/',
+          patchDate: '10/17/2024',
+          patchTitle: 'Patch Notes Version 1.16',
+          publishedAt: '2024-10-17T12:00:00.000Z',
+          title: 'Patch Notes Version 1.16',
+          trackedItemId: item.id,
+        },
+      ]);
+      database.upsertInstallRecord({
+        installedAt: '10/17/2024',
+        installedBuildId: '15950357',
+        installedVersion: 'Patch Notes Version 1.16',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-22T12:00:00.000Z',
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-20T12:00:00.000Z',
+        fingerprint: 'manual-install',
+        observedBuildId: '15950357',
+        observedPatchDate: '10/17/2024',
+        observedPatchLink: 'https://steamdb.info/patchnotes/15950357/',
+        observedPatchTitle: 'Patch Notes Version 1.16',
+        observedVersion: 'Patch Notes Version 1.16',
+        patchSelectionSource: 'rss',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:elden-ring',
+        trackedItemId: item.id,
+      });
+
+      const payloads = [
+        eldenRingParsedSource({
+          buildId: '21034490',
+          sourceKind: 'ankergames',
+          sourceUrl: 'https://ankergames.net/game/elden-ring',
+          version: 'V 1.16.2',
+        }),
+        eldenRingParsedSource({
+          patchDate: '08/21/2025',
+          sourceKind: 'elamigos',
+          sourceUrl:
+            'https://elamigos.site/data/Elden_Ring_Deluxe_Edition_MULTi14_-_ElAmigos.html',
+          version: '1.16.1',
+        }),
+        eldenRingParsedSource({
+          sourceKind: 'steamrip',
+          sourceUrl: 'https://steamrip.com/elden-ring-de-free-download-1gg/',
+          version: '1.16.1',
+        }),
+      ];
+      for (const payload of payloads) {
+        database.upsertSourceMatch({
+          confidence: 1,
+          createdAt: '2026-04-22T12:00:00.000Z',
+          isPrimary: false,
+          lastCheckedAt: '2026-04-22T12:00:00.000Z',
+          lastError: null,
+          method: 'fuzzy_title',
+          normalizedTitle: payload.normalizedTitle,
+          score: 1,
+          sourceKind: payload.sourceKind,
+          sourceTitle: payload.title,
+          sourceUrl: payload.sourceUrl,
+          status: 'probable',
+          trackedItemId: item.id,
+          updatedAt: '2026-04-22T12:00:00.000Z',
+          usable: true,
+        });
+        database.upsertSourceSnapshot({
+          checkedAt: '2026-04-22T12:00:00.000Z',
+          fingerprint: payload.fingerprint,
+          observedBuildId: payload.latestSourceRelease.buildId ?? null,
+          observedPatchDate: payload.latestSourceRelease.patchDate ?? null,
+          observedPatchLink: null,
+          observedPatchTitle: null,
+          observedVersion: payload.latestSourceRelease.version,
+          patchSelectionSource: null,
+          sourceKind: payload.sourceKind,
+          sourceUrl: payload.sourceUrl,
+          trackedItemId: item.id,
+        });
+        database.setRawParsedSourcePayload(item.id, payload);
+      }
+
+      const [view] = await createService(database).listTrackedItems();
+      const anker = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'ankergames',
+      );
+      const elamigos = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'elamigos',
+      );
+      const steamrip = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'steamrip',
+      );
+
+      expect(view?.versionsBehindLatest).toBe(2);
+      expect(anker).toMatchObject({
+        matchedPatch: {
+          buildId: '21034490',
+          patchDate: '12/16/2025',
+          patchTitle: 'Release Note for 2025/12/16',
+        },
+        updateStatus: 'matches_upstream',
+        versionsBehindLatest: 0,
+      });
+      expect(elamigos).toMatchObject({
+        matchedPatch: {
+          buildId: '19493300',
+          patchDate: '08/21/2025',
+          patchTitle: 'ELDEN RING update for 21 August 2025',
+        },
+        snapshot: {
+          observedBuildId: '19493300',
+          observedVersion: '1.16.1',
+        },
+        updateStatus: 'newer_than_installed',
+        versionsBehindLatest: 1,
+      });
+      expect(steamrip).toMatchObject({
+        matchedPatch: {
+          buildId: '19493300',
+        },
+        snapshot: {
+          observedBuildId: '19493300',
+          observedVersion: '1.16.1',
+        },
+        updateStatus: 'newer_than_installed',
+        versionsBehindLatest: 1,
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('does not infer a SteamRIP patch from conflicting peer source versions', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'elden ring',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:elden-ring',
+        title: 'ELDEN RING',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 1245620,
+        coverUrl: null,
+        matchedAt: '2026-04-22T12:00:00.000Z',
+        normalizedTitle: 'elden ring',
+        title: 'ELDEN RING',
+      });
+      database.upsertPatchEntries([
+        {
+          appId: 1245620,
+          buildId: '21034490',
+          link: 'https://steamdb.info/patchnotes/21034490/',
+          patchDate: '12/16/2025',
+          patchTitle: 'Release Note for 2025/12/16',
+          publishedAt: '2025-12-16T12:00:00.000Z',
+          title: 'Release Note for 2025/12/16',
+          trackedItemId: item.id,
+        },
+        {
+          appId: 1245620,
+          buildId: '19493300',
+          link: 'https://steamdb.info/patchnotes/19493300/',
+          patchDate: '08/21/2025',
+          patchTitle: 'ELDEN RING update for 21 August 2025',
+          publishedAt: '2025-08-21T12:00:00.000Z',
+          title: 'ELDEN RING update for 21 August 2025',
+          trackedItemId: item.id,
+        },
+      ]);
+      const payloads = [
+        eldenRingParsedSource({
+          buildId: '21034490',
+          sourceKind: 'ankergames',
+          sourceUrl: 'https://ankergames.net/game/elden-ring',
+          version: '1.16.1',
+        }),
+        eldenRingParsedSource({
+          patchDate: '08/21/2025',
+          sourceKind: 'elamigos',
+          sourceUrl:
+            'https://elamigos.site/data/Elden_Ring_Deluxe_Edition_MULTi14_-_ElAmigos.html',
+          version: '1.16.1',
+        }),
+        eldenRingParsedSource({
+          sourceKind: 'steamrip',
+          sourceUrl: 'https://steamrip.com/elden-ring-de-free-download-1gg/',
+          version: '1.16.1',
+        }),
+      ];
+      for (const payload of payloads) {
+        database.upsertSourceMatch({
+          confidence: 1,
+          createdAt: '2026-04-22T12:00:00.000Z',
+          isPrimary: false,
+          lastCheckedAt: '2026-04-22T12:00:00.000Z',
+          lastError: null,
+          method: 'fuzzy_title',
+          normalizedTitle: payload.normalizedTitle,
+          score: 1,
+          sourceKind: payload.sourceKind,
+          sourceTitle: payload.title,
+          sourceUrl: payload.sourceUrl,
+          status: 'probable',
+          trackedItemId: item.id,
+          updatedAt: '2026-04-22T12:00:00.000Z',
+          usable: true,
+        });
+        database.upsertSourceSnapshot({
+          checkedAt: '2026-04-22T12:00:00.000Z',
+          fingerprint: payload.fingerprint,
+          observedBuildId: payload.latestSourceRelease.buildId ?? null,
+          observedPatchDate: payload.latestSourceRelease.patchDate ?? null,
+          observedVersion: payload.latestSourceRelease.version,
+          sourceKind: payload.sourceKind,
+          sourceUrl: payload.sourceUrl,
+          trackedItemId: item.id,
+        });
+        database.setRawParsedSourcePayload(item.id, payload);
+      }
+
+      const [view] = await createService(database).listTrackedItems();
+      const steamrip = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'steamrip',
+      );
+
+      expect(steamrip?.matchedPatch).toBeNull();
+      expect(steamrip?.snapshot).toMatchObject({
+        observedBuildId: null,
+        observedVersion: '1.16.1',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('leaves ElAmigos date-only sources unresolved when patch dates are ambiguous', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'elden ring',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:elden-ring',
+        title: 'ELDEN RING',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 1245620,
+        coverUrl: null,
+        matchedAt: '2026-04-22T12:00:00.000Z',
+        normalizedTitle: 'elden ring',
+        title: 'ELDEN RING',
+      });
+      database.upsertPatchEntries([
+        {
+          appId: 1245620,
+          buildId: '19493300',
+          link: 'https://steamdb.info/patchnotes/19493300/',
+          patchDate: '08/21/2025',
+          patchTitle: 'Patch A',
+          publishedAt: '2025-08-21T12:00:00.000Z',
+          title: 'Patch A',
+          trackedItemId: item.id,
+        },
+        {
+          appId: 1245620,
+          buildId: '19493301',
+          link: 'https://steamdb.info/patchnotes/19493301/',
+          patchDate: '08/21/2025',
+          patchTitle: 'Patch B',
+          publishedAt: '2025-08-21T13:00:00.000Z',
+          title: 'Patch B',
+          trackedItemId: item.id,
+        },
+      ]);
+      const payload = eldenRingParsedSource({
+        patchDate: '08/21/2025',
+        sourceKind: 'elamigos',
+        sourceUrl:
+          'https://elamigos.site/data/Elden_Ring_Deluxe_Edition_MULTi14_-_ElAmigos.html',
+        version: '1.16.1',
+      });
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-04-22T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-04-22T12:00:00.000Z',
+        lastError: null,
+        method: 'fuzzy_title',
+        normalizedTitle: payload.normalizedTitle,
+        score: 1,
+        sourceKind: payload.sourceKind,
+        sourceTitle: payload.title,
+        sourceUrl: payload.sourceUrl,
+        status: 'probable',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-22T12:00:00.000Z',
+        usable: true,
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-22T12:00:00.000Z',
+        fingerprint: payload.fingerprint,
+        observedBuildId: null,
+        observedPatchDate: '08/21/2025',
+        observedVersion: '1.16.1',
+        sourceKind: 'elamigos',
+        sourceUrl: payload.sourceUrl,
+        trackedItemId: item.id,
+      });
+      database.setRawParsedSourcePayload(item.id, payload);
+
+      const [view] = await createService(database).listTrackedItems();
+      const elamigos = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'elamigos',
+      );
+
+      expect(elamigos?.matchedPatch).toBeNull();
+      expect(elamigos?.snapshot).toMatchObject({
+        observedBuildId: null,
+        observedPatchDate: '08/21/2025',
+        observedVersion: '1.16.1',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('keeps a usable AnkerGames match when a refresh is rate limited', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -3812,6 +4364,269 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       expect(database.getSourceMatch(item.id, 'ankergames')).toMatchObject({
         lastError: 'Rate limited by source; retrying later.',
         sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+        status: 'probable',
+        usable: true,
+      });
+      expect(database.getSourceSnapshot(item.id, 'ankergames')).toMatchObject({
+        observedBuildId: '22630308',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('promotes a refreshed AnkerGames candidate into an update source', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'shape of dreams',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:shape-of-dreams',
+        title: 'Shape of Dreams',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 1234,
+        coverUrl: null,
+        matchedAt: '2026-04-22T12:00:00.000Z',
+        normalizedTitle: 'shape of dreams',
+        title: 'Shape of Dreams',
+      });
+      database.upsertPatchEntries([
+        {
+          appId: 1234,
+          buildId: '22630308',
+          link: 'https://steamdb.info/patchnotes/22630308/',
+          patchDate: '04/22/2026',
+          patchTitle: 'Shape of Dreams update for 22 April 2026',
+          publishedAt: '2026-04-22T12:00:00.000Z',
+          title: 'Shape of Dreams update for 22 April 2026',
+          trackedItemId: item.id,
+        },
+        {
+          appId: 1234,
+          buildId: '100',
+          link: 'https://steamdb.info/patchnotes/100/',
+          patchDate: '04/20/2026',
+          patchTitle: 'Shape of Dreams update for 20 April 2026',
+          publishedAt: '2026-04-20T12:00:00.000Z',
+          title: 'Shape of Dreams update for 20 April 2026',
+          trackedItemId: item.id,
+        },
+      ]);
+      database.upsertInstallRecord({
+        installedAt: '04/20/2026',
+        installedBuildId: '100',
+        installedVersion: 'Build 100',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-22T12:00:00.000Z',
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-20T12:00:00.000Z',
+        fingerprint: 'manual-snapshot',
+        observedBuildId: '100',
+        observedPatchDate: '04/20/2026',
+        observedPatchLink: 'https://steamdb.info/patchnotes/100/',
+        observedPatchTitle: 'Shape of Dreams update for 20 April 2026',
+        observedVersion: 'Build 100',
+        patchSelectionSource: 'rss',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:shape-of-dreams',
+        trackedItemId: item.id,
+      });
+      database.upsertSourceMatch({
+        confidence: 0,
+        createdAt: '2026-04-20T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-04-20T12:00:00.000Z',
+        lastError: 'Rate limited by source; retrying later.',
+        method: 'slug',
+        normalizedTitle: 'shape of dreams',
+        score: 0,
+        sourceKind: 'ankergames',
+        sourceTitle: 'Shape of Dreams',
+        sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+        status: 'candidate',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-20T12:00:00.000Z',
+        usable: false,
+      });
+
+      const sourceFetch = vi.fn(async (input: string, init?: RequestInit) => {
+        if (input === 'https://ankergames.net/game/shape-of-dreams') {
+          return new Response(ankergamesSourceHtml(), { status: 200 });
+        }
+        if (input === 'https://ankergames.net/csrf-token') {
+          return new Response(JSON.stringify({ token: 'csrf-token' }), {
+            status: 200,
+          });
+        }
+
+        expect(input).toBe('https://ankergames.net/livewire/update');
+        expect(init?.method).toBe('POST');
+        return new Response(
+          JSON.stringify({
+            components: [
+              {
+                snapshot: JSON.stringify({
+                  data: {
+                    versionData: [
+                      {
+                        current_build: '22630308',
+                        current_version: 'V 1.2.1.7',
+                      },
+                      { s: 'arr' },
+                    ],
+                  },
+                }),
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      });
+
+      const view = await createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      ).refreshMatchedSource(item.id, 'ankergames');
+      const ankerSource = view.sourceMatches.find(
+        (source) => source.match.sourceKind === 'ankergames',
+      );
+
+      expect(ankerSource).toMatchObject({
+        isUpdateSource: true,
+        match: {
+          lastError: null,
+          status: 'probable',
+          usable: true,
+        },
+        snapshot: {
+          observedBuildId: '22630308',
+        },
+        updateStatus: 'matches_upstream',
+      });
+      expect(view.trackingStatus).toBe('update_available');
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('promotes a cached AnkerGames candidate when its snapshot matches upstream', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'shape of dreams',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:shape-of-dreams',
+        title: 'Shape of Dreams',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 1234,
+        coverUrl: null,
+        matchedAt: '2026-04-22T12:00:00.000Z',
+        normalizedTitle: 'shape of dreams',
+        title: 'Shape of Dreams',
+      });
+      database.upsertPatchEntries([
+        {
+          appId: 1234,
+          buildId: '22630308',
+          link: 'https://steamdb.info/patchnotes/22630308/',
+          patchDate: '04/22/2026',
+          patchTitle: 'Shape of Dreams update for 22 April 2026',
+          publishedAt: '2026-04-22T12:00:00.000Z',
+          title: 'Shape of Dreams update for 22 April 2026',
+          trackedItemId: item.id,
+        },
+        {
+          appId: 1234,
+          buildId: '100',
+          link: 'https://steamdb.info/patchnotes/100/',
+          patchDate: '04/20/2026',
+          patchTitle: 'Shape of Dreams update for 20 April 2026',
+          publishedAt: '2026-04-20T12:00:00.000Z',
+          title: 'Shape of Dreams update for 20 April 2026',
+          trackedItemId: item.id,
+        },
+      ]);
+      database.upsertInstallRecord({
+        installedAt: '04/20/2026',
+        installedBuildId: '100',
+        installedVersion: 'Build 100',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-22T12:00:00.000Z',
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-20T12:00:00.000Z',
+        fingerprint: 'manual-snapshot',
+        observedBuildId: '100',
+        observedPatchDate: '04/20/2026',
+        observedPatchLink: 'https://steamdb.info/patchnotes/100/',
+        observedPatchTitle: 'Shape of Dreams update for 20 April 2026',
+        observedVersion: 'Build 100',
+        patchSelectionSource: 'rss',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:shape-of-dreams',
+        trackedItemId: item.id,
+      });
+      database.upsertSourceMatch({
+        confidence: 0,
+        createdAt: '2026-04-20T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-04-20T12:00:00.000Z',
+        lastError: 'Rate limited by source; retrying later.',
+        method: 'slug',
+        normalizedTitle: 'shape of dreams',
+        score: 0,
+        sourceKind: 'ankergames',
+        sourceTitle: 'Shape of Dreams',
+        sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+        status: 'candidate',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-20T12:00:00.000Z',
+        usable: false,
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-22T12:00:00.000Z',
+        fingerprint: ankergamesSource.fingerprint,
+        observedBuildId: '22630308',
+        observedPatchDate: null,
+        observedPatchLink: null,
+        observedPatchTitle: null,
+        observedVersion: 'V 1.2.1.7',
+        patchSelectionSource: null,
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+        trackedItemId: item.id,
+      });
+      database.setRawParsedSourcePayload(item.id, ankergamesSource);
+
+      const [view] = await createService(database).listTrackedItems();
+      const ankerSource = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'ankergames',
+      );
+
+      expect(ankerSource).toMatchObject({
+        isUpdateSource: true,
+        match: {
+          lastError: 'Rate limited by source; retrying later.',
+          status: 'probable',
+          usable: true,
+        },
+        snapshot: {
+          observedBuildId: '22630308',
+        },
+        updateStatus: 'matches_upstream',
+      });
+      expect(view?.activity.lastSourceScannedAt).toBe(
+        '2026-04-22T12:00:00.000Z',
+      );
+      expect(view?.trackingStatus).toBe('update_available');
+      expect(database.getSourceMatch(item.id, 'ankergames')).toMatchObject({
         status: 'probable',
         usable: true,
       });

@@ -142,6 +142,84 @@ describe('deriveTrackedItemStatus', () => {
     ).toBe(TrackedItemTrackingStatus.UpToDate);
   });
 
+  it('marks imported installs update available when a usable source matches upstream', () => {
+    const latestPatch = {
+      appId: 1245620,
+      buildId: '19493300',
+      link: 'https://steamdb.info/patchnotes/19493300/',
+      patchDate: '08/21/2025',
+      patchTitle: 'ELDEN RING update for 21 August 2025',
+      publishedAt: '2025-08-21T12:00:00.000Z',
+      trackedItemId: 'item',
+      title: 'ELDEN RING',
+    };
+    const selectedPatch = {
+      appId: 1245620,
+      buildId: '15950357',
+      link: 'https://steamdb.info/patchnotes/15950357/',
+      patchDate: '10/17/2024',
+      patchTitle: 'ELDEN RING update for 17 October 2024',
+      publishedAt: '2024-10-17T12:00:00.000Z',
+      trackedItemId: 'item',
+      title: 'ELDEN RING',
+    };
+
+    expect(
+      deriveTrackedItemTrackingStatus({
+        hasSteamMatch: true,
+        installRecord: {
+          installedBuildId: '15950357',
+          installedVersion: 'Patch Notes Version 1.16',
+          trackedItemId: 'item',
+          updatedAt: '2026-04-22T12:00:00.000Z',
+        },
+        latestPatch,
+        selectedPatch,
+        sourceMatches: [
+          {
+            downloadMirrors: [],
+            isUpdateSource: true,
+            match: {
+              confidence: 1,
+              createdAt: '2026-04-22T12:00:00.000Z',
+              isPrimary: false,
+              method: 'slug',
+              normalizedTitle: 'elden ring',
+              score: 1,
+              sourceKind: 'ankergames',
+              status: 'probable',
+              trackedItemId: 'item',
+              updatedAt: '2026-04-22T12:00:00.000Z',
+              usable: true,
+            },
+            snapshot: {
+              checkedAt: '2026-04-22T12:00:00.000Z',
+              fingerprint: '',
+              observedBuildId: '19493300',
+              observedPatchDate: '08/21/2025',
+              observedVersion: 'V 1.16.1',
+              sourceKind: 'ankergames',
+              sourceUrl: 'https://ankergames.net/game/elden-ring',
+              trackedItemId: 'item',
+            },
+            updateStatus: 'matches_upstream',
+          },
+        ],
+        sourceSnapshot: {
+          checkedAt: '2026-04-22T12:00:00.000Z',
+          fingerprint: '',
+          observedBuildId: '15950357',
+          observedPatchDate: '10/17/2024',
+          observedVersion: 'Patch Notes Version 1.16',
+          sourceKind: 'manual',
+          sourceUrl: 'manual:import:item',
+          trackedItemId: 'item',
+        },
+        versionsBehindLatest: 2,
+      }),
+    ).toBe(TrackedItemTrackingStatus.UpdateAvailable);
+  });
+
   it('uses installed as the primary status when the final folder exists', () => {
     expect(
       deriveTrackedItemStatus({

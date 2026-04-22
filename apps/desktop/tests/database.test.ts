@@ -245,6 +245,38 @@ describe('VaultTrackDatabase cleanup metadata', () => {
         sourceUrl: 'https://ankergames.net/game/snowrunner',
         trackedItemId: item.id,
       });
+      const cachedCandidate = database.upsertTrackedItem({
+        normalizedTitle: 'elden ring',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:elden-ring',
+        title: 'ELDEN RING',
+      });
+      database.upsertSourceMatch({
+        confidence: 0,
+        createdAt: '2026-04-21T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-04-21T12:00:00.000Z',
+        lastError: null,
+        method: 'slug',
+        normalizedTitle: 'elden ring',
+        score: 0,
+        sourceKind: 'ankergames',
+        sourceTitle: 'ELDEN RING',
+        sourceUrl: 'https://ankergames.net/game/elden-ring/',
+        status: 'candidate',
+        trackedItemId: cachedCandidate.id,
+        updatedAt: '2026-04-21T12:00:00.000Z',
+        usable: false,
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-21T12:00:00.000Z',
+        fingerprint: 'anker-elden-ring-snapshot',
+        observedBuildId: '21034490',
+        observedVersion: 'V 1.16.1',
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.net/game/elden-ring',
+        trackedItemId: cachedCandidate.id,
+      });
       database.upsertSourceMatch({
         confidence: 0,
         createdAt: '2026-04-21T12:00:00.000Z',
@@ -270,6 +302,13 @@ describe('VaultTrackDatabase cleanup metadata', () => {
 
       expect(reopened.getSourceMatch(item.id, 'ankergames')).toMatchObject({
         lastError: 'Rate limited by source; retrying later.',
+        status: 'probable',
+        usable: true,
+      });
+      expect(
+        reopened.getSourceMatch(cachedCandidate.id, 'ankergames'),
+      ).toMatchObject({
+        lastError: null,
         status: 'probable',
         usable: true,
       });

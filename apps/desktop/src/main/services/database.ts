@@ -332,6 +332,7 @@ function repairTransientSourceMatchState(db: SqlJsDatabase): void {
                  FROM source_snapshots
                 WHERE source_snapshots.tracked_item_id = source_matches.tracked_item_id
                   AND source_snapshots.source_kind = source_matches.source_kind
+                  AND rtrim(source_snapshots.source_url, '/') = rtrim(source_matches.source_url, '/')
              )
              THEN 'probable'
              ELSE 'candidate'
@@ -342,16 +343,37 @@ function repairTransientSourceMatchState(db: SqlJsDatabase): void {
                  FROM source_snapshots
                 WHERE source_snapshots.tracked_item_id = source_matches.tracked_item_id
                   AND source_snapshots.source_kind = source_matches.source_kind
+                  AND rtrim(source_snapshots.source_url, '/') = rtrim(source_matches.source_url, '/')
              )
              THEN 1
              ELSE 0
            END,
-           last_error = 'Rate limited by source; retrying later.'
+           last_error = CASE
+             WHEN COALESCE(last_error, '') LIKE '%429%'
+             THEN 'Rate limited by source; retrying later.'
+             ELSE last_error
+           END
      WHERE source_kind = 'ankergames'
        AND status = 'blocked'
        AND source_url IS NOT NULL
        AND source_url != ''
        AND COALESCE(last_error, '') LIKE '%429%';
+
+    UPDATE source_matches
+       SET status = 'probable',
+           usable = 1
+     WHERE source_kind = 'ankergames'
+       AND status = 'candidate'
+       AND usable = 0
+       AND source_url IS NOT NULL
+       AND source_url != ''
+       AND EXISTS (
+             SELECT 1
+               FROM source_snapshots
+              WHERE source_snapshots.tracked_item_id = source_matches.tracked_item_id
+                AND source_snapshots.source_kind = source_matches.source_kind
+                AND rtrim(source_snapshots.source_url, '/') = rtrim(source_matches.source_url, '/')
+           );
 
     DELETE FROM source_matches
      WHERE source_kind = 'elamigos'

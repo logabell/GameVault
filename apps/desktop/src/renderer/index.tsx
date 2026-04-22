@@ -914,10 +914,15 @@ function shouldShowTrackingStatus(item: TrackedItemView): boolean {
 
 function formatSourceScan(item: TrackedItemView): string {
   const activity = getItemActivity(item);
-  if (activity.lastSourceWatchCheckedAt) {
-    return formatRelativeTime(activity.lastSourceWatchCheckedAt);
-  }
-  return formatRelativeTime(activity.lastSourceScannedAt);
+  const timestamps = [
+    activity.lastSourceScannedAt,
+    activity.lastSourceWatchCheckedAt,
+  ].filter(Boolean) as string[];
+  const latestTimestamp = timestamps
+    .map((value) => ({ time: new Date(value).getTime(), value }))
+    .filter(({ time }) => !Number.isNaN(time))
+    .sort((left, right) => right.time - left.time)[0]?.value;
+  return formatRelativeTime(latestTimestamp);
 }
 
 function formatNextSourceScan(item: TrackedItemView): string {
@@ -1039,8 +1044,22 @@ function getSourcePatchComparison(
   if (source.updateStatus === 'failed' || source.updateStatus === 'blocked') {
     return { label: formatLabel(source.updateStatus), rank: 850 };
   }
+  if (source.matchedPatch) {
+    if (source.versionsBehindLatest === 0) {
+      return { label: 'Aligned with upstream', rank: 0 };
+    }
+    if (typeof source.versionsBehindLatest === 'number') {
+      return {
+        label: formatPatchBehindCount(
+          source.versionsBehindLatest,
+          source.versionsBehindLatestIsLowerBound,
+        ),
+        rank: source.versionsBehindLatest,
+      };
+    }
+  }
   if (sourceSnapshotMatchesPatch(snapshot, item.latestPatch)) {
-    return { label: 'Up to date', rank: 0 };
+    return { label: 'Aligned with upstream', rank: 0 };
   }
   if (sourceSnapshotMatchesPatch(snapshot, item.selectedPatch)) {
     if (typeof item.versionsBehindLatest === 'number') {
@@ -1057,7 +1076,7 @@ function getSourcePatchComparison(
 
   switch (source.updateStatus) {
     case 'matches_upstream':
-      return { label: 'Up to date', rank: 0 };
+      return { label: 'Aligned with upstream', rank: 0 };
     case 'newer_than_installed':
       return { label: 'Newer than installed', rank: 100 };
     case 'possible_update':
@@ -1073,7 +1092,7 @@ function getSourcePatchComparison(
           }
         : { label: 'Same as installed', rank: 300 };
     case 'source_behind_upstream':
-      return { label: 'Behind upstream', rank: 400 };
+      return { label: 'Source behind upstream', rank: 400 };
     default:
       return { label: 'Unknown', rank: 700 };
   }
@@ -1107,6 +1126,29 @@ function getCurrentInstallSummary(item: TrackedItemView) {
     patchLabel,
     sourceKind: getInstalledSourceKind(item),
     version: installedVersion,
+  };
+}
+
+function getSourcePatchSummary(item: TrackedItemView) {
+  const snapshot = item.sourceSnapshot;
+  return {
+    buildId: snapshot?.observedBuildId ?? null,
+    date: snapshot?.observedPatchDate ?? null,
+    patchLabel:
+      snapshot?.observedPatchTitle ??
+      snapshot?.observedVersion ??
+      'Source patch unavailable',
+    version: snapshot?.observedVersion ?? null,
+  };
+}
+
+function getUpstreamPatchSummary(item: TrackedItemView) {
+  const patch = item.latestPatch;
+  return {
+    buildId: patch?.buildId ?? null,
+    date: patch?.patchDate ?? null,
+    patchLabel: patch?.patchTitle ?? 'Latest SteamDB patch unavailable',
+    version: patch?.version ?? null,
   };
 }
 
@@ -3311,6 +3353,34 @@ function App() {
     );
   }
 
+  function renderPatchComparisonSummary(item: TrackedItemView) {
+    const currentInstall = getCurrentInstallSummary(item);
+    const sourcePatch = getSourcePatchSummary(item);
+    const upstreamPatch = getUpstreamPatchSummary(item);
+    return (
+      <section className="patch-comparison-panel">
+        <div>
+          <p className="eyebrow">Current install</p>
+          <strong>{currentInstall.patchLabel}</strong>
+          <span>{formatBuildValue(currentInstall.buildId)}</span>
+          <span>{formatOptionalValue(currentInstall.date)}</span>
+        </div>
+        <div>
+          <p className="eyebrow">Source</p>
+          <strong>{sourcePatch.patchLabel}</strong>
+          <span>{formatBuildValue(sourcePatch.buildId)}</span>
+          <span>{formatOptionalValue(sourcePatch.date)}</span>
+        </div>
+        <div>
+          <p className="eyebrow">Latest upstream</p>
+          <strong>{upstreamPatch.patchLabel}</strong>
+          <span>{formatBuildValue(upstreamPatch.buildId)}</span>
+          <span>{formatOptionalValue(upstreamPatch.date)}</span>
+        </div>
+      </section>
+    );
+  }
+
   function renderLibraryProgress(
     item: TrackedItemView,
     progress: number | null,
@@ -3457,9 +3527,10 @@ function App() {
             disabled={itemBusy}
             onClick={(event) =>
               runItemMenuAction(event, () => {
-                void runItemAction(item.item.id, () =>
-                  window.vaultTrackApi.refreshTrackedItem(item.item.id),
-                );
+                void runItemAction(item.item.id, async () => {
+                  await window.vaultTrackApi.refreshTrackedItem(item.item.id);
+                  await window.vaultTrackApi.discoverSourceMatches(item.item.id);
+                });
               })
             }
             role="menuitem"
@@ -3611,6 +3682,7 @@ function App() {
     if (!sourcesModal) return null;
     const item = sourcesModal.item;
     const currentInstall = getCurrentInstallSummary(item);
+    const upstreamPatch = getUpstreamPatchSummary(item);
     const fileState = getItemFileState(item);
     const rows = SUPPORTED_RENDER_SOURCE_KINDS.map((sourceKind) => {
       const source = item.sourceMatches.find(
@@ -3708,9 +3780,15 @@ function App() {
           </div>
           <div className="details-modal__body">
             <section className="source-install-panel">
-              <div>
-                <p className="eyebrow">Current install</p>
-                <h3>{currentInstall.patchLabel}</h3>
+              <div className="source-install-panel__heading">
+                <div>
+                  <p className="eyebrow">Current install</p>
+                  <h3>{currentInstall.patchLabel}</h3>
+                </div>
+                <div>
+                  <p className="eyebrow">Latest upstream</p>
+                  <h3>{upstreamPatch.patchLabel}</h3>
+                </div>
               </div>
               <div className="source-install-grid">
                 <div>
@@ -3738,12 +3816,21 @@ function App() {
                   <strong>Patch Lag</strong>
                   <span>{formatPatchLag(item)}</span>
                 </div>
+                <div>
+                  <strong>Upstream Build</strong>
+                  <span>{formatBuildValue(upstreamPatch.buildId)}</span>
+                </div>
+                <div>
+                  <strong>Upstream Date</strong>
+                  <span>{formatOptionalValue(upstreamPatch.date)}</span>
+                </div>
               </div>
             </section>
             <div className="source-offer-list">
               {rows.map(({ comparison, source, sourceKind }) => {
                 const match = source?.match;
                 const snapshot = source?.snapshot;
+                const matchedPatch = source?.matchedPatch;
                 const fullMirror = source?.downloadMirrors.find(
                   (mirror) => mirror.kind === 'full',
                 );
@@ -3786,11 +3873,28 @@ function App() {
                       </div>
                       <div>
                         <strong>Build</strong>
-                        <span>{formatBuildValue(snapshot?.observedBuildId)}</span>
+                        <span>
+                          {formatBuildValue(
+                            matchedPatch?.buildId ?? snapshot?.observedBuildId,
+                          )}
+                        </span>
                       </div>
                       <div>
                         <strong>Date</strong>
-                        <span>{formatOptionalValue(snapshot?.observedPatchDate)}</span>
+                        <span>
+                          {formatOptionalValue(
+                            matchedPatch?.patchDate ?? snapshot?.observedPatchDate,
+                          )}
+                        </span>
+                      </div>
+                      <div>
+                        <strong>Patch</strong>
+                        <span>
+                          {formatOptionalValue(
+                            matchedPatch?.patchTitle ??
+                              snapshot?.observedPatchTitle,
+                          )}
+                        </span>
                       </div>
                       <div>
                         <strong>SteamDB</strong>
@@ -5501,6 +5605,7 @@ function App() {
             {!patchEditor.loading && patchEditor.backfillStatus === 'failed' ? (
               <p className="muted-text">SteamDB build table lookup failed.</p>
             ) : null}
+            {renderPatchComparisonSummary(patchEditor.item)}
             {patchEditor.item.item.steamAppId ? (
               <div className="patch-toolbar">
                 <button

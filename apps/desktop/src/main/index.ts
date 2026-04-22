@@ -411,7 +411,10 @@ async function bootstrap() {
     service.refreshTrackedItem(trackedItemId),
   );
   ipcMain.handle('vault:discoverSourceMatches', (_event, trackedItemId: string) =>
-    service.discoverSourceMatches(trackedItemId),
+    service.discoverSourceMatches(trackedItemId, {
+      bypassBackoff: true,
+      forceCatalog: true,
+    }),
   );
   ipcMain.handle('vault:refreshMatchedSource', (_event, payload) =>
     service.refreshMatchedSource(payload.trackedItemId, payload.sourceKind),

@@ -72,6 +72,71 @@ function cleanupAnkerTitle(input: string): string {
   );
 }
 
+const SOURCE_TITLE_NOISE_WORDS = new Set([
+  'ankergames',
+  'definitive',
+  'deluxe',
+  'download',
+  'edition',
+  'elamigos',
+  'free',
+  'gold',
+  'premium',
+  'steamrip',
+  'ultimate',
+  'update',
+  'version',
+]);
+
+export interface SourceTitleMatchRank {
+  normalizedLength: number;
+  score: number;
+  unmatchedSignificantTokens: number;
+}
+
+function cleanupTitleForMatching(input: string): string {
+  return compactText(
+    input
+      .replace(/\+\s*\[Update[^\]]+\]/gi, ' ')
+      .replace(/\[Update[^\]]+\]/gi, ' ')
+      .replace(/\[(?:Build|Version)[^\]]+\]/gi, ' ')
+      .replace(/\((?:v|version|build)\s*[^)]*\)/gi, ' ')
+      .replace(/\bFree\s+Download\b.*$/gi, ' ')
+      .replace(/\b(?:ElAmigos|SteamRIP|AnkerGames)\b/gi, ' '),
+  );
+}
+
+function titleTokens(input: string): string[] {
+  return normalizeTitle(cleanupTitleForMatching(input)).split(' ').filter(Boolean);
+}
+
+function significantTitleTokens(input: string): string[] {
+  const tokens = titleTokens(input);
+  const significantTokens = tokens.filter(
+    (token) =>
+      !SOURCE_TITLE_NOISE_WORDS.has(token) &&
+      !/^\d{5,}$/.test(token) &&
+      !/^v\d+[a-z0-9]*$/i.test(token),
+  );
+
+  return significantTokens.length > 0 ? significantTokens : tokens;
+}
+
+function significantTitle(input: string): string {
+  return significantTitleTokens(input).join(' ');
+}
+
+function unmatchedSignificantTokenCount(
+  expectedTokens: string[],
+  candidateTokens: string[],
+): number {
+  const expected = new Set(expectedTokens);
+  const candidate = new Set(candidateTokens);
+  const missing = expectedTokens.filter((token) => !candidate.has(token)).length;
+  const extra = candidateTokens.filter((token) => !expected.has(token)).length;
+  return missing + extra;
+}
+
 function pushUnique(
   entries: SourceCatalogEntry[],
   seen: Set<string>,
@@ -307,34 +372,73 @@ function levenshtein(left: string, right: string): number {
   return previous[right.length]!;
 }
 
-export function scoreSourceTitleMatch(
+export function rankSourceTitleMatch(
   expectedTitle: string,
   candidateTitle: string,
-): number {
-  const expected = normalizeTitle(expectedTitle);
-  const candidate = normalizeTitle(candidateTitle);
+): SourceTitleMatchRank {
+  const expected = significantTitle(expectedTitle);
+  const candidate = significantTitle(candidateTitle);
+  const expectedTokens = expected.split(' ').filter(Boolean);
+  const candidateTokens = candidate.split(' ').filter(Boolean);
+  const unmatchedSignificantTokens = unmatchedSignificantTokenCount(
+    expectedTokens,
+    candidateTokens,
+  );
+  const normalizedLength = candidate.length;
   if (!expected || !candidate) {
-    return 0;
+    return {
+      normalizedLength,
+      score: 0,
+      unmatchedSignificantTokens,
+    };
   }
   if (expected === candidate) {
-    return 1;
+    return {
+      normalizedLength,
+      score: titleTokens(expectedTitle).join(' ') === titleTokens(candidateTitle).join(' ')
+        ? 1
+        : 0.99,
+      unmatchedSignificantTokens,
+    };
   }
   if (expected.replace(/\s+/g, '') === candidate.replace(/\s+/g, '')) {
-    return 1;
+    return {
+      normalizedLength,
+      score: 1,
+      unmatchedSignificantTokens,
+    };
   }
   if (
     (expected.length >= 5 && candidate.startsWith(`${expected} `)) ||
     (candidate.length >= 5 && expected.startsWith(`${candidate} `))
   ) {
-    return 0.94;
+    return {
+      normalizedLength,
+      score: 0.94,
+      unmatchedSignificantTokens,
+    };
   }
 
   const maxLength = Math.max(expected.length, candidate.length);
   const editScore = 1 - levenshtein(expected, candidate) / maxLength;
-  const expectedTokens = new Set(expected.split(' '));
-  const candidateTokens = new Set(candidate.split(' '));
-  const shared = [...expectedTokens].filter((token) => candidateTokens.has(token)).length;
-  const tokenScore = shared / Math.max(expectedTokens.size, candidateTokens.size);
+  const expectedTokenSet = new Set(expectedTokens);
+  const candidateTokenSet = new Set(candidateTokens);
+  const shared = [...expectedTokenSet].filter((token) =>
+    candidateTokenSet.has(token),
+  ).length;
+  const tokenScore =
+    shared / Math.max(expectedTokenSet.size, candidateTokenSet.size);
 
-  return Math.max(0, Math.min(1, editScore * 0.65 + tokenScore * 0.35));
+  return {
+    normalizedLength,
+    score: Math.max(0, Math.min(1, editScore * 0.65 + tokenScore * 0.35)),
+    unmatchedSignificantTokens,
+  };
+}
+
+export function scoreSourceTitleMatch(
+  expectedTitle: string,
+  candidateTitle: string,
+): number {
+  return rankSourceTitleMatch(expectedTitle, candidateTitle).score;
 }

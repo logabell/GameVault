@@ -1575,6 +1575,41 @@ code {
   letter-spacing: 0;
 }
 
+.source-install-panel__heading,
+.patch-comparison-panel {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.patch-comparison-panel {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--panel-strong);
+}
+
+.source-install-panel__heading > div,
+.patch-comparison-panel > div {
+  display: grid;
+  align-content: start;
+  gap: 3px;
+  min-width: 0;
+}
+
+.patch-comparison-panel strong {
+  color: var(--ink);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.patch-comparison-panel span {
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
 .source-install-grid,
 .source-offer-meta {
   display: grid;
@@ -1764,10 +1799,12 @@ code {
   }
 
   .source-install-grid,
+  .source-install-panel__heading,
   .source-offer-meta,
   .source-offer-list,
   .source-offer-card__heading,
   .source-offer-card__footer,
+  .patch-comparison-panel,
   .manual-source-panel {
     grid-template-columns: 1fr;
   }

@@ -165,6 +165,9 @@ export interface SourceMatch {
 export interface MatchedSourceView {
   match: SourceMatch;
   snapshot?: SourceSnapshot | null;
+  matchedPatch?: SteamPatchEntry | null;
+  versionsBehindLatest?: number | null;
+  versionsBehindLatestIsLowerBound?: boolean;
   updateStatus: SourceUpdateStatus;
   isUpdateSource: boolean;
   downloadMirrors: DownloadMirrorRecord[];

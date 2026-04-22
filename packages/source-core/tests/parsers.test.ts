@@ -10,6 +10,7 @@ import {
   buildAnkerGamesSlugCandidates,
   parseAnkerGamesRecentUpdates,
   parseElAmigosCatalog,
+  rankSourceTitleMatch,
   parseSteamRipCatalog,
   parseSteamRipUpdatedGames,
   scoreSourceTitleMatch,
@@ -132,6 +133,51 @@ describe('source parsers', () => {
     ]);
 
     expect(
+      parseElAmigosCatalog(`
+        <h2>21.08.2025</h2>
+        <h3>Elden Ring Deluxe Edition ElAmigos [Update 1.12.0] +[Update 1.16.1] <a href="/data/Elden_Ring_Deluxe_Edition_MULTi14_-_ElAmigos.html">DOWNLOAD</a></h3>
+        <h3>Elden Ring Nightreign Deluxe Edition ElAmigos [Update 1.03.2] <a href="/data/Elden_Ring_Nightreign_Deluxe_Edition_MULTi14_-_ElAmigos.html">DOWNLOAD</a></h3>
+      `).map((entry) => ({
+        title: entry.title,
+        url: entry.sourceUrl,
+        version: entry.listedVersion,
+      })),
+    ).toEqual([
+      {
+        title: 'Elden Ring Deluxe Edition',
+        url: 'https://elamigos.site/data/Elden_Ring_Deluxe_Edition_MULTi14_-_ElAmigos.html',
+        version: '1.12.0',
+      },
+      {
+        title: 'Elden Ring Nightreign Deluxe Edition',
+        url: 'https://elamigos.site/data/Elden_Ring_Nightreign_Deluxe_Edition_MULTi14_-_ElAmigos.html',
+        version: '1.03.2',
+      },
+    ]);
+
+    expect(
+      parseSteamRipCatalog(`
+        <a href="https://steamrip.com/elden-ring-de-free-download-1gg/">Elden Ring Deluxe Edition Free Download (v1.16.1)</a>
+        <a href="https://steamrip.com/elden-ring-nightreign-free-download/">ELDEN RING NIGHTREIGN Free Download (v1.03.2 + Co-op)</a>
+      `).map((entry) => ({
+        title: entry.title,
+        url: entry.sourceUrl,
+        version: entry.listedVersion,
+      })),
+    ).toEqual([
+      {
+        title: 'Elden Ring Deluxe Edition',
+        url: 'https://steamrip.com/elden-ring-de-free-download-1gg/',
+        version: '1.16.1',
+      },
+      {
+        title: 'ELDEN RING NIGHTREIGN',
+        url: 'https://steamrip.com/elden-ring-nightreign-free-download/',
+        version: '1.03.2 + Co-op',
+      },
+    ]);
+
+    expect(
       parseAnkerGamesRecentUpdates(`
         <a href="/game/mouse-p-i-for-hire">MOUSE: P.I. For Hire V 1.0.5.8168 by Axiom 1d ago</a>
       `)[0],
@@ -201,6 +247,82 @@ describe('source parsers', () => {
     expect(
       scoreSourceTitleMatch('MOUSE: P.I. For Hire', 'Frostpunk 2'),
     ).toBeLessThan(0.5);
+
+    expect(
+      rankSourceTitleMatch('ELDEN RING', 'Elden Ring Deluxe Edition').score,
+    ).toBeGreaterThan(
+      rankSourceTitleMatch(
+        'ELDEN RING',
+        'Elden Ring Nightreign Deluxe Edition',
+      ).score,
+    );
+  });
+
+  it('parses Elden Ring detail pages from ElAmigos and SteamRIP', () => {
+    expect(
+      parseSupportedPageForKind(
+        'elamigos',
+        'https://elamigos.site/data/Elden_Ring_Deluxe_Edition_MULTi14_-_ElAmigos.html',
+        `
+          <html><body>
+            <h2>Elden Ring Deluxe Edition (2022), 62.44GB</h2>
+            <h3>ElAmigos release. Updated to version 1.12.0 (20.06.2023).</h3>
+            <h2>Elden Ring update 1.12.0 - 1.16.1 (21.08.2025) & crack, 437MB</h2>
+            <h2>DDOWNLOAD</h2>
+            <a href="https://www.filecrypt.cc/Container/DBBE0ACC87.html">FileCrypt</a>
+          </body></html>
+        `,
+      ),
+    ).toMatchObject({
+      latestSourceRelease: {
+        buildId: null,
+        patchDate: '08/21/2025',
+        version: '1.16.1',
+      },
+      title: 'Elden Ring Deluxe Edition',
+    });
+
+    expect(
+      parseSupportedPageForKind(
+        'steamrip',
+        'https://steamrip.com/elden-ring-de-free-download-1gg/',
+        `
+          <html><body>
+            <h1>Elden Ring Deluxe Edition Free Download (v1.16.1)</h1>
+            <h4>GAME INFO</h4>
+            <div>Version: v1.16.1 (Build 19493300) | All DLCs | Deluxe Edition</div>
+            <a href="https://gofile.io/d/elden">DOWNLOAD HERE</a>
+          </body></html>
+        `,
+      ),
+    ).toMatchObject({
+      latestSourceRelease: {
+        buildId: '19493300',
+        version: '1.16.1',
+      },
+      title: 'Elden Ring Deluxe Edition',
+    });
+  });
+
+  it('keeps ElAmigos dotted versions separate from explicit numeric build ids', () => {
+    expect(
+      parseSupportedPageForKind(
+        'elamigos',
+        'https://elamigos.site/data/Example_-_ElAmigos.html',
+        `
+          <html><body>
+            <h2>Example Game (2026), 2GB</h2>
+            <h2>Example Game update 1.0.0 - 1.2.3 (21.08.2025), build 21034490</h2>
+          </body></html>
+        `,
+      ),
+    ).toMatchObject({
+      latestSourceRelease: {
+        buildId: '21034490',
+        patchDate: '08/21/2025',
+        version: '1.2.3',
+      },
+    });
   });
 
   it('parses Ankergames pages with visible version and stable download endpoint', () => {
@@ -853,6 +975,7 @@ describe('source parsers', () => {
 
     expect(parsed.title).toBe('MOUSE: P.I. For Hire');
     expect(parsed.latestSourceRelease.version).toBe('1.0.3.8157');
+    expect(parsed.latestSourceRelease.buildId).toBeNull();
     expect(parsed.fullDownloadUrls).toEqual([
       {
         kind: 'full',
