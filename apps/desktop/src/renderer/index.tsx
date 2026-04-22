@@ -23,6 +23,9 @@ import {
   faPenToSquare,
   faRotateRight,
   faScroll,
+  faSort,
+  faSortDown,
+  faSortUp,
   faSun,
   faTableCellsLarge,
   faTrash,
@@ -78,6 +81,8 @@ type LibraryStatusFilter =
   | 'sourceBehind'
   | 'updates';
 type LibraryViewMode = 'cards' | 'list';
+type ImportSortKey = 'folder' | 'patchMetadata' | 'steamMatch';
+type SortDirection = 'asc' | 'desc';
 type ResolvedTheme = 'light' | 'dark';
 type SettingsSaveStatus = 'idle' | 'saving' | 'saved';
 type ItemBusyAction =
@@ -387,30 +392,6 @@ function normalizeSettingsLibraryRoots(
         },
       ]
     : [];
-}
-
-function sanitizeFolderName(value: string): string {
-  const withoutControlCharacters = Array.from(value, (character) =>
-    character.charCodeAt(0) < 32 ? ' ' : character,
-  ).join('');
-  return (
-    withoutControlCharacters
-      .replace(/[<>:"/\\|?*]/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .replace(/[. ]+$/g, '') || 'Untitled'
-  );
-}
-
-function importRenameTarget(
-  candidate: ImportCandidate,
-  row: ImportRowState | undefined,
-  renameEnabled = true,
-): string {
-  if (!renameEnabled || !row?.steamMatch) {
-    return candidate.folderName;
-  }
-  return sanitizeFolderName(row.steamMatch.title);
 }
 
 function buildSteamDbPatchnotesUrl(appId: number): string {
@@ -974,6 +955,49 @@ function sortLibraryItems(
   });
 }
 
+function compareNullableText(
+  left: string | null | undefined,
+  right: string | null | undefined,
+): number {
+  return (left ?? '').localeCompare(right ?? '');
+}
+
+function sortImportCandidates(
+  candidates: ImportCandidate[],
+  rows: Record<string, ImportRowState>,
+  sort: { direction: SortDirection; key: ImportSortKey },
+): ImportCandidate[] {
+  const direction = sort.direction === 'asc' ? 1 : -1;
+  return [...candidates].sort((left, right) => {
+    const leftRow = rows[left.id];
+    const rightRow = rows[right.id];
+    let result = 0;
+    if (sort.key === 'folder') {
+      result =
+        compareNullableText(left.folderName, right.folderName) ||
+        compareNullableText(left.folderPath, right.folderPath);
+    } else if (sort.key === 'steamMatch') {
+      result =
+        Number(Boolean(leftRow?.steamMatch)) -
+          Number(Boolean(rightRow?.steamMatch)) ||
+        compareNullableText(
+          leftRow?.steamMatch?.title ?? left.folderName,
+          rightRow?.steamMatch?.title ?? right.folderName,
+        );
+    } else {
+      const leftPatch = getSelectedImportPatch(leftRow);
+      const rightPatch = getSelectedImportPatch(rightRow);
+      result =
+        Number(Boolean(leftPatch)) - Number(Boolean(rightPatch)) ||
+        compareNullableText(
+          leftPatch?.patchTitle ?? getImportPatchHistoryLabel(leftRow),
+          rightPatch?.patchTitle ?? getImportPatchHistoryLabel(rightRow),
+        );
+    }
+    return result * direction;
+  });
+}
+
 function resolveTheme(
   themeMode: ThemeMode | null | undefined,
   systemPrefersDark: boolean,
@@ -1065,7 +1089,10 @@ function App() {
     useState(0);
   const [importBuildLookupClock, setImportBuildLookupClock] = useState(0);
   const [importBusy, setImportBusy] = useState(false);
-  const [includeIgnoredImports, setIncludeIgnoredImports] = useState(false);
+  const [importSort, setImportSort] = useState<{
+    direction: SortDirection;
+    key: ImportSortKey;
+  }>({ direction: 'asc', key: 'folder' });
   const [importMessage, setImportMessage] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<ItemBusyAction | null>(null);
@@ -1148,16 +1175,10 @@ function App() {
       ),
     [importCandidates, importRows],
   );
-  const importRowsReady =
-    selectedImportCandidates.length > 0 &&
-    selectedImportCandidates.every((candidate) => {
-      const row = importRows[candidate.id];
-      return Boolean(
-        row?.steamMatch &&
-        getSelectedImportPatch(row) &&
-        (!candidate.duplicateSteamMatch || row.duplicateOverride),
-      );
-    });
+  const sortedImportCandidates = useMemo(
+    () => sortImportCandidates(importCandidates, importRows, importSort),
+    [importCandidates, importRows, importSort],
+  );
   const importPatchHistoryProgress = useMemo(() => {
     const matchedRows = selectedImportCandidates
       .map((candidate) => importRows[candidate.id])
@@ -1177,6 +1198,10 @@ function App() {
   const nextImportBuildLookupRowId = activeImportBuildLookupRowId
     ? null
     : getNextReadyImportBuildLookupRowId(importBuildLookupQueue, importRows);
+  const importScanning =
+    importBusy && importMessage === 'Scanning library roots...';
+  const importSaving =
+    importBusy && importMessage === 'Saving selected imports...';
 
   async function refreshItems() {
     const [trackedItems, loadedLogs] = await Promise.all([
@@ -1482,14 +1507,10 @@ function App() {
     setImportBusy(true);
     setImportMessage('Scanning library roots...');
     try {
-      const candidates = await window.vaultTrackApi.scanImportCandidates({
-        includeIgnored: includeIgnoredImports,
-      });
+      const candidates = await window.vaultTrackApi.scanImportCandidates();
       initializeImportRows(candidates);
       setImportMessage(
-        candidates.length
-          ? `${candidates.length} folders ready for review.`
-          : 'No untracked folders found.',
+        candidates.length ? null : 'No untracked folders found.',
       );
     } catch (error) {
       setImportMessage(
@@ -1891,24 +1912,34 @@ function App() {
     setImportManualPatch(null);
   }
 
-  async function ignoreImportCandidate(candidate: ImportCandidate) {
-    await window.vaultTrackApi.ignoreImportFolder({
-      folderName: candidate.folderName,
-      rootPath: candidate.rootPath,
-    });
-    await refreshSettings();
-    setImportCandidates((current) =>
-      current.filter((row) => row.id !== candidate.id),
-    );
-    setImportRows((current) => {
-      const next = { ...current };
-      delete next[candidate.id];
-      return next;
-    });
-    removeImportBuildLookup(candidate.id);
-  }
-
   async function saveImportRows() {
+    if (!selectedImportCandidates.length) {
+      setImportMessage('Select at least one folder to import.');
+      return;
+    }
+
+    const blockedCandidates = selectedImportCandidates.filter((candidate) => {
+      const row = importRows[candidate.id];
+      return (
+        !row?.steamMatch ||
+        !getSelectedImportPatch(row) ||
+        !isImportPatchHistoryComplete(row) ||
+        Boolean(candidate.duplicateSteamMatch && !row.duplicateOverride)
+      );
+    });
+
+    if (blockedCandidates.length) {
+      const firstBlocked = blockedCandidates[0];
+      setImportMessage(
+        `${blockedCandidates.length} selected import${
+          blockedCandidates.length === 1 ? '' : 's'
+        } still need a Steam match, completed patch metadata, or duplicate override${
+          firstBlocked ? ` (${firstBlocked.folderName} first).` : '.'
+        }`,
+      );
+      return;
+    }
+
     setImportBusy(true);
     setImportMessage('Saving selected imports...');
     try {
@@ -3074,6 +3105,39 @@ function App() {
     );
   }
 
+  function renderImportSortHeader(key: ImportSortKey, label: string) {
+    const active = importSort.key === key;
+    const direction = active ? importSort.direction : 'asc';
+    const icon = active
+      ? direction === 'asc'
+        ? faSortUp
+        : faSortDown
+      : faSort;
+    return (
+      <button
+        aria-label={`Sort imports by ${label}`}
+        aria-sort={
+          active ? (direction === 'asc' ? 'ascending' : 'descending') : 'none'
+        }
+        className={`import-sort-button ${active ? 'is-active' : ''}`}
+        onClick={() =>
+          setImportSort((current) =>
+            current.key === key
+              ? {
+                  key,
+                  direction: current.direction === 'asc' ? 'desc' : 'asc',
+                }
+              : { key, direction: 'asc' },
+          )
+        }
+        type="button"
+      >
+        <span>{label}</span>
+        <FontAwesomeIcon aria-hidden="true" icon={icon} />
+      </button>
+    );
+  }
+
   const deviceChoices = connectionHealth?.devices ?? [];
 
   return (
@@ -3663,32 +3727,17 @@ function App() {
           <section className="surface-panel import-surface">
             <div className="panel-heading">
               <div>
-                <p className="panel-title">Imports</p>
-                <p className="muted-text">
-                  Scan configured library roots, review untracked folders, add
-                  Steam and patch metadata, then save selected rows.
-                </p>
+                <p className="panel-title">Import Games</p>
               </div>
             </div>
             <div className="action-row">
-              <label className="checkbox-line">
-                <input
-                  checked={includeIgnoredImports}
-                  onChange={(event) => {
-                    const checked = event.currentTarget.checked;
-                    setIncludeIgnoredImports(checked);
-                  }}
-                  type="checkbox"
-                />
-                Include ignored folders
-              </label>
               <button
                 className="ghost-button"
                 disabled={importBusy}
                 onClick={() => void scanImportCandidates()}
                 type="button"
               >
-                Scan Library Roots
+                {importScanning ? 'Scanning...' : 'Scan Library Roots'}
               </button>
               {importBuildLookupStopped ? (
                 <button
@@ -3708,11 +3757,11 @@ function App() {
               ) : null}
               <button
                 className="primary-button"
-                disabled={importBusy || !importRowsReady}
+                disabled={importBusy}
                 onClick={() => void saveImportRows()}
                 type="button"
               >
-                Save Selected Imports
+                {importSaving ? 'Saving...' : 'Save Selected Imports'}
               </button>
             </div>
             {importMessage ? (
@@ -3720,10 +3769,6 @@ function App() {
             ) : null}
             <div className="import-summary-row">
               <span>{selectedImportCandidates.length} selected</span>
-              <span>
-                Save requires a Steam match, patch/build metadata, and any
-                duplicate-app override.
-              </span>
             </div>
             <div className="import-progress">
               <div className="import-progress__header">
@@ -3755,18 +3800,22 @@ function App() {
               <table className="import-table">
                 <thead>
                   <tr>
-                    <th>Use</th>
-                    <th>Root</th>
-                    <th>Folder</th>
-                    <th>Steam match</th>
-                    <th>Patch metadata</th>
-                    <th>Folder target</th>
-                    <th>Actions</th>
+                    <th className="import-table__use">Use</th>
+                    <th>{renderImportSortHeader('folder', 'Folder')}</th>
+                    <th>
+                      {renderImportSortHeader('steamMatch', 'Steam Match')}
+                    </th>
+                    <th>
+                      {renderImportSortHeader(
+                        'patchMetadata',
+                        'Patch Metadata',
+                      )}
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
-                  {importCandidates.length ? (
-                    importCandidates.map((candidate) => {
+                  {sortedImportCandidates.length ? (
+                    sortedImportCandidates.map((candidate) => {
                       const row = importRows[candidate.id];
                       const selectedPatch = getSelectedImportPatch(row);
                       const now = Date.now();
@@ -3807,8 +3856,9 @@ function App() {
                           className={row?.included ? undefined : 'is-muted'}
                           key={candidate.id}
                         >
-                          <td>
+                          <td className="import-table__use-cell">
                             <input
+                              className="import-use-checkbox"
                               checked={Boolean(row?.included)}
                               onChange={(event) => {
                                 const included = event.currentTarget.checked;
@@ -3820,15 +3870,11 @@ function App() {
                               type="checkbox"
                             />
                           </td>
-                          <td>
-                            <strong>{candidate.rootLabel}</strong>
-                            <small>{candidate.rootPath}</small>
-                          </td>
-                          <td>
+                          <td className="import-folder-cell">
                             <strong>{candidate.folderName}</strong>
                             <small>{candidate.folderPath}</small>
                           </td>
-                          <td>
+                          <td className="import-match-cell">
                             {row?.steamMatch ? (
                               <>
                                 <strong>{row.steamMatch.title}</strong>
@@ -3866,7 +3912,7 @@ function App() {
                               </label>
                             ) : null}
                           </td>
-                          <td>
+                          <td className="import-patch-cell">
                             {selectedPatch ? (
                               <>
                                 <strong>{selectedPatch.patchTitle}</strong>
@@ -3948,37 +3994,12 @@ function App() {
                               ) : null}
                             </div>
                           </td>
-                          <td>
-                            <strong>
-                              {importRenameTarget(
-                                candidate,
-                                row,
-                                settings.renameGameFoldersOnImport ?? true,
-                              )}
-                            </strong>
-                            <small>
-                              {(settings.renameGameFoldersOnImport ?? true)
-                                ? 'Uses Settings rename-on-import'
-                                : 'Keeps discovered folder name'}
-                            </small>
-                          </td>
-                          <td>
-                            <button
-                              className="danger-button"
-                              onClick={() =>
-                                void ignoreImportCandidate(candidate)
-                              }
-                              type="button"
-                            >
-                              Ignore
-                            </button>
-                          </td>
                         </tr>
                       );
                     })
                   ) : (
                     <tr>
-                      <td colSpan={7}>
+                      <td colSpan={4}>
                         No scan results yet. Configure roots in Settings, then
                         scan library roots.
                       </td>
@@ -4107,12 +4128,14 @@ function App() {
                       <div className="candidate-choice">
                         <div>
                           <strong>{candidate.title}</strong>
-                          <div className="candidate-meta">
+                          <div className="candidate-meta import-steam-candidate-meta">
                             <span>
-                              {candidate.releaseDate ??
-                                'Release date unavailable'}
+                              <strong>Release date:</strong>{' '}
+                              {candidate.releaseDate ?? 'Unavailable'}
                             </span>
-                            <span>Steam app {candidate.appId}</span>
+                            <span>
+                              <strong>App ID:</strong> {candidate.appId}
+                            </span>
                           </div>
                         </div>
                       </div>

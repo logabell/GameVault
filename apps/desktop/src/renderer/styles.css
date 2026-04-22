@@ -951,17 +951,96 @@ code {
 
 .import-table {
   width: 100%;
-  min-width: 1180px;
+  min-width: 980px;
   border-collapse: collapse;
   background: var(--card);
+  table-layout: fixed;
 }
 
 .import-table th,
 .import-table td {
-  padding: 11px;
+  padding: 13px 14px;
   border-bottom: 1px solid var(--border);
   text-align: left;
   vertical-align: top;
+}
+
+.import-table__use {
+  width: 64px;
+}
+
+.import-table__use-cell {
+  text-align: center;
+  vertical-align: middle;
+}
+
+.import-use-checkbox {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  border-radius: 4px;
+  accent-color: var(--accent);
+}
+
+.import-table th:nth-child(2) {
+  width: 32%;
+}
+
+.import-table th:nth-child(3) {
+  width: 28%;
+}
+
+.import-table th:nth-child(4) {
+  width: 40%;
+}
+
+.import-sort-button {
+  min-height: 26px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+}
+
+.import-sort-button svg {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.import-sort-button.is-active {
+  color: var(--muted-strong);
+}
+
+.import-folder-cell,
+.import-match-cell,
+.import-patch-cell {
+  min-width: 0;
+}
+
+.import-table td > strong,
+.import-table td > small,
+.import-table td > .muted-text,
+.import-patch-status {
+  display: block;
+}
+
+.import-table td > strong {
+  margin-bottom: 5px;
+}
+
+.import-folder-cell small {
+  color: var(--muted);
+  line-height: 1.35;
+}
+
+.import-match-cell .import-search-button,
+.import-patch-cell .inline-controls {
+  margin-top: 10px;
 }
 
 .import-table tr.is-muted {
@@ -969,8 +1048,8 @@ code {
 }
 
 .inline-controls {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   margin-top: 8px;
 }
@@ -1245,6 +1324,25 @@ code {
 .ignored-row small,
 .toggle-field small {
   color: var(--muted);
+}
+
+.import-steam-candidate-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin-top: 7px;
+  line-height: 1.35;
+}
+
+.import-steam-candidate-meta span {
+  display: inline-flex;
+  gap: 4px;
+  align-items: baseline;
+}
+
+.import-steam-candidate-meta strong {
+  color: var(--muted-strong);
+  font-weight: 800;
 }
 
 .retry-dropdown__option:hover,
