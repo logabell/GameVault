@@ -58,11 +58,15 @@ export function needsPatchMetadataAttention(item: TrackedItemView): boolean {
 }
 
 export function hasActionableSourceUpdate(item: TrackedItemView): boolean {
-  return getTrackingStatus(item) === TrackedItemTrackingStatus.UpdateAvailable;
+  return (
+    !needsPatchMetadataAttention(item) &&
+    getTrackingStatus(item) === TrackedItemTrackingStatus.UpdateAvailable
+  );
 }
 
 export function isSourceBehindUpstream(item: TrackedItemView): boolean {
   return (
+    !needsPatchMetadataAttention(item) &&
     getTrackingStatus(item) === TrackedItemTrackingStatus.SourceBehindUpstream
   );
 }

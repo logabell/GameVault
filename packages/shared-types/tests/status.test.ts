@@ -83,6 +83,65 @@ describe('deriveTrackedItemStatus', () => {
     ).toBe(TrackedItemTrackingStatus.SourceBehindUpstream);
   });
 
+  it('does not mark imported manual items as update available when installed matches upstream', () => {
+    const latestPatch = {
+      appId: 516750,
+      buildId: '20171487',
+      link: 'https://steamdb.info/patchnotes/20171487/',
+      patchDate: '09/29/2025',
+      patchTitle: 'My Summer Car update for 29 September 2025',
+      publishedAt: '2025-09-29T12:00:00.000Z',
+      trackedItemId: 'item',
+      title: 'My Summer Car',
+    };
+
+    expect(
+      deriveTrackedItemTrackingStatus({
+        hasSteamMatch: true,
+        installRecord: {
+          installedBuildId: '20171487',
+          installedVersion: 'My Summer Car update for 29 September 2025',
+          trackedItemId: 'item',
+          updatedAt: '2026-04-22T12:00:00.000Z',
+        },
+        latestPatch,
+        selectedPatch: latestPatch,
+        sourceMatches: [
+          {
+            downloadMirrors: [],
+            isUpdateSource: true,
+            match: {
+              confidence: 1,
+              createdAt: '2026-04-22T12:00:00.000Z',
+              isPrimary: false,
+              method: 'catalog_title',
+              normalizedTitle: 'my summer car',
+              score: 1,
+              sourceKind: 'steamrip',
+              status: 'verified',
+              trackedItemId: 'item',
+              updatedAt: '2026-04-22T12:00:00.000Z',
+              usable: true,
+            },
+            snapshot: null,
+            updateStatus: 'matches_upstream',
+          },
+        ],
+        sourceSnapshot: {
+          checkedAt: '2026-04-22T12:00:00.000Z',
+          fingerprint: '',
+          observedBuildId: '20171487',
+          observedPatchDate: '09/29/2025',
+          observedVersion: 'My Summer Car update for 29 September 2025',
+          sourceKind: 'manual',
+          sourceUrl: 'manual:import:item',
+          trackedItemId: 'item',
+        },
+        versionsBehindLatest: 0,
+      }),
+    ).toBe(TrackedItemTrackingStatus.UpToDate);
+  });
+
   it('uses installed as the primary status when the final folder exists', () => {
     expect(
       deriveTrackedItemStatus({

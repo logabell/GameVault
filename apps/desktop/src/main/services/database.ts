@@ -320,6 +320,7 @@ function applyMigrations(db: SqlJsDatabase): void {
   migrateDownloadMirrorsPrimaryKey(db);
   migrateDownloadJobParts(db);
   repairTransientSourceMatchState(db);
+  repairSourceSnapshotsFromRawPayload(db);
 }
 
 function repairTransientSourceMatchState(db: SqlJsDatabase): void {
@@ -360,6 +361,91 @@ function repairTransientSourceMatchState(db: SqlJsDatabase): void {
        AND source_url IS NULL
        AND is_primary = 0;
   `);
+}
+
+function optionalTrimmedString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function repairSourceSnapshotsFromRawPayload(db: SqlJsDatabase): void {
+  const rows: Array<{
+    tracked_item_id: string;
+    source_kind: SourceKind;
+    source_url: string;
+    fingerprint: string;
+    observed_version: string;
+    observed_build_id: string | null;
+    observed_patch_date: string | null;
+    patch_selection_source: string | null;
+    raw_payload_json: string;
+  }> = [];
+  const statement = db.prepare(`
+    SELECT tracked_item_id, source_kind, source_url, fingerprint,
+           observed_version, observed_build_id, observed_patch_date,
+           patch_selection_source, raw_payload_json
+      FROM source_snapshots
+     WHERE source_kind != 'manual'
+       AND raw_payload_json IS NOT NULL
+       AND raw_payload_json != 'null'
+  `);
+  while (statement.step()) {
+    rows.push(statement.getAsObject() as (typeof rows)[number]);
+  }
+  statement.free();
+
+  for (const row of rows) {
+    let payload: Partial<ParsedSourcePayload> | null = null;
+    try {
+      payload = JSON.parse(row.raw_payload_json) as Partial<ParsedSourcePayload>;
+    } catch {
+      payload = null;
+    }
+
+    if (!payload?.latestSourceRelease || payload.sourceKind !== row.source_kind) {
+      continue;
+    }
+
+    const release = payload.latestSourceRelease;
+    const observedVersion =
+      optionalTrimmedString(release.version) ?? row.observed_version;
+    const observedBuildId = optionalTrimmedString(release.buildId);
+    const observedPatchDate = optionalTrimmedString(release.patchDate);
+    const sourceUrl = optionalTrimmedString(payload.sourceUrl) ?? row.source_url;
+    const fingerprint = optionalTrimmedString(payload.fingerprint) ?? row.fingerprint;
+    const shouldRepair =
+      row.patch_selection_source != null ||
+      row.observed_version !== observedVersion ||
+      row.observed_build_id !== observedBuildId ||
+      row.observed_patch_date !== observedPatchDate ||
+      row.source_url !== sourceUrl ||
+      row.fingerprint !== fingerprint;
+
+    if (!shouldRepair) {
+      continue;
+    }
+
+    db.run(
+      `UPDATE source_snapshots
+          SET source_url = ?,
+              fingerprint = ?,
+              observed_version = ?,
+              observed_build_id = ?,
+              observed_patch_date = ?,
+              observed_patch_title = NULL,
+              observed_patch_link = NULL,
+              patch_selection_source = NULL
+        WHERE tracked_item_id = ? AND source_kind = ?`,
+      [
+        sourceUrl,
+        fingerprint,
+        observedVersion,
+        observedBuildId,
+        observedPatchDate,
+        row.tracked_item_id,
+        row.source_kind,
+      ],
+    );
+  }
 }
 
 function tableHasColumn(
@@ -850,7 +936,7 @@ export class VaultTrackDatabase {
 
   getSourceSnapshot(
     trackedItemId: string,
-    sourceKind?: SupportedSourceKind | null,
+    sourceKind?: SourceKind | null,
   ): SourceSnapshot | null {
     const row = this.queryOne<{
       tracked_item_id: string;

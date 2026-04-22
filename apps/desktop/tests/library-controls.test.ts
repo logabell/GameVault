@@ -127,6 +127,10 @@ describe('library controls', () => {
     const updateAvailable = makeItem('Update Available', {
       trackingStatus: TrackedItemTrackingStatus.UpdateAvailable,
     });
+    const updateWithMissingPatch = makeItem('Update Needs Attention', {
+      patchMetadataStatus: 'needs_attention',
+      trackingStatus: TrackedItemTrackingStatus.UpdateAvailable,
+    });
     const sourceBehind = makeItem('Source Behind', {
       trackingStatus: TrackedItemTrackingStatus.SourceBehindUpstream,
     });
@@ -136,6 +140,13 @@ describe('library controls', () => {
 
     expect(filterLibraryItem(updateAvailable, 'updates')).toBe(true);
     expect(matchesLibraryStatusFilter(updateAvailable, 'updates')).toBe(true);
+    expect(filterLibraryItem(updateWithMissingPatch, 'updates')).toBe(false);
+    expect(matchesLibraryStatusFilter(updateWithMissingPatch, 'updates')).toBe(
+      false,
+    );
+    expect(matchesLibraryStatusFilter(updateWithMissingPatch, 'needsAttention')).toBe(
+      true,
+    );
     expect(filterLibraryItem(sourceBehind, 'updates')).toBe(false);
     expect(matchesLibraryStatusFilter(sourceBehind, 'updates')).toBe(false);
     expect(filterLibraryItem(patchBehind, 'updates')).toBe(false);
@@ -146,9 +157,22 @@ describe('library controls', () => {
     const sourceBehind = makeItem('Source Behind', {
       trackingStatus: TrackedItemTrackingStatus.SourceBehindUpstream,
     });
+    const sourceBehindWithMissingPatch = makeItem('Source Behind Needs Attention', {
+      patchMetadataStatus: 'needs_attention',
+      trackingStatus: TrackedItemTrackingStatus.SourceBehindUpstream,
+    });
     const installed = makeItem('Installed');
 
     expect(matchesLibraryStatusFilter(sourceBehind, 'sourceBehind')).toBe(true);
+    expect(
+      matchesLibraryStatusFilter(sourceBehindWithMissingPatch, 'sourceBehind'),
+    ).toBe(false);
+    expect(
+      matchesLibraryStatusFilter(
+        sourceBehindWithMissingPatch,
+        'needsAttention',
+      ),
+    ).toBe(true);
     expect(matchesLibraryStatusFilter(sourceBehind, 'installedUpToDate')).toBe(
       false,
     );

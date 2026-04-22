@@ -665,7 +665,8 @@ code {
 }
 
 .status-chip.failed,
-.status-chip.folder_missing {
+.status-chip.folder_missing,
+.tracking-chip.needs_attention {
   color: color-mix(in srgb, var(--danger) 72%, var(--ink));
   border-color: color-mix(in srgb, var(--danger) 30%, var(--border));
   background: color-mix(in srgb, var(--danger) 12%, var(--panel-soft));
@@ -1536,42 +1537,195 @@ code {
   color: var(--ink);
 }
 
-.source-match-list {
-  display: grid;
-  gap: 10px;
+.source-modal-menu {
+  position: absolute;
+  z-index: 2;
+  top: 12px;
+  right: 54px;
 }
 
-.source-match-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) auto;
-  gap: 12px;
-  align-items: center;
+.sources-update-modal {
+  width: min(1080px, 100%);
+}
+
+.sources-update-modal .details-modal__hero {
+  min-height: 150px;
+}
+
+.sources-update-modal .details-modal__body {
+  gap: 10px;
   padding: 12px;
+}
+
+.source-install-panel,
+.source-offer-card,
+.manual-source-panel {
+  display: grid;
+  gap: 9px;
+  padding: 10px;
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--panel-strong);
 }
 
-.source-match-row > div {
+.source-install-panel h3,
+.source-offer-card h3 {
+  margin: 0;
+  color: var(--ink);
+  letter-spacing: 0;
+}
+
+.source-install-grid,
+.source-offer-meta {
   display: grid;
+  gap: 7px;
+}
+
+.source-install-grid {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+
+.source-offer-meta {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.source-install-grid > div,
+.source-offer-meta > div {
+  display: grid;
+  align-content: start;
+  gap: 3px;
+  min-width: 0;
+}
+
+.source-install-grid strong,
+.source-offer-meta strong {
+  color: var(--muted-strong);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.source-install-grid span,
+.source-offer-meta span,
+.source-offer-card__heading p {
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.source-offer-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.source-offer-card__heading,
+.source-offer-card__footer {
+  display: grid;
+  gap: 8px;
+  align-items: start;
+}
+
+.source-offer-card__heading {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.source-offer-card__heading p {
+  margin: 2px 0 0;
+}
+
+.source-tag-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-start;
   gap: 4px;
 }
 
-.source-match-row span {
+.source-tag {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel-soft);
+  color: var(--muted-strong);
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.source-tag.current_installed_source {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 32%, var(--border));
+  background: color-mix(in srgb, var(--success) 12%, var(--panel-soft));
+}
+
+.source-tag.update_source {
+  color: color-mix(in srgb, var(--warning) 82%, var(--ink));
+  border-color: color-mix(in srgb, var(--warning) 34%, var(--border));
+  background: color-mix(in srgb, var(--warning) 14%, var(--panel-soft));
+}
+
+.source-tag.not_matched,
+.source-tag.failed,
+.source-tag.blocked {
   color: var(--muted);
-  font-size: 12px;
+}
+
+.source-offer-card__footer {
+  align-items: start;
 }
 
 .source-match-row__actions {
   display: flex;
   flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 8px;
+  justify-content: flex-start;
+  gap: 6px;
 }
 
-.source-modal-actions {
-  display: flex;
-  justify-content: flex-end;
+.source-match-row__actions button {
+  min-height: 31px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-soft);
+  color: var(--ink);
+  font-weight: 800;
+  font-size: 12px;
+}
+
+.source-match-row__actions button[aria-busy='true'] {
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--border));
+  background: color-mix(in srgb, var(--accent-soft) 64%, var(--panel-soft));
+  color: var(--accent);
+}
+
+.source-match-row__actions button:hover,
+.source-match-row__actions button:focus-visible {
+  border-color: color-mix(in srgb, var(--accent) 36%, var(--border));
+  background: color-mix(in srgb, var(--accent-soft) 58%, var(--panel-soft));
+}
+
+.source-offer-notice {
+  margin: 0;
+  padding: 7px 8px;
+  border: 1px solid color-mix(in srgb, var(--warning) 22%, var(--border));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--warning) 8%, var(--panel-soft));
+  color: var(--muted-strong);
+  font-size: 11px;
+}
+
+.manual-source-panel {
+  grid-template-columns: minmax(140px, 0.4fr) minmax(0, 1fr) auto;
+  align-items: end;
 }
 
 code {
@@ -1609,8 +1763,18 @@ code {
     grid-template-columns: 1fr;
   }
 
-  .source-match-row {
+  .source-install-grid,
+  .source-offer-meta,
+  .source-offer-list,
+  .source-offer-card__heading,
+  .source-offer-card__footer,
+  .manual-source-panel {
     grid-template-columns: 1fr;
+  }
+
+  .source-tag-row,
+  .source-match-row__actions {
+    justify-content: flex-start;
   }
 
   .game-row {

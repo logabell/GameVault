@@ -4,6 +4,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  type MouseEvent,
   useRef,
   useState,
 } from 'react';
@@ -57,6 +58,7 @@ import type {
   SteamMatchResolutionPayload,
   SteamPatchCandidate,
   SteamPatchFeedResult,
+  SourceKind,
   SupportedSourceKind,
   ThemeMode,
   TrackedItemView,
@@ -902,8 +904,11 @@ function getItemFileState(item: TrackedItemView): TrackedItemView['fileState'] {
 }
 
 function shouldShowTrackingStatus(item: TrackedItemView): boolean {
-  return !['queued', 'downloading', 'extracting', 'staged', 'failed'].includes(
-    item.status,
+  return (
+    !needsPatchMetadataAttention(item) &&
+    !['queued', 'downloading', 'extracting', 'staged', 'failed'].includes(
+      item.status,
+    )
   );
 }
 
@@ -947,6 +952,18 @@ function formatPatchLag(item: TrackedItemView): string {
   return 'Unknown';
 }
 
+function formatPatchBehindCount(
+  count: number,
+  isLowerBound?: boolean | null,
+): string {
+  if (count === 0) {
+    return 'Up to date';
+  }
+  return `${count}${isLowerBound ? '+' : ''} patch${
+    count === 1 ? '' : 'es'
+  } behind`;
+}
+
 function getPatchEditorTitle(item: TrackedItemView): string {
   if (needsPatchMetadataAttention(item)) {
     return 'Resolve Installed Patch';
@@ -962,6 +979,196 @@ function formatTrackedSourceKind(value: string | null | undefined): string {
   if (value === 'steamrip') return 'SteamRIP';
   if (value === 'manual') return 'Imported';
   return formatLabel(value);
+}
+
+function isImportedInstall(item: TrackedItemView): boolean {
+  return (
+    item.item.sourceKind === 'manual' ||
+    Boolean(item.installRecord && !item.item.sourceKind)
+  );
+}
+
+function getInstalledSourceKind(item: TrackedItemView): SourceKind | null {
+  if (isImportedInstall(item)) {
+    return 'manual';
+  }
+  return item.item.sourceKind ?? item.sourceSnapshot?.sourceKind ?? null;
+}
+
+function formatOptionalValue(value: string | null | undefined): string {
+  return value?.trim() || 'n/a';
+}
+
+function formatBuildValue(value: string | null | undefined): string {
+  return value?.trim() ? `Build ${value}` : 'Build n/a';
+}
+
+function sourceSnapshotMatchesPatch(
+  snapshot: TrackedItemView['sourceSnapshot'] | null | undefined,
+  patch: TrackedItemView['latestPatch'] | null | undefined,
+): boolean {
+  if (!snapshot || !patch) {
+    return false;
+  }
+  if (snapshot.observedBuildId && patch.buildId) {
+    return snapshot.observedBuildId === patch.buildId;
+  }
+  if (snapshot.observedPatchLink && patch.link) {
+    return snapshot.observedPatchLink === patch.link;
+  }
+  return Boolean(
+    snapshot.observedPatchDate &&
+      snapshot.observedPatchTitle &&
+      snapshot.observedPatchDate === patch.patchDate &&
+      snapshot.observedPatchTitle === patch.patchTitle,
+  );
+}
+
+function getSourcePatchComparison(
+  item: TrackedItemView,
+  source?: TrackedItemView['sourceMatches'][number],
+): { label: string; rank: number } {
+  if (!source) {
+    return { label: 'Not matched', rank: 900 };
+  }
+
+  const snapshot = source.snapshot;
+  if (source.updateStatus === 'not_matched') {
+    return { label: 'Not matched', rank: 900 };
+  }
+  if (source.updateStatus === 'failed' || source.updateStatus === 'blocked') {
+    return { label: formatLabel(source.updateStatus), rank: 850 };
+  }
+  if (sourceSnapshotMatchesPatch(snapshot, item.latestPatch)) {
+    return { label: 'Up to date', rank: 0 };
+  }
+  if (sourceSnapshotMatchesPatch(snapshot, item.selectedPatch)) {
+    if (typeof item.versionsBehindLatest === 'number') {
+      return {
+        label: formatPatchBehindCount(
+          item.versionsBehindLatest,
+          item.versionsBehindLatestIsLowerBound,
+        ),
+        rank: item.versionsBehindLatest,
+      };
+    }
+    return { label: 'Same as installed', rank: 300 };
+  }
+
+  switch (source.updateStatus) {
+    case 'matches_upstream':
+      return { label: 'Up to date', rank: 0 };
+    case 'newer_than_installed':
+      return { label: 'Newer than installed', rank: 100 };
+    case 'possible_update':
+      return { label: 'Possible update', rank: 150 };
+    case 'same_as_installed':
+      return typeof item.versionsBehindLatest === 'number'
+        ? {
+            label: formatPatchBehindCount(
+              item.versionsBehindLatest,
+              item.versionsBehindLatestIsLowerBound,
+            ),
+            rank: item.versionsBehindLatest,
+          }
+        : { label: 'Same as installed', rank: 300 };
+    case 'source_behind_upstream':
+      return { label: 'Behind upstream', rank: 400 };
+    default:
+      return { label: 'Unknown', rank: 700 };
+  }
+}
+
+function getCurrentInstallSummary(item: TrackedItemView) {
+  const installedVersion =
+    item.installRecord?.installedVersion ??
+    item.selectedPatch?.version ??
+    item.sourceSnapshot?.observedVersion ??
+    null;
+  const installedBuildId =
+    item.installRecord?.installedBuildId ??
+    item.selectedPatch?.buildId ??
+    item.sourceSnapshot?.observedBuildId ??
+    null;
+  const installedDate =
+    item.installRecord?.installedAt ??
+    item.selectedPatch?.patchDate ??
+    item.sourceSnapshot?.observedPatchDate ??
+    null;
+  const patchLabel =
+    item.selectedPatch?.patchTitle ??
+    item.sourceSnapshot?.observedPatchTitle ??
+    installedVersion ??
+    'Installed patch unknown';
+
+  return {
+    buildId: installedBuildId,
+    date: installedDate,
+    patchLabel,
+    sourceKind: getInstalledSourceKind(item),
+    version: installedVersion,
+  };
+}
+
+function isSourceCurrentForInstall(
+  item: TrackedItemView,
+  sourceKind: SupportedSourceKind,
+  source?: TrackedItemView['sourceMatches'][number],
+): boolean {
+  if (isImportedInstall(item)) {
+    return false;
+  }
+  const installedSourceKind = getInstalledSourceKind(item);
+  return Boolean(
+    source?.match.isPrimary ||
+      installedSourceKind === sourceKind,
+  );
+}
+
+function getSourceOfferTags(
+  item: TrackedItemView,
+  sourceKind: SupportedSourceKind,
+  source?: TrackedItemView['sourceMatches'][number],
+): string[] {
+  if (!source) {
+    return ['Not matched'];
+  }
+
+  const tags: string[] = [];
+  if (isSourceCurrentForInstall(item, sourceKind, source)) {
+    tags.push('Current installed source');
+  }
+  if (source.isUpdateSource) {
+    tags.push('Update source');
+  }
+  if (source.match.method === 'manual') {
+    tags.push('Manual');
+  }
+  if (
+    source.match.status === 'verified' ||
+    source.match.status === 'probable' ||
+    source.match.status === 'candidate'
+  ) {
+    tags.push(formatLabel(source.match.status));
+  }
+  if (source.match.status === 'not_found') {
+    tags.push('Not matched');
+  }
+  if (source.match.status === 'failed' || source.match.status === 'blocked') {
+    tags.push(formatLabel(source.match.status));
+  }
+
+  return tags.length ? tags : ['Unknown'];
+}
+
+function isSubduedSourceIssue(
+  source?: TrackedItemView['sourceMatches'][number],
+): boolean {
+  return Boolean(
+    source?.snapshot &&
+      source.match.lastError &&
+      /rate limited|retrying later/i.test(source.match.lastError),
+  );
 }
 
 function readStoredLibraryViewMode(
@@ -1132,9 +1339,13 @@ function App() {
   } | null>(null);
   const [sourcesModal, setSourcesModal] = useState<{
     item: TrackedItemView;
+    manualEditorOpen: boolean;
     manualSourceKind: SupportedSourceKind;
     manualUrl: string;
   } | null>(null);
+  const [sourceBusyKind, setSourceBusyKind] = useState<
+    SupportedSourceKind | 'manual' | 'matches' | null
+  >(null);
   const [patchEditor, setPatchEditor] = useState<{
     backfillStatus: SteamDbBackfillStatus;
     error: string | null;
@@ -2498,8 +2709,10 @@ function App() {
   }
 
   async function openSourcesForItem(item: TrackedItemView) {
+    setSourceBusyKind(null);
     setSourcesModal({
       item,
+      manualEditorOpen: false,
       manualSourceKind: 'steamrip',
       manualUrl: '',
     });
@@ -2508,6 +2721,7 @@ function App() {
   async function refreshSourceMatches(item: TrackedItemView) {
     setBusyId(item.item.id);
     setBusyAction('sources');
+    setSourceBusyKind('matches');
     try {
       const updated = await window.vaultTrackApi.discoverSourceMatches(
         item.item.id,
@@ -2521,6 +2735,7 @@ function App() {
     } finally {
       setBusyId(null);
       setBusyAction(null);
+      setSourceBusyKind(null);
     }
   }
 
@@ -2528,6 +2743,7 @@ function App() {
     if (!sourcesModal?.manualUrl.trim()) return;
     setBusyId(sourcesModal.item.item.id);
     setBusyAction('sources');
+    setSourceBusyKind('manual');
     try {
       const updated = await window.vaultTrackApi.setManualSourceMatch({
         sourceKind: sourcesModal.manualSourceKind,
@@ -2539,6 +2755,7 @@ function App() {
           ? {
               ...current,
               item: updated,
+              manualEditorOpen: false,
               manualUrl: '',
             }
           : current,
@@ -2549,6 +2766,7 @@ function App() {
     } finally {
       setBusyId(null);
       setBusyAction(null);
+      setSourceBusyKind(null);
     }
   }
 
@@ -2556,6 +2774,7 @@ function App() {
     if (!sourcesModal) return;
     setBusyId(sourcesModal.item.item.id);
     setBusyAction('sources');
+    setSourceBusyKind(sourceKind);
     try {
       const updated = await window.vaultTrackApi.refreshMatchedSource({
         sourceKind,
@@ -2570,6 +2789,7 @@ function App() {
     } finally {
       setBusyId(null);
       setBusyAction(null);
+      setSourceBusyKind(null);
     }
   }
 
@@ -2577,6 +2797,7 @@ function App() {
     if (!sourcesModal) return;
     setBusyId(sourcesModal.item.item.id);
     setBusyAction('retry');
+    setSourceBusyKind(sourceKind);
     try {
       const updated = await window.vaultTrackApi.queueUpdateFromSource({
         sourceKind,
@@ -2591,6 +2812,7 @@ function App() {
     } finally {
       setBusyId(null);
       setBusyAction(null);
+      setSourceBusyKind(null);
     }
   }
 
@@ -2996,11 +3218,17 @@ function App() {
   function renderLibraryStatusChips(item: TrackedItemView) {
     const trackingStatus = getTrackingStatus(item);
     const showTrackingStatus = shouldShowTrackingStatus(item);
+    const showNeedsAttention = needsPatchMetadataAttention(item);
     return (
       <div className="chip-row game-chip-row">
         <span className={`status-chip ${item.status}`}>
           {formatLabel(item.status)}
         </span>
+        {showNeedsAttention ? (
+          <span className="tracking-chip needs_attention">
+            Needs attention
+          </span>
+        ) : null}
         {showTrackingStatus ? (
           <span className={`tracking-chip ${trackingStatus}`}>
             {formatLabel(trackingStatus)}
@@ -3116,6 +3344,20 @@ function App() {
     );
   }
 
+  function closeItemActionMenu(event: MouseEvent<HTMLElement>) {
+    event.currentTarget
+      .closest('.item-action-menu')
+      ?.removeAttribute('open');
+  }
+
+  function runItemMenuAction(
+    event: MouseEvent<HTMLElement>,
+    action: () => void,
+  ) {
+    closeItemActionMenu(event);
+    action();
+  }
+
   function renderLibraryActionMenu(item: TrackedItemView) {
     const itemBusy = busyId === item.item.id;
     const itemBusyAction = itemBusy ? busyAction : null;
@@ -3128,8 +3370,10 @@ function App() {
         <div className="item-action-menu__panel" role="menu">
           {item.item.sourceUrl ? (
             <button
-              onClick={() =>
-                void window.vaultTrackApi.openExternal(item.item.sourceUrl!)
+              onClick={(event) =>
+                runItemMenuAction(event, () => {
+                  void window.vaultTrackApi.openExternal(item.item.sourceUrl!);
+                })
               }
               role="menuitem"
               type="button"
@@ -3141,7 +3385,11 @@ function App() {
           <button
             aria-busy={itemBusyAction === 'sources'}
             disabled={itemBusy}
-            onClick={() => void openSourcesForItem(item)}
+            onClick={(event) =>
+              runItemMenuAction(event, () => {
+                void openSourcesForItem(item);
+              })
+            }
             role="menuitem"
             type="button"
           >
@@ -3151,10 +3399,12 @@ function App() {
           {item.item.steamAppId ? (
             <>
               <button
-                onClick={() =>
-                  void window.vaultTrackApi.openExternal(
-                    `https://store.steampowered.com/app/${item.item.steamAppId}/`,
-                  )
+                onClick={(event) =>
+                  runItemMenuAction(event, () => {
+                    void window.vaultTrackApi.openExternal(
+                      `https://store.steampowered.com/app/${item.item.steamAppId}/`,
+                    );
+                  })
                 }
                 role="menuitem"
                 type="button"
@@ -3166,10 +3416,12 @@ function App() {
                 <span>Open Steam</span>
               </button>
               <button
-                onClick={() =>
-                  void window.vaultTrackApi.openExternal(
-                    `https://steamdb.info/app/${item.item.steamAppId}/`,
-                  )
+                onClick={(event) =>
+                  runItemMenuAction(event, () => {
+                    void window.vaultTrackApi.openExternal(
+                      `https://steamdb.info/app/${item.item.steamAppId}/`,
+                    );
+                  })
                 }
                 role="menuitem"
                 type="button"
@@ -3184,7 +3436,11 @@ function App() {
                 <button
                   aria-busy={itemBusyAction === 'updatePatch'}
                   disabled={itemBusy}
-                  onClick={() => void openSourcePatchEditor(item)}
+                  onClick={(event) =>
+                    runItemMenuAction(event, () => {
+                      void openSourcePatchEditor(item);
+                    })
+                  }
                   role="menuitem"
                   type="button"
                 >
@@ -3199,10 +3455,12 @@ function App() {
           <button
             aria-busy={itemBusyAction === 'refresh'}
             disabled={itemBusy}
-            onClick={() =>
-              void runItemAction(item.item.id, () =>
-                window.vaultTrackApi.refreshTrackedItem(item.item.id),
-              )
+            onClick={(event) =>
+              runItemMenuAction(event, () => {
+                void runItemAction(item.item.id, () =>
+                  window.vaultTrackApi.refreshTrackedItem(item.item.id),
+                );
+              })
             }
             role="menuitem"
             type="button"
@@ -3213,7 +3471,9 @@ function App() {
           {showRetryDownload ? (
             <button
               disabled={itemBusy}
-              onClick={() => openRetrySelector(item)}
+              onClick={(event) =>
+                runItemMenuAction(event, () => openRetrySelector(item))
+              }
               role="menuitem"
               type="button"
             >
@@ -3226,7 +3486,11 @@ function App() {
               aria-busy={itemBusyAction === 'markFailed'}
               className="is-danger"
               disabled={itemBusy}
-              onClick={() => void markDownloadFailed(item)}
+              onClick={(event) =>
+                runItemMenuAction(event, () => {
+                  void markDownloadFailed(item);
+                })
+              }
               role="menuitem"
               type="button"
             >
@@ -3243,13 +3507,15 @@ function App() {
             <button
               aria-busy={itemBusyAction === 'completeInstall'}
               disabled={itemBusy}
-              onClick={() =>
-                void runItemAction(
-                  item.item.id,
-                  () =>
-                    window.vaultTrackApi.completeStagedInstall(item.item.id),
-                  'completeInstall',
-                )
+              onClick={(event) =>
+                runItemMenuAction(event, () => {
+                  void runItemAction(
+                    item.item.id,
+                    () =>
+                      window.vaultTrackApi.completeStagedInstall(item.item.id),
+                    'completeInstall',
+                  );
+                })
               }
               role="menuitem"
               type="button"
@@ -3262,7 +3528,11 @@ function App() {
           ) : null}
           <button
             disabled={itemBusy}
-            onClick={() => void removeTrackedItem(item, 'tracking_only')}
+            onClick={(event) =>
+              runItemMenuAction(event, () => {
+                void removeTrackedItem(item, 'tracking_only');
+              })
+            }
             role="menuitem"
             type="button"
           >
@@ -3273,7 +3543,11 @@ function App() {
             aria-busy={itemBusyAction === 'deleteFiles'}
             className="is-danger"
             disabled={itemBusy}
-            onClick={() => void removeTrackedItem(item, 'delete_files')}
+            onClick={(event) =>
+              runItemMenuAction(event, () => {
+                void removeTrackedItem(item, 'delete_files');
+              })
+            }
             role="menuitem"
             type="button"
           >
@@ -3336,16 +3610,29 @@ function App() {
   function renderSourcesModal() {
     if (!sourcesModal) return null;
     const item = sourcesModal.item;
+    const currentInstall = getCurrentInstallSummary(item);
+    const fileState = getItemFileState(item);
     const rows = SUPPORTED_RENDER_SOURCE_KINDS.map((sourceKind) => {
       const source = item.sourceMatches.find(
         (entry) => entry.match.sourceKind === sourceKind,
       );
+      const comparison = getSourcePatchComparison(item, source);
       return {
+        comparison,
         source,
         sourceKind,
       };
-    });
-    const itemBusy = busyId === item.item.id;
+    }).sort(
+      (left, right) =>
+        left.comparison.rank - right.comparison.rank ||
+        SUPPORTED_RENDER_SOURCE_KINDS.indexOf(left.sourceKind) -
+          SUPPORTED_RENDER_SOURCE_KINDS.indexOf(right.sourceKind),
+    );
+    const installedPathLabel = fileState.finalPathExists
+      ? 'Folder found'
+      : fileState.finalPath
+        ? 'Folder not found'
+        : 'Install path unknown';
     return (
       <div
         className="details-modal-backdrop"
@@ -3354,15 +3641,62 @@ function App() {
         <section
           aria-labelledby="sources-modal-title"
           aria-modal="true"
-          className="details-modal"
+          className="details-modal sources-update-modal"
           onMouseDown={(event) => event.stopPropagation()}
           role="dialog"
         >
-          <div className="details-modal__header">
-            <div>
-              <p className="eyebrow">Sources</p>
+          <div className="details-modal__hero">
+            {renderLibraryArtwork(item, 'details-modal__cover')}
+            <div className="details-modal__shade" />
+            <div className="details-modal__hero-content">
+              {renderLibraryStatusChips(item)}
+              <p className="eyebrow">Sources & updates</p>
               <h2 id="sources-modal-title">{item.item.title}</h2>
+              <p>
+                Patch Status: <span>{formatPatchLag(item)}</span>
+              </p>
             </div>
+            <details className="item-action-menu source-modal-menu">
+              <summary aria-label="Source actions">
+                <FontAwesomeIcon aria-hidden="true" icon={faEllipsis} />
+              </summary>
+              <div className="item-action-menu__panel" role="menu">
+                <button
+                  disabled={sourceBusyKind === 'matches'}
+                  onClick={(event) => {
+                    closeItemActionMenu(event);
+                    void refreshSourceMatches(item);
+                  }}
+                  role="menuitem"
+                  type="button"
+                >
+                  <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
+                  <span>
+                    {sourceBusyKind === 'matches'
+                      ? 'Refreshing...'
+                      : 'Refresh Matches'}
+                  </span>
+                </button>
+                <button
+                  onClick={(event) => {
+                    closeItemActionMenu(event);
+                    setSourcesModal((current) =>
+                      current
+                        ? {
+                            ...current,
+                            manualEditorOpen: !current.manualEditorOpen,
+                          }
+                        : current,
+                    );
+                  }}
+                  role="menuitem"
+                  type="button"
+                >
+                  <FontAwesomeIcon aria-hidden="true" icon={faPenToSquare} />
+                  <span>Add Source URL</span>
+                </button>
+              </div>
+            </details>
             <button
               aria-label="Close sources"
               className="modal-close-button"
@@ -3373,36 +3707,102 @@ function App() {
             </button>
           </div>
           <div className="details-modal__body">
-            <div className="source-match-list">
-              {rows.map(({ source, sourceKind }) => {
+            <section className="source-install-panel">
+              <div>
+                <p className="eyebrow">Current install</p>
+                <h3>{currentInstall.patchLabel}</h3>
+              </div>
+              <div className="source-install-grid">
+                <div>
+                  <strong>Source</strong>
+                  <span>{formatTrackedSourceKind(currentInstall.sourceKind)}</span>
+                </div>
+                <div>
+                  <strong>Patch Version</strong>
+                  <span>{formatOptionalValue(currentInstall.version)}</span>
+                </div>
+                <div>
+                  <strong>Build ID</strong>
+                  <span>{formatBuildValue(currentInstall.buildId)}</span>
+                </div>
+                <div>
+                  <strong>Release Date</strong>
+                  <span>{formatOptionalValue(currentInstall.date)}</span>
+                </div>
+                <div>
+                  <strong>Installed Path</strong>
+                  <span>{installedPathLabel}</span>
+                  <span>{fileState.finalPath ?? 'Root path not set'}</span>
+                </div>
+                <div>
+                  <strong>Patch Lag</strong>
+                  <span>{formatPatchLag(item)}</span>
+                </div>
+              </div>
+            </section>
+            <div className="source-offer-list">
+              {rows.map(({ comparison, source, sourceKind }) => {
                 const match = source?.match;
                 const snapshot = source?.snapshot;
                 const fullMirror = source?.downloadMirrors.find(
                   (mirror) => mirror.kind === 'full',
                 );
+                const tags = getSourceOfferTags(item, sourceKind, source);
+                const sourceIssue = match?.lastError;
+                const issueIsSubdued = isSubduedSourceIssue(source);
+                const scanTime =
+                  snapshot?.checkedAt ?? match?.lastCheckedAt ?? null;
+                const isRefreshing = sourceBusyKind === sourceKind;
                 return (
-                  <div className="source-match-row" key={sourceKind}>
-                    <div>
-                      <strong>{formatTrackedSourceKind(sourceKind)}</strong>
-                      <span>
-                        {match?.status
-                          ? `${formatLabel(match.status)} ${Math.round(
-                              match.confidence * 100,
-                            )}%`
-                          : 'Not matched'}
-                      </span>
-                      <span>{formatLabel(source?.updateStatus ?? 'unknown')}</span>
+                  <article className="source-offer-card" key={sourceKind}>
+                    <div className="source-offer-card__heading">
+                      <div>
+                        <h3>{formatTrackedSourceKind(sourceKind)}</h3>
+                        <p>
+                          {match?.status
+                            ? `${formatLabel(match.status)} ${Math.round(
+                                match.confidence * 100,
+                              )}%`
+                            : 'Not matched'}
+                        </p>
+                      </div>
+                      <div className="source-tag-row">
+                        {tags.map((tag) => (
+                          <span
+                            className={`source-tag ${tag
+                              .toLowerCase()
+                              .replace(/[^a-z0-9]+/g, '_')}`}
+                            key={tag}
+                          >
+                            {tag}
+                          </span>
+                        ))}
+                      </div>
                     </div>
-                    <div>
-                      <span>{snapshot?.observedVersion ?? 'Version unknown'}</span>
-                      <span>
-                        {snapshot?.observedBuildId
-                          ? `Build ${snapshot.observedBuildId}`
-                          : 'Build n/a'}
-                      </span>
-                      <span>{snapshot?.observedPatchDate ?? 'Date n/a'}</span>
+                    <div className="source-offer-meta">
+                      <div>
+                        <strong>Version</strong>
+                        <span>{snapshot?.observedVersion ?? 'Unknown'}</span>
+                      </div>
+                      <div>
+                        <strong>Build</strong>
+                        <span>{formatBuildValue(snapshot?.observedBuildId)}</span>
+                      </div>
+                      <div>
+                        <strong>Date</strong>
+                        <span>{formatOptionalValue(snapshot?.observedPatchDate)}</span>
+                      </div>
+                      <div>
+                        <strong>SteamDB</strong>
+                        <span>{comparison.label}</span>
+                      </div>
+                      <div>
+                        <strong>Scanned</strong>
+                        <span>{formatRelativeTime(scanTime)}</span>
+                      </div>
                     </div>
-                    <div className="source-match-row__actions">
+                    <div className="source-offer-card__footer">
+                      <div className="source-match-row__actions">
                       {match?.sourceUrl ? (
                         <button
                           onClick={() =>
@@ -3421,7 +3821,8 @@ function App() {
                       ) : null}
                       {match?.sourceUrl ? (
                         <button
-                          disabled={itemBusy}
+                          aria-busy={isRefreshing}
+                          disabled={isRefreshing}
                           onClick={() =>
                             void refreshOneMatchedSource(sourceKind)
                           }
@@ -3431,12 +3832,12 @@ function App() {
                             aria-hidden="true"
                             icon={faRotateRight}
                           />
-                          <span>Refresh</span>
+                          <span>{isRefreshing ? 'Refreshing...' : 'Refresh'}</span>
                         </button>
                       ) : null}
                       {source?.isUpdateSource && fullMirror ? (
                         <button
-                          disabled={itemBusy}
+                          disabled={isRefreshing}
                           onClick={() => void queueSourceUpdate(sourceKind)}
                           type="button"
                         >
@@ -3447,25 +3848,27 @@ function App() {
                           <span>Download</span>
                         </button>
                       ) : null}
+                      </div>
                     </div>
-                    {match?.lastError ? (
-                      <p className="form-error">{match.lastError}</p>
+                    {sourceIssue ? (
+                      <p
+                        className={
+                          issueIsSubdued
+                            ? 'source-offer-notice'
+                            : 'form-error'
+                        }
+                      >
+                        {issueIsSubdued
+                          ? `Last refresh issue: ${sourceIssue}`
+                          : sourceIssue}
+                      </p>
                     ) : null}
-                  </div>
+                  </article>
                 );
               })}
             </div>
-            <div className="source-modal-actions">
-              <button
-                disabled={itemBusy}
-                onClick={() => void refreshSourceMatches(item)}
-                type="button"
-              >
-                <FontAwesomeIcon aria-hidden="true" icon={faMagnifyingGlass} />
-                <span>Find Matches</span>
-              </button>
-            </div>
-            <div className="settings-card">
+            {sourcesModal.manualEditorOpen ? (
+            <div className="manual-source-panel settings-card">
               <label>
                 <span>Source</span>
                 <select
@@ -3504,14 +3907,20 @@ function App() {
                 />
               </label>
               <button
-                disabled={itemBusy || !sourcesModal.manualUrl.trim()}
+                disabled={
+                  sourceBusyKind === 'manual' ||
+                  !sourcesModal.manualUrl.trim()
+                }
                 onClick={() => void saveManualSourceMatch()}
                 type="button"
               >
                 <FontAwesomeIcon aria-hidden="true" icon={faCheck} />
-                <span>Save URL</span>
+                <span>
+                  {sourceBusyKind === 'manual' ? 'Saving...' : 'Save URL'}
+                </span>
               </button>
             </div>
+            ) : null}
           </div>
         </section>
       </div>
@@ -3528,7 +3937,7 @@ function App() {
       item,
       variant: 'list',
     });
-    const showUpdateButton = getTrackingStatus(item) === 'update_available';
+    const showUpdateButton = hasActionableSourceUpdate(item);
     const showResolvePatchButton = needsPatchMetadataAttention(item);
 
     if (libraryViewMode === 'list') {

@@ -17,9 +17,11 @@ export interface StatusComputationInput {
   sourceSnapshot?: SourceSnapshot | null;
   currentWatch?: SourceWatch | null;
   latestPatch?: SteamPatchEntry | null;
+  selectedPatch?: SteamPatchEntry | null;
   currentDownload?: DownloadJobRecord | null;
   finalPathExists?: boolean;
   hasKnownFinalPath?: boolean;
+  versionsBehindLatest?: number | null;
 }
 
 export interface PatchLagComputationInput {
@@ -84,6 +86,18 @@ function hasMatchedSourceBehind(sourceMatches: MatchedSourceView[] | null | unde
         source.updateStatus === 'source_behind_upstream',
     ),
   );
+}
+
+function selectedPatchIsLatest(input: StatusComputationInput): boolean {
+  if (input.versionsBehindLatest === 0) {
+    return true;
+  }
+
+  if (!input.selectedPatch || !input.latestPatch) {
+    return false;
+  }
+
+  return patchIdentityMatches(input.selectedPatch, input.latestPatch);
 }
 
 export function derivePatchLag(
@@ -216,12 +230,22 @@ export function deriveTrackedItemTrackingStatus(
     return TrackedItemTrackingStatus.WatchWindowExpired;
   }
 
+  if (selectedPatchIsLatest(input)) {
+    return TrackedItemTrackingStatus.UpToDate;
+  }
+
   if (hasMatchedSourceUpdate(input.sourceMatches)) {
     return TrackedItemTrackingStatus.UpdateAvailable;
   }
 
   if (hasMatchedSourceBehind(input.sourceMatches)) {
     return TrackedItemTrackingStatus.SourceBehindUpstream;
+  }
+
+  const hasComparableSourceSnapshot =
+    input.sourceSnapshot && input.sourceSnapshot.sourceKind !== 'manual';
+  if (!hasComparableSourceSnapshot) {
+    return TrackedItemTrackingStatus.WatchingSource;
   }
 
   const sourceVersion = input.sourceSnapshot?.observedBuildId

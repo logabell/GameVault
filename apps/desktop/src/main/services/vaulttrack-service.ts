@@ -871,6 +871,14 @@ export class VaultTrackService {
     };
   }
 
+  private getItemSourceSnapshot(item: TrackedItemRecord): SourceSnapshot | null {
+    return (
+      (item.sourceKind
+        ? this.database.getSourceSnapshot(item.id, item.sourceKind)
+        : null) ?? this.database.getSourceSnapshot(item.id)
+    );
+  }
+
   private async buildTrackedItemView(
     trackedItemId: string,
   ): Promise<TrackedItemView> {
@@ -881,7 +889,7 @@ export class VaultTrackService {
 
     const settings = this.database.getSettings();
     const steamMatch = this.database.getSteamMatch(trackedItemId);
-    const sourceSnapshot = this.database.getSourceSnapshot(trackedItemId);
+    const sourceSnapshot = this.getItemSourceSnapshot(item);
     const sourceSnapshots = this.database.listSourceSnapshots(trackedItemId);
     const sourceMatches = this.database.listSourceMatches(trackedItemId);
     const installRecord = this.database.getInstallRecord(trackedItemId);
@@ -1008,8 +1016,10 @@ export class VaultTrackService {
       hasSteamMatch: Boolean(steamMatch),
       installRecord,
       latestPatch,
+      selectedPatch,
       sourceSnapshot,
       sourceMatches: matchedSourceViews,
+      versionsBehindLatest: patchLag.versionsBehindLatest,
     });
     const patchMetadataStatus = derivePatchMetadataStatus({
       hasSteamMatch: Boolean(steamMatch),
@@ -1908,7 +1918,10 @@ export class VaultTrackService {
   }
 
   private reconcileSteamPatchWatch(trackedItemId: string): void {
-    const sourceSnapshot = this.database.getSourceSnapshot(trackedItemId);
+    const item = this.database.findTrackedItemById(trackedItemId);
+    const sourceSnapshot = item
+      ? this.getItemSourceSnapshot(item)
+      : this.database.getSourceSnapshot(trackedItemId);
     const latestPatch = this.getLatestPatch(trackedItemId);
     const settings = this.database.getSettings();
     const installRecord = this.database.getInstallRecord(trackedItemId);
@@ -2375,7 +2388,7 @@ export class VaultTrackService {
 
     const steamMatch = this.database.getSteamMatch(trackedItemId);
     if (!item?.sourceUrl || item.sourceKind === 'manual' || !item.sourceKind) {
-      const snapshot = this.database.getSourceSnapshot(trackedItemId);
+      const snapshot = this.getItemSourceSnapshot(item);
 
       if (steamMatch) {
         await this.syncSteamPatchFeed(trackedItemId, steamMatch).catch((error) => {
@@ -2924,8 +2937,11 @@ export class VaultTrackService {
     trackedItemId: string,
   ): Promise<void> {
     const item = this.database.findTrackedItemById(trackedItemId);
-    const sourceSnapshot = this.database.getSourceSnapshot(trackedItemId);
-    if (!item || !sourceSnapshot) {
+    if (!item) {
+      return;
+    }
+    const sourceSnapshot = this.getItemSourceSnapshot(item);
+    if (!sourceSnapshot) {
       return;
     }
 
@@ -3221,7 +3237,7 @@ export class VaultTrackService {
             }
 
             if (nextJob.stage === 'complete') {
-              const sourceSnapshot = this.database.getSourceSnapshot(item.id);
+              const sourceSnapshot = this.getItemSourceSnapshot(item);
               if (sourceSnapshot) {
                 this.database.upsertInstallRecord({
                   installedAt:
@@ -3935,7 +3951,8 @@ export class VaultTrackService {
   ): Promise<TrackedItemView> {
     const steamMatch = await this.withCanonicalSteamCover(match);
     this.database.upsertSteamMatch(trackedItemId, steamMatch);
-    const sourceSnapshot = this.database.getSourceSnapshot(trackedItemId);
+    const item = this.database.findTrackedItemById(trackedItemId);
+    const sourceSnapshot = item ? this.getItemSourceSnapshot(item) : null;
     if (sourceSnapshot) {
       await this.syncSteamPatchFeed(trackedItemId, steamMatch);
     }
@@ -3967,9 +3984,7 @@ export class VaultTrackService {
       );
     }
 
-    const sourceSnapshot = this.database.getSourceSnapshot(
-      params.trackedItemId,
-    );
+    const sourceSnapshot = this.getItemSourceSnapshot(item);
     if (!sourceSnapshot) {
       throw new Error('No source snapshot is available for this item.');
     }
@@ -4052,13 +4067,13 @@ export class VaultTrackService {
   }
 
   async completeStagedInstall(trackedItemId: string): Promise<TrackedItemView> {
-    const sourceSnapshot = this.database.getSourceSnapshot(trackedItemId);
-    if (!sourceSnapshot) {
-      throw new Error('No staged source snapshot is available for this item.');
-    }
     const item = this.database.findTrackedItemById(trackedItemId);
     if (!item) {
       throw new Error(`Tracked item ${trackedItemId} not found`);
+    }
+    const sourceSnapshot = this.getItemSourceSnapshot(item);
+    if (!sourceSnapshot) {
+      throw new Error('No staged source snapshot is available for this item.');
     }
     const settings = this.database.getSettings();
     const steamMatch = this.database.getSteamMatch(trackedItemId);

@@ -5,7 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { VaultTrackDatabase } from '../src/main/services/database.js';
-import type { SourceMatch, SteamPatchCandidate } from '@vaulttrack/shared-types';
+import type {
+  ParsedSourcePayload,
+  SourceMatch,
+  SteamPatchCandidate,
+} from '@vaulttrack/shared-types';
 
 function resolveSqlWasmPath(): string {
   const candidates = [
@@ -270,6 +274,82 @@ describe('VaultTrackDatabase cleanup metadata', () => {
         usable: true,
       });
       expect(reopened.getSourceMatch(item.id, 'elamigos')).toBeNull();
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('repairs matched source snapshots from saved raw source payloads', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'barony',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:import:barony',
+        title: 'Barony',
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-21T12:00:00.000Z',
+        fingerprint: 'manual-import',
+        observedBuildId: '18871170',
+        observedPatchDate: '06/15/2025',
+        observedPatchLink: 'https://steamdb.info/patchnotes/18871170/',
+        observedPatchTitle: 'No title',
+        observedVersion: 'No title',
+        patchSelectionSource: 'steamdb_builds',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:import:barony',
+        trackedItemId: item.id,
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-22T12:00:00.000Z',
+        fingerprint: 'polluted-anker',
+        observedBuildId: '18871170',
+        observedPatchDate: '06/15/2025',
+        observedPatchLink: 'https://steamdb.info/patchnotes/18871170/',
+        observedPatchTitle: 'No title',
+        observedVersion: 'No title',
+        patchSelectionSource: 'steamdb_builds',
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.net/game/barony',
+        trackedItemId: item.id,
+      });
+      const payload: ParsedSourcePayload = {
+        fingerprint: 'raw-anker',
+        fullDownloadUrls: [],
+        latestSourceRelease: {
+          buildId: '22630456',
+          isPatch: false,
+          label: 'Version V 5.0.2.2026.04.03',
+          patchDate: null,
+          version: 'V 5.0.2.2026.04.03',
+        },
+        normalizedTitle: 'barony',
+        patchDownloadUrls: [],
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.net/game/barony',
+        title: 'Barony',
+      };
+      database.setRawParsedSourcePayload(item.id, payload);
+
+      const reopened = await VaultTrackDatabase.open(
+        join(tempRoot, 'vaulttrack.sqlite'),
+        resolveSqlWasmPath(),
+      );
+
+      expect(reopened.getSourceSnapshot(item.id, 'manual')).toMatchObject({
+        observedBuildId: '18871170',
+        sourceKind: 'manual',
+      });
+      expect(reopened.getSourceSnapshot(item.id, 'ankergames')).toMatchObject({
+        fingerprint: 'raw-anker',
+        observedBuildId: '22630456',
+        observedPatchDate: null,
+        observedPatchLink: null,
+        observedPatchTitle: null,
+        observedVersion: 'V 5.0.2.2026.04.03',
+        patchSelectionSource: null,
+      });
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
