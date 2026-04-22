@@ -1,15 +1,19 @@
 import type {
   DownloadJobRecord,
   InstallRecord,
+  MatchedSourceView,
+  PatchMetadataStatus,
   SourceSnapshot,
   SourceWatch,
   SteamPatchEntry,
 } from './models.js';
 import { TrackedItemStatus, TrackedItemTrackingStatus } from './models.js';
+import { mergePatchHistory } from './patch-history.js';
 
 export interface StatusComputationInput {
   hasSteamMatch: boolean;
   installRecord?: InstallRecord | null;
+  sourceMatches?: MatchedSourceView[] | null;
   sourceSnapshot?: SourceSnapshot | null;
   currentWatch?: SourceWatch | null;
   latestPatch?: SteamPatchEntry | null;
@@ -26,6 +30,16 @@ export interface PatchLagComputationInput {
 export interface PatchLagComputationResult {
   selectedPatchMissingFromFeed: boolean;
   versionsBehindLatest: number | null;
+  versionsBehindLatestIsLowerBound: boolean;
+}
+
+export interface PatchMetadataStatusInput {
+  hasSteamMatch: boolean;
+  isInstalled: boolean;
+  selectedPatch?: SteamPatchEntry | null;
+  selectedPatchMissingFromFeed?: boolean | null;
+  versionsBehindLatest?: number | null;
+  versionsBehindLatestIsLowerBound?: boolean | null;
 }
 
 function patchIdentityMatches(left: SteamPatchEntry, right: SteamPatchEntry): boolean {
@@ -50,6 +64,28 @@ function patchTimestamp(entry: SteamPatchEntry): number {
   return Number.isNaN(dated) ? 0 : dated;
 }
 
+function hasMatchedSourceUpdate(sourceMatches: MatchedSourceView[] | null | undefined): boolean {
+  return Boolean(
+    sourceMatches?.some(
+      (source) =>
+        source.isUpdateSource &&
+        (source.updateStatus === 'newer_than_installed' ||
+          source.updateStatus === 'matches_upstream' ||
+          source.updateStatus === 'possible_update'),
+    ),
+  );
+}
+
+function hasMatchedSourceBehind(sourceMatches: MatchedSourceView[] | null | undefined): boolean {
+  return Boolean(
+    sourceMatches?.some(
+      (source) =>
+        source.match.usable &&
+        source.updateStatus === 'source_behind_upstream',
+    ),
+  );
+}
+
 export function derivePatchLag(
   input: PatchLagComputationInput,
 ): PatchLagComputationResult {
@@ -57,6 +93,19 @@ export function derivePatchLag(
     return {
       selectedPatchMissingFromFeed: false,
       versionsBehindLatest: null,
+      versionsBehindLatestIsLowerBound: false,
+    };
+  }
+
+  const feedEntries = mergePatchHistory(input.feedEntries ?? []).filter(
+    (entry) => entry.selectionSource !== 'older_than_available',
+  );
+
+  if (input.selectedPatch.selectionSource === 'older_than_available') {
+    return {
+      selectedPatchMissingFromFeed: false,
+      versionsBehindLatest: feedEntries.length > 0 ? feedEntries.length : null,
+      versionsBehindLatestIsLowerBound: feedEntries.length > 0,
     };
   }
 
@@ -64,12 +113,11 @@ export function derivePatchLag(
     return {
       selectedPatchMissingFromFeed: false,
       versionsBehindLatest: null,
+      versionsBehindLatestIsLowerBound: false,
     };
   }
 
-  const feedEntries = (input.feedEntries ?? [])
-    .slice()
-    .sort((left, right) => patchTimestamp(right) - patchTimestamp(left));
+  feedEntries.sort((left, right) => patchTimestamp(right) - patchTimestamp(left));
   const selectedIndex = feedEntries.findIndex((entry) =>
     patchIdentityMatches(entry, input.selectedPatch!),
   );
@@ -78,13 +126,47 @@ export function derivePatchLag(
     return {
       selectedPatchMissingFromFeed: feedEntries.length > 0,
       versionsBehindLatest: null,
+      versionsBehindLatestIsLowerBound: false,
     };
   }
 
   return {
     selectedPatchMissingFromFeed: false,
     versionsBehindLatest: selectedIndex,
+    versionsBehindLatestIsLowerBound: false,
   };
+}
+
+export function derivePatchMetadataStatus(
+  input: PatchMetadataStatusInput,
+): PatchMetadataStatus {
+  if (input.selectedPatch?.selectionSource === 'older_than_available') {
+    return 'behind';
+  }
+
+  if (
+    input.isInstalled &&
+    input.hasSteamMatch &&
+    (!input.selectedPatch ||
+      !input.selectedPatch.buildId ||
+      !input.selectedPatch.patchDate)
+  ) {
+    return 'needs_attention';
+  }
+
+  if (input.selectedPatchMissingFromFeed) {
+    return 'outside_saved_history';
+  }
+
+  if (typeof input.versionsBehindLatest === 'number') {
+    return input.versionsBehindLatest === 0 ? 'latest' : 'behind';
+  }
+
+  if (input.selectedPatch?.selectionSource === 'manual') {
+    return 'manual';
+  }
+
+  return 'unknown';
 }
 
 export function deriveTrackedItemStatus(
@@ -132,6 +214,14 @@ export function deriveTrackedItemTrackingStatus(
 
   if (input.currentWatch?.expiredAt) {
     return TrackedItemTrackingStatus.WatchWindowExpired;
+  }
+
+  if (hasMatchedSourceUpdate(input.sourceMatches)) {
+    return TrackedItemTrackingStatus.UpdateAvailable;
+  }
+
+  if (hasMatchedSourceBehind(input.sourceMatches)) {
+    return TrackedItemTrackingStatus.SourceBehindUpstream;
   }
 
   const sourceVersion = input.sourceSnapshot?.observedBuildId

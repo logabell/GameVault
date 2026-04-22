@@ -53,4 +53,20 @@ describe('Steam patch list merging', () => {
       mergeSteamPatchLists([rssLatest], [steamDbLatest, steamDbOlder]),
     ).toEqual([rssLatest, steamDbOlder]);
   });
+
+  it('keeps the richer title when deduplicating matching build ids', () => {
+    const rssPatch = patch(
+      '22515865',
+      'rss',
+      'Way of the Hunter update for 27 March 2026',
+    );
+    const buildTablePatch = patch('22515865', 'steamdb_builds', 'No title');
+
+    expect(mergeSteamPatchLists([buildTablePatch], [rssPatch])).toEqual([
+      expect.objectContaining({
+        buildId: '22515865',
+        patchTitle: 'Way of the Hunter update for 27 March 2026',
+      }),
+    ]);
+  });
 });

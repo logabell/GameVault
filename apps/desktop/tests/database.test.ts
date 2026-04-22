@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { VaultTrackDatabase } from '../src/main/services/database.js';
-import type { SteamPatchCandidate } from '@vaulttrack/shared-types';
+import type { SourceMatch, SteamPatchCandidate } from '@vaulttrack/shared-types';
 
 function resolveSqlWasmPath(): string {
   const candidates = [
@@ -117,6 +117,159 @@ describe('VaultTrackDatabase cleanup metadata', () => {
 
       expect(database.findTrackedItemById(item.id)).toBeNull();
       expect(database.getSteamFeedCheck(item.id)).toBeNull();
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('stores source-aware matches, snapshots, and mirrors', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'mouse p i for hire',
+        sourceKind: 'steamrip',
+        sourceUrl: 'https://steamrip.com/mouse-p-i-for-hire-free-download/',
+        title: 'MOUSE: P.I. For Hire',
+      });
+      const match: SourceMatch = {
+        confidence: 1,
+        createdAt: '2026-04-21T12:00:00.000Z',
+        isPrimary: true,
+        lastCheckedAt: '2026-04-21T12:00:00.000Z',
+        method: 'primary_source',
+        normalizedTitle: 'mouse p i for hire',
+        score: 1,
+        sourceKind: 'steamrip',
+        sourceTitle: 'MOUSE: P.I. For Hire',
+        sourceUrl: 'https://steamrip.com/mouse-p-i-for-hire-free-download/',
+        status: 'verified',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-21T12:00:00.000Z',
+        usable: true,
+      };
+      database.upsertSourceMatch(match);
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-21T12:00:00.000Z',
+        fingerprint: 'steamrip-fingerprint',
+        observedBuildId: '22862861',
+        observedVersion: '1.0.5',
+        sourceKind: 'steamrip',
+        sourceUrl: match.sourceUrl!,
+        trackedItemId: item.id,
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-21T13:00:00.000Z',
+        fingerprint: 'anker-fingerprint',
+        observedBuildId: '22862861',
+        observedVersion: 'V 1.0.5',
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.net/game/mouse-p-i-for-hire',
+        trackedItemId: item.id,
+      });
+      database.syncDownloadMirrors(item.id, 'steamrip', [
+        {
+          kind: 'full',
+          label: 'GOFILE',
+          url: 'https://gofile.io/d/full',
+        },
+      ]);
+      database.syncDownloadMirrors(item.id, 'ankergames', [
+        {
+          kind: 'full',
+          label: 'DataNodes',
+          url: 'https://ankergames.net/generate-download-url/123',
+        },
+      ]);
+
+      expect(database.listSourceMatches(item.id)).toEqual([
+        expect.objectContaining({
+          sourceKind: 'steamrip',
+          status: 'verified',
+          usable: true,
+        }),
+      ]);
+      expect(database.listSourceSnapshots(item.id)).toHaveLength(2);
+      expect(database.listDownloadMirrors(item.id, 'steamrip')).toEqual([
+        expect.objectContaining({
+          sourceKind: 'steamrip',
+          url: 'https://gofile.io/d/full',
+        }),
+      ]);
+      expect(database.listDownloadMirrors(item.id, 'ankergames')).toEqual([
+        expect.objectContaining({
+          sourceKind: 'ankergames',
+          url: 'https://ankergames.net/generate-download-url/123',
+        }),
+      ]);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('repairs transient source match states on open', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'snowrunner',
+        sourceKind: 'steamrip',
+        sourceUrl: 'https://steamrip.com/snowrunner-free-download/',
+        title: 'SnowRunner',
+      });
+      database.upsertSourceMatch({
+        confidence: 0,
+        createdAt: '2026-04-21T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-04-21T12:00:00.000Z',
+        lastError: 'Source returned 429',
+        method: 'slug',
+        normalizedTitle: 'snowrunner',
+        score: 0,
+        sourceKind: 'ankergames',
+        sourceTitle: 'SnowRunner',
+        sourceUrl: 'https://ankergames.net/game/snowrunner',
+        status: 'blocked',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-21T12:00:00.000Z',
+        usable: false,
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-21T12:00:00.000Z',
+        fingerprint: 'anker-snapshot',
+        observedBuildId: '22630308',
+        observedVersion: 'V 1.0',
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.net/game/snowrunner',
+        trackedItemId: item.id,
+      });
+      database.upsertSourceMatch({
+        confidence: 0,
+        createdAt: '2026-04-21T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-04-21T12:00:00.000Z',
+        lastError: null,
+        method: 'fuzzy_title',
+        normalizedTitle: 'snowrunner',
+        score: 0,
+        sourceKind: 'elamigos',
+        sourceTitle: null,
+        sourceUrl: null,
+        status: 'not_found',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-21T12:00:00.000Z',
+        usable: false,
+      });
+
+      const reopened = await VaultTrackDatabase.open(
+        join(tempRoot, 'vaulttrack.sqlite'),
+        resolveSqlWasmPath(),
+      );
+
+      expect(reopened.getSourceMatch(item.id, 'ankergames')).toMatchObject({
+        lastError: 'Rate limited by source; retrying later.',
+        status: 'probable',
+        usable: true,
+      });
+      expect(reopened.getSourceMatch(item.id, 'elamigos')).toBeNull();
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }

@@ -1,0 +1,340 @@
+import type {
+  SourceCatalogEntry,
+  SourceMatchMethod,
+  SupportedSourceKind,
+} from '@vaulttrack/shared-types';
+import { load } from 'cheerio';
+import type { AnyNode } from 'domhandler';
+
+import { compactText, normalizeSlashDate, normalizeTitle } from './utils.js';
+
+const SOURCE_HOSTS: Record<SupportedSourceKind, string> = {
+  ankergames: 'https://ankergames.net',
+  elamigos: 'https://elamigos.site',
+  steamrip: 'https://steamrip.com',
+};
+
+function absoluteUrl(href: string, sourceKind: SupportedSourceKind): string {
+  return new URL(href, SOURCE_HOSTS[sourceKind]).toString();
+}
+
+function firstMatch(input: string, patterns: RegExp[]): string | null {
+  for (const pattern of patterns) {
+    const match = input.match(pattern);
+    const value = match?.groups?.value ?? match?.[1];
+    if (value?.trim()) {
+      return value.trim();
+    }
+  }
+
+  return null;
+}
+
+function extractListedVersion(input: string): string | null {
+  return firstMatch(input, [
+    /\((?:v|version)\s*(?<value>[^)]+)\)/i,
+    /\bV\s*(?<value>[0-9][\w.-]*)/i,
+    /\bv(?<value>[0-9][\w.-]*)/i,
+    /\[Update\s+(?<value>[^\]]+)\]/i,
+  ]);
+}
+
+function extractListedBuildId(input: string): string | null {
+  return firstMatch(input, [
+    /\bBuild\s*(?<value>\d{5,})\b/i,
+    /\bB\s*(?<value>\d{5,})\b/i,
+  ]);
+}
+
+function cleanupSteamRipTitle(input: string): string {
+  return compactText(
+    input
+      .replace(/\s*Free Download\b.*$/i, '')
+      .replace(/\s*\((?:v|version|build)\s*[^)]*\)\s*$/i, ''),
+  );
+}
+
+function cleanupElAmigosTitle(input: string): string {
+  return compactText(
+    input
+      .replace(/\s+DOWNLOAD\s*$/i, '')
+      .replace(/\s+ElAmigos\b.*$/i, '')
+      .replace(/\s+\+\[Update[^\]]+\]\s*$/i, '')
+      .replace(/\s+\[Update[^\]]+\]\s*$/i, ''),
+  );
+}
+
+function cleanupAnkerTitle(input: string): string {
+  return compactText(
+    input
+      .replace(/\s+\b(?:V|Build|B)\s+[0-9][\w.-]*(?:\s+by\b.*)?$/i, '')
+      .replace(/\s+\bby\s+\w+.*$/i, ''),
+  );
+}
+
+function pushUnique(
+  entries: SourceCatalogEntry[],
+  seen: Set<string>,
+  entry: SourceCatalogEntry,
+): void {
+  const key = `${entry.sourceKind}:${entry.sourceUrl}`;
+  if (seen.has(key) || !entry.title || !entry.sourceUrl) {
+    return;
+  }
+
+  seen.add(key);
+  entries.push(entry);
+}
+
+export function parseElAmigosCatalog(html: string): SourceCatalogEntry[] {
+  const $ = load(html);
+  const entries: SourceCatalogEntry[] = [];
+  const seen = new Set<string>();
+  let currentDate: string | null = null;
+
+  function titleFromUrl(href: string): string {
+    const path = href.split('/').pop() ?? href;
+    return cleanupElAmigosTitle(
+      decodeURIComponent(path)
+        .replace(/\.html(?:[?#].*)?$/i, '')
+        .replace(/__?ElAmigos.*$/i, ' ElAmigos')
+        .replace(/_MULTi\d+.*$/i, '')
+        .replace(/[_-]+/g, ' '),
+    );
+  }
+
+  function catalogTextForLink(element: AnyNode): string {
+    const linkText = compactText($(element).text());
+    if (linkText && !/^download$/i.test(linkText)) {
+      return linkText;
+    }
+
+    const parentText = compactText($(element).parent().text());
+    if (parentText && !/^download$/i.test(parentText)) {
+      return parentText;
+    }
+
+    const href = $(element).attr('href') ?? '';
+    return titleFromUrl(href);
+  }
+
+  $('body')
+    .find('h1,h2,h3,p,div,a,br')
+    .each((_index, element) => {
+      const text = compactText($(element).text());
+      const date = normalizeSlashDate(text);
+      if (date && text.length <= 30) {
+        currentDate = date;
+      }
+
+      if (element.tagName?.toLowerCase() !== 'a') {
+        return;
+      }
+
+      const href = $(element).attr('href') ?? '';
+      if (!/\/?data\/.+\.html/i.test(href)) {
+        return;
+      }
+
+      const catalogText = catalogTextForLink(element);
+      const title = cleanupElAmigosTitle(catalogText) || titleFromUrl(href);
+      pushUnique(entries, seen, {
+        listedBuildId: extractListedBuildId(catalogText),
+        listedDate: currentDate,
+        listedVersion: extractListedVersion(catalogText),
+        method: 'catalog_title',
+        normalizedTitle: normalizeTitle(title),
+        sourceKind: 'elamigos',
+        sourceUrl: absoluteUrl(href, 'elamigos'),
+        title,
+      });
+    });
+
+  return entries;
+}
+
+export function parseSteamRipCatalog(html: string): SourceCatalogEntry[] {
+  const $ = load(html);
+  const entries: SourceCatalogEntry[] = [];
+  const seen = new Set<string>();
+
+  $('a[href]').each((_index, element) => {
+    const href = $(element).attr('href') ?? '';
+    const text = compactText($(element).text());
+    if (!/free\s+download/i.test(text) || /updated-games|games-list-page/i.test(href)) {
+      return;
+    }
+
+    const title = cleanupSteamRipTitle(text);
+    pushUnique(entries, seen, {
+      listedBuildId: extractListedBuildId(text),
+      listedDate: null,
+      listedVersion: extractListedVersion(text),
+      method: 'catalog_title',
+      normalizedTitle: normalizeTitle(title),
+      sourceKind: 'steamrip',
+      sourceUrl: absoluteUrl(href, 'steamrip'),
+      title,
+    });
+  });
+
+  return entries;
+}
+
+export function parseSteamRipUpdatedGames(html: string): SourceCatalogEntry[] {
+  const $ = load(html);
+  const entries: SourceCatalogEntry[] = [];
+  const seen = new Set<string>();
+  let currentDate: string | null = null;
+
+  $('body')
+    .find('h1,h2,h3,h4,p,li,a')
+    .each((_index, element) => {
+      const text = compactText($(element).text());
+      const date = normalizeSlashDate(text);
+      if (date && text.length <= 30) {
+        currentDate = date;
+      }
+
+      if (element.tagName?.toLowerCase() !== 'a') {
+        return;
+      }
+
+      const href = $(element).attr('href') ?? '';
+      if (!/free\s+download/i.test(text)) {
+        return;
+      }
+
+      const title = cleanupSteamRipTitle(text);
+      pushUnique(entries, seen, {
+        listedBuildId: extractListedBuildId(text),
+        listedDate: currentDate,
+        listedVersion: extractListedVersion(text),
+        method: 'recent_updates',
+        normalizedTitle: normalizeTitle(title),
+        sourceKind: 'steamrip',
+        sourceUrl: absoluteUrl(href, 'steamrip'),
+        title,
+      });
+    });
+
+  return entries;
+}
+
+export function parseAnkerGamesCatalog(html: string): SourceCatalogEntry[] {
+  const $ = load(html);
+  const entries: SourceCatalogEntry[] = [];
+  const seen = new Set<string>();
+
+  $('a[href*="/game/"], a[href^="/game/"]').each((_index, element) => {
+    const href = $(element).attr('href') ?? '';
+    const text = compactText($(element).text());
+    const title = cleanupAnkerTitle(text);
+    if (!title) {
+      return;
+    }
+
+    pushUnique(entries, seen, {
+      listedBuildId: extractListedBuildId(text),
+      listedDate: null,
+      listedVersion: extractListedVersion(text),
+      method: 'catalog_title',
+      normalizedTitle: normalizeTitle(title),
+      sourceKind: 'ankergames',
+      sourceUrl: absoluteUrl(href, 'ankergames'),
+      title,
+    });
+  });
+
+  return entries;
+}
+
+export function parseAnkerGamesRecentUpdates(html: string): SourceCatalogEntry[] {
+  const entries = parseAnkerGamesCatalog(html);
+  return entries.map((entry) => ({
+    ...entry,
+    method: 'recent_updates' satisfies SourceMatchMethod,
+  }));
+}
+
+export function buildAnkerGamesSlugCandidates(title: string): string[] {
+  const normalized = title
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/['’]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .replace(/-{2,}/g, '-');
+  const compactInitials = normalized.replace(/\b([a-z])-([a-z])\b/g, '$1-$2');
+  const withoutEdition = normalizeTitle(title)
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .replace(/-{2,}/g, '-');
+
+  return Array.from(
+    new Set([normalized, compactInitials, withoutEdition].filter(Boolean)),
+  );
+}
+
+function levenshtein(left: string, right: string): number {
+  if (left === right) {
+    return 0;
+  }
+  if (!left) {
+    return right.length;
+  }
+  if (!right) {
+    return left.length;
+  }
+
+  const previous = Array.from({ length: right.length + 1 }, (_value, index) => index);
+  const current = Array.from({ length: right.length + 1 }, () => 0);
+
+  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+    current[0] = leftIndex;
+    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+      const cost = left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1;
+      current[rightIndex] = Math.min(
+        current[rightIndex - 1]! + 1,
+        previous[rightIndex]! + 1,
+        previous[rightIndex - 1]! + cost,
+      );
+    }
+    previous.splice(0, previous.length, ...current);
+  }
+
+  return previous[right.length]!;
+}
+
+export function scoreSourceTitleMatch(
+  expectedTitle: string,
+  candidateTitle: string,
+): number {
+  const expected = normalizeTitle(expectedTitle);
+  const candidate = normalizeTitle(candidateTitle);
+  if (!expected || !candidate) {
+    return 0;
+  }
+  if (expected === candidate) {
+    return 1;
+  }
+  if (expected.replace(/\s+/g, '') === candidate.replace(/\s+/g, '')) {
+    return 1;
+  }
+  if (
+    (expected.length >= 5 && candidate.startsWith(`${expected} `)) ||
+    (candidate.length >= 5 && expected.startsWith(`${candidate} `))
+  ) {
+    return 0.94;
+  }
+
+  const maxLength = Math.max(expected.length, candidate.length);
+  const editScore = 1 - levenshtein(expected, candidate) / maxLength;
+  const expectedTokens = new Set(expected.split(' '));
+  const candidateTokens = new Set(candidate.split(' '));
+  const shared = [...expectedTokens].filter((token) => candidateTokens.has(token)).length;
+  const tokenScore = shared / Math.max(expectedTokens.size, candidateTokens.size);
+
+  return Math.max(0, Math.min(1, editScore * 0.65 + tokenScore * 0.35));
+}

@@ -7,6 +7,14 @@ import {
   resolveAnkerGamesDownloadUrl,
 } from '../src/adapters/ankergames-client.js';
 import {
+  buildAnkerGamesSlugCandidates,
+  parseAnkerGamesRecentUpdates,
+  parseElAmigosCatalog,
+  parseSteamRipCatalog,
+  parseSteamRipUpdatedGames,
+  scoreSourceTitleMatch,
+} from '../src/catalog.js';
+import {
   getAdapterForUrl,
   parseSupportedPage,
   parseSupportedPageForKind,
@@ -61,6 +69,140 @@ function ankerGamesHtml(): string {
 }
 
 describe('source parsers', () => {
+  it('parses source catalog pages and recent update signals', () => {
+    expect(
+      parseElAmigosCatalog(`
+        <html><body>
+          <p>Full log of updates / updates archive 2026-2013 is available here</p>
+          <a href="/data/100_Percent_Orange_Juice_MULTi4_-_ElAmigos.html">100 Percent Orange Juice ElAmigos [Update 3.7]</a>
+          <h2>21.04.2026</h2>
+          <a href="/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html">Mouse PI for Hire Deluxe Edition ElAmigos +[Update 1.0.5.8168]</a>
+        </body></html>
+      `).map((entry) => ({
+        date: entry.listedDate,
+        title: entry.title,
+        url: entry.sourceUrl,
+        version: entry.listedVersion,
+      })),
+    ).toEqual([
+      {
+        date: null,
+        title: '100 Percent Orange Juice',
+        url: 'https://elamigos.site/data/100_Percent_Orange_Juice_MULTi4_-_ElAmigos.html',
+        version: '3.7',
+      },
+      {
+        date: '04/21/2026',
+        title: 'Mouse PI for Hire Deluxe Edition',
+        url: 'https://elamigos.site/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html',
+        version: '1.0.5.8168',
+      },
+    ]);
+
+    expect(
+      parseSteamRipCatalog(`
+        <a href="https://steamrip.com/mouse-p-i-for-hire-free-download/">MOUSE: P.I. For Hire Free Download (v1.0.4.8161)</a>
+        <a href="/updated-games/">Recent Updates</a>
+      `)[0],
+    ).toMatchObject({
+      listedVersion: '1.0.4.8161',
+      sourceKind: 'steamrip',
+      sourceUrl: 'https://steamrip.com/mouse-p-i-for-hire-free-download/',
+      title: 'MOUSE: P.I. For Hire',
+    });
+
+    expect(
+      parseSteamRipUpdatedGames(`
+        <h2>04/20/2026</h2>
+        <a href="/mouse-p-i-for-hire-free-download/">MOUSE: P.I. For Hire Free Download (v1.0.5.8168)</a>
+        <a href="/replaced-free-download/">REPLACED Free Download (Build 22862896)</a>
+      `),
+    ).toEqual([
+      expect.objectContaining({
+        listedDate: '04/20/2026',
+        listedVersion: '1.0.5.8168',
+        method: 'recent_updates',
+        title: 'MOUSE: P.I. For Hire',
+      }),
+      expect.objectContaining({
+        listedBuildId: '22862896',
+        listedDate: '04/20/2026',
+        title: 'REPLACED',
+      }),
+    ]);
+
+    expect(
+      parseAnkerGamesRecentUpdates(`
+        <a href="/game/mouse-p-i-for-hire">MOUSE: P.I. For Hire V 1.0.5.8168 by Axiom 1d ago</a>
+      `)[0],
+    ).toMatchObject({
+      listedVersion: '1.0.5.8168',
+      method: 'recent_updates',
+      sourceUrl: 'https://ankergames.net/game/mouse-p-i-for-hire',
+      title: 'MOUSE: P.I. For Hire',
+    });
+  });
+
+  it('parses ElAmigos homepage rows whose link text is only DOWNLOAD', () => {
+    expect(
+      parseElAmigosCatalog(`
+        <html><body>
+          <h1>19.04.2026</h1>
+          <h3>
+            Frostpunk 2 Deluxe Edition ElAmigos [Update 1.5.0] +[Update 1.5.4.H2]
+            <a href="data/Frostpunk_2_MULTi14_-_ElAmigos.html">DOWNLOAD</a>
+          </h3>
+          <p>
+            SnowRunner A MudRunner Game ElAmigos +[Update 04.05.2026]
+            <a href="/data/SnowRunner_A_MudRunner_Game_MULTi12__ElAmigos_-_keMpBvyQ.html">DOWNLOAD</a>
+          </p>
+        </body></html>
+      `).map((entry) => ({
+        date: entry.listedDate,
+        title: entry.title,
+        url: entry.sourceUrl,
+        version: entry.listedVersion,
+      })),
+    ).toEqual([
+      {
+        date: '04/19/2026',
+        title: 'Frostpunk 2 Deluxe Edition',
+        url: 'https://elamigos.site/data/Frostpunk_2_MULTi14_-_ElAmigos.html',
+        version: '1.5.0',
+      },
+      {
+        date: '04/19/2026',
+        title: 'SnowRunner A MudRunner Game',
+        url: 'https://elamigos.site/data/SnowRunner_A_MudRunner_Game_MULTi12__ElAmigos_-_keMpBvyQ.html',
+        version: '04.05.2026',
+      },
+    ]);
+  });
+
+  it('generates AnkerGames slug candidates and scores fuzzy source titles', () => {
+    expect(buildAnkerGamesSlugCandidates('Travellers Rest')).toContain(
+      'travellers-rest',
+    );
+    expect(
+      buildAnkerGamesSlugCandidates('Clair Obscur: Expedition 33'),
+    ).toContain('clair-obscur-expedition-33');
+    expect(buildAnkerGamesSlugCandidates('MOUSE: P.I. For Hire')).toContain(
+      'mouse-p-i-for-hire',
+    );
+    expect(
+      scoreSourceTitleMatch('MOUSE: P.I. For Hire', 'Mouse PI for Hire'),
+    ).toBeGreaterThanOrEqual(0.92);
+    expect(
+      scoreSourceTitleMatch('Frostpunk 2', 'Frostpunk 2 Deluxe Edition'),
+    ).toBeGreaterThanOrEqual(0.92);
+    expect(
+      scoreSourceTitleMatch('SnowRunner', 'SnowRunner A MudRunner Game'),
+    ).toBeGreaterThanOrEqual(0.92);
+    expect(
+      scoreSourceTitleMatch('MOUSE: P.I. For Hire', 'Frostpunk 2'),
+    ).toBeLessThan(0.5);
+  });
+
   it('parses Ankergames pages with visible version and stable download endpoint', () => {
     const parsed = parseSupportedPage(
       'https://ankergames.net/game/shape-of-dreams',

@@ -372,6 +372,8 @@ describe('VaultTrackService import workflow', () => {
         ],
         renameGameFoldersOnImport: true,
         rootLibraryPath: firstRoot,
+        sourceWatchDurationDays: 5,
+        sourceWatchIntervalHours: 8,
       });
 
       const saved = service.saveSettings({
@@ -395,6 +397,8 @@ describe('VaultTrackService import workflow', () => {
       expect(saved).toMatchObject({
         renameGameFoldersOnImport: false,
         rootLibraryPath: secondRoot,
+        sourceWatchDurationDays: 5,
+        sourceWatchIntervalHours: 8,
       });
       expect(service.getSettings().libraryRoots).toEqual([
         {
@@ -585,6 +589,253 @@ describe('VaultTrackService import workflow', () => {
           }),
         ]),
       );
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('refreshes imported items without a source URL and keeps saved build-table history', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootPath = join(tempRoot, 'Library');
+      const folderPath = join(rootPath, 'Schedule I');
+      await mkdir(folderPath, { recursive: true });
+      await writeFile(join(folderPath, 'ScheduleI.exe'), 'game');
+      database.setSetting('library.rootPath', rootPath);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL) => {
+          const url = new URL(String(input));
+          if (url.hostname === 'api.steampowered.com') {
+            return new Response(
+              steamCoverPayload(3164500, 'library_hero_2x.jpg'),
+              { status: 200 },
+            );
+          }
+          if (url.hostname === 'steamdb.info') {
+            return new Response(rss([]), { status: 200 });
+          }
+          return new Response('', { status: 404 });
+        }),
+      );
+      const service = createService(database);
+      const steamPatchEntries: SteamPatchCandidate[] = Array.from(
+        { length: 8 },
+        (_value, index) => ({
+          appId: 3164500,
+          buildId: String(22829950 - index),
+          link: `https://steamdb.info/patchnotes/${22829950 - index}/`,
+          patchDate: '04/17/2026',
+          patchTitle: `Patch ${index}`,
+          publishedAt: new Date(
+            Date.UTC(2026, 3, 17, 12, 0 - index),
+          ).toISOString(),
+          selectionSource: 'steamdb_builds' as const,
+          title: `Patch ${index}`,
+          version: `0.4.5f${2 - index}`,
+        }),
+      );
+      const selectedSteamPatch = steamPatchEntries[3]!;
+
+      const result = await service.saveImportBatch({
+        rows: [
+          {
+            folderName: 'Schedule I',
+            folderPath,
+            renameFolder: false,
+            rootPath,
+            selectedSteamPatch,
+            steamMatch: {
+              appId: 3164500,
+              coverUrl: null,
+              matchedAt: '2026-04-20T00:00:00.000Z',
+              normalizedTitle: 'schedule i',
+              title: 'Schedule I',
+            },
+            steamPatchEntries,
+          },
+        ],
+      });
+      const imported = result.imported[0]!;
+      expect(imported.versionsBehindLatest).toBe(3);
+      expect(imported.patchMetadataStatus).toBe('behind');
+      database.upsertSteamDbBuildCache({
+        appId: 3164500,
+        capturedAt: '2000-01-01T00:00:00.000Z',
+        expiresAt: '2000-01-01T01:00:00.000Z',
+        patches: steamPatchEntries,
+      });
+
+      await expect(service.refreshTrackedItem(imported.item.id)).resolves.toEqual(
+        expect.objectContaining({
+          status: 'installed',
+        }),
+      );
+
+      expect(database.getSteamFeedCheck(imported.item.id)).toMatchObject({
+        lastError: null,
+        lastSuccessfulAt: expect.any(String),
+      });
+      const refreshedView = await service.getTrackedItemStatusBySourceUrl(
+        `manual:import:${imported.item.id}`,
+      );
+      expect(refreshedView).toMatchObject({
+        patchMetadataStatus: 'behind',
+        versionsBehindLatest: 3,
+      });
+      expect(
+        database
+          .listPatchEntries(imported.item.id)
+          .some((entry) => entry.selectionSource === 'steamdb_builds'),
+      ).toBe(true);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('refreshes imported items even if no source snapshot exists', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootPath = join(tempRoot, 'Library');
+      const folderPath = join(rootPath, 'Snapshotless');
+      await mkdir(folderPath, { recursive: true });
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL) => {
+          const url = new URL(String(input));
+          if (url.hostname === 'api.steampowered.com') {
+            return new Response(steamCoverPayload(123456, 'library_hero_2x.jpg'), {
+              status: 200,
+            });
+          }
+          if (url.hostname === 'steamdb.info') {
+            return new Response(rss([]), { status: 200 });
+          }
+          return new Response('', { status: 404 });
+        }),
+      );
+      const service = createService(database);
+      const result = await service.saveImportBatch({
+        rows: [
+          {
+            folderName: 'Snapshotless',
+            folderPath,
+            renameFolder: false,
+            rootPath,
+            selectedSteamPatch: {
+              appId: 123456,
+              buildId: '123456789',
+              link: 'https://steamdb.info/patchnotes/123456789/',
+              patchDate: '04/20/2026',
+              patchTitle: 'Snapshotless update',
+              publishedAt: '2026-04-20T12:00:00.000Z',
+              selectionSource: 'steamdb_builds',
+              title: 'Snapshotless update',
+              version: '1.0',
+            },
+            steamMatch: {
+              appId: 123456,
+              coverUrl: null,
+              matchedAt: '2026-04-20T00:00:00.000Z',
+              normalizedTitle: 'snapshotless',
+              title: 'Snapshotless',
+            },
+          },
+        ],
+      });
+      const imported = result.imported[0]!;
+      (
+        database as unknown as {
+          exec(sql: string, params?: string[]): void;
+        }
+      ).exec('DELETE FROM source_snapshots WHERE tracked_item_id = ?', [
+        imported.item.id,
+      ]);
+
+      await expect(service.refreshTrackedItem(imported.item.id)).resolves.toEqual(
+        expect.objectContaining({
+          snapshot: null,
+          status: 'installed',
+        }),
+      );
+      expect(database.getSteamFeedCheck(imported.item.id)).toMatchObject({
+        lastError: null,
+        lastSuccessfulAt: expect.any(String),
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('uses saved patch history by link when imported metadata was incomplete', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootPath = join(tempRoot, 'Library');
+      const folderPath = join(rootPath, 'Satisfactory');
+      await mkdir(folderPath, { recursive: true });
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL) => {
+          const url = new URL(String(input));
+          if (url.hostname === 'api.steampowered.com') {
+            return new Response(steamCoverPayload(526870, 'library_hero_2x.jpg'), {
+              status: 200,
+            });
+          }
+          if (url.hostname === 'steamdb.info') {
+            return new Response(rss([]), { status: 200 });
+          }
+          return new Response('', { status: 404 });
+        }),
+      );
+      const service = createService(database);
+      const patchLink = 'https://steamdb.info/patchnotes/21237829/';
+      const selectedSteamPatch: SteamPatchCandidate = {
+        appId: 526870,
+        buildId: null,
+        link: patchLink,
+        patchDate: '',
+        patchTitle: '1.1 Fixes v1.1.2.2',
+        publishedAt: '1970-01-01T00:00:00.000Z',
+        selectionSource: 'rss',
+        title: '1.1 Fixes v1.1.2.2',
+        version: '1.1.2.2',
+      };
+      const savedHistoryPatch: SteamPatchCandidate = {
+        ...selectedSteamPatch,
+        buildId: '21237829',
+        patchDate: '12/19/2025',
+        publishedAt: '2025-12-19T12:00:00.000Z',
+      };
+
+      const result = await service.saveImportBatch({
+        rows: [
+          {
+            folderName: 'Satisfactory',
+            folderPath,
+            renameFolder: false,
+            rootPath,
+            selectedSteamPatch,
+            steamMatch: {
+              appId: 526870,
+              coverUrl: null,
+              matchedAt: '2026-04-20T00:00:00.000Z',
+              normalizedTitle: 'satisfactory',
+              title: 'Satisfactory',
+            },
+            steamPatchEntries: [savedHistoryPatch],
+          },
+        ],
+      });
+
+      expect(result.imported[0]).toMatchObject({
+        patchMetadataStatus: 'latest',
+        selectedPatch: {
+          buildId: '21237829',
+          patchDate: '12/19/2025',
+        },
+        versionsBehindLatest: 0,
+      });
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
@@ -3347,8 +3598,270 @@ describe('VaultTrackService SteamDB patch workflow', () => {
 
       expect(database.listPatchEntries(item.id)[0]?.buildId).toBe('22862861');
       expect(database.getWatch(item.id)).toMatchObject({
+        endsAt: expect.stringContaining('2026'),
         trackedItemId: item.id,
       });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('discovers and snapshots a high-confidence cross-source match', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'mouse pi for hire deluxe',
+        sourceKind: 'elamigos',
+        sourceUrl: 'https://elamigos.site/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html',
+        title: 'Mouse PI for Hire Deluxe Edition',
+      });
+      database.upsertSteamMatch(item.id, steamMatch);
+
+      const sourceFetch = vi.fn(async (input: string) => {
+        if (input === 'https://steamrip.com/games-list-page/') {
+          return new Response(
+            `<a href="https://steamrip.com/mouse-p-i-for-hire-free-download/">MOUSE: P.I. For Hire Free Download (Build 22862861)</a>`,
+            { status: 200 },
+          );
+        }
+
+        if (input === 'https://steamrip.com/updated-games/') {
+          return new Response('', { status: 200 });
+        }
+
+        if (input === 'https://steamrip.com/mouse-p-i-for-hire-free-download/') {
+          return new Response(
+            steamRipSourceHtml({
+              buildId: '22862861',
+              mirrorUrl: 'https://gofile.io/d/newer',
+              title: 'MOUSE: P.I. For Hire',
+              version: '1.0.5',
+            }),
+            { status: 200 },
+          );
+        }
+
+        return new Response('', { status: 404 });
+      });
+
+      const view = await createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      ).discoverSourceMatches(item.id);
+
+      expect(
+        view.sourceMatches.find(
+          (source) => source.match.sourceKind === 'steamrip',
+        ),
+      ).toMatchObject({
+        match: {
+          status: 'probable',
+          usable: true,
+        },
+        snapshot: {
+          observedBuildId: '22862861',
+        },
+      });
+      expect(database.listDownloadMirrors(item.id, 'steamrip')).toEqual([
+        expect.objectContaining({ url: 'https://gofile.io/d/newer' }),
+      ]);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('keeps a usable AnkerGames match when a refresh is rate limited', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'shape of dreams',
+        sourceKind: 'steamrip',
+        sourceUrl: 'https://steamrip.com/shape-of-dreams-free-download/',
+        title: 'Shape of Dreams',
+      });
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-04-20T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-04-20T12:00:00.000Z',
+        lastError: null,
+        method: 'slug',
+        normalizedTitle: 'shape of dreams',
+        score: 1,
+        sourceKind: 'ankergames',
+        sourceTitle: 'Shape of Dreams',
+        sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+        status: 'probable',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-20T12:00:00.000Z',
+        usable: true,
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-20T12:00:00.000Z',
+        fingerprint: 'anker-snapshot',
+        observedBuildId: '22630308',
+        observedPatchDate: null,
+        observedPatchLink: null,
+        observedPatchTitle: null,
+        observedVersion: 'V 1.2.1.7',
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+        trackedItemId: item.id,
+      });
+
+      const service = createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        vi.fn(async () => new Response('', { status: 429 })),
+      );
+
+      await expect(
+        service.refreshMatchedSource(item.id, 'ankergames'),
+      ).rejects.toThrow('Source refresh failed with 429');
+
+      expect(database.getSourceMatch(item.id, 'ankergames')).toMatchObject({
+        lastError: 'Rate limited by source; retrying later.',
+        sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+        status: 'probable',
+        usable: true,
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('stores AnkerGames slug matches as retryable candidates when detail probing is rate limited', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'mouse p i for hire',
+        sourceKind: 'steamrip',
+        sourceUrl: 'https://steamrip.com/mouse-p-i-for-hire-free-download/',
+        title: 'MOUSE: P.I. For Hire',
+      });
+      database.upsertSteamMatch(item.id, steamMatch);
+      const sourceFetch = vi.fn(async (input: string) => {
+        if (input === 'https://ankergames.net/game/mouse-p-i-for-hire') {
+          return new Response('', { status: 429 });
+        }
+        return new Response('', { status: 503 });
+      });
+
+      await createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      ).discoverSourceMatches(item.id);
+
+      expect(database.getSourceMatch(item.id, 'ankergames')).toMatchObject({
+        lastError: 'Rate limited by source; retrying later.',
+        sourceUrl: 'https://ankergames.net/game/mouse-p-i-for-hire',
+        status: 'candidate',
+        usable: false,
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('records unavailable ElAmigos catalogs as transient failures instead of not-found matches', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'mouse p i for hire',
+        sourceKind: 'steamrip',
+        sourceUrl: 'https://steamrip.com/mouse-p-i-for-hire-free-download/',
+        title: 'MOUSE: P.I. For Hire',
+      });
+      database.upsertSteamMatch(item.id, steamMatch);
+      const sourceFetch = vi.fn(async (input: string) => {
+        if (input === 'https://ankergames.net/game/mouse-p-i-for-hire') {
+          return new Response('', { status: 429 });
+        }
+        if (input === 'https://elamigos.site/') {
+          return new Response('', { status: 200 });
+        }
+        return new Response('', { status: 503 });
+      });
+
+      await createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      ).discoverSourceMatches(item.id);
+
+      expect(database.getSourceMatch(item.id, 'elamigos')).toMatchObject({
+        lastError: 'elamigos catalog returned no entries',
+        status: 'failed',
+        usable: false,
+      });
+      expect(database.getSourceMatch(item.id, 'elamigos')?.status).not.toBe(
+        'not_found',
+      );
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('stops daily SteamDB polling after a rate limit without marking remaining games failed', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const firstItem = database.upsertTrackedItem({
+        normalizedTitle: 'first game',
+        sourceKind: 'manual',
+        sourceUrl: null,
+        title: 'First Game',
+      });
+      const secondItem = database.upsertTrackedItem({
+        normalizedTitle: 'second game',
+        sourceKind: 'manual',
+        sourceUrl: null,
+        title: 'Second Game',
+      });
+      database.upsertSteamMatch(firstItem.id, {
+        ...steamMatch,
+        appId: 111,
+        normalizedTitle: 'first game',
+        title: 'First Game',
+      });
+      database.upsertSteamMatch(secondItem.id, {
+        ...steamMatch,
+        appId: 222,
+        normalizedTitle: 'second game',
+        title: 'Second Game',
+      });
+
+      const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+        const url = new URL(String(input));
+        if (url.searchParams.get('appid') === '111') {
+          return new Response('', { status: 429 });
+        }
+        throw new Error('Second SteamDB feed should not be requested');
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const service = createService(database);
+      await service.pollSteamFeeds();
+
+      expect(database.getSteamFeedCheck(firstItem.id)).toMatchObject({
+        lastError: 'SteamDB RSS request failed: 429',
+      });
+      expect(database.getSteamFeedCheck(secondItem.id)).toBeNull();
+      expect(service.getLatestDailyPollAt()).toBeNull();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }

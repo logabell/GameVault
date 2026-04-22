@@ -10,7 +10,9 @@ import type {
   SettingsView,
   SteamDbBuildLookupState,
   SteamPatchCandidate,
+  SteamPatchEntry,
   SteamPatchFeedResult,
+  SupportedSourceKind,
   TrackedItemView,
   SteamMatchResolutionPayload,
   ThemeMode,
@@ -43,6 +45,10 @@ export type NativeMessageRequest =
       payload: { appId: number };
     }
   | {
+      type: 'listSteamPatchEntries';
+      payload: { trackedItemId: string };
+    }
+  | {
       type: 'listPendingSteamDbBuildLookups';
       payload: EmptyPayload;
     }
@@ -63,6 +69,22 @@ export type NativeMessageRequest =
       payload: { trackedItemId: string };
     }
   | {
+      type: 'discoverSourceMatches';
+      payload: { trackedItemId: string };
+    }
+  | {
+      type: 'refreshMatchedSource';
+      payload: { sourceKind: SupportedSourceKind; trackedItemId: string };
+    }
+  | {
+      type: 'setManualSourceMatch';
+      payload: {
+        sourceKind: SupportedSourceKind;
+        sourceUrl: string;
+        trackedItemId: string;
+      };
+    }
+  | {
       type: 'updateSourcePatch';
       payload: {
         selectedSteamPatch: SteamPatchCandidate;
@@ -81,6 +103,14 @@ export type NativeMessageRequest =
   | {
       type: 'retryDownload';
       payload: { selectedDownloads?: SelectedDownloads; trackedItemId: string };
+    }
+  | {
+      type: 'queueUpdateFromSource';
+      payload: {
+        selectedDownloads?: SelectedDownloads;
+        sourceKind: SupportedSourceKind;
+        trackedItemId: string;
+      };
     }
   | {
       type: 'clearDownloadMirrorFailed';
@@ -123,6 +153,9 @@ export type NativeMessageRequest =
       payload: {
         libraryRoots?: SettingsView['libraryRoots'];
         renameGameFoldersOnImport?: boolean;
+        pollDailyHourLocal?: number;
+        sourceWatchDurationDays?: number;
+        sourceWatchIntervalHours?: number;
         themeMode?: ThemeMode | null;
         rootLibraryPath?: string | null;
       };
@@ -155,6 +188,11 @@ export type NativeMessageResponse =
     }
   | {
       ok: true;
+      type: 'listSteamPatchEntries';
+      payload: SteamPatchEntry[];
+    }
+  | {
+      ok: true;
       type: 'listPendingSteamDbBuildLookups';
       payload: SteamDbBuildLookupState[];
     }
@@ -180,6 +218,21 @@ export type NativeMessageResponse =
     }
   | {
       ok: true;
+      type: 'discoverSourceMatches';
+      payload: TrackedItemView;
+    }
+  | {
+      ok: true;
+      type: 'refreshMatchedSource';
+      payload: TrackedItemView;
+    }
+  | {
+      ok: true;
+      type: 'setManualSourceMatch';
+      payload: TrackedItemView;
+    }
+  | {
+      ok: true;
       type: 'updateSourcePatch';
       payload: TrackedItemView;
     }
@@ -196,6 +249,11 @@ export type NativeMessageResponse =
   | {
       ok: true;
       type: 'retryDownload';
+      payload: TrackedItemView;
+    }
+  | {
+      ok: true;
+      type: 'queueUpdateFromSource';
       payload: TrackedItemView;
     }
   | {

@@ -116,7 +116,84 @@ export interface SourceSnapshot {
   checkedAt: string;
 }
 
-export type PatchSelectionSource = 'rss' | 'steamdb_builds' | 'manual';
+export type SourceMatchStatus =
+  | 'verified'
+  | 'probable'
+  | 'candidate'
+  | 'not_found'
+  | 'blocked'
+  | 'failed';
+
+export type SourceMatchMethod =
+  | 'primary_source'
+  | 'manual'
+  | 'steam_app_id'
+  | 'slug'
+  | 'catalog_title'
+  | 'recent_updates'
+  | 'fuzzy_title';
+
+export type SourceUpdateStatus =
+  | 'unknown'
+  | 'not_matched'
+  | 'blocked'
+  | 'failed'
+  | 'same_as_installed'
+  | 'newer_than_installed'
+  | 'source_behind_upstream'
+  | 'matches_upstream'
+  | 'possible_update';
+
+export interface SourceMatch {
+  trackedItemId: string;
+  sourceKind: SupportedSourceKind;
+  sourceUrl?: string | null;
+  sourceTitle?: string | null;
+  normalizedTitle?: string | null;
+  status: SourceMatchStatus;
+  method: SourceMatchMethod;
+  score: number;
+  confidence: number;
+  usable: boolean;
+  isPrimary: boolean;
+  lastCheckedAt?: string | null;
+  lastError?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MatchedSourceView {
+  match: SourceMatch;
+  snapshot?: SourceSnapshot | null;
+  updateStatus: SourceUpdateStatus;
+  isUpdateSource: boolean;
+  downloadMirrors: DownloadMirrorRecord[];
+}
+
+export interface SourceCatalogEntry {
+  sourceKind: SupportedSourceKind;
+  sourceUrl: string;
+  title: string;
+  normalizedTitle: string;
+  listedVersion?: string | null;
+  listedBuildId?: string | null;
+  listedDate?: string | null;
+  steamAppId?: number | null;
+  method: SourceMatchMethod;
+}
+
+export type PatchSelectionSource =
+  | 'rss'
+  | 'steamdb_builds'
+  | 'manual'
+  | 'older_than_available';
+export type PatchMetadataStatus =
+  | 'behind'
+  | 'latest'
+  | 'manual'
+  | 'needs_attention'
+  | 'outside_saved_history'
+  | 'unknown';
 
 export interface SteamPatchCandidate {
   appId: number;
@@ -212,6 +289,7 @@ export interface DownloadJobRecord {
 
 export interface DownloadMirrorRecord {
   trackedItemId: string;
+  sourceKind?: SupportedSourceKind | null;
   url: string;
   label: string;
   kind: 'full' | 'patch';
@@ -244,6 +322,8 @@ export interface SettingsRecord {
   myJDownloaderEmail?: string | null;
   myJDownloaderDeviceId?: string | null;
   pollDailyHourLocal?: number;
+  sourceWatchDurationDays?: number;
+  sourceWatchIntervalHours?: number;
   themeMode?: ThemeMode | null;
 }
 
@@ -290,12 +370,15 @@ export interface TrackedItemFileState {
 export interface TrackedItemView {
   item: TrackedItemRecord;
   sourceSnapshot?: SourceSnapshot | null;
+  sourceMatches: MatchedSourceView[];
   installRecord?: InstallRecord | null;
   currentWatch?: SourceWatch | null;
   latestPatch?: SteamPatchEntry | null;
+  patchMetadataStatus?: PatchMetadataStatus;
   selectedPatch?: SteamPatchEntry | null;
   selectedPatchMissingFromFeed?: boolean;
   versionsBehindLatest?: number | null;
+  versionsBehindLatestIsLowerBound?: boolean;
   currentDownload?: DownloadJobRecord | null;
   downloadMirrors: DownloadMirrorRecord[];
   selectedMirror?: DownloadMirrorRecord | null;
@@ -308,6 +391,7 @@ export interface TrackedItemView {
 export interface SelectedDownloads {
   fullUrl: string;
   patchUrl?: string | null;
+  sourceKind?: SupportedSourceKind | null;
 }
 
 export interface AddTrackedItemRequestPayload {
@@ -435,7 +519,7 @@ export interface UpdateSteamDbBuildLookupPayload {
 }
 
 export interface RefreshResult {
-  snapshot: SourceSnapshot;
+  snapshot: SourceSnapshot | null;
   latestPatch?: SteamPatchEntry | null;
   status: TrackedItemStatus;
   trackingStatus: TrackedItemTrackingStatus;

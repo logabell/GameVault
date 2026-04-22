@@ -629,13 +629,23 @@ describe('SteamDB RSS parsing', () => {
 });
 
 describe('watch logic', () => {
-  it('creates a seven day watch window with an eight hour next check', () => {
+  it('creates a five day watch window with an eight hour next check by default', () => {
     const watch = createWatchWindow(
       'tracked',
       new Date('2026-04-19T12:00:00.000Z'),
     );
     expect(watch.nextCheckAt).toBe('2026-04-19T20:00:00.000Z');
-    expect(watch.endsAt).toBe('2026-04-26T12:00:00.000Z');
+    expect(watch.endsAt).toBe('2026-04-24T12:00:00.000Z');
+  });
+
+  it('accepts custom watch interval and duration settings', () => {
+    const watch = createWatchWindow(
+      'tracked',
+      new Date('2026-04-19T12:00:00.000Z'),
+      { durationDays: 2, intervalHours: 4 },
+    );
+    expect(watch.nextCheckAt).toBe('2026-04-19T16:00:00.000Z');
+    expect(watch.endsAt).toBe('2026-04-21T12:00:00.000Z');
   });
 
   it('marks the item as update available when the source has caught up but install is older', () => {

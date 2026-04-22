@@ -362,23 +362,60 @@ function normalizeSteamPatchCandidate(
   };
 }
 
+function hasSteamDbBuildTableRows(patches: SteamPatchCandidate[]): boolean {
+  return patches.some((patch) => patch.selectionSource === 'steamdb_builds');
+}
+
 function isPatchSelectionSource(value: unknown): value is PatchSelectionSource {
-  return value === 'rss' || value === 'steamdb_builds' || value === 'manual';
+  return (
+    value === 'rss' ||
+    value === 'steamdb_builds' ||
+    value === 'manual' ||
+    value === 'older_than_available'
+  );
 }
 
 function formatPatchSourceLabel(
   value: PatchSelectionSource | null | undefined,
 ): string | null {
-  if (value === 'manual') return 'Manually added';
-  if (value === 'steamdb_builds') return 'SteamDB manual override';
+  if (value === 'manual') return 'Manual';
+  if (value === 'steamdb_builds') return 'Build table';
+  if (value === 'rss') return 'RSS';
   return null;
 }
 
-function formatPatchListSourceLabel(
-  value: PatchSelectionSource | null | undefined,
-): string | null {
-  if (value === 'manual') return 'Manually added';
-  return null;
+function createOlderThanAvailablePatch(appId: number): SteamPatchCandidate {
+  return {
+    appId,
+    buildId: null,
+    description: 'Installed patch predates the available SteamDB patch history.',
+    link: `vaulttrack:older-than-available:${appId}`,
+    patchDate: '',
+    patchTitle: 'Older than available / not listed',
+    publishedAt: '',
+    selectionSource: 'older_than_available',
+    title: 'Older than available / not listed',
+    version: null,
+  };
+}
+
+function getSteamPatchOptions(
+  patches: SteamPatchCandidate[],
+  appId: number | null | undefined,
+): SteamPatchCandidate[] {
+  const merged = mergeSteamPatchLists([], patches);
+  const availablePatches = merged.filter(
+    (patch) => patch.selectionSource !== 'older_than_available',
+  );
+  if (!appId || availablePatches.length === 0) {
+    return merged;
+  }
+
+  const olderPatch = createOlderThanAvailablePatch(appId);
+  const existingOlderPatch = merged.find(
+    (patch) => patch.selectionSource === 'older_than_available',
+  );
+  return [...availablePatches, existingOlderPatch ?? olderPatch];
 }
 
 function formatDateInputAsPatchDate(value: string): string {
@@ -417,17 +454,44 @@ function createManualSteamPatchCandidate(params: {
 }
 
 function formatPatchLag(item: TrackedItemView): string {
-  if (item.selectedPatchMissingFromFeed) {
-    return 'Outside feed window';
+  if (item.patchMetadataStatus === 'needs_attention') {
+    return 'Needs attention';
+  }
+
+  if (
+    item.patchMetadataStatus === 'outside_saved_history' ||
+    item.selectedPatchMissingFromFeed
+  ) {
+    return 'Outside saved history';
   }
 
   if (typeof item.versionsBehindLatest === 'number') {
+    if (item.versionsBehindLatestIsLowerBound) {
+      return `${item.versionsBehindLatest}+ behind`;
+    }
     return item.versionsBehindLatest === 0
       ? 'Latest'
       : `${item.versionsBehindLatest} behind`;
   }
 
+  if (item.patchMetadataStatus === 'manual') {
+    return 'Manual metadata';
+  }
+
   return 'Unknown';
+}
+
+function needsPatchMetadataAttention(item: TrackedItemView): boolean {
+  return item.patchMetadataStatus === 'needs_attention';
+}
+
+function getPatchEditorTitle(item: TrackedItemView): string {
+  if (needsPatchMetadataAttention(item)) {
+    return 'Resolve Installed Patch';
+  }
+  return item.item.sourceKind === 'manual'
+    ? 'Edit Installed Patch'
+    : 'Edit Source Patch';
 }
 
 function readStoredLibraryViewMode(
@@ -940,7 +1004,7 @@ function App() {
     !sharedSourcePatchMirrors,
   );
   const selectedSteamPatch =
-    steamPatches.find(
+    getSteamPatchOptions(steamPatches, selectedAppId).find(
       (patch) => getSteamPatchKey(patch) === selectedSteamPatchKey,
     ) ?? null;
   const selectedPatchSourceLabel = formatPatchSourceLabel(
@@ -2284,9 +2348,52 @@ function App() {
     });
     setBusy(true);
     setMessage(null);
-    void startSourcePatchEditorBackfill(appId, requestId);
 
     try {
+      const persistedResponse = await chrome.runtime.sendMessage({
+        trackedItemId: item.item.id,
+        type: 'vaulttrack:list-steam-patch-entries',
+      });
+      if (sourcePatchEditorRequestIdRef.current !== requestId) {
+        return;
+      }
+      const persistedPatches = Array.isArray(persistedResponse?.payload)
+        ? (persistedResponse.payload as unknown[])
+            .map((entry) => normalizeSteamPatchCandidate(entry, appId))
+            .filter((entry): entry is SteamPatchCandidate => entry != null)
+        : [];
+      const currentPatches = mergeSteamPatches(seedPatches, persistedPatches);
+      setSourcePatchEditor((current) => {
+        if (
+          !current ||
+          current.item.item.steamAppId !== appId ||
+          sourcePatchEditorRequestIdRef.current !== requestId
+        ) {
+          return current;
+        }
+
+        const selectedKey =
+          current.selectedKey &&
+          currentPatches.some(
+            (patch) => getSteamPatchKey(patch) === current.selectedKey,
+          )
+            ? current.selectedKey
+            : (getSourceSnapshotPatchKey(current.item, currentPatches) ??
+              (currentPatches[0] ? getSteamPatchKey(currentPatches[0]) : null));
+
+        return {
+          ...current,
+          backfillStatus: hasSteamDbBuildTableRows(currentPatches)
+            ? 'loaded'
+            : current.backfillStatus,
+          patches: currentPatches,
+          selectedKey,
+        };
+      });
+      if (!hasSteamDbBuildTableRows(currentPatches)) {
+        void startSourcePatchEditorBackfill(appId, requestId);
+      }
+
       const response = await sendRuntimeMessageWithTimeout<{
         errorMessage?: string | null;
         feedUrl?: string | null;
@@ -2379,9 +2486,10 @@ function App() {
   async function applySourcePatchEditorSelection() {
     if (!sourcePatchEditor?.selectedKey) return;
 
-    const selectedPatch = sourcePatchEditor.patches.find(
-      (patch) => getSteamPatchKey(patch) === sourcePatchEditor.selectedKey,
-    );
+    const selectedPatch = getSteamPatchOptions(
+      sourcePatchEditor.patches,
+      sourcePatchEditor.item.item.steamAppId,
+    ).find((patch) => getSteamPatchKey(patch) === sourcePatchEditor.selectedKey);
     if (!selectedPatch) return;
 
     setBusy(true);
@@ -2683,7 +2791,7 @@ function App() {
               type="button"
             >
               <FontAwesomeIcon aria-hidden="true" icon={faPenToSquare} />
-              <span>Edit Source Patch</span>
+              <span>{getPatchEditorTitle(item)}</span>
             </button>
           ) : null}
           {canRetryDownload(item) ? (
@@ -2754,10 +2862,6 @@ function App() {
   ) {
     const activity = getItemActivity(item);
     const fileState = getItemFileState(item);
-    const patchSourceLabel = formatPatchSourceLabel(
-      item.selectedPatch?.selectionSource ??
-        item.sourceSnapshot?.patchSelectionSource,
-    );
     const sourcePatchBuild =
       item.selectedPatch?.buildId ?? item.sourceSnapshot?.observedBuildId;
     const sourcePatchTitle =
@@ -2782,7 +2886,6 @@ function App() {
             {sourcePatchBuild ? `Build ${sourcePatchBuild}` : 'Build n/a'}
           </span>
           <span>{sourcePatchDate ?? 'Date n/a'}</span>
-          {patchSourceLabel ? <span>{patchSourceLabel}</span> : null}
         </div>
         <div>
           <strong>Latest SteamDB</strong>
@@ -2795,7 +2898,7 @@ function App() {
           <span>{item.latestPatch?.patchDate ?? 'Date n/a'}</span>
         </div>
         <div>
-          <strong>SteamDB Check</strong>
+          <strong>SteamDB RSS Check</strong>
           <span>{formatRelativeTime(activity.lastSteamFeedCheckedAt)}</span>
           <span>
             {activity.lastSteamFeedError ? 'Last check failed' : 'Feed ok'}
@@ -3468,15 +3571,15 @@ function App() {
                         </p>
                       ) : null}
                       {!patchLoading
-                        ? steamPatches.map((patch) => {
+                        ? getSteamPatchOptions(
+                            steamPatches,
+                            selectedAppId,
+                          ).map((patch) => {
                             const patchKey = getSteamPatchKey(patch);
                             const patchSuggestion =
                               likelySteamPatch?.key === patchKey
                                 ? likelySteamPatch
                                 : null;
-                            const patchSourceLabel = formatPatchListSourceLabel(
-                              patch.selectionSource,
-                            );
                             return (
                               <button
                                 className={`candidate-row selection-row ${selectedSteamPatchKey === patchKey ? 'is-selected' : ''}`}
@@ -3502,11 +3605,6 @@ function App() {
                                             icon={faCheck}
                                           />
                                           <span>Likely</span>
-                                        </span>
-                                      ) : null}
-                                      {patchSourceLabel ? (
-                                        <span className="manual-patch-chip">
-                                          {patchSourceLabel}
                                         </span>
                                       ) : null}
                                     </div>
@@ -4171,7 +4269,9 @@ function App() {
                 >
                   <div className="section-heading retry-modal__heading">
                     <div>
-                      <p className="section-title">Edit Source Patch</p>
+                      <p className="section-title">
+                        {getPatchEditorTitle(sourcePatchEditor.item)}
+                      </p>
                       <p className="muted-text">
                         {sourcePatchEditor.item.item.title}
                       </p>
@@ -4218,11 +4318,11 @@ function App() {
                         No SteamDB patches were returned for this app.
                       </p>
                     ) : null}
-                    {sourcePatchEditor.patches.map((patch) => {
+                    {getSteamPatchOptions(
+                      sourcePatchEditor.patches,
+                      sourcePatchEditor.item.item.steamAppId,
+                    ).map((patch) => {
                       const patchKey = getSteamPatchKey(patch);
-                      const patchSourceLabel = formatPatchListSourceLabel(
-                        patch.selectionSource,
-                      );
                       return (
                         <button
                           className={`candidate-row selection-row ${sourcePatchEditor.selectedKey === patchKey ? 'is-selected' : ''}`}
@@ -4246,11 +4346,6 @@ function App() {
                                 {currentPatchKey === patchKey ? (
                                   <span className="likely-match-chip">
                                     Current
-                                  </span>
-                                ) : null}
-                                {patchSourceLabel ? (
-                                  <span className="manual-patch-chip">
-                                    {patchSourceLabel}
                                   </span>
                                 ) : null}
                               </div>

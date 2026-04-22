@@ -4,6 +4,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from 'react';
 import { createRoot } from 'react-dom/client';
@@ -44,7 +45,6 @@ import type {
   ImportScanPayload,
   LibraryRootRecord,
   MyJDownloaderDeviceSummary,
-  PatchSelectionSource,
   RemoveTrackedItemMode,
   SaveImportBatchPayload,
   SaveImportBatchResult,
@@ -57,8 +57,13 @@ import type {
   SteamMatchResolutionPayload,
   SteamPatchCandidate,
   SteamPatchFeedResult,
+  SupportedSourceKind,
   ThemeMode,
   TrackedItemView,
+} from '@vaulttrack/shared-types';
+import {
+  getPatchHistoryKey,
+  mergePatchHistory,
 } from '@vaulttrack/shared-types';
 
 import {
@@ -68,18 +73,24 @@ import {
   IMPORT_BUILD_LOOKUP_MAX_ATTEMPTS,
   type ImportBuildLookupPauseReason,
 } from './import-queue-timing.js';
+import {
+  filterLibraryItem,
+  getDefaultLibrarySortDirection,
+  getScopedLibraryStatusFilterCounts,
+  getTrackingStatus,
+  hasActionableSourceUpdate,
+  LIBRARY_STATUS_FILTER_OPTIONS,
+  matchesLibrarySearch,
+  matchesLibraryStatusFilter,
+  needsPatchMetadataAttention,
+  sortLibraryItems,
+  type LibraryFilter,
+  type LibrarySortDirection,
+  type LibrarySortMode,
+  type LibraryStatusFilter,
+} from './library-controls.js';
 
 type Section = 'library' | 'imports' | 'logs' | 'settings';
-type LibraryFilter = 'tracked' | 'updates';
-type LibrarySortMode = 'default' | 'title' | 'status';
-type LibraryStatusFilter =
-  | 'all'
-  | 'downloads'
-  | 'failed'
-  | 'folderMissing'
-  | 'installed'
-  | 'sourceBehind'
-  | 'updates';
 type LibraryViewMode = 'cards' | 'list';
 type ImportSortKey = 'folder' | 'patchMetadata' | 'steamMatch';
 type SortDirection = 'asc' | 'desc';
@@ -93,6 +104,7 @@ type ItemBusyAction =
   | 'refresh'
   | 'remove'
   | 'retry'
+  | 'sources'
   | 'updatePatch'
   | 'updateInstall';
 type RetryMirrorOption = Pick<
@@ -106,6 +118,7 @@ type ImportPatchHistoryStatus =
   | 'needs_attention'
   | 'queued'
   | 'retrying';
+type SteamDbBackfillStatus = 'idle' | 'loading' | 'loaded' | 'failed';
 type ImportRowState = {
   attentionKind: SteamDbBuildLookupAttentionKind | null;
   buildLookupId: string | null;
@@ -152,19 +165,14 @@ type ImportManualPatchModal = {
 };
 
 const DESKTOP_LIBRARY_VIEW_STORAGE_KEY = 'vaulttrack:desktop:library-view';
+const PATCH_EDITOR_BACKFILL_POLL_INTERVAL_MS = 750;
+const PATCH_EDITOR_BACKFILL_POLL_TIMEOUT_MS = 26000;
 const STEAM_LEGACY_APP_ART_BASE =
   'https://cdn.cloudflare.steamstatic.com/steam/apps';
-const LIBRARY_STATUS_FILTER_OPTIONS: Array<{
-  label: string;
-  value: LibraryStatusFilter;
-}> = [
-  { label: 'All statuses', value: 'all' },
-  { label: 'Installed', value: 'installed' },
-  { label: 'Updates', value: 'updates' },
-  { label: 'Source behind', value: 'sourceBehind' },
-  { label: 'Folder missing', value: 'folderMissing' },
-  { label: 'Downloads', value: 'downloads' },
-  { label: 'Failed', value: 'failed' },
+const SUPPORTED_RENDER_SOURCE_KINDS: SupportedSourceKind[] = [
+  'elamigos',
+  'steamrip',
+  'ankergames',
 ];
 
 declare global {
@@ -192,6 +200,11 @@ declare global {
       openDesktop(trackedItemId?: string): Promise<{ opened: true }>;
       openExternal(target: string): Promise<void>;
       pickDirectory(): Promise<string | null>;
+      discoverSourceMatches(trackedItemId: string): Promise<TrackedItemView>;
+      refreshMatchedSource(payload: {
+        sourceKind: SupportedSourceKind;
+        trackedItemId: string;
+      }): Promise<TrackedItemView>;
       refreshTrackedItem(trackedItemId: string): Promise<unknown>;
       removeTrackedItem(payload: {
         trackedItemId: string;
@@ -204,9 +217,17 @@ declare global {
       resolveSteamPatches(payload: {
         appId: number;
       }): Promise<SteamPatchFeedResult>;
+      listSteamPatchEntries(
+        trackedItemId: string,
+      ): Promise<SteamPatchCandidate[]>;
       retryDownload(trackedItemId: string): Promise<TrackedItemView>;
       retryDownloadWithSelection(payload: {
         selectedDownloads: SelectedDownloads;
+        trackedItemId: string;
+      }): Promise<TrackedItemView>;
+      queueUpdateFromSource(payload: {
+        selectedDownloads?: SelectedDownloads;
+        sourceKind: SupportedSourceKind;
         trackedItemId: string;
       }): Promise<TrackedItemView>;
       saveSettings(payload: {
@@ -214,6 +235,8 @@ declare global {
         pollDailyHourLocal?: number;
         renameGameFoldersOnImport?: boolean;
         rootLibraryPath?: string | null;
+        sourceWatchDurationDays?: number;
+        sourceWatchIntervalHours?: number;
         themeMode?: ThemeMode | null;
       }): Promise<SettingsView>;
       scanImportCandidates(
@@ -244,8 +267,14 @@ declare global {
         installedVersion?: string | null;
         trackedItemId: string;
       }): Promise<TrackedItemView>;
+      setManualSourceMatch(payload: {
+        sourceKind: SupportedSourceKind;
+        sourceUrl: string;
+        trackedItemId: string;
+      }): Promise<TrackedItemView>;
       updateSourcePatch(payload: {
         selectedSteamPatch: SteamPatchCandidate;
+        steamPatchEntries?: SteamPatchCandidate[] | null;
         trackedItemId: string;
       }): Promise<TrackedItemView>;
     };
@@ -324,34 +353,89 @@ function formatLabel(value: string | null | undefined): string {
     .replace(/\b\w/g, (character) => character.toUpperCase());
 }
 
-function formatPatchSourceLabel(
-  value: PatchSelectionSource | null | undefined,
-): string | null {
-  if (value === 'manual') return 'Manually added';
-  if (value === 'steamdb_builds') return 'SteamDB manual override';
-  return null;
+function createOlderThanAvailablePatch(appId: number): SteamPatchCandidate {
+  return {
+    appId,
+    buildId: null,
+    description: 'Installed patch predates the available SteamDB patch history.',
+    link: `vaulttrack:older-than-available:${appId}`,
+    patchDate: '',
+    patchTitle: 'Older than available / not listed',
+    publishedAt: '',
+    selectionSource: 'older_than_available',
+    title: 'Older than available / not listed',
+    version: null,
+  };
+}
+
+function isOlderThanAvailablePatch(
+  patch: SteamPatchCandidate | null | undefined,
+): boolean {
+  return patch?.selectionSource === 'older_than_available';
+}
+
+function getPatchOptions(
+  patches: SteamPatchCandidate[],
+  appId: number | null | undefined,
+): SteamPatchCandidate[] {
+  const merged = mergePatchCandidates(patches);
+  const availablePatches = merged.filter(
+    (patch) => !isOlderThanAvailablePatch(patch),
+  );
+  if (!appId || availablePatches.length === 0) {
+    return merged;
+  }
+
+  const olderPatch = createOlderThanAvailablePatch(appId);
+  const existingOlderPatch = merged.find((patch) =>
+    isOlderThanAvailablePatch(patch),
+  );
+  return [...availablePatches, existingOlderPatch ?? olderPatch];
 }
 
 function patchCandidateKey(
-  patch: Pick<SteamPatchCandidate, 'buildId' | 'link' | 'patchDate'>,
+  patch: SteamPatchCandidate,
 ): string {
-  return patch.link || `${patch.buildId ?? 'no-build'}:${patch.patchDate}`;
+  return getPatchHistoryKey(patch);
 }
 
 function mergePatchCandidates(
   patches: SteamPatchCandidate[],
 ): SteamPatchCandidate[] {
-  const seen = new Set<string>();
-  const merged: SteamPatchCandidate[] = [];
-  for (const patch of patches) {
-    const key = patchCandidateKey(patch);
-    if (seen.has(key)) {
-      continue;
-    }
-    seen.add(key);
-    merged.push(patch);
+  return mergePatchHistory(patches);
+}
+
+function hasSteamDbBuildTableRows(patches: SteamPatchCandidate[]): boolean {
+  return patches.some((patch) => patch.selectionSource === 'steamdb_builds');
+}
+
+function getTrackedPatchKey(
+  item: TrackedItemView,
+  patches: SteamPatchCandidate[],
+): string | null {
+  if (item.selectedPatch) {
+    return patchCandidateKey(item.selectedPatch);
   }
-  return merged;
+
+  const snapshot = item.sourceSnapshot;
+  if (!snapshot) {
+    return null;
+  }
+
+  const matchedPatch = patches.find((patch) => {
+    if (snapshot.observedBuildId && patch.buildId) {
+      return patch.buildId === snapshot.observedBuildId;
+    }
+    if (snapshot.observedPatchLink && patch.link) {
+      return patch.link === snapshot.observedPatchLink;
+    }
+    return (
+      patch.patchDate === snapshot.observedPatchDate &&
+      patch.patchTitle === snapshot.observedPatchTitle
+    );
+  });
+
+  return matchedPatch ? patchCandidateKey(matchedPatch) : null;
 }
 
 function todayDateInput(): string {
@@ -457,6 +541,12 @@ function formatDurationShort(milliseconds: number): string {
   return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
 }
 
+function waitForMs(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
 function isManualImportPatch(patch: SteamPatchCandidate | null): boolean {
   return patch?.selectionSource === 'manual';
 }
@@ -535,7 +625,7 @@ function getSelectedImportPatch(
     return null;
   }
   return (
-    row.patches.find(
+    getPatchOptions(row.patches, row.steamMatch?.appId).find(
       (patch) => patchCandidateKey(patch) === row.selectedPatchKey,
     ) ?? null
   );
@@ -578,6 +668,10 @@ function createManualImportPatch(
 }
 
 function patchSummary(patch: SteamPatchCandidate): string {
+  if (isOlderThanAvailablePatch(patch)) {
+    return 'Installed patch predates the available SteamDB history';
+  }
+
   return [
     patch.buildId ? `Build ${patch.buildId}` : null,
     patch.version ? `Version ${patch.version}` : null,
@@ -807,10 +901,6 @@ function getItemFileState(item: TrackedItemView): TrackedItemView['fileState'] {
   );
 }
 
-function getTrackingStatus(item: TrackedItemView): string {
-  return (item as Partial<TrackedItemView>).trackingStatus ?? 'watching_source';
-}
-
 function shouldShowTrackingStatus(item: TrackedItemView): boolean {
   return !['queued', 'downloading', 'extracting', 'staged', 'failed'].includes(
     item.status,
@@ -830,17 +920,40 @@ function formatNextSourceScan(item: TrackedItemView): string {
 }
 
 function formatPatchLag(item: TrackedItemView): string {
-  if (item.selectedPatchMissingFromFeed) {
-    return 'Outside feed window';
+  if (item.patchMetadataStatus === 'needs_attention') {
+    return 'Needs attention';
+  }
+
+  if (
+    item.patchMetadataStatus === 'outside_saved_history' ||
+    item.selectedPatchMissingFromFeed
+  ) {
+    return 'Outside saved history';
   }
 
   if (typeof item.versionsBehindLatest === 'number') {
+    if (item.versionsBehindLatestIsLowerBound) {
+      return `${item.versionsBehindLatest}+ behind`;
+    }
     return item.versionsBehindLatest === 0
       ? 'Latest'
       : `${item.versionsBehindLatest} behind`;
   }
 
+  if (item.patchMetadataStatus === 'manual') {
+    return 'Manual metadata';
+  }
+
   return 'Unknown';
+}
+
+function getPatchEditorTitle(item: TrackedItemView): string {
+  if (needsPatchMetadataAttention(item)) {
+    return 'Resolve Installed Patch';
+  }
+  return item.item.sourceKind === 'manual'
+    ? 'Edit Installed Patch'
+    : 'Edit Source Patch';
 }
 
 function formatTrackedSourceKind(value: string | null | undefined): string {
@@ -861,98 +974,6 @@ function readStoredLibraryViewMode(
   } catch {
     return fallback;
   }
-}
-
-function isInstalledLibraryItem(item: TrackedItemView): boolean {
-  return (
-    item.status === 'installed' ||
-    Boolean(getItemFileState(item).finalPathExists)
-  );
-}
-
-function isUpdateLibraryItem(item: TrackedItemView): boolean {
-  const trackingStatus = getTrackingStatus(item);
-  return (
-    trackingStatus === 'update_available' ||
-    trackingStatus === 'source_behind_upstream' ||
-    Boolean(
-      typeof item.versionsBehindLatest === 'number' &&
-      item.versionsBehindLatest > 0,
-    )
-  );
-}
-
-function matchesLibrarySearch(item: TrackedItemView, query: string): boolean {
-  const normalizedQuery = query.trim().toLowerCase();
-  if (!normalizedQuery) return true;
-  const haystack = [
-    item.item.title,
-    item.item.steamTitle,
-    item.item.sourceKind,
-    item.selectedMirror?.label,
-    item.sourceSnapshot?.observedVersion,
-    item.sourceSnapshot?.observedBuildId,
-    item.installRecord?.installedVersion,
-    item.installRecord?.installedBuildId,
-  ]
-    .filter(Boolean)
-    .join(' ')
-    .toLowerCase();
-  return haystack.includes(normalizedQuery);
-}
-
-function filterLibraryItem(
-  item: TrackedItemView,
-  filter: LibraryFilter,
-): boolean {
-  if (filter === 'updates') return isUpdateLibraryItem(item);
-  return true;
-}
-
-function matchesLibraryStatusFilter(
-  item: TrackedItemView,
-  filter: LibraryStatusFilter,
-): boolean {
-  if (filter === 'all') return true;
-  if (filter === 'installed') return isInstalledLibraryItem(item);
-  if (filter === 'updates') return isUpdateLibraryItem(item);
-  if (filter === 'sourceBehind') {
-    return getTrackingStatus(item) === 'source_behind_upstream';
-  }
-  if (filter === 'folderMissing') return item.status === 'folder_missing';
-  if (filter === 'downloads') {
-    return ['queued', 'downloading', 'extracting', 'staged'].includes(
-      item.status,
-    );
-  }
-  return item.status === 'failed';
-}
-
-function getLibraryStatusFilterCount(
-  items: TrackedItemView[],
-  filter: LibraryStatusFilter,
-): number {
-  return items.filter((item) => matchesLibraryStatusFilter(item, filter))
-    .length;
-}
-
-function sortLibraryItems(
-  items: TrackedItemView[],
-  sortMode: LibrarySortMode,
-): TrackedItemView[] {
-  if (sortMode === 'default') return items;
-  return [...items].sort((left, right) => {
-    if (sortMode === 'title') {
-      return left.item.title.localeCompare(right.item.title);
-    }
-    if (sortMode === 'status') {
-      const statusCompare = formatLabel(getTrackingStatus(left)).localeCompare(
-        formatLabel(getTrackingStatus(right)),
-      );
-      return statusCompare || left.item.title.localeCompare(right.item.title);
-    }
-    return 0;
-  });
 }
 
 function compareNullableText(
@@ -1035,7 +1056,9 @@ function App() {
   const [section, setSection] = useState<Section>('library');
   const [libraryFilter, setLibraryFilter] = useState<LibraryFilter>('tracked');
   const [librarySearch, setLibrarySearch] = useState('');
-  const [librarySort, setLibrarySort] = useState<LibrarySortMode>('default');
+  const [librarySort, setLibrarySort] = useState<LibrarySortMode>('name');
+  const [librarySortDirection, setLibrarySortDirection] =
+    useState<LibrarySortDirection>('asc');
   const [libraryStatusFilter, setLibraryStatusFilter] =
     useState<LibraryStatusFilter>('all');
   const [libraryViewMode, setLibraryViewMode] = useState<LibraryViewMode>(() =>
@@ -1052,6 +1075,8 @@ function App() {
     useState<ConnectionHealthSummary | null>(null);
   const [settingsDraft, setSettingsDraft] = useState({
     pollDailyHourLocal: '9',
+    sourceWatchDurationDays: '5',
+    sourceWatchIntervalHours: '8',
   });
   const [libraryRootsDraft, setLibraryRootsDraft] = useState<
     LibraryRootRecord[]
@@ -1105,13 +1130,20 @@ function App() {
     item: TrackedItemView;
     patchUrl: string | null;
   } | null>(null);
+  const [sourcesModal, setSourcesModal] = useState<{
+    item: TrackedItemView;
+    manualSourceKind: SupportedSourceKind;
+    manualUrl: string;
+  } | null>(null);
   const [patchEditor, setPatchEditor] = useState<{
+    backfillStatus: SteamDbBackfillStatus;
     error: string | null;
     item: TrackedItemView;
     loading: boolean;
     patches: SteamPatchCandidate[];
     selectedKey: string | null;
   } | null>(null);
+  const patchEditorRequestIdRef = useRef(0);
   const [systemPrefersDark, setSystemPrefersDark] = useState(
     window.matchMedia('(prefers-color-scheme: dark)').matches,
   );
@@ -1119,20 +1151,18 @@ function App() {
   const libraryTabCounts = useMemo(
     () => ({
       tracked: items.length,
-      updates: items.filter(isUpdateLibraryItem).length,
+      updates: items.filter(hasActionableSourceUpdate).length,
     }),
     [items],
   );
   const libraryStatusFilterCounts = useMemo(
     () =>
-      LIBRARY_STATUS_FILTER_OPTIONS.reduce(
-        (acc, option) => {
-          acc[option.value] = getLibraryStatusFilterCount(items, option.value);
-          return acc;
-        },
-        {} as Record<LibraryStatusFilter, number>,
+      getScopedLibraryStatusFilterCounts(
+        items,
+        libraryFilter,
+        librarySearch,
       ),
-    [items],
+    [items, libraryFilter, librarySearch],
   );
   const visibleLibraryItems = useMemo(
     () =>
@@ -1144,8 +1174,16 @@ function App() {
             matchesLibrarySearch(item, librarySearch),
         ),
         librarySort,
+        librarySortDirection,
       ),
-    [items, libraryFilter, librarySearch, librarySort, libraryStatusFilter],
+    [
+      items,
+      libraryFilter,
+      librarySearch,
+      librarySort,
+      librarySortDirection,
+      libraryStatusFilter,
+    ],
   );
   const detailsItem = useMemo(
     () => items.find((item) => item.item.id === detailsItemId) ?? null,
@@ -1228,6 +1266,8 @@ function App() {
     setSettings(nextSettings);
     setSettingsDraft({
       pollDailyHourLocal: String(nextSettings.pollDailyHourLocal ?? 9),
+      sourceWatchDurationDays: String(nextSettings.sourceWatchDurationDays ?? 5),
+      sourceWatchIntervalHours: String(nextSettings.sourceWatchIntervalHours ?? 8),
     });
     setLibraryRootsDraft(normalizeSettingsLibraryRoots(nextSettings));
     setRenameOnImportDraft(nextSettings.renameGameFoldersOnImport ?? true);
@@ -1257,6 +1297,12 @@ function App() {
           libraryRoots: libraryRootsDraft,
           pollDailyHourLocal: Number(settingsDraft.pollDailyHourLocal),
           renameGameFoldersOnImport: renameOnImportDraft,
+          sourceWatchDurationDays: Number(
+            settingsDraft.sourceWatchDurationDays,
+          ),
+          sourceWatchIntervalHours: Number(
+            settingsDraft.sourceWatchIntervalHours,
+          ),
           themeMode: settings.themeMode,
         }),
       );
@@ -2388,6 +2434,12 @@ function App() {
       setConnectionHealth(health);
       setSettingsDraft({
         pollDailyHourLocal: String(loadedSettings.pollDailyHourLocal ?? 9),
+        sourceWatchDurationDays: String(
+          loadedSettings.sourceWatchDurationDays ?? 5,
+        ),
+        sourceWatchIntervalHours: String(
+          loadedSettings.sourceWatchIntervalHours ?? 8,
+        ),
       });
       setLibraryRootsDraft(normalizeSettingsLibraryRoots(loadedSettings));
       setRenameOnImportDraft(loadedSettings.renameGameFoldersOnImport ?? true);
@@ -2436,6 +2488,103 @@ function App() {
     setBusyAction(actionKind);
     try {
       await action();
+      await refreshItems();
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : 'Action failed.');
+    } finally {
+      setBusyId(null);
+      setBusyAction(null);
+    }
+  }
+
+  async function openSourcesForItem(item: TrackedItemView) {
+    setSourcesModal({
+      item,
+      manualSourceKind: 'steamrip',
+      manualUrl: '',
+    });
+  }
+
+  async function refreshSourceMatches(item: TrackedItemView) {
+    setBusyId(item.item.id);
+    setBusyAction('sources');
+    try {
+      const updated = await window.vaultTrackApi.discoverSourceMatches(
+        item.item.id,
+      );
+      setSourcesModal((current) =>
+        current ? { ...current, item: updated } : current,
+      );
+      await refreshItems();
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : 'Action failed.');
+    } finally {
+      setBusyId(null);
+      setBusyAction(null);
+    }
+  }
+
+  async function saveManualSourceMatch() {
+    if (!sourcesModal?.manualUrl.trim()) return;
+    setBusyId(sourcesModal.item.item.id);
+    setBusyAction('sources');
+    try {
+      const updated = await window.vaultTrackApi.setManualSourceMatch({
+        sourceKind: sourcesModal.manualSourceKind,
+        sourceUrl: sourcesModal.manualUrl.trim(),
+        trackedItemId: sourcesModal.item.item.id,
+      });
+      setSourcesModal((current) =>
+        current
+          ? {
+              ...current,
+              item: updated,
+              manualUrl: '',
+            }
+          : current,
+      );
+      await refreshItems();
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : 'Action failed.');
+    } finally {
+      setBusyId(null);
+      setBusyAction(null);
+    }
+  }
+
+  async function refreshOneMatchedSource(sourceKind: SupportedSourceKind) {
+    if (!sourcesModal) return;
+    setBusyId(sourcesModal.item.item.id);
+    setBusyAction('sources');
+    try {
+      const updated = await window.vaultTrackApi.refreshMatchedSource({
+        sourceKind,
+        trackedItemId: sourcesModal.item.item.id,
+      });
+      setSourcesModal((current) =>
+        current ? { ...current, item: updated } : current,
+      );
+      await refreshItems();
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : 'Action failed.');
+    } finally {
+      setBusyId(null);
+      setBusyAction(null);
+    }
+  }
+
+  async function queueSourceUpdate(sourceKind: SupportedSourceKind) {
+    if (!sourcesModal) return;
+    setBusyId(sourcesModal.item.item.id);
+    setBusyAction('retry');
+    try {
+      const updated = await window.vaultTrackApi.queueUpdateFromSource({
+        sourceKind,
+        trackedItemId: sourcesModal.item.item.id,
+      });
+      setSourcesModal((current) =>
+        current ? { ...current, item: updated } : current,
+      );
       await refreshItems();
     } catch (error) {
       window.alert(error instanceof Error ? error.message : 'Action failed.');
@@ -2594,26 +2743,171 @@ function App() {
     }
   }
 
+  function setPatchEditorBackfillStatus(
+    appId: number,
+    requestId: number,
+    status: SteamDbBackfillStatus,
+  ): void {
+    setPatchEditor((current) =>
+      current &&
+      current.item.item.steamAppId === appId &&
+      patchEditorRequestIdRef.current === requestId
+        ? { ...current, backfillStatus: status }
+        : current,
+    );
+  }
+
+  function applyPatchEditorBackfillPatches(
+    appId: number,
+    requestId: number,
+    patches: SteamPatchCandidate[],
+  ): void {
+    const normalizedPatches = patches.filter((patch) => patch.appId === appId);
+    setPatchEditor((current) => {
+      if (
+        !current ||
+        current.item.item.steamAppId !== appId ||
+        patchEditorRequestIdRef.current !== requestId
+      ) {
+        return current;
+      }
+
+      const merged = mergePatchCandidates([
+        ...current.patches,
+        ...normalizedPatches,
+      ]);
+      const selectedKey =
+        current.selectedKey &&
+        merged.some((patch) => patchCandidateKey(patch) === current.selectedKey)
+          ? current.selectedKey
+          : (getTrackedPatchKey(current.item, merged) ??
+            (merged[0] ? patchCandidateKey(merged[0]) : null));
+
+      return {
+        ...current,
+        backfillStatus: 'loaded',
+        patches: merged,
+        selectedKey,
+      };
+    });
+  }
+
+  async function pollPatchEditorBackfill(
+    appId: number,
+    lookupId: string,
+    requestId: number,
+  ): Promise<void> {
+    const startedAt = Date.now();
+    while (
+      patchEditorRequestIdRef.current === requestId &&
+      Date.now() - startedAt <= PATCH_EDITOR_BACKFILL_POLL_TIMEOUT_MS
+    ) {
+      await waitForMs(PATCH_EDITOR_BACKFILL_POLL_INTERVAL_MS);
+      const lookup = await window.vaultTrackApi.getSteamDbBuildLookup(lookupId);
+      if (patchEditorRequestIdRef.current !== requestId) {
+        return;
+      }
+      if (!lookup) {
+        continue;
+      }
+      if (lookup.status === 'complete') {
+        applyPatchEditorBackfillPatches(appId, requestId, lookup.patches);
+        return;
+      }
+      if (lookup.status === 'failed') {
+        setPatchEditorBackfillStatus(appId, requestId, 'failed');
+        return;
+      }
+    }
+
+    if (patchEditorRequestIdRef.current === requestId) {
+      setPatchEditorBackfillStatus(appId, requestId, 'failed');
+    }
+  }
+
+  async function startPatchEditorBackfill(
+    appId: number,
+    requestId: number,
+  ): Promise<void> {
+    setPatchEditorBackfillStatus(appId, requestId, 'loading');
+    try {
+      const lookup = await window.vaultTrackApi.requestSteamDbBuildLookup(appId);
+      if (patchEditorRequestIdRef.current !== requestId) {
+        return;
+      }
+      if (lookup.status === 'complete') {
+        applyPatchEditorBackfillPatches(appId, requestId, lookup.patches);
+        return;
+      }
+      if (lookup.status === 'failed') {
+        setPatchEditorBackfillStatus(appId, requestId, 'failed');
+        return;
+      }
+      await pollPatchEditorBackfill(appId, lookup.id, requestId);
+    } catch {
+      if (patchEditorRequestIdRef.current === requestId) {
+        setPatchEditorBackfillStatus(appId, requestId, 'failed');
+      }
+    }
+  }
+
+  function closePatchEditor(): void {
+    patchEditorRequestIdRef.current += 1;
+    setPatchEditor(null);
+  }
+
   async function openSourcePatchEditor(item: TrackedItemView) {
     if (!item.item.steamAppId) return;
 
-    const seedPatches = item.selectedPatch ? [item.selectedPatch] : [];
+    const seedPatches: SteamPatchCandidate[] = item.selectedPatch
+      ? [item.selectedPatch]
+      : [];
+    const requestId = ++patchEditorRequestIdRef.current;
     setPatchEditor({
+      backfillStatus: hasSteamDbBuildTableRows(seedPatches) ? 'loaded' : 'idle',
       error: null,
       item,
       loading: true,
       patches: seedPatches,
-      selectedKey: item.selectedPatch
-        ? patchCandidateKey(item.selectedPatch)
-        : null,
+      selectedKey: getTrackedPatchKey(item, seedPatches),
     });
     setBusyId(item.item.id);
     setBusyAction('updatePatch');
+    let patches: SteamPatchCandidate[] = seedPatches;
     try {
+      const persistedPatches = await window.vaultTrackApi.listSteamPatchEntries(
+        item.item.id,
+      );
+      if (patchEditorRequestIdRef.current !== requestId) {
+        return;
+      }
+      patches = mergePatchCandidates([...patches, ...persistedPatches]);
+      setPatchEditor((current) =>
+        current
+          ? {
+              ...current,
+              backfillStatus: hasSteamDbBuildTableRows(patches)
+                ? 'loaded'
+                : current.backfillStatus,
+              patches,
+              selectedKey:
+                current.selectedKey ??
+                getTrackedPatchKey(current.item, patches) ??
+                (patches[0] ? patchCandidateKey(patches[0]) : null),
+            }
+          : current,
+      );
+      if (!hasSteamDbBuildTableRows(patches)) {
+        void startPatchEditorBackfill(item.item.steamAppId, requestId);
+      }
+
       const result = await window.vaultTrackApi.resolveSteamPatches({
         appId: item.item.steamAppId,
       });
-      const patches = mergePatchCandidates([...seedPatches, ...result.patches]);
+      patches = mergePatchCandidates([...patches, ...result.patches]);
+      if (patchEditorRequestIdRef.current !== requestId) {
+        return;
+      }
       setPatchEditor((current) =>
         current
           ? {
@@ -2623,6 +2917,7 @@ function App() {
               patches,
               selectedKey:
                 current.selectedKey ??
+                getTrackedPatchKey(current.item, patches) ??
                 (patches[0] ? patchCandidateKey(patches[0]) : null),
             }
           : current,
@@ -2649,9 +2944,10 @@ function App() {
   async function applySourcePatchSelection() {
     if (!patchEditor?.selectedKey) return;
 
-    const selectedPatch = patchEditor.patches.find(
-      (patch) => patchCandidateKey(patch) === patchEditor.selectedKey,
-    );
+    const selectedPatch = getPatchOptions(
+      patchEditor.patches,
+      patchEditor.item.item.steamAppId,
+    ).find((patch) => patchCandidateKey(patch) === patchEditor.selectedKey);
     if (!selectedPatch) return;
 
     setBusyId(patchEditor.item.item.id);
@@ -2659,9 +2955,10 @@ function App() {
     try {
       await window.vaultTrackApi.updateSourcePatch({
         selectedSteamPatch: selectedPatch,
+        steamPatchEntries: patchEditor.patches,
         trackedItemId: patchEditor.item.item.id,
       });
-      setPatchEditor(null);
+      closePatchEditor();
       await refreshItems();
     } catch (error) {
       window.alert(error instanceof Error ? error.message : 'Action failed.');
@@ -2717,10 +3014,9 @@ function App() {
     activity: TrackedItemView['activity'];
     fileState: TrackedItemView['fileState'];
     item: TrackedItemView;
-    patchSourceLabel: string | null;
     variant?: 'list' | 'modal';
   }) {
-    const { activity, fileState, item, patchSourceLabel, variant } = params;
+    const { activity, fileState, item, variant } = params;
     const sourcePatchBuild =
       item.selectedPatch?.buildId ?? item.sourceSnapshot?.observedBuildId;
     const sourcePatchDate =
@@ -2749,7 +3045,6 @@ function App() {
             {sourcePatchBuild ? `Build ${sourcePatchBuild}` : 'Build n/a'}
           </span>
           <span>{sourcePatchDate ?? 'Date n/a'}</span>
-          {patchSourceLabel ? <span>{patchSourceLabel}</span> : null}
         </div>
         <div>
           <strong>Latest SteamDB</strong>
@@ -2762,7 +3057,7 @@ function App() {
           <span>{item.latestPatch?.patchDate ?? 'Date n/a'}</span>
         </div>
         <div>
-          <strong>SteamDB Check</strong>
+          <strong>SteamDB RSS Check</strong>
           <span>{formatRelativeTime(activity.lastSteamFeedCheckedAt)}</span>
           <span>
             {activity.lastSteamFeedError ? 'Last check failed' : 'Feed ok'}
@@ -2843,6 +3138,16 @@ function App() {
               <span>Open Source</span>
             </button>
           ) : null}
+          <button
+            aria-busy={itemBusyAction === 'sources'}
+            disabled={itemBusy}
+            onClick={() => void openSourcesForItem(item)}
+            role="menuitem"
+            type="button"
+          >
+            <FontAwesomeIcon aria-hidden="true" icon={faList} />
+            <span>View Sources</span>
+          </button>
           {item.item.steamAppId ? (
             <>
               <button
@@ -2886,7 +3191,7 @@ function App() {
                   <FontAwesomeIcon aria-hidden="true" icon={faPenToSquare} />
                   {itemBusyAction === 'updatePatch'
                     ? 'Loading Patches...'
-                    : 'Edit Source Patch'}
+                    : getPatchEditorTitle(item)}
                 </button>
               ) : null}
             </>
@@ -2984,10 +3289,6 @@ function App() {
     if (!detailsItem) return null;
     const activity = getItemActivity(detailsItem);
     const fileState = getItemFileState(detailsItem);
-    const patchSourceLabel = formatPatchSourceLabel(
-      detailsItem.selectedPatch?.selectionSource ??
-        detailsItem.sourceSnapshot?.patchSelectionSource,
-    );
     return (
       <div
         className="details-modal-backdrop"
@@ -3024,9 +3325,193 @@ function App() {
               activity,
               fileState,
               item: detailsItem,
-              patchSourceLabel,
               variant: 'modal',
             })}
+          </div>
+        </section>
+      </div>
+    );
+  }
+
+  function renderSourcesModal() {
+    if (!sourcesModal) return null;
+    const item = sourcesModal.item;
+    const rows = SUPPORTED_RENDER_SOURCE_KINDS.map((sourceKind) => {
+      const source = item.sourceMatches.find(
+        (entry) => entry.match.sourceKind === sourceKind,
+      );
+      return {
+        source,
+        sourceKind,
+      };
+    });
+    const itemBusy = busyId === item.item.id;
+    return (
+      <div
+        className="details-modal-backdrop"
+        onMouseDown={() => setSourcesModal(null)}
+      >
+        <section
+          aria-labelledby="sources-modal-title"
+          aria-modal="true"
+          className="details-modal"
+          onMouseDown={(event) => event.stopPropagation()}
+          role="dialog"
+        >
+          <div className="details-modal__header">
+            <div>
+              <p className="eyebrow">Sources</p>
+              <h2 id="sources-modal-title">{item.item.title}</h2>
+            </div>
+            <button
+              aria-label="Close sources"
+              className="modal-close-button"
+              onClick={() => setSourcesModal(null)}
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faXmark} />
+            </button>
+          </div>
+          <div className="details-modal__body">
+            <div className="source-match-list">
+              {rows.map(({ source, sourceKind }) => {
+                const match = source?.match;
+                const snapshot = source?.snapshot;
+                const fullMirror = source?.downloadMirrors.find(
+                  (mirror) => mirror.kind === 'full',
+                );
+                return (
+                  <div className="source-match-row" key={sourceKind}>
+                    <div>
+                      <strong>{formatTrackedSourceKind(sourceKind)}</strong>
+                      <span>
+                        {match?.status
+                          ? `${formatLabel(match.status)} ${Math.round(
+                              match.confidence * 100,
+                            )}%`
+                          : 'Not matched'}
+                      </span>
+                      <span>{formatLabel(source?.updateStatus ?? 'unknown')}</span>
+                    </div>
+                    <div>
+                      <span>{snapshot?.observedVersion ?? 'Version unknown'}</span>
+                      <span>
+                        {snapshot?.observedBuildId
+                          ? `Build ${snapshot.observedBuildId}`
+                          : 'Build n/a'}
+                      </span>
+                      <span>{snapshot?.observedPatchDate ?? 'Date n/a'}</span>
+                    </div>
+                    <div className="source-match-row__actions">
+                      {match?.sourceUrl ? (
+                        <button
+                          onClick={() =>
+                            void window.vaultTrackApi.openExternal(
+                              match.sourceUrl!,
+                            )
+                          }
+                          type="button"
+                        >
+                          <FontAwesomeIcon
+                            aria-hidden="true"
+                            icon={faUpRightFromSquare}
+                          />
+                          <span>Open</span>
+                        </button>
+                      ) : null}
+                      {match?.sourceUrl ? (
+                        <button
+                          disabled={itemBusy}
+                          onClick={() =>
+                            void refreshOneMatchedSource(sourceKind)
+                          }
+                          type="button"
+                        >
+                          <FontAwesomeIcon
+                            aria-hidden="true"
+                            icon={faRotateRight}
+                          />
+                          <span>Refresh</span>
+                        </button>
+                      ) : null}
+                      {source?.isUpdateSource && fullMirror ? (
+                        <button
+                          disabled={itemBusy}
+                          onClick={() => void queueSourceUpdate(sourceKind)}
+                          type="button"
+                        >
+                          <FontAwesomeIcon
+                            aria-hidden="true"
+                            icon={faArrowDownWideShort}
+                          />
+                          <span>Download</span>
+                        </button>
+                      ) : null}
+                    </div>
+                    {match?.lastError ? (
+                      <p className="form-error">{match.lastError}</p>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+            <div className="source-modal-actions">
+              <button
+                disabled={itemBusy}
+                onClick={() => void refreshSourceMatches(item)}
+                type="button"
+              >
+                <FontAwesomeIcon aria-hidden="true" icon={faMagnifyingGlass} />
+                <span>Find Matches</span>
+              </button>
+            </div>
+            <div className="settings-card">
+              <label>
+                <span>Source</span>
+                <select
+                  onChange={(event) =>
+                    setSourcesModal((current) =>
+                      current
+                        ? {
+                            ...current,
+                            manualSourceKind: event.currentTarget
+                              .value as SupportedSourceKind,
+                          }
+                        : current,
+                    )
+                  }
+                  value={sourcesModal.manualSourceKind}
+                >
+                  {SUPPORTED_RENDER_SOURCE_KINDS.map((sourceKind) => (
+                    <option key={sourceKind} value={sourceKind}>
+                      {formatTrackedSourceKind(sourceKind)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>Detail URL</span>
+                <input
+                  onChange={(event) =>
+                    setSourcesModal((current) =>
+                      current
+                        ? { ...current, manualUrl: event.currentTarget.value }
+                        : current,
+                    )
+                  }
+                  placeholder="https://..."
+                  value={sourcesModal.manualUrl}
+                />
+              </label>
+              <button
+                disabled={itemBusy || !sourcesModal.manualUrl.trim()}
+                onClick={() => void saveManualSourceMatch()}
+                type="button"
+              >
+                <FontAwesomeIcon aria-hidden="true" icon={faCheck} />
+                <span>Save URL</span>
+              </button>
+            </div>
           </div>
         </section>
       </div>
@@ -3037,17 +3522,14 @@ function App() {
     const progress = progressPercent(item);
     const activity = getItemActivity(item);
     const fileState = getItemFileState(item);
-    const patchSourceLabel = formatPatchSourceLabel(
-      item.selectedPatch?.selectionSource ??
-        item.sourceSnapshot?.patchSelectionSource,
-    );
     const details = renderLibraryDetailGrid({
       activity,
       fileState,
       item,
-      patchSourceLabel,
       variant: 'list',
     });
+    const showUpdateButton = getTrackingStatus(item) === 'update_available';
+    const showResolvePatchButton = needsPatchMetadataAttention(item);
 
     if (libraryViewMode === 'list') {
       return (
@@ -3055,6 +3537,7 @@ function App() {
           <div className="game-row__media">
             {renderLibraryArtwork(item, 'game-row__cover', 'cover')}
           </div>
+          {renderLibraryActionMenu(item)}
           <div className="game-row__body">
             <div className="game-row__main">
               <div>
@@ -3064,9 +3547,38 @@ function App() {
                   Patch Status: <span>{formatPatchLag(item)}</span>
                 </p>
               </div>
-              {renderLibraryActionMenu(item)}
             </div>
             {renderLibraryProgress(item, progress)}
+            {showUpdateButton || showResolvePatchButton ? (
+              <div className="game-row__actions">
+                {showUpdateButton ? (
+                  <button
+                    className="primary-inline-button"
+                    onClick={() => void openSourcesForItem(item)}
+                    type="button"
+                  >
+                    <FontAwesomeIcon
+                      aria-hidden="true"
+                      icon={faArrowDownWideShort}
+                    />
+                    <span>Update</span>
+                  </button>
+                ) : null}
+                {showResolvePatchButton ? (
+                  <button
+                    className="primary-inline-button patch-attention-button"
+                    onClick={() => void openSourcePatchEditor(item)}
+                    type="button"
+                  >
+                    <FontAwesomeIcon
+                      aria-hidden="true"
+                      icon={faTriangleExclamation}
+                    />
+                    <span>Resolve Patch</span>
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
             {details}
           </div>
         </article>
@@ -3092,13 +3604,43 @@ function App() {
             {renderLibraryActionMenu(item)}
           </div>
           {renderLibraryProgress(item, progress)}
+          {showUpdateButton || showResolvePatchButton ? (
+            <div className="game-card__actions">
+              {showUpdateButton ? (
+                <button
+                  className="primary-inline-button"
+                  onClick={() => void openSourcesForItem(item)}
+                  type="button"
+                >
+                  <FontAwesomeIcon
+                    aria-hidden="true"
+                    icon={faArrowDownWideShort}
+                  />
+                  <span>Update</span>
+                </button>
+              ) : null}
+              {showResolvePatchButton ? (
+                <button
+                  className="primary-inline-button patch-attention-button"
+                  onClick={() => void openSourcePatchEditor(item)}
+                  type="button"
+                >
+                  <FontAwesomeIcon
+                    aria-hidden="true"
+                    icon={faTriangleExclamation}
+                  />
+                  <span>Resolve Patch</span>
+                </button>
+              ) : null}
+            </div>
+          ) : null}
           <button
+            aria-label="Additional details"
             className="detail-toggle-button"
             onClick={() => setDetailsItemId(item.item.id)}
             type="button"
           >
             <FontAwesomeIcon aria-hidden="true" icon={faCircleInfo} />
-            <span>Additional Details</span>
           </button>
         </div>
       </article>
@@ -3283,28 +3825,59 @@ function App() {
                     value={librarySearch}
                   />
                 </label>
-                <label className="select-field">
-                  <span className="field-label">
-                    <FontAwesomeIcon
-                      aria-hidden="true"
-                      icon={faArrowDownWideShort}
-                    />
-                    Sort
-                  </span>
-                  <select
-                    aria-label="Sort library"
-                    onChange={(event) =>
-                      setLibrarySort(
-                        event.currentTarget.value as LibrarySortMode,
+                <div className="sort-control">
+                  <label className="select-field">
+                    <span className="field-label">
+                      <FontAwesomeIcon
+                        aria-hidden="true"
+                        icon={faArrowDownWideShort}
+                      />
+                      Sort
+                    </span>
+                    <select
+                      aria-label="Sort library"
+                      onChange={(event) => {
+                        const nextSort = event.currentTarget
+                          .value as LibrarySortMode;
+                        setLibrarySort(nextSort);
+                        setLibrarySortDirection(
+                          getDefaultLibrarySortDirection(nextSort),
+                        );
+                      }}
+                      value={librarySort}
+                    >
+                      <option value="name">Name</option>
+                      <option value="status">Status</option>
+                      <option value="recentlyUpdated">Recently updated</option>
+                    </select>
+                  </label>
+                  <button
+                    aria-label={`Sort ${
+                      librarySortDirection === 'asc'
+                        ? 'ascending'
+                        : 'descending'
+                    }`}
+                    className="sort-direction-button"
+                    onClick={() =>
+                      setLibrarySortDirection((current) =>
+                        current === 'asc' ? 'desc' : 'asc',
                       )
                     }
-                    value={librarySort}
+                    title={
+                      librarySortDirection === 'asc'
+                        ? 'Ascending'
+                        : 'Descending'
+                    }
+                    type="button"
                   >
-                    <option value="default">Default</option>
-                    <option value="title">Title</option>
-                    <option value="status">Status</option>
-                  </select>
-                </label>
+                    <FontAwesomeIcon
+                      aria-hidden="true"
+                      icon={
+                        librarySortDirection === 'asc' ? faSortUp : faSortDown
+                      }
+                    />
+                  </button>
+                </div>
                 <label className="select-field">
                   <span className="field-label">
                     <FontAwesomeIcon aria-hidden="true" icon={faFilter} />
@@ -3396,6 +3969,40 @@ function App() {
                   }}
                   type="number"
                   value={settingsDraft.pollDailyHourLocal}
+                />
+              </label>
+              <label className="field">
+                <span className="field-label">Source watch interval hours</span>
+                <input
+                  max="72"
+                  min="1"
+                  onChange={(event) => {
+                    const sourceWatchIntervalHours = event.currentTarget.value;
+                    setSettingsDraft((current) => ({
+                      ...current,
+                      sourceWatchIntervalHours,
+                    }));
+                    setSettingsSaveStatus('idle');
+                  }}
+                  type="number"
+                  value={settingsDraft.sourceWatchIntervalHours}
+                />
+              </label>
+              <label className="field">
+                <span className="field-label">Source watch duration days</span>
+                <input
+                  max="30"
+                  min="1"
+                  onChange={(event) => {
+                    const sourceWatchDurationDays = event.currentTarget.value;
+                    setSettingsDraft((current) => ({
+                      ...current,
+                      sourceWatchDurationDays,
+                    }));
+                    setSettingsSaveStatus('idle');
+                  }}
+                  type="number"
+                  value={settingsDraft.sourceWatchDurationDays}
                 />
               </label>
               <label className="toggle-field">
@@ -4169,6 +4776,10 @@ function App() {
         ? (() => {
             const row = importRows[importPatchSelector.candidate.id];
             const patches = row?.patches ?? [];
+            const patchOptions = getPatchOptions(
+              patches,
+              row?.steamMatch?.appId,
+            );
             return (
               <div className="modal-backdrop" role="presentation">
                 <div
@@ -4195,14 +4806,14 @@ function App() {
                   {row?.patchesLoading ? (
                     <p className="muted-text">Loading SteamDB patches...</p>
                   ) : null}
-                  {!row?.patchesLoading && patches.length === 0 ? (
+                  {!row?.patchesLoading && patchOptions.length === 0 ? (
                     <p className="muted-text">
                       No SteamDB patches are loaded for this app yet. You can
                       still add metadata manually.
                     </p>
                   ) : null}
                   <div className="patch-list" role="listbox">
-                    {patches.map((patch) => {
+                    {patchOptions.map((patch) => {
                       const key = patchCandidateKey(patch);
                       const selected = key === importPatchSelector.selectedKey;
                       return (
@@ -4339,6 +4950,7 @@ function App() {
         </div>
       ) : null}
       {renderLibraryDetailsModal()}
+      {renderSourcesModal()}
       {retrySelection
         ? (() => {
             const fullRows = retrySelection.item.downloadMirrors.filter(
@@ -4454,26 +5066,56 @@ function App() {
           >
             <div className="panel-heading retry-modal__heading">
               <div>
-                <p className="panel-title">Edit Source Patch</p>
+                <p className="panel-title">
+                  {getPatchEditorTitle(patchEditor.item)}
+                </p>
                 <p className="muted-text">{patchEditor.item.item.title}</p>
               </div>
               <button
                 aria-label="Close source patch editor"
                 className="modal-close-button"
-                onClick={() => setPatchEditor(null)}
+                onClick={closePatchEditor}
                 type="button"
               >
                 <FontAwesomeIcon aria-hidden="true" icon={faXmark} />
               </button>
             </div>
             {patchEditor.loading ? (
-              <p className="muted-text">Loading SteamDB patches...</p>
+              <p className="muted-text">Loading SteamDB RSS patches...</p>
             ) : null}
             {patchEditor.error ? (
               <p className="muted-text">{patchEditor.error}</p>
             ) : null}
+            {!patchEditor.loading && patchEditor.backfillStatus === 'loading' ? (
+              <p className="muted-text">Loading SteamDB build table...</p>
+            ) : null}
+            {!patchEditor.loading && patchEditor.backfillStatus === 'failed' ? (
+              <p className="muted-text">SteamDB build table lookup failed.</p>
+            ) : null}
+            {patchEditor.item.item.steamAppId ? (
+              <div className="patch-toolbar">
+                <button
+                  className="ghost-button patch-toolbar__button"
+                  onClick={() =>
+                    void window.vaultTrackApi.openExternal(
+                      buildSteamDbPatchnotesUrl(patchEditor.item.item.steamAppId!),
+                    )
+                  }
+                  type="button"
+                >
+                  <FontAwesomeIcon
+                    aria-hidden="true"
+                    icon={faUpRightFromSquare}
+                  />
+                  <span>Open SteamDB Patchnotes</span>
+                </button>
+              </div>
+            ) : null}
             <div className="patch-list" role="listbox">
-              {patchEditor.patches.map((patch) => {
+              {getPatchOptions(
+                patchEditor.patches,
+                patchEditor.item.item.steamAppId,
+              ).map((patch) => {
                 const key = patchCandidateKey(patch);
                 const selected = key === patchEditor.selectedKey;
                 return (
@@ -4489,7 +5131,9 @@ function App() {
                     role="option"
                     type="button"
                   >
-                    <span>{patch.patchTitle}</span>
+                    <span className="patch-option__title">
+                      <span>{patch.patchTitle}</span>
+                    </span>
                     <small>{patchSummary(patch)}</small>
                   </button>
                 );
@@ -4498,7 +5142,7 @@ function App() {
             <div className="action-row">
               <button
                 className="ghost-button"
-                onClick={() => setPatchEditor(null)}
+                onClick={closePatchEditor}
                 type="button"
               >
                 Cancel

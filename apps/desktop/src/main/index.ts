@@ -399,6 +399,9 @@ async function bootstrap() {
   ipcMain.handle('vault:resolveSteamPatches', (_event, payload) =>
     service.resolveSteamPatches(payload.appId),
   );
+  ipcMain.handle('vault:listSteamPatchEntries', (_event, trackedItemId: string) =>
+    service.listSteamPatchEntries(trackedItemId),
+  );
   ipcMain.handle(
     'vault:applySteamMatch',
     (_event, payload: { trackedItemId: string; match: ConfirmedSteamMatch }) =>
@@ -407,8 +410,20 @@ async function bootstrap() {
   ipcMain.handle('vault:refreshTrackedItem', (_event, trackedItemId: string) =>
     service.refreshTrackedItem(trackedItemId),
   );
+  ipcMain.handle('vault:discoverSourceMatches', (_event, trackedItemId: string) =>
+    service.discoverSourceMatches(trackedItemId),
+  );
+  ipcMain.handle('vault:refreshMatchedSource', (_event, payload) =>
+    service.refreshMatchedSource(payload.trackedItemId, payload.sourceKind),
+  );
+  ipcMain.handle('vault:setManualSourceMatch', (_event, payload) =>
+    service.setManualSourceMatch(payload),
+  );
   ipcMain.handle('vault:retryDownload', (_event, trackedItemId: string) =>
     service.retryDownload(trackedItemId),
+  );
+  ipcMain.handle('vault:queueUpdateFromSource', (_event, payload) =>
+    service.queueUpdateFromSource(payload),
   );
   ipcMain.handle(
     'vault:retryDownloadWithSelection',

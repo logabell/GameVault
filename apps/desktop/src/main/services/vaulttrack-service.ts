@@ -21,9 +21,14 @@ import type {
   SaveImportBatchPayload,
   SaveImportBatchResult,
   SelectedDownloads,
+  SourceCatalogEntry,
   SourceKind,
+  SourceMatch,
+  SourceMatchMethod,
+  SourceMatchStatus,
   SettingsView,
   SourceSnapshot,
+  SupportedSourceKind,
   SteamDbBuildLookupState,
   ThemeMode,
   SteamPatchCandidate,
@@ -36,6 +41,7 @@ import type {
 } from '@vaulttrack/shared-types';
 import {
   TrackedItemTrackingStatus,
+  derivePatchMetadataStatus,
   derivePatchLag,
   deriveTrackedItemStatus,
   deriveTrackedItemTrackingStatus,
@@ -43,8 +49,15 @@ import {
 import {
   isAnkerGamesDirectDownloadUrl,
   isAnkerGamesGeneratedDownloadUrl,
+  buildAnkerGamesSlugCandidates,
+  parseAnkerGamesCatalog,
+  parseAnkerGamesRecentUpdates,
+  parseElAmigosCatalog,
+  parseSteamRipCatalog,
+  parseSteamRipUpdatedGames,
   parseSupportedPageForKindWithNetwork,
   resolveAnkerGamesDownloadUrl,
+  scoreSourceTitleMatch,
   type AnkerGamesSignedDownloadPageRenderer,
   type SourceFetch,
 } from '@vaulttrack/source-core';
@@ -82,9 +95,112 @@ import { MyJDownloaderService } from './myjdownloader.js';
 
 export type RendererSettingsView = SettingsView;
 
+const IS_TEST_ENV = process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST);
 const STEAMDB_RSS_TIMEOUT_MS = 15000;
+const STEAMDB_RSS_MIN_DELAY_MS = IS_TEST_ENV ? 0 : 5000;
+const STEAMDB_RSS_RATE_LIMIT_BACKOFF_MS = IS_TEST_ENV ? 0 : 60 * 60 * 1000;
+const ANKERGAMES_MIN_DELAY_MS = IS_TEST_ENV ? 0 : 1500;
+const ANKERGAMES_RATE_LIMIT_BACKOFF_MS = IS_TEST_ENV ? 0 : 30 * 60 * 1000;
+const SOURCE_DEFAULT_MIN_DELAY_MS = IS_TEST_ENV ? 0 : 250;
 const IMPORT_STEAM_MATCH_CONCURRENCY = 3;
 const STEAMDB_BUILD_LOOKUP_TTL_MS = 60 * 60 * 1000;
+const SOURCE_CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
+const SOURCE_MATCH_PROBABLE_SCORE = 0.92;
+const SOURCE_MATCH_CANDIDATE_SCORE = 0.84;
+const SUPPORTED_SOURCE_KINDS: SupportedSourceKind[] = [
+  'ankergames',
+  'elamigos',
+  'steamrip',
+];
+
+const SOURCE_CATALOG_URLS: Record<SupportedSourceKind, string[]> = {
+  ankergames: [
+    'https://ankergames.net/recent-updates',
+    'https://ankergames.net/games-list',
+  ],
+  elamigos: ['https://elamigos.site/'],
+  steamrip: [
+    'https://steamrip.com/games-list-page/',
+    'https://steamrip.com/updated-games/',
+  ],
+};
+
+interface RequestPacingState {
+  queue: Promise<void>;
+  nextAllowedAt: number;
+}
+
+interface RequestPacingOptions {
+  defaultBackoffMs: number;
+  key: string;
+  minDelayMs: number;
+  rateLimitStatuses: Set<number>;
+}
+
+class SourceCatalogUnavailableError extends Error {
+  constructor(
+    readonly sourceKind: SupportedSourceKind,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'SourceCatalogUnavailableError';
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
+}
+
+function retryAfterMs(response: Response, defaultMs: number): number {
+  const retryAfter = response.headers.get('retry-after');
+  if (!retryAfter) {
+    return defaultMs;
+  }
+
+  const seconds = Number(retryAfter);
+  if (Number.isFinite(seconds) && seconds > 0) {
+    return seconds * 1000;
+  }
+
+  const retryAt = new Date(retryAfter).getTime();
+  if (!Number.isNaN(retryAt)) {
+    return Math.max(0, retryAt - Date.now());
+  }
+
+  return defaultMs;
+}
+
+function sourcePacingOptions(url: string): RequestPacingOptions {
+  const host = new URL(url).hostname.toLowerCase();
+  if (host === 'ankergames.net') {
+    return {
+      defaultBackoffMs: ANKERGAMES_RATE_LIMIT_BACKOFF_MS,
+      key: host,
+      minDelayMs: ANKERGAMES_MIN_DELAY_MS,
+      rateLimitStatuses: new Set([403, 429]),
+    };
+  }
+
+  return {
+    defaultBackoffMs: SOURCE_DEFAULT_MIN_DELAY_MS,
+    key: host,
+    minDelayMs: SOURCE_DEFAULT_MIN_DELAY_MS,
+    rateLimitStatuses: new Set([429]),
+  };
+}
+
+function transientSourceErrorMessage(status: number): string {
+  return status === 429
+    ? 'Rate limited by source; retrying later.'
+    : 'Source temporarily blocked the request; retrying later.';
+}
+
+function isTransientSourceResponse(
+  sourceKind: SupportedSourceKind,
+  status: number,
+): boolean {
+  return status === 429 || (sourceKind === 'ankergames' && status === 403);
+}
 
 function dateStamp(): string {
   return new Date().toLocaleDateString('en-US', {
@@ -104,6 +220,34 @@ function ignoredImportKey(rootPath: string, folderName: string): string {
 
 function libraryRootLabel(path: string): string {
   return basename(path) || path;
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) {
+    return min;
+  }
+
+  return Math.min(max, Math.max(min, Math.round(value)));
+}
+
+function sourceVersionIdentity(snapshot?: SourceSnapshot | null): string | null {
+  if (!snapshot) {
+    return null;
+  }
+
+  if (snapshot.observedBuildId) {
+    return `build:${snapshot.observedBuildId}`;
+  }
+
+  if (snapshot.observedVersion) {
+    return `version:${snapshot.observedVersion.toLowerCase()}`;
+  }
+
+  if (snapshot.observedPatchDate) {
+    return `date:${snapshot.observedPatchDate}`;
+  }
+
+  return null;
 }
 
 function normalizeLibraryRootsForSave(
@@ -411,12 +555,16 @@ async function fetchWithTimeout(
   url: string,
   init: RequestInit,
   timeoutMs: number,
+  fetcher: (url: string, init: RequestInit) => Promise<Response> = (
+    input,
+    requestInit,
+  ) => fetch(input, requestInit),
 ): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    return await fetch(url, {
+    return await fetcher(url, {
       ...init,
       signal: controller.signal,
     });
@@ -436,6 +584,12 @@ export class VaultTrackService {
     string,
     SteamDbBuildLookupState
   >();
+  private readonly sourceCatalogCache = new Map<
+    SupportedSourceKind,
+    { capturedAt: number; entries: SourceCatalogEntry[] }
+  >();
+  private readonly requestPacingStates = new Map<string, RequestPacingState>();
+  private steamFeedPollPromise: Promise<void> | null = null;
   private steamLibraryCoverBackfillPromise: Promise<number> | null = null;
 
   constructor(
@@ -449,11 +603,72 @@ export class VaultTrackService {
     private readonly showWindow: (trackedItemId?: string) => void,
     private readonly pickDirectoryDialog: () => Promise<string | null>,
     private readonly dismountIsoUnderPath: typeof dismountIsoImagesUnderPath = dismountIsoImagesUnderPath,
-    private readonly sourceFetch: SourceFetch = fetch,
+    private readonly sourceFetch: SourceFetch = (input, init) => fetch(input, init),
     private readonly renderAnkerGamesSignedDownloadPage?: AnkerGamesSignedDownloadPageRenderer,
     private readonly extractStagedZipArchive: typeof extractSingleStagedZipArchive = extractSingleStagedZipArchive,
-    private readonly steamFetch: typeof fetch = fetch,
+    private readonly steamFetch: typeof fetch = (input, init) => fetch(input, init),
   ) {}
+
+  private async pacedFetch(
+    input: string,
+    init: RequestInit | undefined,
+    fetcher: (input: string, init?: RequestInit) => Promise<Response>,
+    options: RequestPacingOptions,
+    bypassBackoff = false,
+  ): Promise<Response> {
+    const state =
+      this.requestPacingStates.get(options.key) ??
+      ({ nextAllowedAt: 0, queue: Promise.resolve() } satisfies RequestPacingState);
+    this.requestPacingStates.set(options.key, state);
+
+    const request = state.queue.then(async () => {
+      const now = Date.now();
+      const waitUntil = bypassBackoff
+        ? Math.min(state.nextAllowedAt, now + options.minDelayMs)
+        : state.nextAllowedAt;
+      const waitMs = waitUntil - now;
+      if (waitMs > 0) {
+        await sleep(waitMs);
+      }
+
+      const response = await fetcher(input, init);
+      state.nextAllowedAt =
+        Date.now() +
+        (options.rateLimitStatuses.has(response.status)
+          ? retryAfterMs(response, options.defaultBackoffMs)
+          : options.minDelayMs);
+      return response;
+    });
+
+    state.queue = request.then(
+      () => undefined,
+      () => undefined,
+    );
+    return request;
+  }
+
+  private fetchSource(
+    input: string,
+    init?: RequestInit,
+    options: { bypassBackoff?: boolean } = {},
+  ): Promise<Response> {
+    return this.pacedFetch(
+      input,
+      init,
+      this.sourceFetch,
+      sourcePacingOptions(input),
+      options.bypassBackoff,
+    );
+  }
+
+  private fetchSteamDbRss(input: string, init?: RequestInit): Promise<Response> {
+    return this.pacedFetch(input, init, this.steamFetch, {
+      defaultBackoffMs: STEAMDB_RSS_RATE_LIMIT_BACKOFF_MS,
+      key: 'steamdb-rss',
+      minDelayMs: STEAMDB_RSS_MIN_DELAY_MS,
+      rateLimitStatuses: new Set([429]),
+    });
+  }
 
   private appendEvent(
     level: EventLogRecord['level'],
@@ -562,6 +777,38 @@ export class VaultTrackService {
       return matchingEntry;
     }
 
+    const linkMatchingEntry = sourceSnapshot.observedPatchLink
+      ? (patchEntries.find(
+          (entry) =>
+            entry.link === sourceSnapshot.observedPatchLink &&
+            (!sourceSnapshot.patchSelectionSource ||
+              entry.selectionSource === sourceSnapshot.patchSelectionSource),
+        ) ??
+        patchEntries.find((entry) => entry.link === sourceSnapshot.observedPatchLink))
+      : null;
+    if (linkMatchingEntry) {
+      return linkMatchingEntry;
+    }
+
+    const dateTitleMatchingEntry =
+      sourceSnapshot.observedPatchDate && sourceSnapshot.observedPatchTitle
+        ? (patchEntries.find(
+            (entry) =>
+              entry.patchDate === sourceSnapshot.observedPatchDate &&
+              entry.patchTitle === sourceSnapshot.observedPatchTitle &&
+              (!sourceSnapshot.patchSelectionSource ||
+                entry.selectionSource === sourceSnapshot.patchSelectionSource),
+          ) ??
+          patchEntries.find(
+            (entry) =>
+              entry.patchDate === sourceSnapshot.observedPatchDate &&
+              entry.patchTitle === sourceSnapshot.observedPatchTitle,
+          ))
+        : null;
+    if (dateTitleMatchingEntry) {
+      return dateTitleMatchingEntry;
+    }
+
     if (
       !sourceSnapshot.observedBuildId &&
       !sourceSnapshot.observedPatchDate &&
@@ -635,6 +882,8 @@ export class VaultTrackService {
     const settings = this.database.getSettings();
     const steamMatch = this.database.getSteamMatch(trackedItemId);
     const sourceSnapshot = this.database.getSourceSnapshot(trackedItemId);
+    const sourceSnapshots = this.database.listSourceSnapshots(trackedItemId);
+    const sourceMatches = this.database.listSourceMatches(trackedItemId);
     const installRecord = this.database.getInstallRecord(trackedItemId);
     const currentWatch = this.database.getWatch(trackedItemId);
     const storedDownload = this.database.getDownloadJob(trackedItemId);
@@ -650,6 +899,32 @@ export class VaultTrackService {
       this.database.listPatchEntries(trackedItemId),
     );
     const latestPatch = patchEntries[0] ?? null;
+    const matchedSourceViews = sourceMatches.map((match) => {
+      const snapshot =
+        sourceSnapshots.find(
+          (candidate) => candidate.sourceKind === match.sourceKind,
+        ) ?? null;
+      const updateStatus = this.getSourceUpdateStatus({
+        installRecord,
+        latestPatch,
+        match,
+        snapshot,
+      });
+      return {
+        downloadMirrors: this.database.listDownloadMirrors(
+          trackedItemId,
+          match.sourceKind,
+        ),
+        isUpdateSource:
+          match.usable &&
+          (updateStatus === 'matches_upstream' ||
+            updateStatus === 'newer_than_installed' ||
+            updateStatus === 'possible_update'),
+        match,
+        snapshot,
+        updateStatus,
+      };
+    });
     const selectedPatch = this.getSelectedPatch(
       trackedItemId,
       steamMatch,
@@ -725,6 +1000,7 @@ export class VaultTrackService {
       installRecord,
       latestPatch,
       sourceSnapshot,
+      sourceMatches: matchedSourceViews,
     });
     const trackingStatus = deriveTrackedItemTrackingStatus({
       currentDownload,
@@ -733,6 +1009,16 @@ export class VaultTrackService {
       installRecord,
       latestPatch,
       sourceSnapshot,
+      sourceMatches: matchedSourceViews,
+    });
+    const patchMetadataStatus = derivePatchMetadataStatus({
+      hasSteamMatch: Boolean(steamMatch),
+      isInstalled: status === 'installed',
+      selectedPatch,
+      selectedPatchMissingFromFeed: patchLag.selectedPatchMissingFromFeed,
+      versionsBehindLatest: patchLag.versionsBehindLatest,
+      versionsBehindLatestIsLowerBound:
+        patchLag.versionsBehindLatestIsLowerBound,
     });
 
     return {
@@ -747,13 +1033,17 @@ export class VaultTrackService {
         steamTitle: steamMatch?.title ?? null,
       },
       latestPatch,
+      patchMetadataStatus,
       selectedPatch,
       selectedPatchMissingFromFeed: patchLag.selectedPatchMissingFromFeed,
       selectedMirror,
+      sourceMatches: matchedSourceViews,
       sourceSnapshot,
       status,
       trackingStatus,
       versionsBehindLatest: patchLag.versionsBehindLatest,
+      versionsBehindLatestIsLowerBound:
+        patchLag.versionsBehindLatestIsLowerBound,
       activity: {
         lastSourceScannedAt: sourceSnapshot?.checkedAt ?? null,
         lastSourceWatchCheckedAt: currentWatch?.lastCheckedAt ?? null,
@@ -805,6 +1095,453 @@ export class VaultTrackService {
     };
   }
 
+  private parseCatalogForUrl(
+    sourceKind: SupportedSourceKind,
+    url: string,
+    html: string,
+  ): SourceCatalogEntry[] {
+    if (sourceKind === 'elamigos') {
+      return parseElAmigosCatalog(html);
+    }
+
+    if (sourceKind === 'steamrip') {
+      return url.includes('updated-games')
+        ? parseSteamRipUpdatedGames(html)
+        : parseSteamRipCatalog(html);
+    }
+
+    return url.includes('recent-updates')
+      ? parseAnkerGamesRecentUpdates(html)
+      : parseAnkerGamesCatalog(html);
+  }
+
+  private async getSourceCatalogEntries(
+    sourceKind: SupportedSourceKind,
+    options: { force?: boolean } = {},
+  ): Promise<SourceCatalogEntry[]> {
+    const cached = this.sourceCatalogCache.get(sourceKind);
+    if (
+      cached &&
+      !options.force &&
+      Date.now() - cached.capturedAt < SOURCE_CATALOG_TTL_MS
+    ) {
+      return cached.entries;
+    }
+
+    const entries: SourceCatalogEntry[] = [];
+    let successfulFetches = 0;
+    let lastError: string | null = null;
+    for (const url of SOURCE_CATALOG_URLS[sourceKind]) {
+      try {
+        const response = await this.fetchSource(url);
+        if (!response.ok) {
+          lastError = `Catalog request failed with ${response.status}`;
+          continue;
+        }
+        successfulFetches += 1;
+        entries.push(
+          ...this.parseCatalogForUrl(sourceKind, url, await response.text()),
+        );
+      } catch (error) {
+        lastError =
+          error instanceof Error ? error.message : 'Catalog request failed';
+        // Catalog discovery is best-effort; individual detail refreshes still work.
+      }
+    }
+
+    if (successfulFetches === 0) {
+      throw new SourceCatalogUnavailableError(
+        sourceKind,
+        `${sourceKind} catalog unavailable${
+          lastError ? `: ${lastError}` : ''
+        }`,
+      );
+    }
+
+    if (entries.length === 0) {
+      throw new SourceCatalogUnavailableError(
+        sourceKind,
+        `${sourceKind} catalog returned no entries`,
+      );
+    }
+
+    this.sourceCatalogCache.set(sourceKind, {
+      capturedAt: Date.now(),
+      entries,
+    });
+    return entries;
+  }
+
+  private extractSteamAppIdFromHtml(html: string): number | null {
+    const match = html.match(/store\.steampowered\.com\/app\/(?<appId>\d+)/i);
+    return match?.groups?.appId ? Number(match.groups.appId) : null;
+  }
+
+  private async confirmSourceCandidate(params: {
+    candidate: SourceCatalogEntry;
+    expectedTitle: string;
+    isPrimary?: boolean;
+    steamAppId?: number | null;
+    trackedItemId: string;
+  }): Promise<SourceMatch> {
+    const now = new Date().toISOString();
+    const response = await this.fetchSource(params.candidate.sourceUrl);
+    if (!response.ok) {
+      const score = scoreSourceTitleMatch(
+        params.expectedTitle,
+        params.candidate.title,
+      );
+      const transient = isTransientSourceResponse(
+        params.candidate.sourceKind,
+        response.status,
+      );
+      const status: SourceMatchStatus = transient
+        ? score >= SOURCE_MATCH_CANDIDATE_SCORE ||
+          params.candidate.method === 'slug'
+          ? 'candidate'
+          : 'failed'
+        : response.status === 403
+        ? 'blocked'
+        : 'failed';
+      return {
+        confidence: transient ? score : 0,
+        createdAt: now,
+        isPrimary: Boolean(params.isPrimary),
+        lastCheckedAt: now,
+        lastError: transient
+          ? transientSourceErrorMessage(response.status)
+          : `Source returned ${response.status}`,
+        method: params.candidate.method,
+        normalizedTitle: params.candidate.normalizedTitle,
+        score: transient ? score : 0,
+        sourceKind: params.candidate.sourceKind,
+        sourceTitle: params.candidate.title,
+        sourceUrl: params.candidate.sourceUrl,
+        status,
+        trackedItemId: params.trackedItemId,
+        updatedAt: now,
+        usable: false,
+      };
+    }
+
+    const html = await response.text();
+    const steamAppId = this.extractSteamAppIdFromHtml(html);
+    const parsedSource = await parseSupportedPageForKindWithNetwork(
+      params.candidate.sourceKind,
+      params.candidate.sourceUrl,
+      html,
+      (input, init) => this.fetchSource(input, init),
+    );
+    const detailScore = scoreSourceTitleMatch(
+      params.expectedTitle,
+      parsedSource.title,
+    );
+    const exactSteamAppId =
+      params.steamAppId != null && steamAppId === params.steamAppId;
+    const score = Math.max(
+      params.candidate.normalizedTitle
+        ? scoreSourceTitleMatch(params.expectedTitle, params.candidate.title)
+        : 0,
+      detailScore,
+    );
+    const status: SourceMatchStatus = exactSteamAppId
+      ? 'verified'
+      : score >= SOURCE_MATCH_PROBABLE_SCORE
+      ? 'probable'
+      : score >= SOURCE_MATCH_CANDIDATE_SCORE
+      ? 'candidate'
+      : 'not_found';
+    const usable = status === 'verified' || status === 'probable';
+    const method: SourceMatchMethod = exactSteamAppId
+      ? 'steam_app_id'
+      : params.candidate.method;
+    const match: SourceMatch = {
+      confidence: exactSteamAppId ? 1 : score,
+      createdAt: now,
+      isPrimary: Boolean(params.isPrimary),
+      lastCheckedAt: now,
+      lastError: null,
+      method,
+      normalizedTitle: parsedSource.normalizedTitle,
+      score,
+      sourceKind: params.candidate.sourceKind,
+      sourceTitle: parsedSource.title,
+      sourceUrl: parsedSource.sourceUrl,
+      status,
+      trackedItemId: params.trackedItemId,
+      updatedAt: now,
+      usable,
+    };
+
+    if (status !== 'not_found') {
+      const snapshot = this.buildSnapshotFromParsedSource(
+        params.trackedItemId,
+        parsedSource,
+      );
+      this.database.upsertSourceSnapshot(snapshot);
+      this.database.setRawParsedSourcePayload(params.trackedItemId, parsedSource);
+      this.syncMirrorsFromParsedSource(params.trackedItemId, parsedSource);
+    }
+
+    return match;
+  }
+
+  private sourceMatchFromParsedSource(
+    trackedItemId: string,
+    parsedSource: ParsedSourcePayload,
+    isPrimary: boolean,
+  ): SourceMatch {
+    const now = new Date().toISOString();
+    return {
+      confidence: 1,
+      createdAt: now,
+      isPrimary,
+      lastCheckedAt: now,
+      lastError: null,
+      method: isPrimary ? 'primary_source' : 'manual',
+      normalizedTitle: parsedSource.normalizedTitle,
+      score: 1,
+      sourceKind: parsedSource.sourceKind,
+      sourceTitle: parsedSource.title,
+      sourceUrl: parsedSource.sourceUrl,
+      status: 'verified',
+      trackedItemId,
+      updatedAt: now,
+      usable: true,
+    };
+  }
+
+  private async findBestSourceMatch(params: {
+    item: TrackedItemRecord;
+    sourceKind: SupportedSourceKind;
+    steamMatch?: ConfirmedSteamMatch | null;
+  }): Promise<SourceMatch> {
+    const expectedTitle = params.steamMatch?.title ?? params.item.title;
+    const now = new Date().toISOString();
+    const slugCandidates: SourceCatalogEntry[] = [];
+    let catalogUnavailable: SourceCatalogUnavailableError | null = null;
+    const confirmCandidates = async (
+      candidates: SourceCatalogEntry[],
+    ): Promise<SourceMatch | null> => {
+      for (const candidate of candidates) {
+        try {
+          const match = await this.confirmSourceCandidate({
+            candidate,
+            expectedTitle,
+            steamAppId: params.steamMatch?.appId ?? null,
+            trackedItemId: params.item.id,
+          });
+          if (match.status === 'verified' || match.status === 'probable') {
+            return match;
+          }
+          if (match.status === 'candidate') {
+            return match;
+          }
+          if (match.status === 'blocked') {
+            return match;
+          }
+        } catch (error) {
+          if (params.sourceKind === 'ankergames') {
+            const message =
+              error instanceof Error ? error.message : 'AnkerGames match failed';
+            if (/cloudflare|403|challenge/i.test(message)) {
+              return {
+                confidence: 0,
+                createdAt: now,
+                isPrimary: false,
+                lastCheckedAt: now,
+                lastError: message,
+                method: candidate.method,
+                normalizedTitle: candidate.normalizedTitle,
+                score: 0,
+                sourceKind: params.sourceKind,
+                sourceTitle: candidate.title,
+                sourceUrl: candidate.sourceUrl,
+                status: 'blocked',
+                trackedItemId: params.item.id,
+                updatedAt: now,
+                usable: false,
+              };
+            }
+          }
+        }
+      }
+
+      return null;
+    };
+
+    if (params.sourceKind === 'ankergames') {
+      for (const slug of buildAnkerGamesSlugCandidates(expectedTitle)) {
+        slugCandidates.push({
+          method: 'slug',
+          normalizedTitle: params.steamMatch?.normalizedTitle ?? params.item.normalizedTitle,
+          sourceKind: 'ankergames',
+          sourceUrl: `https://ankergames.net/game/${slug}`,
+          title: expectedTitle,
+        });
+      }
+
+      const slugMatch = await confirmCandidates(slugCandidates);
+      if (slugMatch) {
+        return slugMatch;
+      }
+    }
+
+    let catalogCandidates: SourceCatalogEntry[] = [];
+    try {
+      const catalogEntries = await this.getSourceCatalogEntries(params.sourceKind);
+      catalogCandidates = catalogEntries
+          .map((entry) => ({
+            entry,
+            score: scoreSourceTitleMatch(expectedTitle, entry.title),
+          }))
+          .filter(({ score }) => score >= SOURCE_MATCH_CANDIDATE_SCORE)
+          .sort((left, right) => right.score - left.score)
+          .slice(0, 3)
+          .map(({ entry }) => entry);
+    } catch (error) {
+      if (error instanceof SourceCatalogUnavailableError) {
+        catalogUnavailable = error;
+      } else {
+        throw error;
+      }
+    }
+
+    const catalogMatch = await confirmCandidates(catalogCandidates);
+    if (catalogMatch) {
+      return catalogMatch;
+    }
+
+    if (catalogUnavailable) {
+      return {
+        confidence: 0,
+        createdAt: now,
+        isPrimary: false,
+        lastCheckedAt: now,
+        lastError: catalogUnavailable.message,
+        method: 'fuzzy_title',
+        normalizedTitle: params.steamMatch?.normalizedTitle ?? params.item.normalizedTitle,
+        score: 0,
+        sourceKind: params.sourceKind,
+        sourceTitle: null,
+        sourceUrl: null,
+        status: 'failed',
+        trackedItemId: params.item.id,
+        updatedAt: now,
+        usable: false,
+      };
+    }
+
+    return {
+      confidence: 0,
+      createdAt: now,
+      isPrimary: false,
+      lastCheckedAt: now,
+      lastError: null,
+      method: 'fuzzy_title',
+      normalizedTitle: params.steamMatch?.normalizedTitle ?? params.item.normalizedTitle,
+      score: 0,
+      sourceKind: params.sourceKind,
+      sourceTitle: null,
+      sourceUrl: null,
+      status: 'not_found',
+      trackedItemId: params.item.id,
+      updatedAt: now,
+      usable: false,
+    };
+  }
+
+  private preserveExistingMatchDuringTransientFailure(
+    existing: SourceMatch | null,
+    incoming: SourceMatch,
+  ): SourceMatch {
+    if (
+      !existing?.sourceUrl ||
+      !existing.usable ||
+      incoming.usable ||
+      !incoming.lastError ||
+      !/rate limited|retrying later|catalog unavailable|catalog returned no entries/i.test(
+        incoming.lastError,
+      )
+    ) {
+      return incoming;
+    }
+
+    return {
+      ...existing,
+      lastCheckedAt: incoming.lastCheckedAt,
+      lastError: incoming.lastError,
+      updatedAt: incoming.updatedAt,
+    };
+  }
+
+  async discoverSourceMatches(trackedItemId: string): Promise<TrackedItemView> {
+    const item = this.database.findTrackedItemById(trackedItemId);
+    if (!item) {
+      throw new Error(`Tracked item ${trackedItemId} not found`);
+    }
+
+    const steamMatch = this.database.getSteamMatch(trackedItemId);
+    for (const sourceKind of SUPPORTED_SOURCE_KINDS) {
+      const existing = this.database.getSourceMatch(trackedItemId, sourceKind);
+      if (existing?.isPrimary || existing?.method === 'manual') {
+        continue;
+      }
+
+      const match = await this.findBestSourceMatch({
+        item,
+        sourceKind,
+        steamMatch,
+      });
+      this.database.upsertSourceMatch(
+        this.preserveExistingMatchDuringTransientFailure(existing, match),
+      );
+    }
+
+    this.appendEvent('info', 'Refreshed source matches', { trackedItemId });
+    return this.buildTrackedItemView(trackedItemId);
+  }
+
+  async setManualSourceMatch(params: {
+    sourceKind: SupportedSourceKind;
+    sourceUrl: string;
+    trackedItemId: string;
+  }): Promise<TrackedItemView> {
+    const item = this.database.findTrackedItemById(params.trackedItemId);
+    if (!item) {
+      throw new Error(`Tracked item ${params.trackedItemId} not found`);
+    }
+
+    const response = await this.fetchSource(params.sourceUrl, undefined, {
+      bypassBackoff: true,
+    });
+    if (!response.ok) {
+      throw new Error(`Source match failed with ${response.status}`);
+    }
+
+    const parsedSource = await parseSupportedPageForKindWithNetwork(
+      params.sourceKind,
+      params.sourceUrl,
+      await response.text(),
+      (input, init) => this.fetchSource(input, init),
+    );
+    const snapshot = this.buildSnapshotFromParsedSource(
+      params.trackedItemId,
+      parsedSource,
+    );
+    this.database.upsertSourceSnapshot(snapshot);
+    this.database.setRawParsedSourcePayload(params.trackedItemId, parsedSource);
+    this.syncMirrorsFromParsedSource(params.trackedItemId, parsedSource);
+    this.database.upsertSourceMatch(
+      this.sourceMatchFromParsedSource(params.trackedItemId, parsedSource, false),
+    );
+    this.appendEvent('info', 'Saved manual source match', {
+      sourceKind: params.sourceKind,
+      trackedItemId: params.trackedItemId,
+    });
+    return this.buildTrackedItemView(params.trackedItemId);
+  }
+
   private syncMirrorsFromParsedSource(
     trackedItemId: string,
     parsedSource: ParsedSourcePayload,
@@ -825,7 +1562,78 @@ export class VaultTrackService {
       return mirror;
     });
 
-    this.database.syncDownloadMirrors(trackedItemId, mirrors);
+    this.database.syncDownloadMirrors(
+      trackedItemId,
+      parsedSource.sourceKind,
+      mirrors,
+    );
+  }
+
+  private getSourceUpdateStatus(params: {
+    installRecord?: InstallRecord | null;
+    latestPatch?: SteamPatchEntry | null;
+    match: SourceMatch;
+    snapshot?: SourceSnapshot | null;
+  }): TrackedItemView['sourceMatches'][number]['updateStatus'] {
+    const { installRecord, latestPatch, match, snapshot } = params;
+    if (match.status === 'blocked') {
+      return 'blocked';
+    }
+    if (match.status === 'failed') {
+      return 'failed';
+    }
+    if (!match.usable && match.status !== 'candidate') {
+      return 'not_matched';
+    }
+    if (!snapshot) {
+      return 'unknown';
+    }
+
+    if (
+      latestPatch?.buildId &&
+      snapshot.observedBuildId &&
+      latestPatch.buildId === snapshot.observedBuildId
+    ) {
+      return installRecord?.installedBuildId === snapshot.observedBuildId
+        ? 'same_as_installed'
+        : 'matches_upstream';
+    }
+
+    if (
+      installRecord?.installedBuildId &&
+      snapshot.observedBuildId &&
+      installRecord.installedBuildId !== snapshot.observedBuildId
+    ) {
+      return 'newer_than_installed';
+    }
+
+    const installIdentity = installRecord?.installedBuildId
+      ? `build:${installRecord.installedBuildId}`
+      : installRecord?.installedVersion
+      ? `version:${installRecord.installedVersion.toLowerCase()}`
+      : null;
+    const sourceIdentity = sourceVersionIdentity(snapshot);
+    if (installIdentity && sourceIdentity) {
+      return installIdentity === sourceIdentity
+        ? 'same_as_installed'
+        : match.method === 'recent_updates' && !snapshot.observedBuildId
+        ? 'possible_update'
+        : 'newer_than_installed';
+    }
+
+    if (
+      latestPatch?.buildId &&
+      snapshot.observedBuildId &&
+      latestPatch.buildId !== snapshot.observedBuildId
+    ) {
+      return 'source_behind_upstream';
+    }
+
+    if (match.method === 'recent_updates' && !snapshot.observedBuildId) {
+      return 'possible_update';
+    }
+
+    return 'unknown';
   }
 
   private upsertSelectedSteamPatch(
@@ -878,6 +1686,7 @@ export class VaultTrackService {
         },
       },
       STEAMDB_RSS_TIMEOUT_MS,
+      (input, init) => this.fetchSteamDbRss(input, init),
     );
 
     if (!response.ok) {
@@ -895,6 +1704,10 @@ export class VaultTrackService {
 
   async resolveSteamPatches(appId: number): Promise<SteamPatchFeedResult> {
     return this.fetchSteamPatchFeed(appId);
+  }
+
+  listSteamPatchEntries(trackedItemId: string): SteamPatchEntry[] {
+    return this.database.listPatchEntries(trackedItemId);
   }
 
   private normalizeSteamDbBuildCachePatches(
@@ -1097,16 +1910,51 @@ export class VaultTrackService {
   private reconcileSteamPatchWatch(trackedItemId: string): void {
     const sourceSnapshot = this.database.getSourceSnapshot(trackedItemId);
     const latestPatch = this.getLatestPatch(trackedItemId);
+    const settings = this.database.getSettings();
+    const installRecord = this.database.getInstallRecord(trackedItemId);
+    const matchedSources = this.database.listSourceMatches(trackedItemId);
+    const sourceSnapshots = this.database.listSourceSnapshots(trackedItemId);
+    const anyMatchedSourceNeedsWatch =
+      latestPatch != null &&
+      matchedSources.some((match) => {
+        if (!match.usable) {
+          return false;
+        }
+        const snapshot =
+          sourceSnapshots.find(
+            (candidate) => candidate.sourceKind === match.sourceKind,
+          ) ?? null;
+        const status = this.getSourceUpdateStatus({
+          installRecord,
+          latestPatch,
+          match,
+          snapshot,
+        });
+        return (
+          status === 'source_behind_upstream' ||
+          status === 'matches_upstream' ||
+          status === 'newer_than_installed' ||
+          status === 'possible_update' ||
+          status === 'unknown'
+        );
+      });
     const compareStatus = compareSourceToUpstream({
-      installRecord: this.database.getInstallRecord(trackedItemId),
+      installRecord,
       latestPatch,
       sourceSnapshot,
     });
 
-    if (compareStatus === TrackedItemTrackingStatus.SourceBehindUpstream) {
+    if (
+      anyMatchedSourceNeedsWatch ||
+      compareStatus === TrackedItemTrackingStatus.SourceBehindUpstream
+    ) {
       const existingWatch = this.database.getWatch(trackedItemId);
       this.database.upsertWatch(
-        existingWatch ?? createWatchWindow(trackedItemId),
+        existingWatch ??
+          createWatchWindow(trackedItemId, new Date(), {
+            durationDays: clampNumber(settings.sourceWatchDurationDays ?? 5, 1, 30),
+            intervalHours: clampNumber(settings.sourceWatchIntervalHours ?? 8, 1, 72),
+          }),
       );
       return;
     }
@@ -1178,7 +2026,7 @@ export class VaultTrackService {
     const fullUrl = selectedDownloads.fullUrl.trim();
     const resolvedFullUrl = isAnkerGamesGeneratedDownloadUrl(fullUrl)
       ? await resolveAnkerGamesDownloadUrl({
-          fetch: this.sourceFetch,
+          fetch: (input, init) => this.fetchSource(input, init),
           renderSignedDownloadPage: this.renderAnkerGamesSignedDownloadPage,
           sourceUrl: parsedSource.sourceUrl,
           stableDownloadUrl: fullUrl,
@@ -1456,6 +2304,9 @@ export class VaultTrackService {
     );
     this.database.upsertSourceSnapshot(snapshot);
     this.database.setRawParsedSourcePayload(item.id, payload.parsedSource);
+    this.database.upsertSourceMatch(
+      this.sourceMatchFromParsedSource(item.id, payload.parsedSource, true),
+    );
     this.syncMirrorsFromParsedSource(item.id, payload.parsedSource);
     if (payload.steamPatchEntries?.length) {
       this.database.upsertPatchEntries(
@@ -1473,12 +2324,14 @@ export class VaultTrackService {
       item.id,
       payload.selectedDownloads.fullUrl,
       'full',
+      payload.parsedSource.sourceKind,
     );
     if (payload.selectedDownloads.patchUrl) {
       this.database.selectDownloadMirror(
         item.id,
         payload.selectedDownloads.patchUrl,
         'patch',
+        payload.parsedSource.sourceKind,
       );
     }
 
@@ -1516,11 +2369,38 @@ export class VaultTrackService {
 
   async refreshTrackedItem(trackedItemId: string): Promise<RefreshResult> {
     const item = this.database.findTrackedItemById(trackedItemId);
-    if (!item?.sourceUrl || item.sourceKind === 'manual' || !item.sourceKind) {
-      throw new Error('This item does not have a refreshable source');
+    if (!item) {
+      throw new Error(`Tracked item ${trackedItemId} not found`);
     }
 
-    const response = await this.sourceFetch(item.sourceUrl);
+    const steamMatch = this.database.getSteamMatch(trackedItemId);
+    if (!item?.sourceUrl || item.sourceKind === 'manual' || !item.sourceKind) {
+      const snapshot = this.database.getSourceSnapshot(trackedItemId);
+
+      if (steamMatch) {
+        await this.syncSteamPatchFeed(trackedItemId, steamMatch).catch((error) => {
+          this.appendEvent(
+            'warn',
+            'SteamDB feed sync failed while refreshing imported item',
+            {
+              error:
+                error instanceof Error ? error.message : 'Unknown SteamDB RSS error',
+              trackedItemId,
+            },
+          );
+        });
+      }
+
+      await this.reconcileLocalInstallAfterRefresh(trackedItemId);
+
+      const latestPatch = this.getLatestPatch(trackedItemId);
+      const view = await this.buildTrackedItemView(trackedItemId);
+      const { status, trackingStatus } = view;
+      this.appendEvent('info', `Refreshed ${item.title}`, { trackedItemId });
+      return { latestPatch, snapshot, status, trackingStatus };
+    }
+
+    const response = await this.fetchSource(item.sourceUrl);
 
     if (!response.ok) {
       throw new Error(`Source refresh failed with ${response.status}`);
@@ -1531,7 +2411,7 @@ export class VaultTrackService {
       item.sourceKind,
       item.sourceUrl,
       html,
-      this.sourceFetch,
+      (input, init) => this.fetchSource(input, init),
     );
     if (
       parsedSource.sourceKind === 'ankergames' &&
@@ -1545,9 +2425,11 @@ export class VaultTrackService {
     );
     this.database.upsertSourceSnapshot(snapshot);
     this.database.setRawParsedSourcePayload(trackedItemId, parsedSource);
+    this.database.upsertSourceMatch(
+      this.sourceMatchFromParsedSource(trackedItemId, parsedSource, true),
+    );
     this.syncMirrorsFromParsedSource(trackedItemId, parsedSource);
 
-    const steamMatch = this.database.getSteamMatch(trackedItemId);
     if (steamMatch) {
       const entries = await this.syncSteamPatchFeed(trackedItemId, steamMatch);
       const matchedPatch = this.findPatchForSourceRelease(
@@ -1572,6 +2454,8 @@ export class VaultTrackService {
     const { status, trackingStatus } = view;
     if (
       trackingStatus !== TrackedItemTrackingStatus.SourceBehindUpstream &&
+      trackingStatus !== TrackedItemTrackingStatus.UpdateAvailable &&
+      trackingStatus !== TrackedItemTrackingStatus.WatchingSource &&
       this.database.getWatch(trackedItemId)
     ) {
       this.database.clearWatch(trackedItemId);
@@ -1579,6 +2463,90 @@ export class VaultTrackService {
 
     this.appendEvent('info', `Refreshed ${item.title}`, { trackedItemId });
     return { latestPatch, snapshot, status, trackingStatus };
+  }
+
+  async refreshMatchedSource(
+    trackedItemId: string,
+    sourceKind: SupportedSourceKind,
+  ): Promise<TrackedItemView> {
+    const match = this.database.getSourceMatch(trackedItemId, sourceKind);
+    if (!match?.sourceUrl) {
+      throw new Error(`No matched ${sourceKind} source is available.`);
+    }
+
+    const response = await this.fetchSource(match.sourceUrl, undefined, {
+      bypassBackoff: true,
+    });
+    const now = new Date().toISOString();
+    if (!response.ok) {
+      const transient = isTransientSourceResponse(sourceKind, response.status);
+      this.database.upsertSourceMatch({
+        ...match,
+        lastCheckedAt: now,
+        lastError: transient
+          ? transientSourceErrorMessage(response.status)
+          : `Source refresh failed with ${response.status}`,
+        status: transient
+          ? match.status
+          : response.status === 403
+          ? 'blocked'
+          : 'failed',
+        updatedAt: now,
+        usable: transient ? match.usable : false,
+      });
+      throw new Error(`Source refresh failed with ${response.status}`);
+    }
+
+    const parsedSource = await parseSupportedPageForKindWithNetwork(
+      sourceKind,
+      match.sourceUrl,
+      await response.text(),
+      (input, init) => this.fetchSource(input, init),
+    );
+    let snapshot = this.buildSnapshotFromParsedSource(
+      trackedItemId,
+      parsedSource,
+    );
+    const latestPatch = this.getLatestPatch(trackedItemId);
+    const matchedPatch = this.findPatchForSourceRelease(
+      parsedSource,
+      this.database.listPatchEntries(trackedItemId),
+    );
+    if (matchedPatch) {
+      snapshot = this.buildSnapshotFromParsedSource(
+        trackedItemId,
+        parsedSource,
+        matchedPatch,
+      );
+    }
+
+    this.database.upsertSourceSnapshot(snapshot);
+    this.database.setRawParsedSourcePayload(trackedItemId, parsedSource);
+    this.syncMirrorsFromParsedSource(trackedItemId, parsedSource);
+    this.database.upsertSourceMatch({
+      ...match,
+      lastCheckedAt: now,
+      lastError: null,
+      normalizedTitle: parsedSource.normalizedTitle,
+      sourceTitle: parsedSource.title,
+      sourceUrl: parsedSource.sourceUrl,
+      status:
+        match.status === 'verified'
+          ? 'verified'
+          : match.status === 'candidate'
+          ? 'candidate'
+          : 'probable',
+      updatedAt: now,
+      usable: match.usable,
+    });
+    this.appendEvent('info', `Refreshed ${sourceKind} source`, {
+      trackedItemId,
+    });
+
+    if (latestPatch) {
+      this.reconcileSteamPatchWatch(trackedItemId);
+    }
+    return this.buildTrackedItemView(trackedItemId);
   }
 
   async retryDownload(
@@ -1596,6 +2564,7 @@ export class VaultTrackService {
         trackedItemId,
         selectedDownloads.fullUrl,
         'full',
+        parsedSource.sourceKind,
       );
     }
     if (selectedDownloads?.patchUrl) {
@@ -1603,6 +2572,7 @@ export class VaultTrackService {
         trackedItemId,
         selectedDownloads.patchUrl,
         'patch',
+        parsedSource.sourceKind,
       );
     }
 
@@ -1649,7 +2619,10 @@ export class VaultTrackService {
       }
     }
 
-    const mirrors = this.database.listDownloadMirrors(trackedItemId);
+    const mirrors = this.database.listDownloadMirrors(
+      trackedItemId,
+      parsedSource.sourceKind,
+    );
     const selectedFullMirror = hasExplicitSelection
       ? mirrors.find(
           (mirror) =>
@@ -1689,6 +2662,63 @@ export class VaultTrackService {
       { force: true },
     );
     return this.buildTrackedItemView(trackedItemId);
+  }
+
+  async queueUpdateFromSource(params: {
+    selectedDownloads?: SelectedDownloads;
+    sourceKind: SupportedSourceKind;
+    trackedItemId: string;
+  }): Promise<TrackedItemView> {
+    const parsedSource = this.database.getRawParsedSourcePayload(
+      params.trackedItemId,
+      params.sourceKind,
+    );
+    if (!parsedSource) {
+      throw new Error(`No cached ${params.sourceKind} source payload is available.`);
+    }
+
+    const mirrors = this.database.listDownloadMirrors(
+      params.trackedItemId,
+      params.sourceKind,
+    );
+    const selectedFull =
+      params.selectedDownloads?.fullUrl ??
+      mirrors.find((mirror) => mirror.kind === 'full' && mirror.selectedAt)?.url ??
+      mirrors.find((mirror) => mirror.kind === 'full')?.url;
+    if (!selectedFull) {
+      throw new Error('Select a full download mirror before queueing this update.');
+    }
+    const selectedPatch =
+      params.selectedDownloads?.patchUrl ??
+      mirrors.find((mirror) => mirror.kind === 'patch' && mirror.selectedAt)?.url ??
+      null;
+
+    this.database.selectDownloadMirror(
+      params.trackedItemId,
+      selectedFull,
+      'full',
+      params.sourceKind,
+    );
+    if (selectedPatch) {
+      this.database.selectDownloadMirror(
+        params.trackedItemId,
+        selectedPatch,
+        'patch',
+        params.sourceKind,
+      );
+    }
+
+    await this.queueDownload(
+      params.trackedItemId,
+      parsedSource,
+      {
+        fullUrl: selectedFull,
+        patchUrl: selectedPatch,
+        sourceKind: params.sourceKind,
+      },
+      { force: true },
+    );
+    return this.buildTrackedItemView(params.trackedItemId);
   }
 
   async updateMirrorSelection(
@@ -2268,29 +3298,60 @@ export class VaultTrackService {
     }
   }
 
+  private steamDbRssBackoffRemainingMs(): number {
+    const nextAllowedAt =
+      this.requestPacingStates.get('steamdb-rss')?.nextAllowedAt ?? 0;
+    return Math.max(0, nextAllowedAt - Date.now());
+  }
+
   async pollSteamFeeds(): Promise<void> {
+    if (this.steamFeedPollPromise) {
+      return this.steamFeedPollPromise;
+    }
+
+    const backoffMs = this.steamDbRssBackoffRemainingMs();
+    if (backoffMs > 0) {
+      return;
+    }
+
+    this.steamFeedPollPromise = this.pollSteamFeedsInternal().finally(() => {
+      this.steamFeedPollPromise = null;
+    });
+    return this.steamFeedPollPromise;
+  }
+
+  private async pollSteamFeedsInternal(): Promise<void> {
     const matches = this.database.listSteamMatches();
+    let stoppedByRateLimit = false;
     for (const match of matches) {
       try {
         await this.syncSteamPatchFeed(match.trackedItemId, match);
       } catch (error) {
+        const message =
+          error instanceof Error ? error.message : 'Unknown SteamDB RSS error';
         this.appendEvent(
           'warn',
           `SteamDB feed check failed for ${match.title}`,
           {
-            error:
-              error instanceof Error
-                ? error.message
-                : 'Unknown SteamDB RSS error',
+            error: message,
             trackedItemId: match.trackedItemId,
           },
         );
+        if (/SteamDB RSS request failed:\s*429/i.test(message)) {
+          stoppedByRateLimit = true;
+          this.appendEvent('warn', 'SteamDB rate limited feed checks; retrying later.', {
+            retryAfterMs: this.steamDbRssBackoffRemainingMs(),
+          });
+          break;
+        }
       }
     }
-    this.database.setSetting(
-      'scheduler.lastDailyPollAt',
-      new Date().toISOString(),
-    );
+    if (!stoppedByRateLimit) {
+      this.database.setSetting(
+        'scheduler.lastDailyPollAt',
+        new Date().toISOString(),
+      );
+    }
   }
 
   async backfillSteamLibraryCovers(): Promise<number> {
@@ -2330,17 +3391,59 @@ export class VaultTrackService {
 
   async processDueWatches(now = new Date()): Promise<void> {
     const dueWatches = this.database.listDueWatches(now.toISOString());
+    const settings = this.database.getSettings();
+    const intervalHours = clampNumber(settings.sourceWatchIntervalHours ?? 8, 1, 72);
     for (const watch of dueWatches) {
       if (new Date(watch.endsAt).getTime() <= now.getTime()) {
         this.database.expireWatch(watch.trackedItemId, now.toISOString());
         continue;
       }
 
-      await this.refreshTrackedItem(watch.trackedItemId);
+      await this.discoverSourceMatches(watch.trackedItemId).catch((error) => {
+        this.appendEvent('warn', 'Source match discovery failed during watch', {
+          error: error instanceof Error ? error.message : 'Unknown discovery error',
+          trackedItemId: watch.trackedItemId,
+        });
+      });
+      const matches = this.database
+        .listSourceMatches(watch.trackedItemId)
+        .filter((match) => match.usable && match.sourceUrl);
+      if (matches.length === 0) {
+        const item = this.database.findTrackedItemById(watch.trackedItemId);
+        if (item?.sourceKind && item.sourceKind !== 'manual' && item.sourceUrl) {
+          await this.refreshTrackedItem(watch.trackedItemId).catch((error) => {
+            this.appendEvent('warn', 'Primary source refresh failed during watch', {
+              error:
+                error instanceof Error
+                  ? error.message
+                  : 'Unknown source refresh error',
+              trackedItemId: watch.trackedItemId,
+            });
+          });
+        }
+      } else {
+        for (const match of matches) {
+          await this.refreshMatchedSource(
+            watch.trackedItemId,
+            match.sourceKind,
+          ).catch((error) => {
+            this.appendEvent('warn', 'Matched source refresh failed', {
+              error:
+                error instanceof Error
+                  ? error.message
+                  : 'Unknown source refresh error',
+              sourceKind: match.sourceKind,
+              trackedItemId: watch.trackedItemId,
+            });
+          });
+        }
+      }
       this.database.upsertWatch({
         ...watch,
         lastCheckedAt: now.toISOString(),
-        nextCheckAt: new Date(now.getTime() + 8 * 60 * 60 * 1000).toISOString(),
+        nextCheckAt: new Date(
+          now.getTime() + intervalHours * 60 * 60 * 1000,
+        ).toISOString(),
       });
     }
   }
@@ -2356,6 +3459,8 @@ export class VaultTrackService {
       pollDailyHourLocal: settings.pollDailyHourLocal,
       renameGameFoldersOnImport: settings.renameGameFoldersOnImport ?? true,
       rootLibraryPath: settings.rootLibraryPath,
+      sourceWatchDurationDays: settings.sourceWatchDurationDays ?? 5,
+      sourceWatchIntervalHours: settings.sourceWatchIntervalHours ?? 8,
       themeMode: settings.themeMode ?? 'system',
     };
   }
@@ -2368,6 +3473,8 @@ export class VaultTrackService {
     pollDailyHourLocal?: number;
     renameGameFoldersOnImport?: boolean;
     rootLibraryPath?: string | null;
+    sourceWatchDurationDays?: number;
+    sourceWatchIntervalHours?: number;
     themeMode?: ThemeMode | null;
   }): RendererSettingsView {
     if (input.libraryRoots !== undefined) {
@@ -2413,6 +3520,18 @@ export class VaultTrackService {
       this.database.setSetting(
         'scheduler.pollDailyHourLocal',
         String(input.pollDailyHourLocal),
+      );
+    }
+    if (typeof input.sourceWatchIntervalHours === 'number') {
+      this.database.setSetting(
+        'sourceWatch.intervalHours',
+        String(clampNumber(input.sourceWatchIntervalHours, 1, 72)),
+      );
+    }
+    if (typeof input.sourceWatchDurationDays === 'number') {
+      this.database.setSetting(
+        'sourceWatch.durationDays',
+        String(clampNumber(input.sourceWatchDurationDays, 1, 30)),
       );
     }
     if (input.renameGameFoldersOnImport !== undefined) {
@@ -2881,6 +4000,21 @@ export class VaultTrackService {
         sourceSnapshot.observedVersion,
       patchSelectionSource: selectionSource,
     });
+    if (item.sourceKind === 'manual') {
+      const installRecord = this.database.getInstallRecord(params.trackedItemId);
+      if (installRecord) {
+        this.database.upsertInstallRecord({
+          ...installRecord,
+          installedAt: params.selectedSteamPatch.patchDate || installRecord.installedAt,
+          installedBuildId: params.selectedSteamPatch.buildId ?? null,
+          installedVersion:
+            params.selectedSteamPatch.version?.trim() ||
+            params.selectedSteamPatch.patchTitle ||
+            installRecord.installedVersion,
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    }
     this.reconcileSteamPatchWatch(params.trackedItemId);
 
     this.appendEvent('info', 'Updated source patch selection', {

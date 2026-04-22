@@ -5,9 +5,12 @@ import { TrackedItemTrackingStatus } from '@vaulttrack/shared-types';
 export function createWatchWindow(
   trackedItemId: string,
   now = new Date(),
+  options: { durationDays?: number; intervalHours?: number } = {},
 ): SourceWatch {
-  const nextCheck = new Date(now.getTime() + 8 * 60 * 60 * 1000);
-  const endsAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+  const intervalHours = options.intervalHours ?? 8;
+  const durationDays = options.durationDays ?? 5;
+  const nextCheck = new Date(now.getTime() + intervalHours * 60 * 60 * 1000);
+  const endsAt = new Date(now.getTime() + durationDays * 24 * 60 * 60 * 1000);
 
   return {
     endsAt: endsAt.toISOString(),

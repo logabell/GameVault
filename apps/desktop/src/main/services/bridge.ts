@@ -118,6 +118,14 @@ export class NativeBridgeServer {
             ),
             type: request.type,
           };
+        case 'listSteamPatchEntries':
+          return {
+            ok: true,
+            payload: this.service.listSteamPatchEntries(
+              request.payload.trackedItemId,
+            ),
+            type: request.type,
+          };
         case 'listPendingSteamDbBuildLookups':
           return {
             ok: true,
@@ -150,6 +158,29 @@ export class NativeBridgeServer {
             ),
             type: request.type,
           };
+        case 'discoverSourceMatches':
+          return {
+            ok: true,
+            payload: await this.service.discoverSourceMatches(
+              request.payload.trackedItemId,
+            ),
+            type: request.type,
+          };
+        case 'refreshMatchedSource':
+          return {
+            ok: true,
+            payload: await this.service.refreshMatchedSource(
+              request.payload.trackedItemId,
+              request.payload.sourceKind,
+            ),
+            type: request.type,
+          };
+        case 'setManualSourceMatch':
+          return {
+            ok: true,
+            payload: await this.service.setManualSourceMatch(request.payload),
+            type: request.type,
+          };
         case 'updateSourcePatch':
           return {
             ok: true,
@@ -179,6 +210,12 @@ export class NativeBridgeServer {
               request.payload.trackedItemId,
               request.payload.selectedDownloads,
             ),
+            type: request.type,
+          };
+        case 'queueUpdateFromSource':
+          return {
+            ok: true,
+            payload: await this.service.queueUpdateFromSource(request.payload),
             type: request.type,
           };
         case 'clearDownloadMirrorFailed':

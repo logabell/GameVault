@@ -993,6 +993,22 @@ async function resolveSteamPatches(appId: number): Promise<{
   }
 }
 
+async function listSteamPatchEntries(
+  trackedItemId: string,
+): Promise<SteamPatchCandidate[]> {
+  try {
+    const response = await sendDesktopRequest({
+      payload: { trackedItemId },
+      type: 'listSteamPatchEntries',
+    });
+    return response.ok && response.type === 'listSteamPatchEntries'
+      ? response.payload
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 async function getSteamDbBackfillState(
   appId: number,
 ): Promise<SteamDbBackfillState | null> {
@@ -1941,6 +1957,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         feedUrl: result.feedUrl,
         ok: true,
         payload: result.patches,
+      });
+      return;
+    }
+
+    if (message.type === 'vaulttrack:list-steam-patch-entries') {
+      const trackedItemId =
+        typeof message.trackedItemId === 'string' ? message.trackedItemId : '';
+      sendResponse({
+        ok: true,
+        payload: trackedItemId
+          ? await listSteamPatchEntries(trackedItemId)
+          : [],
       });
       return;
     }

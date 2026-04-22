@@ -22,18 +22,26 @@ const api = {
   openExternal: (target: string) =>
     ipcRenderer.invoke('vault:openExternal', target),
   pickDirectory: () => ipcRenderer.invoke('vault:pickDirectory'),
+  discoverSourceMatches: (trackedItemId: string) =>
+    ipcRenderer.invoke('vault:discoverSourceMatches', trackedItemId),
   refreshTrackedItem: (trackedItemId: string) =>
     ipcRenderer.invoke('vault:refreshTrackedItem', trackedItemId),
+  refreshMatchedSource: (payload: unknown) =>
+    ipcRenderer.invoke('vault:refreshMatchedSource', payload),
   removeTrackedItem: (payload: unknown) =>
     ipcRenderer.invoke('vault:removeTrackedItem', payload),
   resolveSteamMatch: (payload: { queryTitle?: string | null; title: string }) =>
     ipcRenderer.invoke('vault:resolveSteamMatch', payload),
   resolveSteamPatches: (payload: { appId: number }) =>
     ipcRenderer.invoke('vault:resolveSteamPatches', payload),
+  listSteamPatchEntries: (trackedItemId: string) =>
+    ipcRenderer.invoke('vault:listSteamPatchEntries', trackedItemId),
   retryDownload: (trackedItemId: string) =>
     ipcRenderer.invoke('vault:retryDownload', trackedItemId),
   retryDownloadWithSelection: (payload: unknown) =>
     ipcRenderer.invoke('vault:retryDownloadWithSelection', payload),
+  queueUpdateFromSource: (payload: unknown) =>
+    ipcRenderer.invoke('vault:queueUpdateFromSource', payload),
   selectMyJDownloaderDevice: (deviceId: string) =>
     ipcRenderer.invoke('vault:selectMyJDownloaderDevice', deviceId),
   saveSettings: (payload: unknown) =>
@@ -52,6 +60,8 @@ const api = {
     ipcRenderer.invoke('vault:getSteamDbBuildLookup', lookupId),
   updateInstallRecord: (payload: unknown) =>
     ipcRenderer.invoke('vault:updateInstallRecord', payload),
+  setManualSourceMatch: (payload: unknown) =>
+    ipcRenderer.invoke('vault:setManualSourceMatch', payload),
   updateSourcePatch: (payload: unknown) =>
     ipcRenderer.invoke('vault:updateSourcePatch', payload),
 };

@@ -11,14 +11,17 @@ import type {
   LibraryRootRecord,
   ParsedSourcePayload,
   SettingsRecord,
+  SourceMatch,
   SourceKind,
   SourceSnapshot,
+  SupportedSourceKind,
   SteamFeedCheckRecord,
   SourceWatch,
   SteamPatchEntry,
   SteamPatchCandidate,
   TrackedItemRecord,
 } from '@vaulttrack/shared-types';
+import { mergePatchHistory } from '@vaulttrack/shared-types';
 import initSqlJs, { type Database as SqlJsDatabase, type SqlJsStatic } from 'sql.js';
 import { basename } from 'node:path';
 
@@ -35,7 +38,7 @@ CREATE TABLE IF NOT EXISTS tracked_items (
 );
 
 CREATE TABLE IF NOT EXISTS source_snapshots (
-  tracked_item_id TEXT PRIMARY KEY,
+  tracked_item_id TEXT NOT NULL,
   source_kind TEXT NOT NULL,
   source_url TEXT NOT NULL,
   fingerprint TEXT NOT NULL,
@@ -46,7 +49,27 @@ CREATE TABLE IF NOT EXISTS source_snapshots (
   observed_patch_link TEXT,
   patch_selection_source TEXT,
   raw_payload_json TEXT NOT NULL,
-  checked_at TEXT NOT NULL
+  checked_at TEXT NOT NULL,
+  PRIMARY KEY (tracked_item_id, source_kind)
+);
+
+CREATE TABLE IF NOT EXISTS source_matches (
+  tracked_item_id TEXT NOT NULL,
+  source_kind TEXT NOT NULL,
+  source_url TEXT,
+  source_title TEXT,
+  normalized_title TEXT,
+  status TEXT NOT NULL,
+  method TEXT NOT NULL,
+  score REAL NOT NULL,
+  confidence REAL NOT NULL,
+  usable INTEGER NOT NULL,
+  is_primary INTEGER NOT NULL,
+  last_checked_at TEXT,
+  last_error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (tracked_item_id, source_kind)
 );
 
 CREATE TABLE IF NOT EXISTS steam_matches (
@@ -153,13 +176,14 @@ CREATE TABLE IF NOT EXISTS download_job_parts (
 
 CREATE TABLE IF NOT EXISTS download_mirrors (
   tracked_item_id TEXT NOT NULL,
+  source_kind TEXT,
   url TEXT NOT NULL,
   label TEXT NOT NULL,
   kind TEXT NOT NULL,
   selected_at TEXT,
   manually_failed_at TEXT,
   last_seen_at TEXT NOT NULL,
-  PRIMARY KEY (tracked_item_id, url, kind)
+  PRIMARY KEY (tracked_item_id, source_kind, url, kind)
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -291,8 +315,157 @@ function applyMigrations(db: SqlJsDatabase): void {
     }
   }
 
+  migrateSourceSnapshotsPrimaryKey(db);
+  migrateSourceMatches(db);
   migrateDownloadMirrorsPrimaryKey(db);
   migrateDownloadJobParts(db);
+  repairTransientSourceMatchState(db);
+}
+
+function repairTransientSourceMatchState(db: SqlJsDatabase): void {
+  db.exec(`
+    UPDATE source_matches
+       SET status = CASE
+             WHEN EXISTS (
+               SELECT 1
+                 FROM source_snapshots
+                WHERE source_snapshots.tracked_item_id = source_matches.tracked_item_id
+                  AND source_snapshots.source_kind = source_matches.source_kind
+             )
+             THEN 'probable'
+             ELSE 'candidate'
+           END,
+           usable = CASE
+             WHEN EXISTS (
+               SELECT 1
+                 FROM source_snapshots
+                WHERE source_snapshots.tracked_item_id = source_matches.tracked_item_id
+                  AND source_snapshots.source_kind = source_matches.source_kind
+             )
+             THEN 1
+             ELSE 0
+           END,
+           last_error = 'Rate limited by source; retrying later.'
+     WHERE source_kind = 'ankergames'
+       AND status = 'blocked'
+       AND source_url IS NOT NULL
+       AND source_url != ''
+       AND COALESCE(last_error, '') LIKE '%429%';
+
+    DELETE FROM source_matches
+     WHERE source_kind = 'elamigos'
+       AND status = 'not_found'
+       AND method = 'fuzzy_title'
+       AND score = 0
+       AND source_url IS NULL
+       AND is_primary = 0;
+  `);
+}
+
+function tableHasColumn(
+  db: SqlJsDatabase,
+  tableName: string,
+  columnName: string,
+): boolean {
+  const tableInfo = db.exec(`PRAGMA table_info(${tableName})`);
+  const rows = tableInfo[0]?.values ?? [];
+  return rows.some((row) => String(row[1]) === columnName);
+}
+
+function getPrimaryKeyColumns(db: SqlJsDatabase, tableName: string): string[] {
+  const tableInfo = db.exec(`PRAGMA table_info(${tableName})`);
+  const rows = tableInfo[0]?.values ?? [];
+  return rows
+    .filter((row) => Number(row[5]) > 0)
+    .sort((left, right) => Number(left[5]) - Number(right[5]))
+    .map((row) => String(row[1]));
+}
+
+function migrateSourceSnapshotsPrimaryKey(db: SqlJsDatabase): void {
+  const primaryKeyColumns = getPrimaryKeyColumns(db, 'source_snapshots');
+  if (primaryKeyColumns.join('|') === 'tracked_item_id|source_kind') {
+    return;
+  }
+
+  db.exec(`
+    DROP TABLE IF EXISTS source_snapshots_next;
+    CREATE TABLE source_snapshots_next (
+      tracked_item_id TEXT NOT NULL,
+      source_kind TEXT NOT NULL,
+      source_url TEXT NOT NULL,
+      fingerprint TEXT NOT NULL,
+      observed_version TEXT NOT NULL,
+      observed_build_id TEXT,
+      observed_patch_date TEXT,
+      observed_patch_title TEXT,
+      observed_patch_link TEXT,
+      patch_selection_source TEXT,
+      raw_payload_json TEXT NOT NULL,
+      checked_at TEXT NOT NULL,
+      PRIMARY KEY (tracked_item_id, source_kind)
+    );
+    INSERT OR REPLACE INTO source_snapshots_next (
+      tracked_item_id, source_kind, source_url, fingerprint, observed_version,
+      observed_build_id, observed_patch_date, observed_patch_title,
+      observed_patch_link, patch_selection_source, raw_payload_json, checked_at
+    )
+    SELECT
+      tracked_item_id, source_kind, source_url, fingerprint, observed_version,
+      observed_build_id, observed_patch_date, observed_patch_title,
+      observed_patch_link, patch_selection_source, raw_payload_json, checked_at
+    FROM source_snapshots;
+    DROP TABLE source_snapshots;
+    ALTER TABLE source_snapshots_next RENAME TO source_snapshots;
+  `);
+}
+
+function migrateSourceMatches(db: SqlJsDatabase): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS source_matches (
+      tracked_item_id TEXT NOT NULL,
+      source_kind TEXT NOT NULL,
+      source_url TEXT,
+      source_title TEXT,
+      normalized_title TEXT,
+      status TEXT NOT NULL,
+      method TEXT NOT NULL,
+      score REAL NOT NULL,
+      confidence REAL NOT NULL,
+      usable INTEGER NOT NULL,
+      is_primary INTEGER NOT NULL,
+      last_checked_at TEXT,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (tracked_item_id, source_kind)
+    );
+
+    INSERT OR IGNORE INTO source_matches (
+      tracked_item_id, source_kind, source_url, source_title, normalized_title,
+      status, method, score, confidence, usable, is_primary, last_checked_at,
+      last_error, created_at, updated_at
+    )
+    SELECT
+      id,
+      source_kind,
+      source_url,
+      title,
+      normalized_title,
+      'verified',
+      'primary_source',
+      1,
+      1,
+      CASE WHEN source_kind = 'manual' THEN 0 ELSE 1 END,
+      1,
+      NULL,
+      NULL,
+      created_at,
+      updated_at
+    FROM tracked_items
+    WHERE source_kind IN ('ankergames', 'elamigos', 'steamrip')
+      AND source_url IS NOT NULL
+      AND source_url != '';
+  `);
 }
 
 function migrateDownloadJobParts(db: SqlJsDatabase): void {
@@ -373,37 +546,34 @@ function migrateDownloadJobParts(db: SqlJsDatabase): void {
   `);
 }
 
-function getDownloadMirrorPrimaryKeyColumns(db: SqlJsDatabase): string[] {
-  const tableInfo = db.exec(`PRAGMA table_info(download_mirrors)`);
-  const rows = tableInfo[0]?.values ?? [];
-  return rows
-    .filter((row) => Number(row[5]) > 0)
-    .sort((left, right) => Number(left[5]) - Number(right[5]))
-    .map((row) => String(row[1]));
-}
-
 function migrateDownloadMirrorsPrimaryKey(db: SqlJsDatabase): void {
-  const primaryKeyColumns = getDownloadMirrorPrimaryKeyColumns(db);
-  if (primaryKeyColumns.join('|') === 'tracked_item_id|url|kind') {
+  const primaryKeyColumns = getPrimaryKeyColumns(db, 'download_mirrors');
+  if (primaryKeyColumns.join('|') === 'tracked_item_id|source_kind|url|kind') {
     return;
   }
+
+  const hasSourceKindColumn = tableHasColumn(db, 'download_mirrors', 'source_kind');
+  const sourceKindExpression = hasSourceKindColumn
+    ? 'source_kind'
+    : `(SELECT source_kind FROM tracked_items WHERE tracked_items.id = download_mirrors.tracked_item_id)`;
 
   db.exec(`
     DROP TABLE IF EXISTS download_mirrors_next;
     CREATE TABLE download_mirrors_next (
       tracked_item_id TEXT NOT NULL,
+      source_kind TEXT,
       url TEXT NOT NULL,
       label TEXT NOT NULL,
       kind TEXT NOT NULL,
       selected_at TEXT,
       manually_failed_at TEXT,
       last_seen_at TEXT NOT NULL,
-      PRIMARY KEY (tracked_item_id, url, kind)
+      PRIMARY KEY (tracked_item_id, source_kind, url, kind)
     );
     INSERT OR REPLACE INTO download_mirrors_next (
-      tracked_item_id, url, label, kind, selected_at, manually_failed_at, last_seen_at
+      tracked_item_id, source_kind, url, label, kind, selected_at, manually_failed_at, last_seen_at
     )
-    SELECT tracked_item_id, url, label, kind, selected_at, manually_failed_at, last_seen_at
+    SELECT tracked_item_id, ${sourceKindExpression}, url, label, kind, selected_at, manually_failed_at, last_seen_at
     FROM download_mirrors;
     DROP TABLE download_mirrors;
     ALTER TABLE download_mirrors_next RENAME TO download_mirrors;
@@ -434,6 +604,7 @@ export class VaultTrackDatabase {
     const db = persisted ? new SQL.Database(persisted) : new SQL.Database();
     db.exec(SCHEMA_SQL);
     applyMigrations(db);
+    writeBinaryFileSync(filePath, db.export());
     return new VaultTrackDatabase(db, filePath);
   }
 
@@ -553,7 +724,134 @@ export class VaultTrackDatabase {
     return this.findTrackedItemById(id)!;
   }
 
-  getSourceSnapshot(trackedItemId: string): SourceSnapshot | null {
+  listSourceMatches(trackedItemId: string): SourceMatch[] {
+    return this.queryAll<{
+      confidence: number;
+      created_at: string;
+      is_primary: number;
+      last_checked_at: string | null;
+      last_error: string | null;
+      method: SourceMatch['method'];
+      normalized_title: string | null;
+      score: number;
+      source_kind: SupportedSourceKind;
+      source_title: string | null;
+      source_url: string | null;
+      status: SourceMatch['status'];
+      tracked_item_id: string;
+      updated_at: string;
+      usable: number;
+    }>(
+      `SELECT * FROM source_matches
+       WHERE tracked_item_id = ?
+       ORDER BY is_primary DESC, source_kind ASC`,
+      [trackedItemId],
+    ).map((row) => ({
+      confidence: row.confidence,
+      createdAt: row.created_at,
+      isPrimary: Boolean(row.is_primary),
+      lastCheckedAt: row.last_checked_at,
+      lastError: row.last_error,
+      method: row.method,
+      normalizedTitle: row.normalized_title,
+      score: row.score,
+      sourceKind: row.source_kind,
+      sourceTitle: row.source_title,
+      sourceUrl: row.source_url,
+      status: row.status,
+      trackedItemId: row.tracked_item_id,
+      updatedAt: row.updated_at,
+      usable: Boolean(row.usable),
+    }));
+  }
+
+  getSourceMatch(
+    trackedItemId: string,
+    sourceKind: SupportedSourceKind,
+  ): SourceMatch | null {
+    return (
+      this.listSourceMatches(trackedItemId).find(
+        (match) => match.sourceKind === sourceKind,
+      ) ?? null
+    );
+  }
+
+  upsertSourceMatch(match: SourceMatch): void {
+    const existing = this.getSourceMatch(match.trackedItemId, match.sourceKind);
+    this.exec(
+      `INSERT INTO source_matches (
+         tracked_item_id, source_kind, source_url, source_title, normalized_title,
+         status, method, score, confidence, usable, is_primary, last_checked_at,
+         last_error, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(tracked_item_id, source_kind) DO UPDATE SET
+         source_url = excluded.source_url,
+         source_title = excluded.source_title,
+         normalized_title = excluded.normalized_title,
+         status = excluded.status,
+         method = excluded.method,
+         score = excluded.score,
+         confidence = excluded.confidence,
+         usable = excluded.usable,
+         is_primary = excluded.is_primary,
+         last_checked_at = excluded.last_checked_at,
+         last_error = excluded.last_error,
+         updated_at = excluded.updated_at`,
+      [
+        match.trackedItemId,
+        match.sourceKind,
+        match.sourceUrl ?? null,
+        match.sourceTitle ?? null,
+        match.normalizedTitle ?? null,
+        match.status,
+        match.method,
+        match.score,
+        match.confidence,
+        match.usable ? 1 : 0,
+        match.isPrimary ? 1 : 0,
+        match.lastCheckedAt ?? null,
+        match.lastError ?? null,
+        existing?.createdAt ?? match.createdAt,
+        match.updatedAt,
+      ],
+    );
+  }
+
+  listSourceSnapshots(trackedItemId: string): SourceSnapshot[] {
+    return this.queryAll<{
+      checked_at: string;
+      fingerprint: string;
+      observed_build_id: string | null;
+      observed_patch_date: string | null;
+      observed_patch_link: string | null;
+      observed_patch_title: string | null;
+      observed_version: string;
+      patch_selection_source: SourceSnapshot['patchSelectionSource'] | null;
+      source_kind: SourceKind;
+      source_url: string;
+      tracked_item_id: string;
+    }>(
+      `SELECT * FROM source_snapshots WHERE tracked_item_id = ?`,
+      [trackedItemId],
+    ).map((row) => ({
+      checkedAt: row.checked_at,
+      fingerprint: row.fingerprint,
+      observedBuildId: row.observed_build_id,
+      observedPatchDate: row.observed_patch_date,
+      observedPatchLink: row.observed_patch_link,
+      observedPatchTitle: row.observed_patch_title,
+      patchSelectionSource: row.patch_selection_source,
+      observedVersion: row.observed_version,
+      sourceKind: row.source_kind,
+      sourceUrl: row.source_url,
+      trackedItemId: row.tracked_item_id,
+    }));
+  }
+
+  getSourceSnapshot(
+    trackedItemId: string,
+    sourceKind?: SupportedSourceKind | null,
+  ): SourceSnapshot | null {
     const row = this.queryOne<{
       tracked_item_id: string;
       source_kind: SourceKind;
@@ -568,8 +866,17 @@ export class VaultTrackDatabase {
       raw_payload_json: string;
       checked_at: string;
     }>(
-      `SELECT * FROM source_snapshots WHERE tracked_item_id = ?`,
-      [trackedItemId],
+      sourceKind
+        ? `SELECT * FROM source_snapshots WHERE tracked_item_id = ? AND source_kind = ?`
+        : `SELECT source_snapshots.*
+           FROM source_snapshots
+           LEFT JOIN source_matches
+             ON source_matches.tracked_item_id = source_snapshots.tracked_item_id
+            AND source_matches.source_kind = source_snapshots.source_kind
+           WHERE source_snapshots.tracked_item_id = ?
+           ORDER BY source_matches.is_primary DESC, source_snapshots.checked_at DESC
+           LIMIT 1`,
+      sourceKind ? [trackedItemId, sourceKind] : [trackedItemId],
     );
 
     if (!row) {
@@ -593,8 +900,9 @@ export class VaultTrackDatabase {
 
   upsertSourceSnapshot(snapshot: SourceSnapshot): void {
     const rawPayloadJson = this.queryOne<{ raw_payload_json: string }>(
-      `SELECT raw_payload_json FROM source_snapshots WHERE tracked_item_id = ?`,
-      [snapshot.trackedItemId],
+      `SELECT raw_payload_json FROM source_snapshots
+       WHERE tracked_item_id = ? AND source_kind = ?`,
+      [snapshot.trackedItemId, snapshot.sourceKind],
     )?.raw_payload_json;
     this.exec(
       `INSERT INTO source_snapshots (
@@ -602,7 +910,7 @@ export class VaultTrackDatabase {
          observed_patch_date, observed_patch_title, observed_patch_link, patch_selection_source,
          raw_payload_json, checked_at
        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(tracked_item_id) DO UPDATE SET
+       ON CONFLICT(tracked_item_id, source_kind) DO UPDATE SET
          source_kind = excluded.source_kind,
          source_url = excluded.source_url,
          fingerprint = excluded.fingerprint,
@@ -636,15 +944,30 @@ export class VaultTrackDatabase {
     payload: ParsedSourcePayload,
   ): void {
     this.exec(
-      `UPDATE source_snapshots SET raw_payload_json = ? WHERE tracked_item_id = ?`,
-      [JSON.stringify(payload), trackedItemId],
+      `UPDATE source_snapshots
+       SET raw_payload_json = ?
+       WHERE tracked_item_id = ? AND source_kind = ?`,
+      [JSON.stringify(payload), trackedItemId, payload.sourceKind],
     );
   }
 
-  getRawParsedSourcePayload(trackedItemId: string): ParsedSourcePayload | null {
+  getRawParsedSourcePayload(
+    trackedItemId: string,
+    sourceKind?: SupportedSourceKind | null,
+  ): ParsedSourcePayload | null {
     const row = this.queryOne<{ raw_payload_json: string }>(
-      `SELECT raw_payload_json FROM source_snapshots WHERE tracked_item_id = ?`,
-      [trackedItemId],
+      sourceKind
+        ? `SELECT raw_payload_json FROM source_snapshots
+           WHERE tracked_item_id = ? AND source_kind = ?`
+        : `SELECT source_snapshots.raw_payload_json
+           FROM source_snapshots
+           LEFT JOIN source_matches
+             ON source_matches.tracked_item_id = source_snapshots.tracked_item_id
+            AND source_matches.source_kind = source_snapshots.source_kind
+           WHERE source_snapshots.tracked_item_id = ?
+           ORDER BY source_matches.is_primary DESC, source_snapshots.checked_at DESC
+           LIMIT 1`,
+      sourceKind ? [trackedItemId, sourceKind] : [trackedItemId],
     );
     if (!row?.raw_payload_json || row.raw_payload_json === 'null') {
       return null;
@@ -653,9 +976,13 @@ export class VaultTrackDatabase {
     return JSON.parse(row.raw_payload_json) as ParsedSourcePayload;
   }
 
-  listDownloadMirrors(trackedItemId: string): DownloadMirrorRecord[] {
+  listDownloadMirrors(
+    trackedItemId: string,
+    sourceKind?: SupportedSourceKind | null,
+  ): DownloadMirrorRecord[] {
     return this.queryAll<{
       tracked_item_id: string;
+      source_kind: SupportedSourceKind | null;
       url: string;
       label: string;
       kind: 'full' | 'patch';
@@ -663,14 +990,21 @@ export class VaultTrackDatabase {
       manually_failed_at: string | null;
       last_seen_at: string;
     }>(
-      `SELECT * FROM download_mirrors WHERE tracked_item_id = ? ORDER BY selected_at DESC, label ASC`,
-      [trackedItemId],
+      sourceKind
+        ? `SELECT * FROM download_mirrors
+           WHERE tracked_item_id = ? AND source_kind = ?
+           ORDER BY selected_at DESC, label ASC`
+        : `SELECT * FROM download_mirrors
+           WHERE tracked_item_id = ?
+           ORDER BY selected_at DESC, label ASC`,
+      sourceKind ? [trackedItemId, sourceKind] : [trackedItemId],
     ).map((row) => ({
       kind: row.kind,
       label: row.label,
       lastSeenAt: row.last_seen_at,
       manuallyFailedAt: row.manually_failed_at,
       selectedAt: row.selected_at,
+      sourceKind: row.source_kind,
       trackedItemId: row.tracked_item_id,
       url: row.url,
     }));
@@ -678,6 +1012,7 @@ export class VaultTrackDatabase {
 
   syncDownloadMirrors(
     trackedItemId: string,
+    sourceKind: SupportedSourceKind,
     mirrors: Array<{
       url: string;
       label: string;
@@ -688,12 +1023,12 @@ export class VaultTrackDatabase {
     for (const mirror of mirrors) {
       this.exec(
         `INSERT INTO download_mirrors (
-         tracked_item_id, url, label, kind, selected_at, manually_failed_at, last_seen_at
-       ) VALUES (?, ?, ?, ?, NULL, NULL, ?)
-         ON CONFLICT(tracked_item_id, url, kind) DO UPDATE SET
+         tracked_item_id, source_kind, url, label, kind, selected_at, manually_failed_at, last_seen_at
+       ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)
+         ON CONFLICT(tracked_item_id, source_kind, url, kind) DO UPDATE SET
            label = excluded.label,
            last_seen_at = excluded.last_seen_at`,
-        [trackedItemId, mirror.url, mirror.label, mirror.kind, now],
+        [trackedItemId, sourceKind, mirror.url, mirror.label, mirror.kind, now],
       );
     }
   }
@@ -702,29 +1037,58 @@ export class VaultTrackDatabase {
     trackedItemId: string,
     url: string,
     kind?: 'full' | 'patch',
+    sourceKind?: SupportedSourceKind | null,
   ): void {
     const now = new Date().toISOString();
     const selectedMirror = this.queryOne<{ kind: 'full' | 'patch' }>(
       kind
-        ? `SELECT kind FROM download_mirrors WHERE tracked_item_id = ? AND url = ? AND kind = ?`
+        ? sourceKind
+          ? `SELECT kind FROM download_mirrors
+             WHERE tracked_item_id = ? AND source_kind = ? AND url = ? AND kind = ?`
+          : `SELECT kind FROM download_mirrors WHERE tracked_item_id = ? AND url = ? AND kind = ?`
+        : sourceKind
+        ? `SELECT kind FROM download_mirrors
+           WHERE tracked_item_id = ? AND source_kind = ? AND url = ?
+           ORDER BY CASE kind WHEN 'full' THEN 0 ELSE 1 END
+           LIMIT 1`
         : `SELECT kind FROM download_mirrors
            WHERE tracked_item_id = ? AND url = ?
            ORDER BY CASE kind WHEN 'full' THEN 0 ELSE 1 END
            LIMIT 1`,
-      kind ? [trackedItemId, url, kind] : [trackedItemId, url],
+      kind
+        ? sourceKind
+          ? [trackedItemId, sourceKind, url, kind]
+          : [trackedItemId, url, kind]
+        : sourceKind
+        ? [trackedItemId, sourceKind, url]
+        : [trackedItemId, url],
     );
     if (!selectedMirror) {
       return;
     }
     this.exec(
-      `UPDATE download_mirrors SET selected_at = NULL WHERE tracked_item_id = ? AND kind = ?`,
-      [trackedItemId, selectedMirror.kind],
+      sourceKind
+        ? `UPDATE download_mirrors
+           SET selected_at = NULL
+           WHERE tracked_item_id = ? AND source_kind = ? AND kind = ?`
+        : `UPDATE download_mirrors
+           SET selected_at = NULL
+           WHERE tracked_item_id = ? AND kind = ?`,
+      sourceKind
+        ? [trackedItemId, sourceKind, selectedMirror.kind]
+        : [trackedItemId, selectedMirror.kind],
     );
     this.exec(
-      `UPDATE download_mirrors
-       SET selected_at = ?
-       WHERE tracked_item_id = ? AND url = ? AND kind = ?`,
-      [now, trackedItemId, url, selectedMirror.kind],
+      sourceKind
+        ? `UPDATE download_mirrors
+           SET selected_at = ?
+           WHERE tracked_item_id = ? AND source_kind = ? AND url = ? AND kind = ?`
+        : `UPDATE download_mirrors
+           SET selected_at = ?
+           WHERE tracked_item_id = ? AND url = ? AND kind = ?`,
+      sourceKind
+        ? [now, trackedItemId, sourceKind, url, selectedMirror.kind]
+        : [now, trackedItemId, url, selectedMirror.kind],
     );
   }
 
@@ -813,7 +1177,7 @@ export class VaultTrackDatabase {
   }
 
   listPatchEntries(trackedItemId: string): SteamPatchEntry[] {
-    return this.queryAll<{
+    const rows = this.queryAll<{
       tracked_item_id: string;
       app_id: number;
       patch_title: string;
@@ -830,19 +1194,22 @@ export class VaultTrackDatabase {
        FROM steam_patch_entries WHERE tracked_item_id = ?
        ORDER BY COALESCE(published_at, patch_date) DESC`,
       [trackedItemId],
-    ).map((row) => ({
-      appId: Number(row.app_id),
-      buildId: row.build_id,
-      description: row.description,
-      link: row.link,
-      patchDate: row.patch_date,
-      patchTitle: row.patch_title,
-      publishedAt: normalizePublishedAt(row.published_at, row.patch_date),
-      selectionSource: row.selection_source,
-      title: row.patch_title,
-      trackedItemId: row.tracked_item_id,
-      version: row.version,
-    }));
+    );
+    return mergePatchHistory(
+      rows.map((row) => ({
+        appId: Number(row.app_id),
+        buildId: row.build_id,
+        description: row.description,
+        link: row.link,
+        patchDate: row.patch_date,
+        patchTitle: row.patch_title,
+        publishedAt: normalizePublishedAt(row.published_at, row.patch_date),
+        selectionSource: row.selection_source,
+        title: row.patch_title,
+        trackedItemId: row.tracked_item_id,
+        version: row.version,
+      })),
+    );
   }
 
   upsertPatchEntries(entries: SteamPatchEntry[]): void {
@@ -870,7 +1237,10 @@ export class VaultTrackDatabase {
         `UPDATE steam_patch_entries
          SET app_id = ?, patch_title = ?, build_id = ?, patch_date = ?, published_at = ?,
              version = ?, description = ?, selection_source = ?
-         WHERE tracked_item_id = ? AND link = ?`,
+          WHERE tracked_item_id = ?
+            AND COALESCE(build_id, '') = ?
+            AND patch_date = ?
+            AND link = ?`,
         [
           entry.appId,
           entry.patchTitle,
@@ -881,6 +1251,8 @@ export class VaultTrackDatabase {
           entry.description ?? null,
           entry.selectionSource ?? 'rss',
           entry.trackedItemId,
+          entry.buildId ?? '',
+          entry.patchDate,
           entry.link,
         ],
       );
@@ -1324,6 +1696,7 @@ export class VaultTrackDatabase {
     const childTables = [
       'source_watches',
       'install_records',
+      'source_matches',
       'source_snapshots',
       'steam_matches',
       'steam_patch_entries',
@@ -1370,6 +1743,12 @@ export class VaultTrackDatabase {
       renameGameFoldersOnImport:
         map.get('import.renameGameFoldersOnImport') !== 'false',
       rootLibraryPath: primaryRoot?.path ?? legacyRootPath,
+      sourceWatchDurationDays: Number(
+        map.get('sourceWatch.durationDays') ?? 5,
+      ),
+      sourceWatchIntervalHours: Number(
+        map.get('sourceWatch.intervalHours') ?? 8,
+      ),
       themeMode: (map.get('appearance.themeMode') as SettingsRecord['themeMode']) ?? 'system',
     };
   }
