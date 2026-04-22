@@ -115,7 +115,7 @@ function steamCoverPayload(appId: number, fileName: string): string {
           appid: appId,
           assets: {
             asset_url_format: `steam/apps/${appId}/\${FILENAME}?t=1234`,
-            library_capsule_2x: fileName,
+            library_hero_2x: fileName,
           },
         },
       ],
@@ -178,7 +178,7 @@ function mockSteamNetwork(
         ids?: Array<{ appid?: number }>;
       };
       const appId = inputJson.ids?.[0]?.appid ?? 0;
-      return new Response(steamCoverPayload(appId, 'library_capsule_2x.jpg'), {
+      return new Response(steamCoverPayload(appId, 'library_hero_2x.jpg'), {
         status: 200,
       });
     }
@@ -771,7 +771,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
     }
   });
 
-  it('stores the Steam library capsule when adding a matched item', async () => {
+  it('stores the Steam landscape artwork when adding a matched item', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
       vi.stubGlobal(
@@ -782,7 +782,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
             return new Response(
               steamCoverPayload(
                 steamMatch.appId,
-                'cover-hash/library_capsule_2x.jpg',
+                'cover-hash/library_hero_2x.jpg',
               ),
               { status: 200 },
             );
@@ -807,14 +807,14 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       });
 
       expect(view.item.coverUrl).toBe(
-        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2416450/cover-hash/library_capsule_2x.jpg?t=1234',
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2416450/cover-hash/library_hero_2x.jpg?t=1234',
       );
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
   });
 
-  it('stores the Steam library capsule when applying a Steam match', async () => {
+  it('stores the Steam landscape artwork when applying a Steam match', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
       const item = database.upsertTrackedItem({
@@ -830,7 +830,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
           new Response(
             steamCoverPayload(
               steamMatch.appId,
-              'applied-cover/library_capsule_2x.jpg',
+              'applied-cover/library_hero_2x.jpg',
             ),
             { status: 200 },
           ),
@@ -843,7 +843,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       );
 
       expect(view.item.coverUrl).toBe(
-        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2416450/applied-cover/library_capsule_2x.jpg?t=1234',
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2416450/applied-cover/library_hero_2x.jpg?t=1234',
       );
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
@@ -883,7 +883,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       database.upsertSteamMatch(alreadyCanonical.id, {
         appId: 222,
         coverUrl:
-          'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/222/hash/library_capsule_2x.jpg?t=1',
+          'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/222/hash/library_hero_2x.jpg?t=1',
         matchedAt: '2026-04-20T12:00:00.000Z',
         normalizedTitle: 'canonical game',
         title: 'Canonical Game',
@@ -894,7 +894,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         return new Response(
           steamCoverPayload(
             Number(inputJson.ids?.[0]?.appid),
-            'backfill/library_capsule_2x.jpg',
+            'backfill/library_hero_2x.jpg',
           ),
           { status: 200 },
         );
@@ -910,10 +910,10 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       const unmatchedView = views.find((view) => view.item.id === unmatched.id);
 
       expect(matchedView?.item.coverUrl).toBe(
-        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/111/backfill/library_capsule_2x.jpg?t=1234',
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/111/backfill/library_hero_2x.jpg?t=1234',
       );
       expect(canonicalView?.item.coverUrl).toBe(
-        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/222/hash/library_capsule_2x.jpg?t=1',
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/222/hash/library_hero_2x.jpg?t=1',
       );
       expect(unmatchedView?.item.coverUrl).toBe(
         'https://ankergames.net/unmatched-poster.png',

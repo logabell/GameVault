@@ -26,8 +26,13 @@ interface MockStoreSearchItem {
 
 interface MockStoreAsset {
   assetUrlFormat?: string;
+  header?: string;
+  heroCapsule?: string;
   libraryCapsule?: string;
   libraryCapsule2x?: string;
+  libraryHero?: string;
+  libraryHero2x?: string;
+  mainCapsule?: string;
 }
 
 function createSteamSearchFetchMock(params: {
@@ -106,8 +111,13 @@ function createSteamSearchFetchMock(params: {
                         asset_url_format:
                           assets.assetUrlFormat ??
                           `steam/apps/${appId}/\${FILENAME}?t=1234`,
+                        header: assets.header,
+                        hero_capsule: assets.heroCapsule,
                         library_capsule: assets.libraryCapsule,
                         library_capsule_2x: assets.libraryCapsule2x,
+                        library_hero: assets.libraryHero,
+                        library_hero_2x: assets.libraryHero2x,
+                        main_capsule: assets.mainCapsule,
                       }
                     : {},
                 },
@@ -124,7 +134,7 @@ function createSteamSearchFetchMock(params: {
 }
 
 describe('steam matching', () => {
-  it('resolves Steam library capsule 2x cover URLs from Store Browse assets', async () => {
+  it('resolves Steam landscape artwork URLs from Store Browse assets', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = new URL(String(input));
       expect(url.pathname).toBe('/IStoreBrowseService/GetItems/v1/');
@@ -141,6 +151,8 @@ describe('steam matching', () => {
                     '64fffd4bdc67e07b180cc695edcbcb8d1e96f1a6/library_capsule.jpg',
                   library_capsule_2x:
                     '64fffd4bdc67e07b180cc695edcbcb8d1e96f1a6/library_capsule_2x.jpg',
+                  library_hero_2x:
+                    'b89260b3db1f336418e8f9739e7ebfb3d44c2861/library_hero_2x.jpg',
                 },
               },
             ],
@@ -153,7 +165,38 @@ describe('steam matching', () => {
     await expect(
       resolveSteamLibraryCoverUrl(2807960, fetchMock as typeof fetch),
     ).resolves.toBe(
-      'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2807960/64fffd4bdc67e07b180cc695edcbcb8d1e96f1a6/library_capsule_2x.jpg?t=1776359117',
+      'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2807960/b89260b3db1f336418e8f9739e7ebfb3d44c2861/library_hero_2x.jpg?t=1776359117',
+    );
+  });
+
+  it('falls back to lower-priority Store Browse landscape art', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          response: {
+            store_items: [
+              {
+                appid: 2807960,
+                assets: {
+                  asset_url_format:
+                    'steam/apps/2807960/${FILENAME}?t=1776359117',
+                  header:
+                    'c12d12ce3c7d217398d3fcad77427bfc9d57c570/header.jpg',
+                  library_capsule:
+                    '64fffd4bdc67e07b180cc695edcbcb8d1e96f1a6/library_capsule.jpg',
+                },
+              },
+            ],
+          },
+        }),
+        { status: 200 },
+      ),
+    );
+
+    await expect(
+      resolveSteamLibraryCoverUrl(2807960, fetchMock as typeof fetch),
+    ).resolves.toBe(
+      'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2807960/c12d12ce3c7d217398d3fcad77427bfc9d57c570/header.jpg?t=1776359117',
     );
   });
 
@@ -186,7 +229,7 @@ describe('steam matching', () => {
     );
   });
 
-  it('uses legacy Steam library cover URLs when Store Browse is unavailable', async () => {
+  it('uses legacy Steam landscape artwork URLs when Store Browse is unavailable', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = new URL(String(input));
       if (url.hostname === 'api.steampowered.com') {
@@ -195,17 +238,19 @@ describe('steam matching', () => {
 
       return new Response('', {
         headers: {
-          'content-length': url.pathname.endsWith('_2x.jpg') ? '0' : '52021',
+          'content-length': url.pathname.endsWith('library_hero_2x.jpg')
+            ? '0'
+            : '52021',
           'content-type': 'image/jpeg',
         },
-        status: url.pathname.endsWith('_2x.jpg') ? 404 : 200,
+        status: url.pathname.endsWith('library_hero_2x.jpg') ? 404 : 200,
       });
     });
 
     await expect(
       resolveSteamLibraryCoverUrl(1245620, fetchMock as typeof fetch),
     ).resolves.toBe(
-      'https://cdn.cloudflare.steamstatic.com/steam/apps/1245620/library_600x900.jpg',
+      'https://cdn.cloudflare.steamstatic.com/steam/apps/1245620/library_hero.jpg',
     );
   });
 
@@ -218,8 +263,10 @@ describe('steam matching', () => {
 
       return new Response('', {
         headers: {
-          'content-length': url.pathname.endsWith('_2x.jpg') ? '4584' : '52021',
-          'content-type': url.pathname.endsWith('_2x.jpg')
+          'content-length': url.pathname.endsWith('library_hero_2x.jpg')
+            ? '4584'
+            : '52021',
+          'content-type': url.pathname.endsWith('library_hero_2x.jpg')
             ? 'image/jpeg'
             : 'text/html',
         },
@@ -235,14 +282,19 @@ describe('steam matching', () => {
   it('identifies saved Steam library cover URLs', () => {
     expect(
       isSteamLibraryCoverUrl(
-        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2807960/hash/library_capsule_2x.jpg?t=1776359117',
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2807960/hash/library_hero_2x.jpg?t=1776359117',
       ),
     ).toBe(true);
     expect(
       isSteamLibraryCoverUrl(
-        'https://cdn.cloudflare.steamstatic.com/steam/apps/1245620/library_600x900.jpg',
+        'https://cdn.cloudflare.steamstatic.com/steam/apps/1245620/header.jpg',
       ),
     ).toBe(true);
+    expect(
+      isSteamLibraryCoverUrl(
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2807960/hash/library_capsule_2x.jpg?t=1776359117',
+      ),
+    ).toBe(false);
     expect(
       isSteamLibraryCoverUrl(
         'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2807960/hash/capsule_231x87.jpg',
@@ -281,7 +333,7 @@ describe('steam matching', () => {
       },
       coverAssets: {
         1601580: {
-          libraryCapsule2x: 'cover-hash/library_capsule_2x.jpg',
+          libraryHero2x: 'cover-hash/library_hero_2x.jpg',
         },
       },
       storeResults: {
@@ -310,7 +362,7 @@ describe('steam matching', () => {
     expect(result.queryTitle).toBe('Frostpunk 2');
     expect(result.candidates[0]?.appId).toBe(1601580);
     expect(result.candidates[0]?.coverUrl).toBe(
-      'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1601580/cover-hash/library_capsule_2x.jpg?t=1234',
+      'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1601580/cover-hash/library_hero_2x.jpg?t=1234',
     );
     expect(result.candidates.map((candidate) => candidate.appId)).not.toContain(
       4065430,

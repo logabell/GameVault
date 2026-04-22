@@ -1,5 +1,28 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  type SyntheticEvent,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { createRoot } from 'react-dom/client';
+import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
+import {
+  faCheck,
+  faCircleInfo,
+  faEllipsis,
+  faFileImport,
+  faGamepad,
+  faGear,
+  faList,
+  faPenToSquare,
+  faRotateRight,
+  faTableCellsLarge,
+  faTrash,
+  faTriangleExclamation,
+  faUpRightFromSquare,
+  faXmark,
+} from '@fortawesome/free-solid-svg-icons';
 
 import type {
   ConnectionHealthSummary,
@@ -20,6 +43,7 @@ import { mergeSteamPatchLists } from './patch-list.js';
 
 type PopupTab = 'game' | 'library' | 'settings';
 type FlowStep = 'game' | 'steam' | 'patch' | 'done';
+type LibraryViewMode = 'cards' | 'list';
 type ResolvedTheme = 'light' | 'dark';
 type HealthSeverity = 'yellow' | 'red' | null;
 type SettingsSaveStatus = 'idle' | 'saving' | 'saved';
@@ -32,6 +56,9 @@ type LibraryAction = {
 const STEAM_PATCH_MESSAGE_TIMEOUT_MS = 20000;
 const STEAMDB_BACKFILL_POLL_INTERVAL_MS = 750;
 const STEAMDB_BACKFILL_POLL_TIMEOUT_MS = 26000;
+const EXTENSION_LIBRARY_VIEW_STORAGE_KEY = 'vaulttrack:extension:library-view';
+const STEAM_LEGACY_APP_ART_BASE =
+  'https://cdn.cloudflare.steamstatic.com/steam/apps';
 
 const lifecycleStatuses = new Set([
   'new',
@@ -272,12 +299,13 @@ function formatLabel(value: string | null | undefined): string {
     .replace(/\b\w/g, (character) => character.toUpperCase());
 }
 
-function formatSourceKind(
-  value: ParsedSourcePayload['sourceKind'] | undefined,
-): string {
+function formatSourceKind(value: string | null | undefined): string {
   if (!value) return 'Source unavailable';
   if (value === 'ankergames') return 'AnkerGames';
-  return value === 'steamrip' ? 'SteamRIP' : 'ElAmigos';
+  if (value === 'steamrip') return 'SteamRIP';
+  if (value === 'elamigos') return 'ElAmigos';
+  if (value === 'manual') return 'Imported';
+  return formatLabel(value);
 }
 
 function normalizeSteamPatchCandidate(
@@ -400,6 +428,18 @@ function formatPatchLag(item: TrackedItemView): string {
   }
 
   return 'Unknown';
+}
+
+function readStoredLibraryViewMode(
+  storageKey: string,
+  fallback: LibraryViewMode = 'cards',
+): LibraryViewMode {
+  try {
+    const value = window.localStorage.getItem(storageKey);
+    return value === 'list' || value === 'cards' ? value : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 function getSourceSnapshotPatchKey(
@@ -612,6 +652,12 @@ function getTrackingStatus(item: TrackedItemView): string {
   );
 }
 
+function shouldShowTrackingStatus(item: TrackedItemView): boolean {
+  return !['queued', 'downloading', 'extracting', 'staged', 'failed'].includes(
+    getLifecycleStatus(item),
+  );
+}
+
 function getLifecycleStatus(item: TrackedItemView): string {
   const itemStatus = String((item as Partial<TrackedItemView>).status ?? '');
   if (lifecycleStatuses.has(itemStatus)) {
@@ -702,6 +748,31 @@ function resolveTheme(
   return systemPrefersDark ? 'dark' : 'light';
 }
 
+function getSteamPortraitCoverUrl(item: TrackedItemView): string | null {
+  return item.item.steamAppId
+    ? `${STEAM_LEGACY_APP_ART_BASE}/${encodeURIComponent(
+        String(item.item.steamAppId),
+      )}/library_600x900.jpg`
+    : null;
+}
+
+function getLibraryArtworkUrl(
+  item: TrackedItemView,
+  variant: 'banner' | 'cover',
+): string | null {
+  if (variant === 'cover') {
+    return getSteamPortraitCoverUrl(item) ?? item.item.coverUrl ?? null;
+  }
+  return item.item.coverUrl ?? null;
+}
+
+function handleArtworkFallback(event: SyntheticEvent<HTMLImageElement>) {
+  const fallback = event.currentTarget.dataset.fallbackSrc;
+  if (fallback && event.currentTarget.src !== fallback) {
+    event.currentTarget.src = fallback;
+  }
+}
+
 function deriveWarningState(
   health: ConnectionHealthSummary | null,
 ): WarningState | null {
@@ -773,6 +844,10 @@ function App() {
   const tabId = searchParams.get('tabId');
 
   const [activeTab, setActiveTab] = useState<PopupTab>('game');
+  const [libraryViewMode, setLibraryViewMode] = useState<LibraryViewMode>(() =>
+    readStoredLibraryViewMode(EXTENSION_LIBRARY_VIEW_STORAGE_KEY),
+  );
+  const [detailsItemId, setDetailsItemId] = useState<string | null>(null);
   const [step, setStep] = useState<FlowStep>('game');
   const [draftShell, setDraftShell] = useState<DraftShellPayload | null>(null);
   const [health, setHealth] = useState<ConnectionHealthSummary | null>(null);
@@ -844,7 +919,10 @@ function App() {
   const warningState = deriveWarningState(health);
   const navAlertSeverity = resolveHealthSeverity(health);
   const deviceChoices = health?.devices ?? [];
-  const themeChoices: ThemeMode[] = ['system', 'light', 'dark'];
+  const themeChoices: Array<Extract<ThemeMode, 'dark' | 'light'>> = [
+    'dark',
+    'light',
+  ];
   const parsedSource = draftShell?.parsedSource ?? null;
   const parsePending = Boolean(draftShell?.parsePending);
   const metadataDate =
@@ -928,6 +1006,10 @@ function App() {
   const currentPageLifecycleStatus = currentPageTrackedItem
     ? getLifecycleStatus(currentPageTrackedItem)
     : null;
+  const detailsItem = useMemo(
+    () => libraryItems.find((item) => item.item.id === detailsItemId) ?? null,
+    [detailsItemId, libraryItems],
+  );
   const shouldPollDraftStatus =
     parsePending ||
     connectionPending ||
@@ -1419,6 +1501,28 @@ function App() {
     document.documentElement.dataset.theme = resolvedTheme;
     document.documentElement.style.colorScheme = resolvedTheme;
   }, [resolvedTheme]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        EXTENSION_LIBRARY_VIEW_STORAGE_KEY,
+        libraryViewMode,
+      );
+    } catch {
+      // localStorage can be unavailable in unusual popup contexts.
+    }
+  }, [libraryViewMode]);
+
+  useEffect(() => {
+    if (!detailsItemId) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setDetailsItemId(null);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [detailsItemId]);
 
   useEffect(
     () => () => {
@@ -2487,6 +2591,384 @@ function App() {
     }
   }
 
+  function renderLibraryArtwork(
+    item: TrackedItemView,
+    className: string,
+    variant: 'banner' | 'cover' = 'banner',
+  ) {
+    const cover = getLibraryArtworkUrl(item, variant);
+    const fallback =
+      variant === 'cover' && cover !== item.item.coverUrl
+        ? (item.item.coverUrl ?? undefined)
+        : undefined;
+    return cover ? (
+      <img
+        alt={item.item.title}
+        className={className}
+        data-fallback-src={fallback}
+        onError={fallback ? handleArtworkFallback : undefined}
+        src={cover}
+      />
+    ) : (
+      <div className={`${className} is-placeholder`}>
+        <span>VT</span>
+      </div>
+    );
+  }
+
+  function renderLibraryActionMenu(item: TrackedItemView) {
+    const canEditSourcePatch = Boolean(
+      item.item.steamAppId && item.sourceSnapshot,
+    );
+    const isCompletingInstall =
+      libraryAction?.kind === 'completeInstall' &&
+      libraryAction.trackedItemId === item.item.id;
+    return (
+      <details className="item-action-menu">
+        <summary aria-label={`Actions for ${item.item.title}`}>
+          <FontAwesomeIcon aria-hidden="true" icon={faEllipsis} />
+        </summary>
+        <div className="item-action-menu__panel" role="menu">
+          {item.item.sourceUrl ? (
+            <button
+              onClick={() =>
+                void chrome.tabs.create({ url: item.item.sourceUrl! })
+              }
+              role="menuitem"
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faUpRightFromSquare} />
+              <span>Open Source</span>
+            </button>
+          ) : null}
+          {item.item.steamAppId ? (
+            <>
+              <button
+                onClick={() =>
+                  void chrome.tabs.create({
+                    url: `https://store.steampowered.com/app/${item.item.steamAppId}/`,
+                  })
+                }
+                role="menuitem"
+                type="button"
+              >
+                <FontAwesomeIcon
+                  aria-hidden="true"
+                  icon={faUpRightFromSquare}
+                />
+                <span>Open Steam</span>
+              </button>
+              <button
+                onClick={() =>
+                  void chrome.tabs.create({
+                    url: `https://steamdb.info/app/${item.item.steamAppId}/`,
+                  })
+                }
+                role="menuitem"
+                type="button"
+              >
+                <FontAwesomeIcon
+                  aria-hidden="true"
+                  icon={faUpRightFromSquare}
+                />
+                <span>Open SteamDB</span>
+              </button>
+            </>
+          ) : null}
+          {canEditSourcePatch ? (
+            <button
+              disabled={busy}
+              onClick={() => void openSourcePatchEditor(item)}
+              role="menuitem"
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faPenToSquare} />
+              <span>Edit Source Patch</span>
+            </button>
+          ) : null}
+          {canRetryDownload(item) ? (
+            <button
+              disabled={busy}
+              onClick={() => openRetrySelector(item)}
+              role="menuitem"
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
+              <span>Retry Download</span>
+            </button>
+          ) : null}
+          {canMarkDownloadFailed(item) ? (
+            <button
+              className="is-danger"
+              disabled={busy}
+              onClick={() => void markDownloadFailed(item)}
+              role="menuitem"
+              type="button"
+            >
+              <FontAwesomeIcon
+                aria-hidden="true"
+                icon={faTriangleExclamation}
+              />
+              <span>Mark Failed</span>
+            </button>
+          ) : null}
+          {canCompleteStagedInstall(item) ? (
+            <button
+              aria-busy={isCompletingInstall}
+              disabled={busy}
+              onClick={() => void completeStagedInstall(item)}
+              role="menuitem"
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faCheck} />
+              {isCompletingInstall ? 'Completing...' : 'Mark Install Complete'}
+            </button>
+          ) : null}
+          <button
+            disabled={busy}
+            onClick={() => void removeTrackedItem(item, 'tracking_only')}
+            role="menuitem"
+            type="button"
+          >
+            <FontAwesomeIcon aria-hidden="true" icon={faXmark} />
+            <span>Remove Tracking</span>
+          </button>
+          <button
+            className="is-danger"
+            disabled={busy}
+            onClick={() => void removeTrackedItem(item, 'delete_files')}
+            role="menuitem"
+            type="button"
+          >
+            <FontAwesomeIcon aria-hidden="true" icon={faTrash} />
+            <span>Delete Files</span>
+          </button>
+        </div>
+      </details>
+    );
+  }
+
+  function renderLibraryDetailGrid(
+    item: TrackedItemView,
+    variant: 'list' | 'modal',
+  ) {
+    const activity = getItemActivity(item);
+    const fileState = getItemFileState(item);
+    const patchSourceLabel = formatPatchSourceLabel(
+      item.selectedPatch?.selectionSource ??
+        item.sourceSnapshot?.patchSelectionSource,
+    );
+    const sourcePatchBuild =
+      item.selectedPatch?.buildId ?? item.sourceSnapshot?.observedBuildId;
+    const sourcePatchTitle =
+      item.selectedPatch?.patchTitle ??
+      item.sourceSnapshot?.observedPatchTitle ??
+      item.sourceSnapshot?.observedVersion ??
+      'Source patch unavailable';
+    const sourcePatchDate =
+      item.selectedPatch?.patchDate ?? item.sourceSnapshot?.observedPatchDate;
+    const latestPatchTitle =
+      item.latestPatch?.patchTitle ?? 'Latest SteamDB patch unavailable';
+    return (
+      <div className={`library-detail-grid is-${variant}`}>
+        <div>
+          <strong>Source</strong>
+          <span>{formatSourceKind(item.item.sourceKind)}</span>
+        </div>
+        <div>
+          <strong>Installed Patch</strong>
+          <span>{sourcePatchTitle}</span>
+          <span>
+            {sourcePatchBuild ? `Build ${sourcePatchBuild}` : 'Build n/a'}
+          </span>
+          <span>{sourcePatchDate ?? 'Date n/a'}</span>
+          {patchSourceLabel ? <span>{patchSourceLabel}</span> : null}
+        </div>
+        <div>
+          <strong>Latest SteamDB</strong>
+          <span>{latestPatchTitle}</span>
+          <span>
+            {item.latestPatch?.buildId
+              ? `Build ${item.latestPatch.buildId}`
+              : 'Build n/a'}
+          </span>
+          <span>{item.latestPatch?.patchDate ?? 'Date n/a'}</span>
+        </div>
+        <div>
+          <strong>SteamDB Check</strong>
+          <span>{formatRelativeTime(activity.lastSteamFeedCheckedAt)}</span>
+          <span>
+            {activity.lastSteamFeedError ? 'Last check failed' : 'Feed ok'}
+          </span>
+        </div>
+        <div>
+          <strong>Source Scan</strong>
+          <span>{formatSourceScan(item)}</span>
+        </div>
+        <div>
+          <strong>Game Folder</strong>
+          <span>
+            {fileState.finalPathExists
+              ? 'Found'
+              : fileState.finalPath
+                ? 'Not found'
+                : 'Unknown'}
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  function renderLibraryDetailsModal() {
+    if (!detailsItem) return null;
+    return (
+      <div
+        className="details-modal-backdrop"
+        onMouseDown={() => setDetailsItemId(null)}
+      >
+        <section
+          aria-labelledby="details-modal-title"
+          aria-modal="true"
+          className="details-modal"
+          onMouseDown={(event) => event.stopPropagation()}
+          role="dialog"
+        >
+          <div className="details-modal__hero">
+            {renderLibraryArtwork(detailsItem, 'details-modal__cover')}
+            <div className="details-modal__shade" />
+            <div className="details-modal__content">
+              <span
+                className={`status-chip ${getLifecycleStatus(detailsItem)}`}
+              >
+                {formatLabel(getLifecycleStatus(detailsItem))}
+              </span>
+              <h2 id="details-modal-title">{detailsItem.item.title}</h2>
+              <p>
+                Patch Status: <span>{formatPatchLag(detailsItem)}</span>
+              </p>
+            </div>
+            <button
+              aria-label="Close details"
+              className="modal-close-button"
+              onClick={() => setDetailsItemId(null)}
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faXmark} />
+            </button>
+          </div>
+          <div className="details-modal__body">
+            {renderLibraryDetailGrid(detailsItem, 'modal')}
+          </div>
+        </section>
+      </div>
+    );
+  }
+
+  function renderLibraryItem(item: TrackedItemView) {
+    const progress = progressPercent(item);
+    const showProgress = hasActiveProgress(item);
+    const trackingStatus = getTrackingStatus(item);
+    const lifecycleStatus = getLifecycleStatus(item);
+    const showTrackingStatus = shouldShowTrackingStatus(item);
+    const detailGrid = renderLibraryDetailGrid(item, 'list');
+    const progressBlock =
+      showProgress && item.currentDownload ? (
+        <div className="progress-block">
+          <div className="progress-track">
+            <div
+              className="progress-fill"
+              style={{ width: `${progress ?? 0}%` }}
+            />
+          </div>
+          <div className="progress-meta">
+            <span>{formatDownloadSummary(item, progress)}</span>
+            <span>{formatProgressAmount(item, progress)}</span>
+            <span>{formatSpeed(item.currentDownload.speed)}</span>
+            <span>{formatEta(item.currentDownload.etaSeconds)}</span>
+          </div>
+          {item.currentDownload.parts &&
+          item.currentDownload.parts.length > 1 ? (
+            <div className="progress-parts">
+              {item.currentDownload.parts.map((part) => (
+                <span key={part.id}>{formatPartStatus(part)}</span>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null;
+
+    if (libraryViewMode === 'list') {
+      return (
+        <article className="library-row" key={item.item.id}>
+          {renderLibraryArtwork(item, 'library-row__cover', 'cover')}
+          <div className="library-row__body">
+            <div className="library-row__top">
+              <div>
+                <div className="chip-row library-row__chips">
+                  <span className={`status-chip ${lifecycleStatus}`}>
+                    {formatLabel(lifecycleStatus)}
+                  </span>
+                  {showTrackingStatus ? (
+                    <span className={`status-chip ${trackingStatus}`}>
+                      {formatLabel(trackingStatus)}
+                    </span>
+                  ) : null}
+                </div>
+                <strong>{item.item.title}</strong>
+                <div className="candidate-meta">
+                  <span className="library-patch-status">
+                    Patch Status: <span>{formatPatchLag(item)}</span>
+                  </span>
+                </div>
+              </div>
+              {renderLibraryActionMenu(item)}
+            </div>
+            {progressBlock}
+            {detailGrid}
+          </div>
+        </article>
+      );
+    }
+
+    return (
+      <article className="library-card" key={item.item.id}>
+        <div className="library-card__media">
+          {renderLibraryArtwork(item, 'library-card__cover')}
+          <div className="library-card__badges">
+            <span className={`status-chip ${lifecycleStatus}`}>
+              {formatLabel(lifecycleStatus)}
+            </span>
+            {showTrackingStatus ? (
+              <span className={`status-chip ${trackingStatus}`}>
+                {formatLabel(trackingStatus)}
+              </span>
+            ) : null}
+          </div>
+        </div>
+        <div className="library-card__top">
+          <div>
+            <strong>{item.item.title}</strong>
+            <div className="candidate-meta">
+              <span className="library-patch-status">
+                Patch Status: <span>{formatPatchLag(item)}</span>
+              </span>
+            </div>
+          </div>
+          {renderLibraryActionMenu(item)}
+        </div>
+        {progressBlock}
+        <button
+          className="detail-toggle-button"
+          onClick={() => setDetailsItemId(item.item.id)}
+          type="button"
+        >
+          <FontAwesomeIcon aria-hidden="true" icon={faCircleInfo} />
+          <span>Additional Details</span>
+        </button>
+      </article>
+    );
+  }
+
   const gameStepLoadingLabel = parsePending
     ? 'Reading page details'
     : connectionPending
@@ -2507,6 +2989,7 @@ function App() {
             onClick={() => setActiveTab('game')}
             type="button"
           >
+            <FontAwesomeIcon aria-hidden="true" icon={faGamepad} />
             Game
           </button>
           <button
@@ -2514,6 +2997,7 @@ function App() {
             onClick={() => setActiveTab('library')}
             type="button"
           >
+            <FontAwesomeIcon aria-hidden="true" icon={faTableCellsLarge} />
             Library
           </button>
           <button
@@ -2522,27 +3006,7 @@ function App() {
             onClick={() => setActiveTab('settings')}
             type="button"
           >
-            <svg
-              aria-hidden="true"
-              className="gear-icon"
-              fill="none"
-              viewBox="0 0 24 24"
-            >
-              <path
-                d="M10.7 2.84a1.5 1.5 0 0 1 2.6 0l.74 1.28a7.95 7.95 0 0 1 1.83.76l1.44-.4a1.5 1.5 0 0 1 1.84 1.06l.25.9a1.5 1.5 0 0 1-.53 1.58l-1.1.9c.1.36.16.73.2 1.11l1.1.88a1.5 1.5 0 0 1 .53 1.59l-.25.9a1.5 1.5 0 0 1-1.84 1.05l-1.44-.39c-.57.34-1.18.6-1.83.77l-.74 1.27a1.5 1.5 0 0 1-2.6 0l-.74-1.27a7.95 7.95 0 0 1-1.83-.77l-1.44.4a1.5 1.5 0 0 1-1.84-1.06l-.25-.9a1.5 1.5 0 0 1 .53-1.58l1.1-.89c-.1-.37-.16-.74-.2-1.12l-1.1-.89a1.5 1.5 0 0 1-.53-1.58l.25-.9a1.5 1.5 0 0 1 1.84-1.06l1.44.4c.57-.34 1.18-.6 1.83-.76l.74-1.28Z"
-                stroke="currentColor"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth="1.6"
-              />
-              <circle
-                cx="12"
-                cy="12"
-                r="3.2"
-                stroke="currentColor"
-                strokeWidth="1.6"
-              />
-            </svg>
+            <FontAwesomeIcon aria-hidden="true" icon={faGear} />
             {navAlertSeverity ? (
               <span className={`nav-alert-badge ${navAlertSeverity}`} />
             ) : null}
@@ -2556,7 +3020,14 @@ function App() {
         {activeTab === 'game' ? (
           <>
             <section
-              className={`hero-card ${shellLoading || parsePending ? 'is-loading' : ''}`}
+              className={`hero-card ${
+                shellLoading || parsePending ? 'is-loading' : ''
+              } ${parsedSource?.coverUrl ? 'has-cover' : ''}`}
+              style={
+                parsedSource?.coverUrl
+                  ? { backgroundImage: `url(${parsedSource.coverUrl})` }
+                  : undefined
+              }
             >
               {currentPageTrackedItem ? (
                 <div className="kicker-row">
@@ -2853,10 +3324,6 @@ function App() {
                     <div className="section-heading">
                       <div>
                         <p className="section-title">Title match</p>
-                        <p className="muted-text">
-                          Confirm the closest Steam app before selecting the
-                          canonical SteamDB patch.
-                        </p>
                       </div>
                     </div>
                     <form
@@ -2969,10 +3436,6 @@ function App() {
                     <div className="section-heading">
                       <div>
                         <p className="section-title">Patch version</p>
-                        <p className="muted-text">
-                          Choose the SteamDB patch that matches the source
-                          release being queued.
-                        </p>
                       </div>
                       <button
                         className="ghost-button compact-button"
@@ -3033,20 +3496,11 @@ function App() {
                                           className="likely-match-chip"
                                           title={patchSuggestion.label}
                                         >
-                                          <svg
+                                          <FontAwesomeIcon
                                             aria-hidden="true"
                                             className="likely-match-icon"
-                                            fill="none"
-                                            viewBox="0 0 16 16"
-                                          >
-                                            <path
-                                              d="M3.5 8.1 6.5 11 12.8 4.7"
-                                              stroke="currentColor"
-                                              strokeLinecap="round"
-                                              strokeLinejoin="round"
-                                              strokeWidth="2"
-                                            />
-                                          </svg>
+                                            icon={faCheck}
+                                          />
                                           <span>Likely</span>
                                         </span>
                                       ) : null}
@@ -3148,6 +3602,7 @@ function App() {
                       }
                       type="button"
                     >
+                      <FontAwesomeIcon aria-hidden="true" icon={faFileImport} />
                       Open Desktop
                     </button>
                   </div>
@@ -3158,231 +3613,66 @@ function App() {
         ) : null}
 
         {activeTab === 'library' ? (
-          <section className="surface-card panel-card">
-            <div className="section-heading">
+          <section className="surface-card panel-card library-surface">
+            <div className="section-heading library-heading">
               <div>
                 <p className="section-title">Tracked library</p>
                 <p className="muted-text">
-                  Quick progress and status view for your current VaultTrack
-                  items.
+                  {libraryItems.length} current VaultTrack items.
                 </p>
               </div>
-              <button
-                className="ghost-button"
-                onClick={() =>
-                  void chrome.runtime.sendMessage({
-                    type: 'vaulttrack:open-desktop',
-                  })
-                }
-                type="button"
-              >
-                Open Desktop
-              </button>
+              <div className="library-heading__actions">
+                <div className="view-toggle" aria-label="Library view mode">
+                  <button
+                    aria-label="Card view"
+                    className={libraryViewMode === 'cards' ? 'is-active' : ''}
+                    onClick={() => setLibraryViewMode('cards')}
+                    type="button"
+                  >
+                    <FontAwesomeIcon
+                      aria-hidden="true"
+                      icon={faTableCellsLarge}
+                    />
+                  </button>
+                  <button
+                    aria-label="List view"
+                    className={libraryViewMode === 'list' ? 'is-active' : ''}
+                    onClick={() => setLibraryViewMode('list')}
+                    type="button"
+                  >
+                    <FontAwesomeIcon aria-hidden="true" icon={faList} />
+                  </button>
+                </div>
+                <button
+                  className="ghost-button compact-button"
+                  onClick={() =>
+                    void chrome.runtime.sendMessage({
+                      type: 'vaulttrack:open-desktop',
+                    })
+                  }
+                  type="button"
+                >
+                  <FontAwesomeIcon aria-hidden="true" icon={faFileImport} />
+                  Open Desktop
+                </button>
+              </div>
             </div>
-            <div className="library-list">
+            <div
+              className={
+                libraryViewMode === 'cards'
+                  ? 'library-card-grid'
+                  : 'library-list'
+              }
+            >
               {libraryItems.length === 0 ? (
-                <p className="muted-text">
-                  Your VaultTrack library is still empty.
-                </p>
+                <div className="empty-state">
+                  <strong>No tracked games yet.</strong>
+                  <p className="muted-text">
+                    Add a supported page or import from the desktop app.
+                  </p>
+                </div>
               ) : (
-                libraryItems.map((item) => {
-                  const progress = progressPercent(item);
-                  const showProgress = hasActiveProgress(item);
-                  const activity = getItemActivity(item);
-                  const fileState = getItemFileState(item);
-                  const trackingStatus = getPrimaryStatus(item);
-                  const lifecycleStatus = getLifecycleStatus(item);
-                  const isCompletingInstall =
-                    libraryAction?.kind === 'completeInstall' &&
-                    libraryAction.trackedItemId === item.item.id;
-                  const patchSourceLabel = formatPatchSourceLabel(
-                    item.selectedPatch?.selectionSource ??
-                      item.sourceSnapshot?.patchSelectionSource,
-                  );
-                  const canEditSourcePatch = Boolean(
-                    item.item.steamAppId && item.sourceSnapshot,
-                  );
-                  return (
-                    <article className="library-card" key={item.item.id}>
-                      <div className="library-card__top">
-                        <div>
-                          <strong>{item.item.title}</strong>
-                          <div className="candidate-meta">
-                            <span>{formatLabel(trackingStatus)}</span>
-                            <span>
-                              {item.selectedMirror
-                                ? `Mirror ${item.selectedMirror.label}`
-                                : 'Mirror not selected'}
-                            </span>
-                          </div>
-                        </div>
-                        <span className={`status-chip ${lifecycleStatus}`}>
-                          {formatLabel(lifecycleStatus)}
-                        </span>
-                      </div>
-                      <div className="library-detail-grid">
-                        <div>
-                          <strong>SteamDB</strong>
-                          <span>
-                            {formatRelativeTime(
-                              activity.lastSteamFeedCheckedAt,
-                            )}
-                          </span>
-                        </div>
-                        <div>
-                          <span className="library-detail-label-row">
-                            <strong>Source patch</strong>
-                            {canEditSourcePatch ? (
-                              <button
-                                aria-label={`Edit source patch for ${item.item.title}`}
-                                className="inline-icon-button"
-                                disabled={busy}
-                                onClick={() => void openSourcePatchEditor(item)}
-                                title="Edit source patch"
-                                type="button"
-                              >
-                                <svg
-                                  aria-hidden="true"
-                                  fill="none"
-                                  viewBox="0 0 16 16"
-                                >
-                                  <path
-                                    d="M3.4 10.9 3 13l2.1-.4 6.7-6.7-1.7-1.7-6.7 6.7Z"
-                                    stroke="currentColor"
-                                    strokeLinecap="round"
-                                    strokeLinejoin="round"
-                                    strokeWidth="1.5"
-                                  />
-                                  <path
-                                    d="m9.4 4.9 1.7 1.7"
-                                    stroke="currentColor"
-                                    strokeLinecap="round"
-                                    strokeWidth="1.5"
-                                  />
-                                </svg>
-                              </button>
-                            ) : null}
-                          </span>
-                          <span>
-                            {item.selectedPatch?.buildId ??
-                              item.sourceSnapshot?.observedBuildId ??
-                              'Unknown'}
-                          </span>
-                          {patchSourceLabel ? (
-                            <span>{patchSourceLabel}</span>
-                          ) : null}
-                        </div>
-                        <div>
-                          <strong>Latest patch</strong>
-                          <span>{item.latestPatch?.buildId ?? 'Unknown'}</span>
-                        </div>
-                        <div>
-                          <strong>Patch lag</strong>
-                          <span>{formatPatchLag(item)}</span>
-                        </div>
-                        <div>
-                          <strong>Source scan</strong>
-                          <span>{formatSourceScan(item)}</span>
-                        </div>
-                        <div>
-                          <strong>Folder</strong>
-                          <span>
-                            {fileState.finalPathExists
-                              ? 'Found'
-                              : fileState.finalPath
-                                ? 'Not found'
-                                : 'Unknown'}
-                          </span>
-                        </div>
-                      </div>
-                      {showProgress && item.currentDownload ? (
-                        <div className="progress-block">
-                          <div className="progress-track">
-                            <div
-                              className="progress-fill"
-                              style={{ width: `${progress ?? 0}%` }}
-                            />
-                          </div>
-                          <div className="progress-meta">
-                            <span>{formatDownloadSummary(item, progress)}</span>
-                            <span>{formatProgressAmount(item, progress)}</span>
-                            <span>
-                              {formatSpeed(item.currentDownload.speed)}
-                            </span>
-                            <span>
-                              {formatEta(item.currentDownload.etaSeconds)}
-                            </span>
-                          </div>
-                          {item.currentDownload.parts &&
-                          item.currentDownload.parts.length > 1 ? (
-                            <div className="progress-parts">
-                              {item.currentDownload.parts.map((part) => (
-                                <span key={part.id}>
-                                  {formatPartStatus(part)}
-                                </span>
-                              ))}
-                            </div>
-                          ) : null}
-                        </div>
-                      ) : null}
-                      <div className="action-row">
-                        {canRetryDownload(item) ? (
-                          <button
-                            className="ghost-button"
-                            disabled={busy}
-                            onClick={() => openRetrySelector(item)}
-                            type="button"
-                          >
-                            Retry Download
-                          </button>
-                        ) : null}
-                        {canMarkDownloadFailed(item) ? (
-                          <button
-                            className="danger-button"
-                            disabled={busy}
-                            onClick={() => void markDownloadFailed(item)}
-                            type="button"
-                          >
-                            Mark Failed
-                          </button>
-                        ) : null}
-                        {canCompleteStagedInstall(item) ? (
-                          <button
-                            className="primary-button"
-                            aria-busy={isCompletingInstall}
-                            disabled={busy}
-                            onClick={() => void completeStagedInstall(item)}
-                            type="button"
-                          >
-                            {isCompletingInstall
-                              ? 'Completing Install...'
-                              : 'Mark Install Complete'}
-                          </button>
-                        ) : null}
-                        <button
-                          className="ghost-button"
-                          disabled={busy}
-                          onClick={() =>
-                            void removeTrackedItem(item, 'tracking_only')
-                          }
-                          type="button"
-                        >
-                          Remove Tracking
-                        </button>
-                        <button
-                          className="danger-button"
-                          disabled={busy}
-                          onClick={() =>
-                            void removeTrackedItem(item, 'delete_files')
-                          }
-                          type="button"
-                        >
-                          Delete Files
-                        </button>
-                      </div>
-                    </article>
-                  );
-                })
+                libraryItems.map((item) => renderLibraryItem(item))
               )}
             </div>
           </section>
@@ -3502,7 +3792,10 @@ function App() {
                 >
                   {themeChoices.map((choice) => (
                     <button
-                      className={`segment-button ${settings.themeMode === choice ? 'is-active' : ''}`}
+                      aria-pressed={resolvedTheme === choice}
+                      className={`segment-button ${
+                        resolvedTheme === choice ? 'is-active' : ''
+                      }`}
                       disabled={themeBusy}
                       key={choice}
                       onClick={() => void saveTheme(choice)}
@@ -3681,6 +3974,7 @@ function App() {
           </section>
         ) : null}
       </main>
+      {renderLibraryDetailsModal()}
       {steamDbConfirmation ? (
         <div className="modal-backdrop" role="presentation">
           <div
@@ -3701,7 +3995,7 @@ function App() {
                 onClick={() => void clearSteamDbConfirmation()}
                 type="button"
               >
-                x
+                <FontAwesomeIcon aria-hidden="true" icon={faXmark} />
               </button>
             </div>
             <div className="confirmation-grid">
@@ -3779,7 +4073,7 @@ function App() {
                 onClick={() => setPatchFallbackMode(null)}
                 type="button"
               >
-                x
+                <FontAwesomeIcon aria-hidden="true" icon={faXmark} />
               </button>
             </div>
             {patchFallbackMode === 'choice' ? (
@@ -3888,7 +4182,7 @@ function App() {
                       onClick={closeSourcePatchEditor}
                       type="button"
                     >
-                      x
+                      <FontAwesomeIcon aria-hidden="true" icon={faXmark} />
                     </button>
                   </div>
 
@@ -4029,7 +4323,7 @@ function App() {
                       onClick={() => setRetrySelection(null)}
                       type="button"
                     >
-                      x
+                      <FontAwesomeIcon aria-hidden="true" icon={faXmark} />
                     </button>
                   </div>
                   {renderRetryMirrorDropdown({

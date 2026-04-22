@@ -7,8 +7,13 @@ const MIN_LEGACY_COVER_BYTES = 10000;
 
 interface StoreItemAssets {
   asset_url_format?: unknown;
+  header?: unknown;
+  hero_capsule?: unknown;
   library_capsule?: unknown;
   library_capsule_2x?: unknown;
+  library_hero?: unknown;
+  library_hero_2x?: unknown;
+  main_capsule?: unknown;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -46,6 +51,11 @@ function buildGetItemsUrl(appId: number): URL {
 function buildStoreAssetUrl(assets: StoreItemAssets): string | null {
   const format = stringOrNull(assets.asset_url_format);
   const filename =
+    stringOrNull(assets.library_hero_2x) ??
+    stringOrNull(assets.library_hero) ??
+    stringOrNull(assets.hero_capsule) ??
+    stringOrNull(assets.main_capsule) ??
+    stringOrNull(assets.header) ??
     stringOrNull(assets.library_capsule_2x) ??
     stringOrNull(assets.library_capsule);
   if (!format || !filename || !format.includes('${FILENAME}')) {
@@ -120,6 +130,11 @@ async function resolveLegacyCoverUrl(
   fetchImpl: typeof fetch,
 ): Promise<string | null> {
   const candidates = [
+    `${LEGACY_STEAM_CDN_BASE}/steam/apps/${appId}/library_hero_2x.jpg`,
+    `${LEGACY_STEAM_CDN_BASE}/steam/apps/${appId}/library_hero.jpg`,
+    `${LEGACY_STEAM_CDN_BASE}/steam/apps/${appId}/hero_capsule.jpg`,
+    `${LEGACY_STEAM_CDN_BASE}/steam/apps/${appId}/capsule_616x353.jpg`,
+    `${LEGACY_STEAM_CDN_BASE}/steam/apps/${appId}/header.jpg`,
     `${LEGACY_STEAM_CDN_BASE}/steam/apps/${appId}/library_600x900_2x.jpg`,
     `${LEGACY_STEAM_CDN_BASE}/steam/apps/${appId}/library_600x900.jpg`,
   ];
@@ -166,7 +181,7 @@ export function isSteamLibraryCoverUrl(url: string | null | undefined): boolean 
     const parsed = new URL(url);
     return (
       /(^|\.)steamstatic\.com$/i.test(parsed.hostname) &&
-      /\/(?:library_capsule(?:_2x)?|library_600x900(?:_2x)?)\.jpg$/i.test(
+      /\/(?:library_hero(?:_2x)?|hero_capsule|capsule_616x353|header)\.jpg$/i.test(
         parsed.pathname,
       )
     );

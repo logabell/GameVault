@@ -3,12 +3,17 @@ import {
   parseSteamDbBuildRowText,
   parseSteamDbBuildRowsFromDocument,
 } from '@vaulttrack/steam-core';
+import { icon } from '@fortawesome/fontawesome-svg-core';
+import { faCheck } from '@fortawesome/free-solid-svg-icons';
 
 import { detectSteamDbChallenge } from '../steamdb-challenge.js';
 
 const BUTTON_CLASS = 'vaulttrack-steamdb-select';
 const STYLE_ID = 'vaulttrack-steamdb-style';
 const BACKFILL_DEBOUNCE_MS = 500;
+const SELECT_ICON_HTML = icon(faCheck, {
+  classes: ['vaulttrack-steamdb-select__icon'],
+}).html.join('');
 
 type SteamDbContextMode = 'select' | 'backfill';
 type SteamDbBackfillFailure = {
@@ -30,22 +35,30 @@ function injectStyles(): void {
     .${BUTTON_CLASS} {
       display: inline-flex;
       align-items: center;
+      gap: 7px;
       justify-content: center;
-      min-width: 104px;
-      min-height: 30px;
-      padding: 6px 10px;
-      border: 1px solid rgba(15, 92, 255, 0.35);
-      border-radius: 6px;
-      background: #0f5cff;
-      color: #fff;
+      min-width: 112px;
+      min-height: 32px;
+      padding: 7px 11px;
+      border: 1px solid rgba(66, 199, 104, 0.42);
+      border-radius: 8px;
+      background: linear-gradient(180deg, #2fa456, #218343);
+      color: #f4fff6;
+      box-shadow: 0 8px 22px rgba(0, 0, 0, 0.28);
       cursor: pointer;
-      font: 700 12px/1.2 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font: 800 12px/1.2 "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      letter-spacing: 0.02em;
       white-space: nowrap;
+    }
+    .${BUTTON_CLASS} .vaulttrack-steamdb-select__icon {
+      width: 12px;
+      height: 12px;
+      flex: 0 0 auto;
     }
     .${BUTTON_CLASS}:hover,
     .${BUTTON_CLASS}:focus-visible {
-      background: #0947cb;
-      outline: 2px solid rgba(15, 92, 255, 0.24);
+      background: linear-gradient(180deg, #3fc46a, #27924c);
+      outline: 2px solid rgba(66, 199, 104, 0.28);
       outline-offset: 2px;
     }
   `;
@@ -73,13 +86,11 @@ function ensureActionHeader(row: HTMLTableRowElement): void {
   row.dataset.vaulttrackHeaderBound = 'true';
   const headerCell = document.createElement('th');
   headerCell.textContent = 'VaultTrack';
+  headerCell.style.whiteSpace = 'nowrap';
   row.append(headerCell);
 }
 
-function ensureActionButton(
-  row: HTMLTableRowElement,
-  appId: number,
-): void {
+function ensureActionButton(row: HTMLTableRowElement, appId: number): void {
   if (row.dataset.vaulttrackBound === 'true') {
     return;
   }
@@ -96,8 +107,9 @@ function ensureActionButton(
   const actionCell = document.createElement('td');
   const button = document.createElement('button');
   button.className = BUTTON_CLASS;
-  button.textContent = 'Select Patch';
   button.type = 'button';
+  button.insertAdjacentHTML('afterbegin', SELECT_ICON_HTML);
+  button.append(document.createTextNode('Select Patch'));
   button.addEventListener('click', (event) => {
     event.preventDefault();
     event.stopPropagation();
@@ -138,7 +150,10 @@ function getSteamDbLoadFailure(): SteamDbBackfillFailure | null {
     };
   }
 
-  if (/Sorry,\s*failed to load/i.test(pageText) && /ServerError/i.test(pageText)) {
+  if (
+    /Sorry,\s*failed to load/i.test(pageText) &&
+    /ServerError/i.test(pageText)
+  ) {
     return {
       kind: 'load_failed',
       message:
