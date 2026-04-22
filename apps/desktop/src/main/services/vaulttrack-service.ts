@@ -106,6 +106,7 @@ const SOURCE_DEFAULT_MIN_DELAY_MS = IS_TEST_ENV ? 0 : 250;
 const IMPORT_STEAM_MATCH_CONCURRENCY = 3;
 const STEAMDB_BUILD_LOOKUP_TTL_MS = 60 * 60 * 1000;
 const SOURCE_CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
+const STEAMRIP_UPLOAD_PATCH_WINDOW_DAYS = 2;
 const SOURCE_MATCH_PROBABLE_SCORE = 0.92;
 const SOURCE_MATCH_CANDIDATE_SCORE = 0.84;
 const SUPPORTED_SOURCE_KINDS: SupportedSourceKind[] = [
@@ -303,6 +304,51 @@ function normalizeSourceVersion(value: string | null | undefined): string | null
     .replace(/^v(?=\d)/i, '')
     .replace(/\s+/g, ' ');
   return normalized || null;
+}
+
+function numericVersionSegments(value: string | null | undefined): number[] | null {
+  const normalized = normalizeSourceVersion(value);
+  if (!normalized || !/^\d+(?:\.\d+)*$/.test(normalized)) {
+    return null;
+  }
+  return normalized.split('.').map((segment) => Number(segment));
+}
+
+function compareNumericVersions(
+  left: string | null | undefined,
+  right: string | null | undefined,
+): number | null {
+  const leftSegments = numericVersionSegments(left);
+  const rightSegments = numericVersionSegments(right);
+  if (!leftSegments || !rightSegments) {
+    return null;
+  }
+  const length = Math.max(leftSegments.length, rightSegments.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftValue = leftSegments[index] ?? 0;
+    const rightValue = rightSegments[index] ?? 0;
+    if (leftValue !== rightValue) {
+      return leftValue > rightValue ? 1 : -1;
+    }
+  }
+  return 0;
+}
+
+function dateOnlyTimestamp(value: string | null | undefined): number | null {
+  if (!value) {
+    return null;
+  }
+  const timestamp = new Date(`${value} 00:00:00`).getTime();
+  return Number.isNaN(timestamp) ? null : timestamp;
+}
+
+function dayDistance(left: string | null | undefined, right: string | null | undefined): number | null {
+  const leftTimestamp = dateOnlyTimestamp(left);
+  const rightTimestamp = dateOnlyTimestamp(right);
+  if (leftTimestamp == null || rightTimestamp == null) {
+    return null;
+  }
+  return Math.abs(leftTimestamp - rightTimestamp) / (24 * 60 * 60 * 1000);
 }
 
 function latestIsoTimestamp(
@@ -1033,6 +1079,60 @@ export class VaultTrackService {
       : null;
   }
 
+  private findUniquePatchNearUploadDate(
+    patchEntries: SteamPatchEntry[],
+    uploadDate: string | null | undefined,
+  ): SteamPatchEntry | null {
+    if (!uploadDate) {
+      return null;
+    }
+    const matches = patchEntries.filter((entry) => {
+      const distance = dayDistance(uploadDate, entry.patchDate);
+      return (
+        distance != null && distance <= STEAMRIP_UPLOAD_PATCH_WINDOW_DAYS
+      );
+    });
+    return matches.length === 1 ? matches[0]! : null;
+  }
+
+  private getComparableBaselineVersionsForSteamRip(
+    trackedItemId: string,
+  ): string[] {
+    const installRecord = this.database.getInstallRecord(trackedItemId);
+    const selectedPatch = this.getSelectedPatch(
+      trackedItemId,
+      this.database.getSteamMatch(trackedItemId),
+      this.getItemSourceSnapshot(
+        this.database.findTrackedItemById(trackedItemId)!,
+      ),
+      this.sortPatchEntries(this.database.listPatchEntries(trackedItemId)),
+    );
+    return [
+      installRecord?.installedVersion,
+      selectedPatch?.version,
+      ...this.database
+        .listSourceSnapshots(trackedItemId)
+        .filter((snapshot) => snapshot.sourceKind !== 'steamrip')
+        .map((snapshot) => snapshot.observedVersion),
+    ].filter((value): value is string => Boolean(numericVersionSegments(value)));
+  }
+
+  private steamRipVersionIsNewerThanKnownBaseline(
+    trackedItemId: string,
+    version: string | null | undefined,
+  ): boolean {
+    if (!numericVersionSegments(version)) {
+      return false;
+    }
+    const baselines = this.getComparableBaselineVersionsForSteamRip(trackedItemId);
+    if (baselines.length === 0) {
+      return false;
+    }
+    return baselines.every(
+      (baseline) => compareNumericVersions(version, baseline) === 1,
+    );
+  }
+
   private getRawSourceReleaseSignals(
     snapshot: SourceSnapshot,
     parsedSource?: ParsedSourcePayload | null,
@@ -1044,6 +1144,7 @@ export class VaultTrackService {
     return {
       buildId:
         numericSteamBuildId(parsedSource?.latestSourceRelease.buildId) ??
+        numericSteamBuildId(parsedSource?.catalogMetadata?.listedBuildId) ??
         numericSteamBuildId(snapshot.observedBuildId),
       patchDate:
         parsedSource?.latestSourceRelease.patchDate ??
@@ -1051,6 +1152,7 @@ export class VaultTrackService {
         null,
       version:
         parsedSource?.latestSourceRelease.version ??
+        parsedSource?.catalogMetadata?.listedVersion ??
         snapshot.observedVersion ??
         null,
     };
@@ -1071,11 +1173,33 @@ export class VaultTrackService {
       return this.findUniquePatchByDate(patchEntries, signals.patchDate);
     }
 
-    if (snapshot.sourceKind === 'steamrip') {
-      return this.findUniquePatchByVersion(patchEntries, signals.version);
+    return null;
+  }
+
+  private findInferredSteamRipPatchFromUploadDate(params: {
+    parsedSource?: ParsedSourcePayload | null;
+    patchEntries: SteamPatchEntry[];
+    trackedItemId: string;
+    version: string | null;
+  }): SteamPatchEntry | null {
+    const uploadDate =
+      params.parsedSource?.catalogMetadata?.method === 'recent_updates'
+        ? params.parsedSource.catalogMetadata.listedDate
+        : null;
+    if (
+      !uploadDate ||
+      !this.steamRipVersionIsNewerThanKnownBaseline(
+        params.trackedItemId,
+        params.version,
+      )
+    ) {
+      return null;
     }
 
-    return null;
+    return this.findUniquePatchNearUploadDate(
+      params.patchEntries,
+      uploadDate,
+    );
   }
 
   private reconcileSourcePatchAlignments(trackedItemId: string): void {
@@ -1173,7 +1297,23 @@ export class VaultTrackService {
       !directPatch && peerPatches?.size === 1
         ? Array.from(peerPatches.values())[0]!
         : null;
-    const matchedPatch = directPatch ?? inheritedPatch;
+    const versionPatch =
+      !directPatch && !inheritedPatch
+        ? this.findUniquePatchByVersion(patchEntries, normalizedSteamRipVersion)
+        : null;
+    const inferredPatch =
+      !directPatch &&
+      !inheritedPatch &&
+      !versionPatch &&
+      (!peerPatches || peerPatches.size === 0)
+        ? this.findInferredSteamRipPatchFromUploadDate({
+            parsedSource: parsedSteamRip,
+            patchEntries,
+            trackedItemId,
+            version: normalizedSteamRipVersion,
+          })
+        : null;
+    const matchedPatch = directPatch ?? inheritedPatch ?? versionPatch ?? inferredPatch;
     const nextSteamRipSnapshot = matchedPatch
       ? this.canonicalizeSourceSnapshotWithPatch(
           steamRipSnapshot,
@@ -1474,6 +1614,40 @@ export class VaultTrackService {
       : parseAnkerGamesCatalog(html);
   }
 
+  private mergeSteamRipCatalogEntries(
+    entries: SourceCatalogEntry[],
+  ): SourceCatalogEntry[] {
+    const merged = new Map<string, SourceCatalogEntry>();
+    const order: string[] = [];
+
+    for (const entry of entries) {
+      const key = comparableSourceUrl(entry.sourceUrl) ?? entry.sourceUrl;
+      const existing = merged.get(key);
+      if (!existing) {
+        merged.set(key, entry);
+        order.push(key);
+        continue;
+      }
+
+      const prefersRecentUpdates =
+        entry.method === 'recent_updates' ||
+        existing.method === 'recent_updates';
+      merged.set(key, {
+        ...existing,
+        listedBuildId:
+          entry.listedBuildId ?? existing.listedBuildId ?? null,
+        listedDate: entry.listedDate ?? existing.listedDate ?? null,
+        listedVersion:
+          entry.method === 'recent_updates'
+            ? entry.listedVersion ?? existing.listedVersion ?? null
+            : existing.listedVersion ?? entry.listedVersion ?? null,
+        method: prefersRecentUpdates ? 'recent_updates' : existing.method,
+      });
+    }
+
+    return order.map((key) => merged.get(key)!);
+  }
+
   private async getSourceCatalogEntries(
     sourceKind: SupportedSourceKind,
     options: SourceDiscoveryOptions = {},
@@ -1526,11 +1700,72 @@ export class VaultTrackService {
       );
     }
 
+    const normalizedEntries =
+      sourceKind === 'steamrip'
+        ? this.mergeSteamRipCatalogEntries(entries)
+        : entries;
     this.sourceCatalogCache.set(sourceKind, {
       capturedAt: Date.now(),
-      entries,
+      entries: normalizedEntries,
     });
-    return entries;
+    return normalizedEntries;
+  }
+
+  private steamRipCatalogEntryForParsedSource(
+    parsedSource: ParsedSourcePayload,
+    entries: SourceCatalogEntry[],
+  ): SourceCatalogEntry | null {
+    return (
+      entries.find(
+        (entry) =>
+          entry.sourceKind === 'steamrip' &&
+          sourceUrlsMatch(entry.sourceUrl, parsedSource.sourceUrl) &&
+          (entry.listedBuildId ||
+            entry.listedDate ||
+            entry.listedVersion ||
+            entry.method === 'recent_updates'),
+      ) ?? null
+    );
+  }
+
+  private withSteamRipCatalogMetadata(
+    parsedSource: ParsedSourcePayload,
+    entry: SourceCatalogEntry,
+  ): ParsedSourcePayload {
+    const existing = parsedSource.catalogMetadata;
+    return {
+      ...parsedSource,
+      catalogMetadata: {
+        listedBuildId:
+          entry.listedBuildId ?? existing?.listedBuildId ?? null,
+        listedDate: entry.listedDate ?? existing?.listedDate ?? null,
+        listedVersion:
+          entry.listedVersion ?? existing?.listedVersion ?? null,
+        method: entry.method ?? existing?.method ?? null,
+      },
+    };
+  }
+
+  private async enrichSteamRipParsedSourceWithCatalogMetadata(
+    parsedSource: ParsedSourcePayload,
+    options: SourceDiscoveryOptions = {},
+  ): Promise<ParsedSourcePayload> {
+    if (parsedSource.sourceKind !== 'steamrip') {
+      return parsedSource;
+    }
+
+    try {
+      const entries = await this.getSourceCatalogEntries('steamrip', options);
+      const entry = this.steamRipCatalogEntryForParsedSource(
+        parsedSource,
+        entries,
+      );
+      return entry
+        ? this.withSteamRipCatalogMetadata(parsedSource, entry)
+        : parsedSource;
+    } catch {
+      return parsedSource;
+    }
   }
 
   private extractSteamAppIdFromHtml(html: string): number | null {
@@ -1607,9 +1842,25 @@ export class VaultTrackService {
           bypassBackoff: params.bypassBackoff,
         }),
     );
+    const parsedSourceWithCatalogMetadata: ParsedSourcePayload =
+      params.candidate.sourceKind === 'steamrip' &&
+      (params.candidate.listedBuildId ||
+        params.candidate.listedDate ||
+        params.candidate.listedVersion ||
+        params.candidate.method === 'recent_updates')
+        ? {
+            ...parsedSource,
+            catalogMetadata: {
+              listedBuildId: params.candidate.listedBuildId ?? null,
+              listedDate: params.candidate.listedDate ?? null,
+              listedVersion: params.candidate.listedVersion ?? null,
+              method: params.candidate.method,
+            },
+          }
+        : parsedSource;
     const detailRank = rankSourceTitleMatch(
       params.expectedTitle,
-      parsedSource.title,
+      parsedSourceWithCatalogMetadata.title,
     );
     const exactSteamAppId =
       params.steamAppId != null && steamAppId === params.steamAppId;
@@ -1632,11 +1883,11 @@ export class VaultTrackService {
       lastCheckedAt: now,
       lastError: null,
       method,
-      normalizedTitle: parsedSource.normalizedTitle,
+      normalizedTitle: parsedSourceWithCatalogMetadata.normalizedTitle,
       score,
       sourceKind: params.candidate.sourceKind,
-      sourceTitle: parsedSource.title,
-      sourceUrl: parsedSource.sourceUrl,
+      sourceTitle: parsedSourceWithCatalogMetadata.title,
+      sourceUrl: parsedSourceWithCatalogMetadata.sourceUrl,
       status,
       trackedItemId: params.trackedItemId,
       updatedAt: now,
@@ -1649,7 +1900,7 @@ export class VaultTrackService {
       detailRank,
       exactSteamAppId,
       match,
-      parsedSource,
+      parsedSource: parsedSourceWithCatalogMetadata,
     };
   }
 
@@ -2090,7 +2341,7 @@ export class VaultTrackService {
       throw new Error(`Source match failed with ${response.status}`);
     }
 
-    const parsedSource = await parseSupportedPageForKindWithNetwork(
+    let parsedSource = await parseSupportedPageForKindWithNetwork(
       params.sourceKind,
       params.sourceUrl,
       await response.text(),
@@ -2098,6 +2349,13 @@ export class VaultTrackService {
         this.fetchSource(input, init, {
           bypassBackoff: true,
         }),
+    );
+    parsedSource = await this.enrichSteamRipParsedSourceWithCatalogMetadata(
+      parsedSource,
+      {
+        bypassBackoff: true,
+        forceCatalog: true,
+      },
     );
     const snapshot = this.buildSnapshotFromParsedSource(
       params.trackedItemId,
@@ -2987,11 +3245,17 @@ export class VaultTrackService {
     }
 
     const html = await response.text();
-    const parsedSource = await parseSupportedPageForKindWithNetwork(
+    let parsedSource = await parseSupportedPageForKindWithNetwork(
       item.sourceKind,
       item.sourceUrl,
       html,
       (input, init) => this.fetchSource(input, init),
+    );
+    parsedSource = await this.enrichSteamRipParsedSourceWithCatalogMetadata(
+      parsedSource,
+      {
+        forceCatalog: true,
+      },
     );
     if (
       parsedSource.sourceKind === 'ankergames' &&
@@ -3048,6 +3312,10 @@ export class VaultTrackService {
   async refreshMatchedSource(
     trackedItemId: string,
     sourceKind: SupportedSourceKind,
+    options: SourceDiscoveryOptions = {
+      bypassBackoff: true,
+      forceCatalog: true,
+    },
   ): Promise<TrackedItemView> {
     const match = this.database.getSourceMatch(trackedItemId, sourceKind);
     if (!match?.sourceUrl) {
@@ -3059,8 +3327,10 @@ export class VaultTrackService {
     }
     const steamMatch = this.database.getSteamMatch(trackedItemId);
 
+    const bypassBackoff = options.bypassBackoff ?? true;
+    const forceCatalog = options.forceCatalog ?? true;
     const response = await this.fetchSource(match.sourceUrl, undefined, {
-      bypassBackoff: true,
+      bypassBackoff,
     });
     const now = new Date().toISOString();
     if (!response.ok) {
@@ -3086,14 +3356,21 @@ export class VaultTrackService {
     const exactSteamAppId =
       steamMatch?.appId != null &&
       this.extractSteamAppIdFromHtml(html) === steamMatch.appId;
-    const parsedSource = await parseSupportedPageForKindWithNetwork(
+    let parsedSource = await parseSupportedPageForKindWithNetwork(
       sourceKind,
       match.sourceUrl,
       html,
       (input, init) =>
         this.fetchSource(input, init, {
-          bypassBackoff: true,
+          bypassBackoff,
         }),
+    );
+    parsedSource = await this.enrichSteamRipParsedSourceWithCatalogMetadata(
+      parsedSource,
+      {
+        bypassBackoff,
+        forceCatalog,
+      },
     );
     const latestPatch = this.getLatestPatch(trackedItemId);
     const matchedPatch = this.findPatchForSourceRelease(
@@ -4000,6 +4277,10 @@ export class VaultTrackService {
           await this.refreshMatchedSource(
             watch.trackedItemId,
             match.sourceKind,
+            {
+              bypassBackoff: false,
+              forceCatalog: false,
+            },
           ).catch((error) => {
             this.appendEvent('warn', 'Matched source refresh failed', {
               error:

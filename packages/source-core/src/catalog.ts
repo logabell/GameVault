@@ -253,7 +253,7 @@ export function parseSteamRipUpdatedGames(html: string): SourceCatalogEntry[] {
   let currentDate: string | null = null;
 
   $('body')
-    .find('h1,h2,h3,h4,p,li,a')
+    .find('h1,h2,h3,h4,div,p,li,a')
     .each((_index, element) => {
       const text = compactText($(element).text());
       const date = normalizeSlashDate(text);

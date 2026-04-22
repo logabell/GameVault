@@ -71,6 +71,12 @@ export interface ParsedSourcePayload {
   fullDownloadUrls: DownloadDescriptor[];
   patchDownloadUrls: DownloadDescriptor[];
   notes?: string[];
+  catalogMetadata?: {
+    listedBuildId?: string | null;
+    listedDate?: string | null;
+    listedVersion?: string | null;
+    method?: SourceMatchMethod | null;
+  } | null;
 }
 
 export interface SteamCandidate {

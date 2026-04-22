@@ -133,6 +133,26 @@ describe('source parsers', () => {
     ]);
 
     expect(
+      parseSteamRipUpdatedGames(`
+        <div class="updated-list-block">
+          <div class="updated-list-date">04/22/2026</div>
+          <ul class="updated-list">
+            <li class="updated-list-item">
+              <a href="/replaced-free-download/">REPLACED Free Download (v1.0.1102)</a>
+            </li>
+          </ul>
+        </div>
+      `)[0],
+    ).toEqual(
+      expect.objectContaining({
+        listedDate: '04/22/2026',
+        listedVersion: '1.0.1102',
+        method: 'recent_updates',
+        title: 'REPLACED',
+      }),
+    );
+
+    expect(
       parseElAmigosCatalog(`
         <h2>21.08.2025</h2>
         <h3>Elden Ring Deluxe Edition ElAmigos [Update 1.12.0] +[Update 1.16.1] <a href="/data/Elden_Ring_Deluxe_Edition_MULTi14_-_ElAmigos.html">DOWNLOAD</a></h3>
@@ -301,6 +321,28 @@ describe('source parsers', () => {
         version: '1.16.1',
       },
       title: 'Elden Ring Deluxe Edition',
+    });
+
+    expect(
+      parseSupportedPageForKind(
+        'steamrip',
+        'https://steamrip.com/replaced-free-download/',
+        `
+          <html><body>
+            <h1>REPLACED Free Download (v1.0.1102)</h1>
+            <h4>GAME INFO</h4>
+            <div>Version: v1.0.1102 | Portable | Pre-installed</div>
+            <a href="https://gofile.io/d/replaced">DOWNLOAD HERE</a>
+          </body></html>
+        `,
+      ),
+    ).toMatchObject({
+      latestSourceRelease: {
+        buildId: null,
+        patchDate: null,
+        version: '1.0.1102',
+      },
+      title: 'REPLACED',
     });
   });
 

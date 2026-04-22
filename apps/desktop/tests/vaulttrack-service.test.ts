@@ -347,6 +347,169 @@ function eldenRingParsedSource(params: {
   };
 }
 
+function replacedParsedSource(params: {
+  buildId?: string | null;
+  catalogListedBuildId?: string | null;
+  catalogListedDate?: string | null;
+  catalogListedVersion?: string | null;
+  patchDate?: string | null;
+  sourceKind: 'ankergames' | 'elamigos' | 'steamrip';
+  sourceUrl: string;
+  version: string;
+}): ParsedSourcePayload {
+  const catalogMetadata =
+    params.sourceKind === 'steamrip' &&
+    (params.catalogListedBuildId ||
+      params.catalogListedDate ||
+      params.catalogListedVersion)
+      ? {
+          listedBuildId: params.catalogListedBuildId ?? null,
+          listedDate: params.catalogListedDate ?? null,
+          listedVersion: params.catalogListedVersion ?? null,
+          method: 'recent_updates' as const,
+        }
+      : null;
+  return {
+    catalogMetadata,
+    coverUrl: null,
+    fingerprint: `${params.sourceKind}-replaced`,
+    fullDownloadUrls: [],
+    latestSourceRelease: {
+      buildId: params.buildId ?? null,
+      isPatch: false,
+      label: params.version,
+      patchDate: params.patchDate ?? null,
+      version: params.version,
+    },
+    normalizedTitle: 'replaced',
+    patchDownloadUrls: [],
+    sourceKind: params.sourceKind,
+    sourceUrl: params.sourceUrl,
+    title: 'REPLACED',
+  };
+}
+
+function seedReplacedSteamRipAlignmentScenario(
+  database: VaultTrackDatabase,
+  params: {
+    includeSteamRipCatalogMetadata?: boolean;
+    patchEntries?: Array<{
+      buildId: string;
+      patchDate: string;
+      patchTitle: string;
+      publishedAt: string;
+      version?: string | null;
+    }>;
+    steamRipListedDate?: string | null;
+    steamRipVersion?: string;
+  } = {},
+) {
+  const item = database.upsertTrackedItem({
+    normalizedTitle: 'replaced',
+    sourceKind: 'elamigos',
+    sourceUrl: 'https://elamigos.site/data/REPLACED_ElAmigos.html',
+    title: 'REPLACED',
+  });
+  database.upsertSteamMatch(item.id, {
+    appId: 1663850,
+    coverUrl: null,
+    matchedAt: '2026-04-22T12:00:00.000Z',
+    normalizedTitle: 'replaced',
+    title: 'REPLACED',
+  });
+  const patchEntries =
+    params.patchEntries ?? [
+      {
+        buildId: '22862896',
+        patchDate: '04/21/2026',
+        patchTitle: 'REPLACED update for 21 April 2026',
+        publishedAt: '2026-04-21T12:00:00.000Z',
+      },
+      {
+        buildId: '22838087',
+        patchDate: '04/17/2026',
+        patchTitle: '1097 UPDATE - 17th April',
+        publishedAt: '2026-04-17T12:00:00.000Z',
+        version: '1.0.1097',
+      },
+    ];
+  database.upsertPatchEntries(
+    patchEntries.map((entry) => ({
+      appId: 1663850,
+      link: `https://steamdb.info/patchnotes/${entry.buildId}/`,
+      title: entry.patchTitle,
+      trackedItemId: item.id,
+      ...entry,
+    })),
+  );
+  database.upsertInstallRecord({
+    installedAt: '04/17/2026',
+    installedBuildId: '22838087',
+    installedVersion: '1.0.1097',
+    trackedItemId: item.id,
+    updatedAt: '2026-04-22T12:00:00.000Z',
+  });
+
+  const payloads = [
+    replacedParsedSource({
+      buildId: '22838087',
+      patchDate: '04/17/2026',
+      sourceKind: 'elamigos',
+      sourceUrl: 'https://elamigos.site/data/REPLACED_ElAmigos.html',
+      version: '1.0.1097',
+    }),
+    replacedParsedSource({
+      catalogListedDate:
+        params.includeSteamRipCatalogMetadata === false
+          ? null
+          : params.steamRipListedDate ?? '04/22/2026',
+      catalogListedVersion:
+        params.includeSteamRipCatalogMetadata === false
+          ? null
+          : params.steamRipVersion ?? '1.0.1102',
+      sourceKind: 'steamrip',
+      sourceUrl: 'https://steamrip.com/replaced-free-download/',
+      version: params.steamRipVersion ?? '1.0.1102',
+    }),
+  ];
+
+  for (const payload of payloads) {
+    database.upsertSourceMatch({
+      confidence: 1,
+      createdAt: '2026-04-22T12:00:00.000Z',
+      isPrimary: payload.sourceKind === 'elamigos',
+      lastCheckedAt: '2026-04-22T12:00:00.000Z',
+      lastError: null,
+      method: payload.catalogMetadata?.method ?? 'fuzzy_title',
+      normalizedTitle: payload.normalizedTitle,
+      score: 1,
+      sourceKind: payload.sourceKind,
+      sourceTitle: payload.title,
+      sourceUrl: payload.sourceUrl,
+      status: 'probable',
+      trackedItemId: item.id,
+      updatedAt: '2026-04-22T12:00:00.000Z',
+      usable: true,
+    });
+    database.upsertSourceSnapshot({
+      checkedAt: '2026-04-22T12:00:00.000Z',
+      fingerprint: payload.fingerprint,
+      observedBuildId: payload.latestSourceRelease.buildId ?? null,
+      observedPatchDate: payload.latestSourceRelease.patchDate ?? null,
+      observedPatchLink: null,
+      observedPatchTitle: null,
+      observedVersion: payload.latestSourceRelease.version,
+      patchSelectionSource: null,
+      sourceKind: payload.sourceKind,
+      sourceUrl: payload.sourceUrl,
+      trackedItemId: item.id,
+    });
+    database.setRawParsedSourcePayload(item.id, payload);
+  }
+
+  return item;
+}
+
 function createService(
   database: VaultTrackDatabase,
   queueLinks: unknown = vi.fn(async () => ({
@@ -4109,6 +4272,244 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         },
         updateStatus: 'newer_than_installed',
         versionsBehindLatest: 1,
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('infers SteamRIP patch alignment from updated-games timing and higher version', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = seedReplacedSteamRipAlignmentScenario(database);
+
+      const [view] = await createService(database).listTrackedItems();
+      const steamrip = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'steamrip',
+      );
+
+      expect(steamrip).toMatchObject({
+        isUpdateSource: true,
+        matchedPatch: {
+          buildId: '22862896',
+          patchDate: '04/21/2026',
+          patchTitle: 'REPLACED update for 21 April 2026',
+        },
+        snapshot: {
+          observedBuildId: '22862896',
+          observedPatchDate: '04/21/2026',
+          observedPatchTitle: 'REPLACED update for 21 April 2026',
+          observedVersion: '1.0.1102',
+        },
+        updateStatus: 'matches_upstream',
+        versionsBehindLatest: 0,
+      });
+      expect(
+        database.getRawParsedSourcePayload(item.id, 'steamrip')?.catalogMetadata,
+      ).toMatchObject({
+        listedDate: '04/22/2026',
+        listedVersion: '1.0.1102',
+        method: 'recent_updates',
+      });
+      expect(
+        database.getRawParsedSourcePayload(
+          item.id,
+          'steamrip',
+        )?.latestSourceRelease.patchDate,
+      ).toBeNull();
+      expect(
+        database.getSourceSnapshot(item.id, 'steamrip')?.observedPatchDate,
+      ).toBe('04/21/2026');
+      expect(
+        database.getSourceSnapshot(item.id, 'steamrip')?.observedPatchDate,
+      ).not.toBe('04/22/2026');
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('adds SteamRIP updated-games metadata during per-source refresh before inferring a patch', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = seedReplacedSteamRipAlignmentScenario(database, {
+        includeSteamRipCatalogMetadata: false,
+      });
+      const sourceFetch: SourceFetch = vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === 'https://steamrip.com/replaced-free-download/') {
+          return new Response(
+            `
+              <html><body>
+                <h1>REPLACED Free Download (v1.0.1102)</h1>
+                <h4>GAME INFO</h4>
+                <div>Version: v1.0.1102 | Portable | Pre-installed</div>
+                <a href="https://gofile.io/d/replaced">DOWNLOAD HERE</a>
+              </body></html>
+            `,
+            { status: 200 },
+          );
+        }
+        if (url === 'https://steamrip.com/games-list-page/') {
+          return new Response(
+            `<a href="/replaced-free-download/">REPLACED Free Download (v1.0.1102)</a>`,
+            { status: 200 },
+          );
+        }
+        if (url === 'https://steamrip.com/updated-games/') {
+          return new Response(
+            `
+              <h2>04/22/2026</h2>
+              <a href="/replaced-free-download/">REPLACED Free Download (v1.0.1102)</a>
+            `,
+            { status: 200 },
+          );
+        }
+        return new Response('', { status: 404 });
+      });
+
+      const view = await createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      ).refreshMatchedSource(item.id, 'steamrip');
+      const steamrip = view.sourceMatches.find(
+        (source) => source.match.sourceKind === 'steamrip',
+      );
+
+      expect(steamrip).toMatchObject({
+        matchedPatch: {
+          buildId: '22862896',
+          patchDate: '04/21/2026',
+          patchTitle: 'REPLACED update for 21 April 2026',
+        },
+        snapshot: {
+          observedBuildId: '22862896',
+          observedPatchDate: '04/21/2026',
+          observedVersion: '1.0.1102',
+        },
+        updateStatus: 'matches_upstream',
+      });
+      expect(
+        database.getRawParsedSourcePayload(item.id, 'steamrip')?.catalogMetadata,
+      ).toMatchObject({
+        listedDate: '04/22/2026',
+        listedVersion: '1.0.1102',
+        method: 'recent_updates',
+      });
+      expect(
+        database.getRawParsedSourcePayload(
+          item.id,
+          'steamrip',
+        )?.latestSourceRelease.patchDate,
+      ).toBeNull();
+      expect(
+        database.getSourceSnapshot(item.id, 'steamrip')?.observedPatchDate,
+      ).not.toBe('04/22/2026');
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('does not infer SteamRIP alignment when the upload date is outside the patch window', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      seedReplacedSteamRipAlignmentScenario(database, {
+        patchEntries: [
+          {
+            buildId: '22862896',
+            patchDate: '04/19/2026',
+            patchTitle: 'REPLACED update for 19 April 2026',
+            publishedAt: '2026-04-19T12:00:00.000Z',
+          },
+          {
+            buildId: '22838087',
+            patchDate: '04/17/2026',
+            patchTitle: '1097 UPDATE - 17th April',
+            publishedAt: '2026-04-17T12:00:00.000Z',
+            version: '1.0.1097',
+          },
+        ],
+      });
+
+      const [view] = await createService(database).listTrackedItems();
+      const steamrip = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'steamrip',
+      );
+
+      expect(steamrip?.matchedPatch).toBeNull();
+      expect(steamrip?.snapshot).toMatchObject({
+        observedBuildId: null,
+        observedPatchDate: null,
+        observedVersion: '1.0.1102',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('does not infer SteamRIP alignment when multiple patches are near the upload date', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      seedReplacedSteamRipAlignmentScenario(database, {
+        patchEntries: [
+          {
+            buildId: '22862896',
+            patchDate: '04/21/2026',
+            patchTitle: 'REPLACED update for 21 April 2026',
+            publishedAt: '2026-04-21T12:00:00.000Z',
+          },
+          {
+            buildId: '22862999',
+            patchDate: '04/22/2026',
+            patchTitle: 'REPLACED hotfix for 22 April 2026',
+            publishedAt: '2026-04-22T12:00:00.000Z',
+          },
+          {
+            buildId: '22838087',
+            patchDate: '04/17/2026',
+            patchTitle: '1097 UPDATE - 17th April',
+            publishedAt: '2026-04-17T12:00:00.000Z',
+            version: '1.0.1097',
+          },
+        ],
+      });
+
+      const [view] = await createService(database).listTrackedItems();
+      const steamrip = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'steamrip',
+      );
+
+      expect(steamrip?.matchedPatch).toBeNull();
+      expect(steamrip?.snapshot).toMatchObject({
+        observedBuildId: null,
+        observedPatchDate: null,
+        observedVersion: '1.0.1102',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('does not infer SteamRIP alignment when the version is not newer than the known baseline', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      seedReplacedSteamRipAlignmentScenario(database, {
+        steamRipVersion: '1.0.1096',
+      });
+
+      const [view] = await createService(database).listTrackedItems();
+      const steamrip = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'steamrip',
+      );
+
+      expect(steamrip?.matchedPatch).toBeNull();
+      expect(steamrip?.snapshot).toMatchObject({
+        observedBuildId: null,
+        observedPatchDate: null,
+        observedVersion: '1.0.1096',
       });
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
