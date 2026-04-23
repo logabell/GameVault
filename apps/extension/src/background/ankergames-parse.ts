@@ -27,7 +27,7 @@ function normalizeComparableUrl(value: string | null | undefined): string | null
 
 export function isAnkergamesBrowserDownloadUrl(
   value: string | null | undefined,
-): boolean {
+): value is string {
   return Boolean(
     value &&
       (isAnkerGamesProxyDownloadUrl(value) ||

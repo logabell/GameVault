@@ -37,6 +37,7 @@ import { NativeBridgeServer } from './services/bridge.js';
 import { MyJDownloaderService } from './services/myjdownloader.js';
 import { VaultTrackScheduler } from './services/scheduler.js';
 import {
+  type VaultTrackService,
   type StartEmbeddedBrowserDownloadParams,
 } from './services/vaulttrack-service.js';
 

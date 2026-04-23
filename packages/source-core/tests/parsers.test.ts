@@ -546,6 +546,32 @@ describe('source parsers', () => {
     expect(parsed.latestSourceRelease.buildId).toBe('22630308');
   });
 
+  it('parses Ankergames current build from the version dropdown row', () => {
+    const parsed = parseSupportedPage(
+      'https://ankergames.net/game/shape-of-dreams',
+      ankerGamesHtml().replace(
+        '<span class="animate-glow">V 1.2.1.7</span>',
+        `<div class="rounded-lg">
+          <button type="button">
+            <span>Current Version</span>
+            <span class="text-gray-900 dark:text-white font-mono text-xs">V 1.4.0</span>
+          </button>
+          <div class="grid grid-cols-2">
+            <span>Current Build</span>
+            <span class="text-gray-900 dark:text-white font-mono text-xs">22813976</span>
+          </div>
+          <div class="grid grid-cols-2">
+            <span>Latest Build</span>
+            <span class="text-gray-900 dark:text-white font-mono text-xs">99999999</span>
+          </div>
+        </div>`,
+      ),
+    );
+
+    expect(parsed.latestSourceRelease.version).toBe('V 1.4.0');
+    expect(parsed.latestSourceRelease.buildId).toBe('22813976');
+  });
+
   it('hydrates Ankergames current version and build from the Livewire status component', async () => {
     const fetchMock = vi.fn(async (input: string, init?: RequestInit) => {
       if (input === 'https://ankergames.net/csrf-token') {

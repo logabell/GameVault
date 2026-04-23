@@ -468,3 +468,38 @@ export function getSourceDownloadSelection(
     sourceKind: source?.match.sourceKind ?? null,
   };
 }
+
+export function hasActionableSourceUpdate(item: TrackedItemView): boolean {
+  return (
+    item.patchMetadataStatus !== 'needs_attention' &&
+    ((item as Partial<TrackedItemView>).trackingStatus ??
+      'watching_source') === 'update_available'
+  );
+}
+
+function sourceHasSelectableFullMirror(source: MatchedSourceView): boolean {
+  return Boolean(
+    source.match.usable &&
+      source.match.sourceUrl &&
+      source.downloadMirrors.some((mirror) => mirror.kind === 'full'),
+  );
+}
+
+export function getPreferredUpdateSource(
+  item: TrackedItemView,
+): MatchedSourceView | null {
+  return (
+    item.sourceMatches.find(
+      (source) =>
+        source.isUpdateSource && sourceHasSelectableFullMirror(source),
+    ) ??
+    item.sourceMatches.find(
+      (source) =>
+        source.match.isPrimary && sourceHasSelectableFullMirror(source),
+    ) ??
+    item.sourceMatches.find(sourceHasSelectableFullMirror) ??
+    item.sourceMatches.find((source) => source.isUpdateSource) ??
+    item.sourceMatches[0] ??
+    null
+  );
+}

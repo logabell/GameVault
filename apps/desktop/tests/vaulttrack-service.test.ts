@@ -569,7 +569,9 @@ function createService(
   startAnkerGamesEmbeddedDownload: AnkerGamesEmbeddedBrowserDownloadRunner = vi.fn(
     () => ({
       cancel: vi.fn(),
-      completion: new Promise(() => undefined),
+      completion: new Promise<{ fileName: string; savePath: string }>(
+        () => undefined,
+      ),
     }),
   ),
 ): VaultTrackService {

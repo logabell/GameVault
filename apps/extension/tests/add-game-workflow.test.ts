@@ -11,15 +11,18 @@ import type {
   SupportedSourceKind,
   TrackedItemView,
 } from '@vaulttrack/shared-types';
+import { TrackedItemTrackingStatus } from '@vaulttrack/shared-types';
 
 import {
   buildCreateMatchedDraftMessage,
+  getPreferredUpdateSource,
   getDownloadAutomationWarning,
   getDownloadQueueSuccessMessage,
   getHeroPresenceState,
   getLikelyPatchForSelectedSource,
   getSourceComparisonLabel,
   getSourceDownloadSelection,
+  hasActionableSourceUpdate,
   isSourceReadyForAutomation,
   trackedItemMatchesSourceUrls,
 } from '../src/popup/add-game-workflow.js';
@@ -157,6 +160,32 @@ function sourceView(
   };
 }
 
+function trackedItem(
+  overrides: Partial<TrackedItemView> = {},
+): TrackedItemView {
+  return {
+    activity: {},
+    currentDownload: null,
+    downloadMirrors: [],
+    fileState: {
+      finalPathExists: true,
+    },
+    installRecord: null,
+    item: {
+      createdAt: now,
+      id: 'tracked-1',
+      normalizedTitle: 'shape of dreams',
+      sourceKind: 'elamigos',
+      title: 'Shape of Dreams',
+      updatedAt: now,
+    },
+    sourceMatches: [],
+    status: 'installed',
+    trackingStatus: 'up_to_date',
+    ...overrides,
+  } as unknown as TrackedItemView;
+}
+
 describe('extension add-game workflow helpers', () => {
   it('builds a Steam-match draft request before any mirror selection is required', () => {
     const message = buildCreateMatchedDraftMessage({
@@ -209,6 +238,72 @@ describe('extension add-game workflow helpers', () => {
     expect(selection.selectedDownloads?.fullUrl).not.toBe(
       parsedSource.fullDownloadUrls[0]?.url,
     );
+  });
+
+  it('marks only actionable source updates for the library update button', () => {
+    expect(
+      hasActionableSourceUpdate(
+        trackedItem({
+          trackingStatus: TrackedItemTrackingStatus.UpdateAvailable,
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      hasActionableSourceUpdate(
+        trackedItem({
+          patchMetadataStatus: 'needs_attention',
+          trackingStatus: TrackedItemTrackingStatus.UpdateAvailable,
+        }),
+      ),
+    ).toBe(false);
+    expect(hasActionableSourceUpdate(trackedItem())).toBe(false);
+  });
+
+  it('prefers a usable update source with a full mirror', () => {
+    const primary = sourceView('elamigos', { observedBuildId: '100' }, [
+      mirror('elamigos', 'full', 'https://elamigos.example.test/full', 'Full'),
+    ]);
+    const update = {
+      ...sourceView('steamrip', { observedBuildId: '200' }, [
+        mirror(
+          'steamrip',
+          'full',
+          'https://steamrip.example.test/full',
+          'Full',
+        ),
+      ]),
+      isUpdateSource: true,
+    };
+
+    expect(
+      getPreferredUpdateSource(
+        trackedItem({
+          sourceMatches: [primary, update],
+        }),
+      )?.match.sourceKind,
+    ).toBe('steamrip');
+  });
+
+  it('falls back to the primary selectable source when no source is marked update', () => {
+    const primary = sourceView('elamigos', { observedBuildId: '100' }, [
+      mirror('elamigos', 'full', 'https://elamigos.example.test/full', 'Full'),
+    ]);
+    const secondary = sourceView('ankergames', { observedBuildId: '200' }, [
+      mirror(
+        'ankergames',
+        'full',
+        'https://ankergames.example.test/full',
+        'Full',
+      ),
+    ]);
+
+    expect(
+      getPreferredUpdateSource(
+        trackedItem({
+          sourceMatches: [secondary, primary],
+        }),
+      )?.match.sourceKind,
+    ).toBe('elamigos');
   });
 
   it('changes the patch suggestion when the selected source changes', () => {

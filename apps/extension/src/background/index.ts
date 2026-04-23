@@ -37,6 +37,7 @@ const NATIVE_HOST_NAME = 'com.vaulttrack.desktop';
 const AUTO_OPEN_PREFIX = 'autoOpen';
 const ACTIVE_DRAFT_KEY = 'activeDraft';
 const CLIPBOARD_DRAFT_KEY = 'clipboardDraft';
+const POPUP_REOPEN_PREFIX = 'popupReopen';
 const STATUS_CACHE_TTL_MS = 30 * 1000;
 const PARSE_CACHE_PREFIX = 'parsedPage:v2';
 const STATUS_CACHE_PREFIX = 'trackedStatus';
@@ -69,6 +70,11 @@ interface DraftShellContext {
 
 interface StoredDraftPointer {
   tabId: number;
+  url: string;
+}
+
+interface PopupReopenRequest {
+  createdAt: number;
   url: string;
 }
 
@@ -521,9 +527,68 @@ function getAutoOpenKey(tabId: number, url: string): string {
   return `${AUTO_OPEN_PREFIX}:${tabId}:${url}`;
 }
 
+function getPopupReopenKey(tabId: number, url: string): string {
+  return `${POPUP_REOPEN_PREFIX}:${tabId}:${canonicalizeSupportedUrl(url)}`;
+}
+
 async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   return tab ?? null;
+}
+
+async function openActionPopupForTab(
+  tabId: number,
+  options: { respectToolbarSetting?: boolean } = {},
+): Promise<void> {
+  try {
+    if (options.respectToolbarSetting) {
+      const userSettings = chrome.action.getUserSettings
+        ? await chrome.action.getUserSettings()
+        : null;
+      if (userSettings && !userSettings.isOnToolbar) {
+        return;
+      }
+    }
+    if (chrome.action.openPopup) {
+      const tab = await chrome.tabs.get(tabId);
+      await chrome.action.openPopup({
+        windowId: tab.windowId,
+      });
+    }
+  } catch {
+    // Popup opening is best-effort and can be blocked by the browser.
+  }
+}
+
+async function requestPopupReopenAfterNavigation(
+  tabId: number,
+  url: string,
+): Promise<void> {
+  await setSessionValue(getPopupReopenKey(tabId, url), {
+    createdAt: Date.now(),
+    url: canonicalizeSupportedUrl(url),
+  } satisfies PopupReopenRequest);
+}
+
+async function maybeReopenPopupAfterNavigation(params: {
+  tabId: number;
+  url: string;
+}): Promise<boolean> {
+  const key = getPopupReopenKey(params.tabId, params.url);
+  const request = await getSessionValue<PopupReopenRequest>(key);
+  if (!request) {
+    return false;
+  }
+
+  await chrome.storage.session.remove(key);
+  if (Date.now() - request.createdAt > 30000) {
+    return false;
+  }
+
+  await openActionPopupForTab(params.tabId, {
+    respectToolbarSetting: false,
+  });
+  return true;
 }
 
 async function requestPageProbe(tabId: number): Promise<PageProbe> {
@@ -739,22 +804,9 @@ async function maybeAutoOpenDetectedPage(params: {
     title: 'VaultTrack is ready on this page',
   });
 
-  try {
-    const userSettings = chrome.action.getUserSettings
-      ? await chrome.action.getUserSettings()
-      : null;
-    if (userSettings && !userSettings.isOnToolbar) {
-      return;
-    }
-    if (chrome.action.openPopup) {
-      const tab = await chrome.tabs.get(params.tabId);
-      await chrome.action.openPopup({
-        windowId: tab.windowId,
-      });
-    }
-  } catch {
-    // Fall back to badge-only prompting when popup opening is blocked by the browser.
-  }
+  await openActionPopupForTab(params.tabId, {
+    respectToolbarSetting: true,
+  });
 }
 
 function cacheHealthFromResponse(response: NativeMessageResponse): void {
@@ -1793,11 +1845,17 @@ async function warmSupportedTab(params: {
   }
   await setReadyBadge(params.tabId);
   if (params.isActive) {
-    await maybeAutoOpenDetectedPage({
-      fingerprint: params.fingerprint,
+    const reopened = await maybeReopenPopupAfterNavigation({
       tabId: params.tabId,
       url: params.url,
     });
+    if (!reopened) {
+      await maybeAutoOpenDetectedPage({
+        fingerprint: params.fingerprint,
+        tabId: params.tabId,
+        url: params.url,
+      });
+    }
   }
 
   return parsedSource;
@@ -1825,11 +1883,17 @@ async function handleSupportedTab(
       }
       await setReadyBadge(tabId);
       if (isActive) {
-        await maybeAutoOpenDetectedPage({
-          fingerprint: pageProbe.fingerprint,
+        const reopened = await maybeReopenPopupAfterNavigation({
           tabId,
           url: pageProbe.url,
         });
+        if (!reopened) {
+          await maybeAutoOpenDetectedPage({
+            fingerprint: pageProbe.fingerprint,
+            tabId,
+            url: pageProbe.url,
+          });
+        }
       }
       return;
     }
@@ -1880,7 +1944,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           }
           await setReadyBadge(tabId);
           if (sender.tab?.active) {
-            await maybeAutoOpenDetectedPage({ fingerprint, tabId, url });
+            const reopened = await maybeReopenPopupAfterNavigation({
+              tabId,
+              url,
+            });
+            if (!reopened) {
+              await maybeAutoOpenDetectedPage({ fingerprint, tabId, url });
+            }
           }
           sendResponse({ ok: true, payload: cached.parsedSource });
           return;
@@ -1953,6 +2023,44 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           typeof message.tabId === 'number' ? (message.tabId as number) : null,
       });
       sendResponse({ ok: true, payload: draftStatus });
+      return;
+    }
+
+    if (message.type === 'vaulttrack:open-source-detail-page') {
+      const targetUrl =
+        typeof message.url === 'string' ? (message.url as string) : null;
+      if (!targetUrl || !isSupportedDetailPage(targetUrl)) {
+        sendResponse({
+          message: 'Source detail page is unavailable.',
+          ok: false,
+        });
+        return;
+      }
+
+      const providedTabId =
+        typeof message.tabId === 'number' ? (message.tabId as number) : null;
+      const activeTab = providedTabId != null ? null : await getActiveTab();
+      const targetTabId = providedTabId ?? activeTab?.id ?? null;
+      if (typeof targetTabId !== 'number') {
+        sendResponse({
+          message: 'Current browser tab is unavailable.',
+          ok: false,
+        });
+        return;
+      }
+
+      const canonicalUrl = canonicalizeSupportedUrl(targetUrl);
+      await setActiveDraft(targetTabId, canonicalUrl);
+      await requestPopupReopenAfterNavigation(targetTabId, canonicalUrl);
+      const tab = await chrome.tabs.update(targetTabId, {
+        active: true,
+        url: canonicalUrl,
+      });
+      const windowId = tab?.windowId;
+      if (typeof windowId === 'number') {
+        await chrome.windows.update(windowId, { focused: true });
+      }
+      sendResponse({ ok: true, payload: { tabId: targetTabId } });
       return;
     }
 

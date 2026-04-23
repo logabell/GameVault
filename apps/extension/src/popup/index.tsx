@@ -1,5 +1,6 @@
 import {
   type SyntheticEvent,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -8,6 +9,7 @@ import {
 import { createRoot } from 'react-dom/client';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import {
+  faArrowLeft,
   faCheck,
   faCircleInfo,
   faEllipsis,
@@ -42,6 +44,7 @@ import type {
 
 import {
   buildCreateMatchedDraftMessage,
+  getPreferredUpdateSource,
   getDownloadAutomationWarning,
   getDownloadQueueSuccessMessage,
   getDownloadQueueTimeoutMessage,
@@ -53,6 +56,7 @@ import {
   getSourceDownloadSelection,
   getSourceMatchPatchKey,
   haveSharedMirrorUrls,
+  hasActionableSourceUpdate,
   isSourceReadyForAutomation,
   normalizeComparableUrl,
   trackedItemMatchesSourceUrls,
@@ -78,6 +82,10 @@ const STATUS_REFRESH_MESSAGE_TIMEOUT_MS = 10000;
 const STEAMDB_BACKFILL_POLL_INTERVAL_MS = 750;
 const STEAMDB_BACKFILL_POLL_TIMEOUT_MS = 26000;
 const EXTENSION_LIBRARY_VIEW_STORAGE_KEY = 'vaulttrack:extension:library-view';
+const EXTENSION_POPUP_STATE_STORAGE_PREFIX =
+  'vaulttrack:extension:popup-state';
+const EXTENSION_POPUP_STATE_VERSION = 1;
+const EXTENSION_POPUP_STATE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const STEAM_LEGACY_APP_ART_BASE =
   'https://cdn.cloudflare.steamstatic.com/steam/apps';
 
@@ -160,6 +168,39 @@ interface SourcePatchEditorState {
   loading: boolean;
   patches: SteamPatchCandidate[];
   selectedKey: string | null;
+}
+
+interface StoredPopupState {
+  activeTab: PopupTab;
+  matchedDraftItemId: string | null;
+  savedAt: number;
+  selectedAppId: number | null;
+  selectedFullMirrorUrl: string | null;
+  selectedPatchMirrorUrl: string | null;
+  selectedSourceKind: SupportedSourceKind | null;
+  selectedSteamPatchKey: string | null;
+  sourceUrl: string;
+  steamCandidates: SteamCandidate[];
+  steamDbBackfillStatus: SteamDbBackfillStatus;
+  steamPatches: SteamPatchCandidate[];
+  steamSearchQuery: string;
+  step: FlowStep;
+  version: typeof EXTENSION_POPUP_STATE_VERSION;
+}
+
+interface WorkflowSnapshot {
+  finishQueued: boolean;
+  matchedDraftItemId: string | null;
+  selectedAppId: number | null;
+  selectedFullMirrorUrl: string | null;
+  selectedPatchMirrorUrl: string | null;
+  selectedSourceKind: SupportedSourceKind | null;
+  selectedSteamPatchKey: string | null;
+  steamCandidates: SteamCandidate[];
+  steamDbBackfillStatus: SteamDbBackfillStatus;
+  steamPatches: SteamPatchCandidate[];
+  steamSearchQuery: string;
+  step: FlowStep;
 }
 
 const STEAM_EDITION_NOISE_RE =
@@ -322,6 +363,13 @@ function formatSourceKind(value: string | null | undefined): string {
   return formatLabel(value);
 }
 
+function formatSourceSignalValue(value: string | null | undefined): string {
+  const trimmed = value?.trim();
+  return trimmed && !/^(?:unknown|version|build)$/i.test(trimmed)
+    ? trimmed
+    : 'N/A';
+}
+
 function normalizeSteamPatchCandidate(
   value: unknown,
   fallbackAppId: number,
@@ -387,15 +435,6 @@ function isPatchSelectionSource(value: unknown): value is PatchSelectionSource {
     value === 'manual' ||
     value === 'older_than_available'
   );
-}
-
-function formatPatchSourceLabel(
-  value: PatchSelectionSource | null | undefined,
-): string | null {
-  if (value === 'manual') return 'Manual';
-  if (value === 'steamdb_builds') return 'Build table';
-  if (value === 'rss') return 'RSS';
-  return null;
 }
 
 function createOlderThanAvailablePatch(appId: number): SteamPatchCandidate {
@@ -518,6 +557,140 @@ function readStoredLibraryViewMode(
     return value === 'list' || value === 'cards' ? value : fallback;
   } catch {
     return fallback;
+  }
+}
+
+function isPopupTab(value: unknown): value is PopupTab {
+  return value === 'game' || value === 'library' || value === 'settings';
+}
+
+function isFlowStep(value: unknown): value is FlowStep {
+  return (
+    value === 'game' ||
+    value === 'steam' ||
+    value === 'patch' ||
+    value === 'done'
+  );
+}
+
+function isSupportedSourceKind(value: unknown): value is SupportedSourceKind {
+  return value === 'ankergames' || value === 'elamigos' || value === 'steamrip';
+}
+
+function isSteamDbBackfillStatus(
+  value: unknown,
+): value is SteamDbBackfillStatus {
+  return (
+    value === 'idle' ||
+    value === 'loading' ||
+    value === 'loaded' ||
+    value === 'failed'
+  );
+}
+
+function getPopupStateStorageKey(sourceUrl: string | null | undefined) {
+  const normalizedUrl = normalizeComparableUrl(sourceUrl);
+  return normalizedUrl
+    ? `${EXTENSION_POPUP_STATE_STORAGE_PREFIX}:${normalizedUrl}`
+    : null;
+}
+
+function normalizeStoredSteamCandidates(value: unknown): SteamCandidate[] {
+  if (!Array.isArray(value)) return [];
+
+  return value.filter((entry): entry is SteamCandidate => {
+    const candidate = entry as Partial<SteamCandidate>;
+    return (
+      candidate &&
+      typeof candidate === 'object' &&
+      typeof candidate.appId === 'number' &&
+      typeof candidate.title === 'string' &&
+      typeof candidate.normalizedTitle === 'string' &&
+      typeof candidate.score === 'number' &&
+      Array.isArray(candidate.reasons)
+    );
+  });
+}
+
+function normalizeStoredSteamPatches(
+  value: unknown,
+  fallbackAppId: number | null,
+): SteamPatchCandidate[] {
+  if (!Array.isArray(value)) return [];
+
+  return value
+    .map((entry) => {
+      const record = entry as Partial<SteamPatchCandidate>;
+      const appId =
+        typeof record?.appId === 'number' ? record.appId : fallbackAppId;
+      return appId ? normalizeSteamPatchCandidate(entry, appId) : null;
+    })
+    .filter((entry): entry is SteamPatchCandidate => entry != null);
+}
+
+function readStoredPopupStateForKey(
+  storageKey: string,
+): StoredPopupState | null {
+  try {
+    const rawValue = window.localStorage.getItem(storageKey);
+    if (!rawValue) return null;
+
+    const record = JSON.parse(rawValue) as Partial<StoredPopupState>;
+    if (
+      record.version !== EXTENSION_POPUP_STATE_VERSION ||
+      typeof record.savedAt !== 'number' ||
+      Date.now() - record.savedAt > EXTENSION_POPUP_STATE_MAX_AGE_MS ||
+      typeof record.sourceUrl !== 'string'
+    ) {
+      window.localStorage.removeItem(storageKey);
+      return null;
+    }
+
+    const selectedAppId =
+      typeof record.selectedAppId === 'number' ? record.selectedAppId : null;
+    return {
+      activeTab: isPopupTab(record.activeTab) ? record.activeTab : 'game',
+      matchedDraftItemId:
+        typeof record.matchedDraftItemId === 'string'
+          ? record.matchedDraftItemId
+          : null,
+      savedAt: record.savedAt,
+      selectedAppId,
+      selectedFullMirrorUrl:
+        typeof record.selectedFullMirrorUrl === 'string'
+          ? record.selectedFullMirrorUrl
+          : null,
+      selectedPatchMirrorUrl:
+        typeof record.selectedPatchMirrorUrl === 'string'
+          ? record.selectedPatchMirrorUrl
+          : null,
+      selectedSourceKind: isSupportedSourceKind(record.selectedSourceKind)
+        ? record.selectedSourceKind
+        : null,
+      selectedSteamPatchKey:
+        typeof record.selectedSteamPatchKey === 'string'
+          ? record.selectedSteamPatchKey
+          : null,
+      sourceUrl: record.sourceUrl,
+      steamCandidates: normalizeStoredSteamCandidates(record.steamCandidates),
+      steamDbBackfillStatus: isSteamDbBackfillStatus(
+        record.steamDbBackfillStatus,
+      )
+        ? record.steamDbBackfillStatus
+        : 'idle',
+      steamPatches: normalizeStoredSteamPatches(
+        record.steamPatches,
+        selectedAppId,
+      ),
+      steamSearchQuery:
+        typeof record.steamSearchQuery === 'string'
+          ? record.steamSearchQuery
+          : '',
+      step: isFlowStep(record.step) ? record.step : 'steam',
+      version: EXTENSION_POPUP_STATE_VERSION,
+    };
+  } catch {
+    return null;
   }
 }
 
@@ -850,6 +1023,9 @@ function App() {
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [libraryAction, setLibraryAction] = useState<LibraryAction>(null);
+  const [libraryUpdateItemId, setLibraryUpdateItemId] = useState<string | null>(
+    null,
+  );
   const [finishQueued, setFinishQueued] = useState(false);
   const [retrySelection, setRetrySelection] = useState<{
     fullUrl: string | null;
@@ -871,7 +1047,12 @@ function App() {
   const steamDbBackfillRequestIdRef = useRef(0);
   const sourcePatchEditorRequestIdRef = useRef(0);
   const steamReleaseDateRefreshKeysRef = useRef<Set<string>>(new Set());
+  const patchHistoryRestoreKeysRef = useRef<Set<string>>(new Set());
   const libraryRedirectTimerRef = useRef<number | null>(null);
+  const detectedWorkflowSnapshotRef = useRef<WorkflowSnapshot | null>(null);
+  const restoredPopupStateKeyRef = useRef<string | null>(null);
+  const restoredSavedPopupStateKeyRef = useRef<string | null>(null);
+  const skipNextPopupStatePersistKeyRef = useRef<string | null>(null);
   const scrollStageRef = useRef<HTMLElement | null>(null);
 
   const resolvedTheme = resolveTheme(settings.themeMode, systemPrefersDark);
@@ -886,9 +1067,6 @@ function App() {
     getSteamPatchOptions(steamPatches, selectedAppId).find(
       (patch) => getSteamPatchKey(patch) === selectedSteamPatchKey,
     ) ?? null;
-  const selectedPatchSourceLabel = formatPatchSourceLabel(
-    selectedSteamPatch?.selectionSource,
-  );
   const selectedSteamCandidate =
     steamCandidates.find((candidate) => candidate.appId === selectedAppId) ??
     null;
@@ -935,12 +1113,22 @@ function App() {
     ? getLifecycleStatus(currentPageTrackedItem)
     : null;
   const currentPageHeroPresence = getHeroPresenceState(currentPageTrackedItem);
+  const libraryUpdateItem = useMemo(
+    () =>
+      libraryUpdateItemId
+        ? (libraryItems.find((item) => item.item.id === libraryUpdateItemId) ??
+          null)
+        : null,
+    [libraryItems, libraryUpdateItemId],
+  );
+  const isLibraryUpdateFlow = Boolean(libraryUpdateItem);
   const activeDraftItem = useMemo(
     () =>
+      libraryUpdateItem ??
       (matchedDraftItemId
         ? libraryItems.find((item) => item.item.id === matchedDraftItemId)
         : null) ?? currentPageTrackedItem,
-    [currentPageTrackedItem, libraryItems, matchedDraftItemId],
+    [currentPageTrackedItem, libraryItems, libraryUpdateItem, matchedDraftItemId],
   );
   const sourceRows = activeDraftItem?.sourceMatches ?? [];
   const selectedSourceView =
@@ -967,14 +1155,16 @@ function App() {
   const likelySteamPatch = useMemo(
     () =>
       getLikelyPatchForSelectedSource(
-        parsedSource,
+        isLibraryUpdateFlow ? null : parsedSource,
         selectedSourceView,
         steamPatches,
       ),
-    [parsedSource, selectedSourceView, steamPatches],
+    [isLibraryUpdateFlow, parsedSource, selectedSourceView, steamPatches],
   );
   const selectedDownloadSourceKind =
-    selectedSourceView?.match.sourceKind ?? parsedSource?.sourceKind ?? null;
+    selectedSourceView?.match.sourceKind ??
+    (isLibraryUpdateFlow ? null : parsedSource?.sourceKind) ??
+    null;
   const warningState: WarningState | null = getDownloadAutomationWarning({
     health,
     rootLibraryPath: settings.rootLibraryPath,
@@ -986,7 +1176,7 @@ function App() {
     rootLibraryPath: settings.rootLibraryPath,
     sourceKind: selectedDownloadSourceKind,
   });
-  const canVisitSteamStep = Boolean(parsedSource);
+  const canVisitSteamStep = !isLibraryUpdateFlow && Boolean(parsedSource);
   const canVisitGameStep =
     step === 'game' || Boolean(activeDraftItem?.item.steamAppId);
   const canVisitPatchStep =
@@ -998,12 +1188,13 @@ function App() {
     [detailsItemId, libraryItems],
   );
   const shouldPollDraftStatus =
-    parsePending ||
-    connectionPending ||
-    trackedStatusPending ||
-    ['queued', 'downloading', 'extracting'].includes(
-      currentPageLifecycleStatus ?? '',
-    );
+    !isLibraryUpdateFlow &&
+    (parsePending ||
+      connectionPending ||
+      trackedStatusPending ||
+      ['queued', 'downloading', 'extracting'].includes(
+        currentPageLifecycleStatus ?? '',
+      ));
 
   function syncTrackedStatus(nextTrackedStatus: TrackedItemView | null) {
     setSelectedFullMirrorUrl(
@@ -1079,6 +1270,53 @@ function App() {
   function refreshPopupStateInBackground(): void {
     void Promise.allSettled([refreshLibrary(), refreshDraftStatus()]);
   }
+
+  const writePopupStateForSourceUrl = useCallback(
+    (stateSourceUrl: string | null | undefined): void => {
+      const storageKey = getPopupStateStorageKey(stateSourceUrl);
+      if (!storageKey || !stateSourceUrl) {
+        return;
+      }
+
+      const snapshot: StoredPopupState = {
+        activeTab,
+        matchedDraftItemId,
+        savedAt: Date.now(),
+        selectedAppId,
+        selectedFullMirrorUrl,
+        selectedPatchMirrorUrl,
+        selectedSourceKind,
+        selectedSteamPatchKey,
+        sourceUrl: stateSourceUrl,
+        steamCandidates: steamCandidates.slice(0, 12),
+        steamDbBackfillStatus,
+        steamPatches: steamPatches.slice(0, 80),
+        steamSearchQuery,
+        step,
+        version: EXTENSION_POPUP_STATE_VERSION,
+      };
+
+      try {
+        window.localStorage.setItem(storageKey, JSON.stringify(snapshot));
+      } catch {
+        // localStorage can be unavailable in unusual popup contexts.
+      }
+    },
+    [
+      activeTab,
+      matchedDraftItemId,
+      selectedAppId,
+      selectedFullMirrorUrl,
+      selectedPatchMirrorUrl,
+      selectedSourceKind,
+      selectedSteamPatchKey,
+      steamCandidates,
+      steamDbBackfillStatus,
+      steamPatches,
+      steamSearchQuery,
+      step,
+    ],
+  );
 
   function getRetryMirrorRows(
     item: TrackedItemView,
@@ -1529,6 +1767,76 @@ function App() {
   }, [libraryViewMode]);
 
   useEffect(() => {
+    if (libraryUpdateItemId) {
+      return;
+    }
+
+    const stateSourceUrl = draftShell?.sourceUrl ?? sourceUrl;
+    const storageKey = getPopupStateStorageKey(stateSourceUrl);
+    if (!storageKey || restoredPopupStateKeyRef.current === storageKey) {
+      return;
+    }
+
+    restoredPopupStateKeyRef.current = storageKey;
+    const storedState = readStoredPopupStateForKey(storageKey);
+    if (!storedState) {
+      return;
+    }
+
+    restoredSavedPopupStateKeyRef.current = storageKey;
+    skipNextPopupStatePersistKeyRef.current = storageKey;
+    steamSearchRequestIdRef.current += 1;
+    setActiveTab(storedState.activeTab);
+    setMatchedDraftItemId(storedState.matchedDraftItemId);
+    setSelectedAppId(storedState.selectedAppId);
+    setSelectedFullMirrorUrl(storedState.selectedFullMirrorUrl);
+    setSelectedPatchMirrorUrl(storedState.selectedPatchMirrorUrl);
+    setSelectedSourceKind(storedState.selectedSourceKind);
+    setSelectedSteamPatchKey(storedState.selectedSteamPatchKey);
+    setSteamCandidates(storedState.steamCandidates);
+    setSteamDbBackfillStatus(storedState.steamDbBackfillStatus);
+    steamPatchesRef.current = storedState.steamPatches;
+    setSteamPatches(storedState.steamPatches);
+    setSteamSearchQuery(storedState.steamSearchQuery);
+    setStep(storedState.step);
+  }, [draftShell?.sourceUrl, libraryUpdateItemId, sourceUrl]);
+
+  useEffect(() => {
+    if (libraryUpdateItemId) {
+      return;
+    }
+
+    const stateSourceUrl = draftShell?.sourceUrl ?? sourceUrl;
+    const storageKey = getPopupStateStorageKey(stateSourceUrl);
+    if (!storageKey || restoredPopupStateKeyRef.current !== storageKey) {
+      return;
+    }
+    if (skipNextPopupStatePersistKeyRef.current === storageKey) {
+      skipNextPopupStatePersistKeyRef.current = null;
+      return;
+    }
+
+    writePopupStateForSourceUrl(stateSourceUrl);
+  }, [
+    activeTab,
+    draftShell?.sourceUrl,
+    libraryUpdateItemId,
+    matchedDraftItemId,
+    selectedAppId,
+    selectedFullMirrorUrl,
+    selectedPatchMirrorUrl,
+    selectedSourceKind,
+    selectedSteamPatchKey,
+    sourceUrl,
+    steamCandidates,
+    steamDbBackfillStatus,
+    steamPatches,
+    steamSearchQuery,
+    step,
+    writePopupStateForSourceUrl,
+  ]);
+
+  useEffect(() => {
     if (!detailsItemId) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
@@ -1629,6 +1937,8 @@ function App() {
     if (
       shellLoading ||
       !parsedSource ||
+      restoredSavedPopupStateKeyRef.current ===
+        getPopupStateStorageKey(draftShell?.sourceUrl ?? sourceUrl) ||
       step !== 'steam' ||
       candidateLoading ||
       steamCandidates.length > 0
@@ -1644,8 +1954,10 @@ function App() {
     }).finally(() => setCandidateLoading(false));
   }, [
     candidateLoading,
+    draftShell?.sourceUrl,
     parsedSource,
     shellLoading,
+    sourceUrl,
     steamCandidates.length,
     step,
   ]);
@@ -1689,8 +2001,50 @@ function App() {
       selectedSourceView,
       steamPatches,
     );
-    setSelectedSteamPatchKey(sourcePatchKey);
-  }, [selectedSourceView, steamPatches]);
+    setSelectedSteamPatchKey((current) => {
+      if (
+        current &&
+        getSteamPatchOptions(steamPatches, selectedAppId).some(
+          (patch) => getSteamPatchKey(patch) === current,
+        )
+      ) {
+        return current;
+      }
+      return sourcePatchKey;
+    });
+  }, [selectedAppId, selectedSourceView, steamPatches]);
+
+  useEffect(() => {
+    const trackedItemId = activeDraftItem?.item.id ?? null;
+    if (
+      step !== 'patch' ||
+      patchLoading ||
+      steamPatches.length > 0 ||
+      !selectedAppId ||
+      !trackedItemId
+    ) {
+      return;
+    }
+
+    const restoreKey = `${trackedItemId}:${selectedAppId}`;
+    if (patchHistoryRestoreKeysRef.current.has(restoreKey)) {
+      return;
+    }
+
+    patchHistoryRestoreKeysRef.current.add(restoreKey);
+    void loadSteamPatchHistory(selectedAppId, {
+      goToPatch: false,
+      trackedItemId,
+    });
+    // The restore key gates this one-shot hydrate; the loader function is intentionally omitted.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    activeDraftItem?.item.id,
+    patchLoading,
+    selectedAppId,
+    steamPatches.length,
+    step,
+  ]);
 
   useEffect(() => {
     if (
@@ -1892,6 +2246,156 @@ function App() {
 
     const sourcePatchKey = getSourceMatchPatchKey(source, steamPatches);
     setSelectedSteamPatchKey(sourcePatchKey);
+  }
+
+  function createDetectedWorkflowSnapshot(): WorkflowSnapshot {
+    return {
+      finishQueued,
+      matchedDraftItemId,
+      selectedAppId,
+      selectedFullMirrorUrl,
+      selectedPatchMirrorUrl,
+      selectedSourceKind,
+      selectedSteamPatchKey,
+      steamCandidates: steamCandidates.slice(),
+      steamDbBackfillStatus,
+      steamPatches: steamPatches.slice(),
+      steamSearchQuery,
+      step,
+    };
+  }
+
+  function restoreDetectedWorkflow(
+    nextTab: PopupTab = 'game',
+    options: { clearMessage?: boolean } = {},
+  ) {
+    const snapshot = detectedWorkflowSnapshotRef.current;
+    setLibraryUpdateItemId(null);
+    setPatchFallbackMode(null);
+    if (options.clearMessage !== false) {
+      setMessage(null);
+    }
+    steamDbBackfillRequestIdRef.current += 1;
+    steamSearchRequestIdRef.current += 1;
+
+    if (snapshot) {
+      setMatchedDraftItemId(snapshot.matchedDraftItemId);
+      setSelectedAppId(snapshot.selectedAppId);
+      setSelectedFullMirrorUrl(snapshot.selectedFullMirrorUrl);
+      setSelectedPatchMirrorUrl(snapshot.selectedPatchMirrorUrl);
+      setSelectedSourceKind(snapshot.selectedSourceKind);
+      setSelectedSteamPatchKey(snapshot.selectedSteamPatchKey);
+      setSteamCandidates(snapshot.steamCandidates);
+      setSteamDbBackfillStatus(snapshot.steamDbBackfillStatus);
+      steamPatchesRef.current = snapshot.steamPatches;
+      setSteamPatches(snapshot.steamPatches);
+      setSteamSearchQuery(snapshot.steamSearchQuery);
+      setStep(snapshot.step);
+      setFinishQueued(snapshot.finishQueued);
+    }
+
+    setActiveTab(nextTab);
+  }
+
+  function handlePopupTabClick(tab: PopupTab) {
+    if (tab === 'game' && isLibraryUpdateFlow) {
+      restoreDetectedWorkflow('game');
+      return;
+    }
+    if (tab === 'library' && isLibraryUpdateFlow) {
+      restoreDetectedWorkflow('library');
+      return;
+    }
+    setActiveTab(tab);
+  }
+
+  function createLibraryUpdateSteamCandidate(
+    item: TrackedItemView,
+  ): SteamCandidate | null {
+    const appId = item.item.steamAppId;
+    if (!appId) return null;
+
+    return {
+      appId,
+      coverUrl: item.item.coverUrl ?? null,
+      normalizedTitle: item.item.normalizedTitle,
+      reasons: ['library'],
+      score: 1,
+      title: item.item.steamTitle ?? item.item.title,
+    };
+  }
+
+  function openLibraryUpdateFlow(item: TrackedItemView) {
+    if (!item.item.steamAppId) {
+      setMessage('Apply a Steam match before queueing an update.');
+      return;
+    }
+
+    detectedWorkflowSnapshotRef.current = createDetectedWorkflowSnapshot();
+    if (libraryRedirectTimerRef.current != null) {
+      window.clearTimeout(libraryRedirectTimerRef.current);
+      libraryRedirectTimerRef.current = null;
+    }
+
+    const preferredSource = getPreferredUpdateSource(item);
+    const selection = getSourceDownloadSelection(preferredSource);
+    const steamCandidate = createLibraryUpdateSteamCandidate(item);
+
+    steamDbBackfillRequestIdRef.current += 1;
+    steamPatchesRef.current = [];
+    setLibraryUpdateItemId(item.item.id);
+    setDetailsItemId(null);
+    setMatchedDraftItemId(null);
+    setSelectedAppId(item.item.steamAppId);
+    setSelectedSourceKind(preferredSource?.match.sourceKind ?? null);
+    setSelectedFullMirrorUrl(selection.selectedFullUrl);
+    setSelectedPatchMirrorUrl(selection.selectedPatchUrl);
+    setSelectedSteamPatchKey(null);
+    setSteamCandidates(steamCandidate ? [steamCandidate] : []);
+    setSteamDbBackfillStatus('idle');
+    setSteamPatchFeedUrl(null);
+    setSteamPatches([]);
+    setSteamSearchQuery(steamCandidate?.title ?? item.item.title);
+    setFinishQueued(false);
+    setPatchFallbackMode(null);
+    setMessage(null);
+    setStep('game');
+    setActiveTab('game');
+  }
+
+  async function openSourceDetailPageInCurrentTab(source: MatchedSourceView) {
+    if (!source.match.sourceUrl) {
+      setMessage('Source detail page is unavailable.');
+      return;
+    }
+
+    const currentSourceUrl = draftShell?.sourceUrl ?? sourceUrl;
+    if (!isLibraryUpdateFlow) {
+      writePopupStateForSourceUrl(currentSourceUrl);
+      writePopupStateForSourceUrl(source.match.sourceUrl);
+    }
+    setMessage(null);
+    try {
+      const response = await chrome.runtime.sendMessage({
+        sourceUrl: isLibraryUpdateFlow ? source.match.sourceUrl : currentSourceUrl,
+        tabId: isLibraryUpdateFlow ? null : tabId ? Number(tabId) : null,
+        type: 'vaulttrack:open-source-detail-page',
+        url: source.match.sourceUrl,
+      });
+      if (!response?.ok) {
+        setMessage(
+          response?.message ??
+            response?.error?.message ??
+            'Unable to open source detail page.',
+        );
+      }
+    } catch (error) {
+      setMessage(
+        error instanceof Error
+          ? error.message
+          : 'Unable to open source detail page.',
+      );
+    }
   }
 
   async function syncTrackedSteamPatches(
@@ -2134,8 +2638,10 @@ function App() {
           patchUrl: effectivePatchMirrorUrl,
         },
         selectedSteamCandidate,
-        sourceUrl,
-        tabId: tabId ? Number(tabId) : null,
+        sourceUrl: isLibraryUpdateFlow
+          ? selectedSourceView?.match.sourceUrl
+          : sourceUrl,
+        tabId: isLibraryUpdateFlow ? null : tabId ? Number(tabId) : null,
         type: 'vaulttrack:open-steamdb-patch-page',
       });
       if (!response.ok) {
@@ -2827,7 +3333,11 @@ function App() {
     }
     const trackedItemId = activeDraftItem?.item.id ?? null;
     if (!trackedItemId) {
-      setMessage('Create a Steam-matched draft before queueing.');
+      setMessage(
+        isLibraryUpdateFlow
+          ? 'Choose a library game before queueing an update.'
+          : 'Create a Steam-matched draft before queueing.',
+      );
       return false;
     }
     if (!selectedSourceView) {
@@ -2884,12 +3394,18 @@ function App() {
       }
       setFinishQueued(true);
       setMessage(
-        getDownloadQueueSuccessMessage(selectedSourceView.match.sourceKind),
+        isLibraryUpdateFlow
+          ? 'Update queued.'
+          : getDownloadQueueSuccessMessage(selectedSourceView.match.sourceKind),
       );
       setStep('done');
       refreshPopupStateInBackground();
       libraryRedirectTimerRef.current = window.setTimeout(() => {
-        setActiveTab('library');
+        if (isLibraryUpdateFlow) {
+          restoreDetectedWorkflow('library', { clearMessage: false });
+        } else {
+          setActiveTab('library');
+        }
         libraryRedirectTimerRef.current = null;
       }, 500);
       if (steamDbConfirmation) {
@@ -3181,6 +3697,7 @@ function App() {
     const trackingStatus = getTrackingStatus(item);
     const lifecycleStatus = getLifecycleStatus(item);
     const showTrackingStatus = shouldShowTrackingStatus(item);
+    const showUpdateButton = hasActionableSourceUpdate(item);
     const detailGrid = renderLibraryDetailGrid(item, 'list');
     const progressBlock =
       showProgress && item.currentDownload ? (
@@ -3235,6 +3752,19 @@ function App() {
               {renderLibraryActionMenu(item)}
             </div>
             {progressBlock}
+            {showUpdateButton ? (
+              <div className="library-item-actions">
+                <button
+                  className="primary-button compact-button library-update-action"
+                  disabled={busy}
+                  onClick={() => openLibraryUpdateFlow(item)}
+                  type="button"
+                >
+                  <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
+                  <span>Update</span>
+                </button>
+              </div>
+            ) : null}
             {detailGrid}
           </div>
         </article>
@@ -3268,25 +3798,48 @@ function App() {
           {renderLibraryActionMenu(item)}
         </div>
         {progressBlock}
-        <button
-          className="detail-toggle-button"
-          onClick={() => setDetailsItemId(item.item.id)}
-          type="button"
-        >
-          <FontAwesomeIcon aria-hidden="true" icon={faCircleInfo} />
-          <span>Additional Details</span>
-        </button>
+        <div className="library-item-actions">
+          {showUpdateButton ? (
+            <button
+              className="primary-button compact-button library-update-action"
+              disabled={busy}
+              onClick={() => openLibraryUpdateFlow(item)}
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
+              <span>Update</span>
+            </button>
+          ) : null}
+          <button
+            className="detail-toggle-button"
+            onClick={() => setDetailsItemId(item.item.id)}
+            type="button"
+          >
+            <FontAwesomeIcon aria-hidden="true" icon={faCircleInfo} />
+            <span>Additional Details</span>
+          </button>
+        </div>
       </article>
     );
   }
 
-  const gameStepLoadingLabel = parsePending
+  const gameStepLoadingLabel = isLibraryUpdateFlow
+    ? null
+    : parsePending
     ? 'Reading page details'
     : connectionPending
       ? 'Refreshing desktop status'
       : trackedStatusPending
         ? 'Checking Vault status'
         : null;
+  const workflowCoverUrl = libraryUpdateItem
+    ? getLibraryArtworkUrl(libraryUpdateItem, 'banner')
+    : (parsedSource?.coverUrl ?? null);
+  const workflowHeroPresence = libraryUpdateItem
+    ? getHeroPresenceState(libraryUpdateItem)
+    : currentPageHeroPresence;
+  const workflowTitle = libraryUpdateItem?.item.title ?? parsedSource?.title;
+  const hasGameWorkflow = Boolean(parsedSource || libraryUpdateItem);
 
   return (
     <div className="popup-shell">
@@ -3297,7 +3850,7 @@ function App() {
         <nav className="topbar-nav" aria-label="VaultTrack popup sections">
           <button
             className={`nav-pill ${activeTab === 'game' ? 'is-active' : ''}`}
-            onClick={() => setActiveTab('game')}
+            onClick={() => handlePopupTabClick('game')}
             type="button"
           >
             <FontAwesomeIcon aria-hidden="true" icon={faGamepad} />
@@ -3305,7 +3858,7 @@ function App() {
           </button>
           <button
             className={`nav-pill ${activeTab === 'library' ? 'is-active' : ''}`}
-            onClick={() => setActiveTab('library')}
+            onClick={() => handlePopupTabClick('library')}
             type="button"
           >
             <FontAwesomeIcon aria-hidden="true" icon={faTableCellsLarge} />
@@ -3314,7 +3867,7 @@ function App() {
           <button
             aria-label="Open settings"
             className={`icon-pill ${activeTab === 'settings' ? 'is-active' : ''}`}
-            onClick={() => setActiveTab('settings')}
+            onClick={() => handlePopupTabClick('settings')}
             type="button"
           >
             <FontAwesomeIcon aria-hidden="true" icon={faGear} />
@@ -3330,40 +3883,55 @@ function App() {
 
         {activeTab === 'game' ? (
           <>
+            {isLibraryUpdateFlow ? (
+              <div className="library-update-toolbar">
+                <button
+                  aria-label="Back to detected game"
+                  className="inline-icon-button library-update-back-button"
+                  onClick={() => restoreDetectedWorkflow('game')}
+                  title="Back to detected game"
+                  type="button"
+                >
+                  <FontAwesomeIcon aria-hidden="true" icon={faArrowLeft} />
+                </button>
+              </div>
+            ) : null}
             <section
               className={`hero-card ${
-                shellLoading || parsePending ? 'is-loading' : ''
-              } ${parsedSource?.coverUrl ? 'has-cover' : ''}`}
+                !isLibraryUpdateFlow && (shellLoading || parsePending)
+                  ? 'is-loading'
+                  : ''
+              } ${workflowCoverUrl ? 'has-cover' : ''}`}
               style={
-                parsedSource?.coverUrl
+                workflowCoverUrl
                   ? {
-                      backgroundImage: `linear-gradient(90deg, rgba(8, 12, 13, 0.94), rgba(8, 12, 13, 0.5)), url(${parsedSource.coverUrl})`,
+                      backgroundImage: `linear-gradient(90deg, rgba(8, 12, 13, 0.94), rgba(8, 12, 13, 0.5)), url(${workflowCoverUrl})`,
                     }
                   : undefined
               }
             >
-              {currentPageHeroPresence.presenceLabel ? (
+              {workflowHeroPresence.presenceLabel ? (
                 <div className="kicker-row">
                   <div className="chip-row">
                     <span
                       className={`library-presence-chip ${
-                        currentPageHeroPresence.presenceLabel === 'Discovered'
+                        workflowHeroPresence.presenceLabel === 'Discovered'
                           ? 'is-discovered'
                           : ''
                       }`}
                     >
-                      {currentPageHeroPresence.presenceLabel}
+                      {workflowHeroPresence.presenceLabel}
                     </span>
-                    {currentPageHeroPresence.statusLabel ? (
+                    {workflowHeroPresence.statusLabel ? (
                       <span className="mini-chip">
-                        {currentPageHeroPresence.statusLabel}
+                        {workflowHeroPresence.statusLabel}
                       </span>
                     ) : null}
                   </div>
                 </div>
               ) : null}
-              {parsedSource ? (
-                <h1 className="hero-title">{parsedSource.title}</h1>
+              {workflowTitle ? (
+                <h1 className="hero-title">{workflowTitle}</h1>
               ) : (
                 <div className="hero-loading">
                   <span className="spinner" aria-hidden="true" />
@@ -3386,7 +3954,7 @@ function App() {
               </section>
             ) : null}
 
-            {parsedSource && warningState ? (
+            {hasGameWorkflow && warningState ? (
               <section className="warning-card">
                 <div>
                   <p className="warning-title">{warningState.title}</p>
@@ -3406,23 +3974,27 @@ function App() {
               </section>
             ) : null}
 
-            {parsedSource && step !== 'done' ? (
+            {hasGameWorkflow && step !== 'done' ? (
               <section className="surface-card panel-card">
                 <div
-                  className="step-row"
+                  className={`step-row ${
+                    isLibraryUpdateFlow ? 'is-update-flow' : ''
+                  }`}
                   role="tablist"
                   aria-label="Add to Vault workflow"
                 >
-                  <button
-                    aria-selected={step === 'steam'}
-                    className={`step-tab ${step === 'steam' ? 'is-active' : ''}`}
-                    disabled={!canVisitSteamStep}
-                    onClick={() => setStep('steam')}
-                    role="tab"
-                    type="button"
-                  >
-                    Title Match
-                  </button>
+                  {!isLibraryUpdateFlow ? (
+                    <button
+                      aria-selected={step === 'steam'}
+                      className={`step-tab ${step === 'steam' ? 'is-active' : ''}`}
+                      disabled={!canVisitSteamStep}
+                      onClick={() => setStep('steam')}
+                      role="tab"
+                      type="button"
+                    >
+                      Title Match
+                    </button>
+                  ) : null}
                   <button
                     aria-selected={step === 'game'}
                     className={`step-tab ${step === 'game' ? 'is-active' : ''}`}
@@ -3458,10 +4030,12 @@ function App() {
                     </div>
                     {!activeDraftItem ? (
                       <p className="muted-text">
-                        Match a Steam title before choosing a download source.
+                        {isLibraryUpdateFlow
+                          ? 'This library item is no longer available.'
+                          : 'Match a Steam title before choosing a download source.'}
                       </p>
                     ) : null}
-                    {sourceDiscoveryLoading ? (
+                    {sourceDiscoveryLoading && !isLibraryUpdateFlow ? (
                       <div className="inline-loader steamdb-backfill-status">
                         <span
                           className="spinner spinner-sm"
@@ -3485,34 +4059,55 @@ function App() {
                             source,
                             activeDraftItem,
                           );
+                          const sourceLabel = formatSourceKind(sourceKind);
                           return (
                             <div
                               className={`source-row ${isSelected ? 'is-selected' : ''}`}
                               key={sourceKind}
                             >
-                              <button
-                                className="source-row__main"
-                                disabled={busy || !canSelect}
-                                onClick={() => selectSourceForDownload(source)}
-                                type="button"
-                              >
-                                <div>
-                                  <strong>
-                                    {formatSourceKind(sourceKind)}
-                                  </strong>
-                                  <span>
-                                    {source.snapshot?.observedVersion ??
-                                      source.match.sourceTitle ??
-                                      'Version unavailable'}
-                                  </span>
-                                  <span>
-                                    {source.snapshot?.observedBuildId
-                                      ? `Build ${source.snapshot.observedBuildId}`
-                                      : (source.snapshot?.observedPatchDate ??
-                                        'Build unavailable')}
-                                  </span>
+                              <div className="source-row__main">
+                                <div className="source-row__title-line">
+                                  <button
+                                    aria-label={`Open ${sourceLabel} source in current tab`}
+                                    className="source-label-button"
+                                    disabled={busy || !source.match.sourceUrl}
+                                    onClick={() =>
+                                      void openSourceDetailPageInCurrentTab(
+                                        source,
+                                      )
+                                    }
+                                    title="Open source page in current tab"
+                                    type="button"
+                                  >
+                                    <span>{sourceLabel}</span>
+                                    <FontAwesomeIcon
+                                      aria-hidden="true"
+                                      icon={faUpRightFromSquare}
+                                    />
+                                  </button>
                                 </div>
-                              </button>
+                                <button
+                                  className="source-row__select"
+                                  disabled={busy || !canSelect}
+                                  onClick={() =>
+                                    selectSourceForDownload(source)
+                                  }
+                                  type="button"
+                                >
+                                  <span>
+                                    Version:{' '}
+                                    {formatSourceSignalValue(
+                                      source.snapshot?.observedVersion,
+                                    )}
+                                  </span>
+                                  <span>
+                                    Build:{' '}
+                                    {formatSourceSignalValue(
+                                      source.snapshot?.observedBuildId,
+                                    )}
+                                  </span>
+                                </button>
+                              </div>
                               <div className="source-row__status">
                                 <span className="mini-chip">{lagLabel}</span>
                                 {isSelected ? (
@@ -3527,22 +4122,28 @@ function App() {
                                     )}
                                   </span>
                                 ) : null}
-                                <button
-                                  aria-label={`Refresh ${formatSourceKind(sourceKind)}`}
-                                  className="ghost-button compact-button"
-                                  disabled={
-                                    busy || refreshingSourceKind === sourceKind
-                                  }
-                                  onClick={() =>
-                                    void refreshSelectedSource(sourceKind)
-                                  }
-                                  type="button"
-                                >
-                                  {refreshingSourceKind === sourceKind
-                                    ? 'Refreshing'
-                                    : 'Refresh'}
-                                </button>
                               </div>
+                              <button
+                                aria-label={`Refresh ${sourceLabel}`}
+                                className={`source-row__refresh-button inline-icon-button ${
+                                  refreshingSourceKind === sourceKind
+                                    ? 'is-loading'
+                                    : ''
+                                }`}
+                                disabled={
+                                  busy || refreshingSourceKind === sourceKind
+                                }
+                                onClick={() =>
+                                  void refreshSelectedSource(sourceKind)
+                                }
+                                title={`Refresh ${sourceLabel}`}
+                                type="button"
+                              >
+                                <FontAwesomeIcon
+                                  aria-hidden="true"
+                                  icon={faRotateRight}
+                                />
+                              </button>
                               {source.match.lastError ? (
                                 <p className="source-row__error">
                                   {source.match.lastError}
@@ -3580,18 +4181,20 @@ function App() {
                                 ) : null}
                               </div>
                             </div>
-                            <div className="mirror-actions">
-                              <button
-                                className="primary-button"
-                                disabled={busy}
-                                onClick={() =>
-                                  setSelectedFullMirrorUrl(mirror.url)
-                                }
-                                type="button"
-                              >
-                                Choose
-                              </button>
-                            </div>
+                            {!isSelected ? (
+                              <div className="mirror-actions">
+                                <button
+                                  className="primary-button"
+                                  disabled={busy}
+                                  onClick={() =>
+                                    setSelectedFullMirrorUrl(mirror.url)
+                                  }
+                                  type="button"
+                                >
+                                  Select
+                                </button>
+                              </div>
+                            ) : null}
                           </div>
                         );
                       })}
@@ -3634,18 +4237,20 @@ function App() {
                                     ) : null}
                                   </div>
                                 </div>
-                                <div className="mirror-actions">
-                                  <button
-                                    className="primary-button"
-                                    disabled={busy}
-                                    onClick={() =>
-                                      setSelectedPatchMirrorUrl(mirror.url)
-                                    }
-                                    type="button"
-                                  >
-                                    Choose
-                                  </button>
-                                </div>
+                                {!isSelected ? (
+                                  <div className="mirror-actions">
+                                    <button
+                                      className="primary-button"
+                                      disabled={busy}
+                                      onClick={() =>
+                                        setSelectedPatchMirrorUrl(mirror.url)
+                                      }
+                                      type="button"
+                                    >
+                                      Select
+                                    </button>
+                                  </div>
+                                ) : null}
                               </div>
                             );
                           })}
@@ -3661,7 +4266,11 @@ function App() {
                     <div className="step-actions">
                       <button
                         className="ghost-button compact-button"
-                        onClick={() => setStep('game')}
+                        onClick={() =>
+                          isLibraryUpdateFlow
+                            ? restoreDetectedWorkflow('game')
+                            : setStep('steam')
+                        }
                         type="button"
                       >
                         Back
@@ -3759,13 +4368,6 @@ function App() {
                           ))
                         : null}
                     </div>
-                    {selectedPatchSourceLabel ? (
-                      <div className="chip-row">
-                        <span className="manual-patch-chip">
-                          {selectedPatchSourceLabel}
-                        </span>
-                      </div>
-                    ) : null}
                     <div className="step-actions">
                       <button
                         className="primary-button compact-button"
@@ -3890,7 +4492,9 @@ function App() {
                     <div className="step-actions">
                       <button
                         className="ghost-button compact-button"
-                        onClick={() => setStep('steam')}
+                        onClick={() =>
+                          setStep(isLibraryUpdateFlow ? 'game' : 'steam')
+                        }
                         type="button"
                       >
                         Back
@@ -3924,14 +4528,17 @@ function App() {
               </section>
             ) : null}
 
-            {parsedSource && step === 'done' ? (
+            {hasGameWorkflow && step === 'done' ? (
               <section className="surface-card panel-card">
                 <div className="section-stack">
                   <div>
-                    <p className="section-title">Added to VaultTrack</p>
+                    <p className="section-title">
+                      {isLibraryUpdateFlow ? 'Update Queued' : 'Added to VaultTrack'}
+                    </p>
                     <p className="muted-text">
-                      The selected mirror was queued and the title now appears
-                      in your library.
+                      {isLibraryUpdateFlow
+                        ? 'The selected update was queued for this library item.'
+                        : 'The selected mirror was queued and the title now appears in your library.'}
                     </p>
                   </div>
                   <div className="action-row">

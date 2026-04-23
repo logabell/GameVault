@@ -54,28 +54,42 @@ function findVisibleVersion($: ReturnType<typeof load>): string | null {
 }
 
 function findVisibleCurrentBuild($: ReturnType<typeof load>): string | null {
+  const readBuildAfterLabel = (text: string): string | null =>
+    compactText(text).match(/\bCurrent\s+Build\b\D*(?<build>\d{5,})\b/i)
+      ?.groups?.build ?? null;
+
   const labelMatch =
     $('span, div')
       .toArray()
       .map((element) => {
         const label = compactText($(element).text());
-        const siblingText = compactText($(element).nextAll().first().text());
-        return { label, siblingText };
+        const siblingText = $(element)
+          .nextAll()
+          .toArray()
+          .map((sibling) => compactText($(sibling).text()))
+          .find((text) => /^\d{5,}$/.test(text));
+        const parentBuild = readBuildAfterLabel($(element).parent().text());
+        const containerBuild = readBuildAfterLabel(
+          $(element).closest('div, li, section').first().text(),
+        );
+        return { containerBuild, label, parentBuild, siblingText };
       })
       .find(
         (entry) =>
           /^Current Build$/i.test(entry.label) &&
-          /^\d{5,}$/.test(entry.siblingText),
-      )?.siblingText ?? null;
-  if (labelMatch) {
-    return labelMatch;
+          (entry.siblingText || entry.parentBuild || entry.containerBuild),
+      );
+  const visibleMatch =
+    labelMatch?.siblingText ??
+    labelMatch?.parentBuild ??
+    labelMatch?.containerBuild ??
+    null;
+  if (visibleMatch) {
+    return visibleMatch;
   }
 
   const bodyText = compactText($('body').text());
-  return (
-    bodyText.match(/\bCurrent\s+Build\s+(?<build>\d{5,})\b/i)?.groups?.build ??
-    null
-  );
+  return readBuildAfterLabel(bodyText);
 }
 
 function normalizeHref(href: string, baseUrl: string): string | null {
