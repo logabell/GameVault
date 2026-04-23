@@ -22,7 +22,10 @@ import type {
   TrackedItemRecord,
 } from '@vaulttrack/shared-types';
 import { mergePatchHistory } from '@vaulttrack/shared-types';
-import initSqlJs, { type Database as SqlJsDatabase, type SqlJsStatic } from 'sql.js';
+import initSqlJs, {
+  type Database as SqlJsDatabase,
+  type SqlJsStatic,
+} from 'sql.js';
 import { basename } from 'node:path';
 
 const SCHEMA_SQL = `
@@ -206,7 +209,9 @@ function randomId(): string {
 
 function normalizePublishedAt(value: string | null, patchDate: string): string {
   const parsed = new Date(value ?? patchDate);
-  return Number.isNaN(parsed.getTime()) ? new Date(0).toISOString() : parsed.toISOString();
+  return Number.isNaN(parsed.getTime())
+    ? new Date(0).toISOString()
+    : parsed.toISOString();
 }
 
 function parseJsonArray<T>(value: string | null | undefined): T[] {
@@ -309,7 +314,10 @@ function applyMigrations(db: SqlJsDatabase): void {
     try {
       db.exec(statement);
     } catch (error) {
-      if (!(error instanceof Error) || !/duplicate column name/i.test(error.message)) {
+      if (
+        !(error instanceof Error) ||
+        !/duplicate column name/i.test(error.message)
+      ) {
         throw error;
       }
     }
@@ -418,12 +426,17 @@ function repairSourceSnapshotsFromRawPayload(db: SqlJsDatabase): void {
   for (const row of rows) {
     let payload: Partial<ParsedSourcePayload> | null = null;
     try {
-      payload = JSON.parse(row.raw_payload_json) as Partial<ParsedSourcePayload>;
+      payload = JSON.parse(
+        row.raw_payload_json,
+      ) as Partial<ParsedSourcePayload>;
     } catch {
       payload = null;
     }
 
-    if (!payload?.latestSourceRelease || payload.sourceKind !== row.source_kind) {
+    if (
+      !payload?.latestSourceRelease ||
+      payload.sourceKind !== row.source_kind
+    ) {
       continue;
     }
 
@@ -432,8 +445,10 @@ function repairSourceSnapshotsFromRawPayload(db: SqlJsDatabase): void {
       optionalTrimmedString(release.version) ?? row.observed_version;
     const observedBuildId = optionalTrimmedString(release.buildId);
     const observedPatchDate = optionalTrimmedString(release.patchDate);
-    const sourceUrl = optionalTrimmedString(payload.sourceUrl) ?? row.source_url;
-    const fingerprint = optionalTrimmedString(payload.fingerprint) ?? row.fingerprint;
+    const sourceUrl =
+      optionalTrimmedString(payload.sourceUrl) ?? row.source_url;
+    const fingerprint =
+      optionalTrimmedString(payload.fingerprint) ?? row.fingerprint;
     const shouldRepair =
       row.patch_selection_source != null ||
       row.observed_version !== observedVersion ||
@@ -660,7 +675,11 @@ function migrateDownloadMirrorsPrimaryKey(db: SqlJsDatabase): void {
     return;
   }
 
-  const hasSourceKindColumn = tableHasColumn(db, 'download_mirrors', 'source_kind');
+  const hasSourceKindColumn = tableHasColumn(
+    db,
+    'download_mirrors',
+    'source_kind',
+  );
   const sourceKindExpression = hasSourceKindColumn
     ? 'source_kind'
     : `(SELECT source_kind FROM tracked_items WHERE tracked_items.id = download_mirrors.tracked_item_id)`;
@@ -703,7 +722,10 @@ export class VaultTrackDatabase {
     private readonly filePath: string,
   ) {}
 
-  static async open(filePath: string, wasmPath: string): Promise<VaultTrackDatabase> {
+  static async open(
+    filePath: string,
+    wasmPath: string,
+  ): Promise<VaultTrackDatabase> {
     const SQL = (await initSqlJs({
       locateFile: () => wasmPath,
     })) as SqlJsStatic;
@@ -767,10 +789,7 @@ export class VaultTrackDatabase {
   }
 
   findTrackedItemById(id: string): TrackedItemRecord | null {
-    return (
-      this.listTrackedItems().find((entry) => entry.id === id) ??
-      null
-    );
+    return this.listTrackedItems().find((entry) => entry.id === id) ?? null;
   }
 
   findTrackedItemBySourceUrl(sourceUrl: string): TrackedItemRecord | null {
@@ -780,11 +799,14 @@ export class VaultTrackDatabase {
     );
   }
 
-  findManualTrackedItemByNormalizedTitle(normalizedTitle: string): TrackedItemRecord | null {
+  findManualTrackedItemByNormalizedTitle(
+    normalizedTitle: string,
+  ): TrackedItemRecord | null {
     return (
       this.listTrackedItems().find(
         (entry) =>
-          entry.sourceKind === 'manual' && entry.normalizedTitle === normalizedTitle,
+          entry.sourceKind === 'manual' &&
+          entry.normalizedTitle === normalizedTitle,
       ) ?? null
     );
   }
@@ -798,10 +820,9 @@ export class VaultTrackDatabase {
     title: string;
   }): TrackedItemRecord {
     const now = new Date().toISOString();
-    const existing =
-      record.sourceUrl
-        ? this.findTrackedItemBySourceUrl(record.sourceUrl)
-        : record.sourceKind === 'manual'
+    const existing = record.sourceUrl
+      ? this.findTrackedItemBySourceUrl(record.sourceUrl)
+      : record.sourceKind === 'manual'
         ? this.findManualTrackedItemByNormalizedTitle(record.normalizedTitle)
         : null;
     const id = existing?.id ?? record.id ?? randomId();
@@ -830,6 +851,44 @@ export class VaultTrackDatabase {
     );
 
     return this.findTrackedItemById(id)!;
+  }
+
+  updateTrackedItemPrimarySource(
+    trackedItemId: string,
+    record: {
+      coverUrl?: string | null;
+      normalizedTitle: string;
+      sourceKind: SourceKind;
+      sourceUrl: string;
+      title: string;
+    },
+  ): TrackedItemRecord {
+    const now = new Date().toISOString();
+    this.exec(
+      `UPDATE tracked_items
+       SET title = ?,
+           normalized_title = ?,
+           source_kind = ?,
+           source_url = ?,
+           cover_url = COALESCE(?, cover_url),
+           updated_at = ?
+       WHERE id = ?`,
+      [
+        record.title,
+        record.normalizedTitle,
+        record.sourceKind,
+        record.sourceUrl,
+        record.coverUrl ?? null,
+        now,
+        trackedItemId,
+      ],
+    );
+
+    const item = this.findTrackedItemById(trackedItemId);
+    if (!item) {
+      throw new Error(`Tracked item ${trackedItemId} not found`);
+    }
+    return item;
   }
 
   listSourceMatches(trackedItemId: string): SourceMatch[] {
@@ -938,10 +997,9 @@ export class VaultTrackDatabase {
       source_kind: SourceKind;
       source_url: string;
       tracked_item_id: string;
-    }>(
-      `SELECT * FROM source_snapshots WHERE tracked_item_id = ?`,
-      [trackedItemId],
-    ).map((row) => ({
+    }>(`SELECT * FROM source_snapshots WHERE tracked_item_id = ?`, [
+      trackedItemId,
+    ]).map((row) => ({
       checkedAt: row.checked_at,
       fingerprint: row.fingerprint,
       observedBuildId: row.observed_build_id,
@@ -1155,11 +1213,11 @@ export class VaultTrackDatabase {
              WHERE tracked_item_id = ? AND source_kind = ? AND url = ? AND kind = ?`
           : `SELECT kind FROM download_mirrors WHERE tracked_item_id = ? AND url = ? AND kind = ?`
         : sourceKind
-        ? `SELECT kind FROM download_mirrors
+          ? `SELECT kind FROM download_mirrors
            WHERE tracked_item_id = ? AND source_kind = ? AND url = ?
            ORDER BY CASE kind WHEN 'full' THEN 0 ELSE 1 END
            LIMIT 1`
-        : `SELECT kind FROM download_mirrors
+          : `SELECT kind FROM download_mirrors
            WHERE tracked_item_id = ? AND url = ?
            ORDER BY CASE kind WHEN 'full' THEN 0 ELSE 1 END
            LIMIT 1`,
@@ -1168,8 +1226,8 @@ export class VaultTrackDatabase {
           ? [trackedItemId, sourceKind, url, kind]
           : [trackedItemId, url, kind]
         : sourceKind
-        ? [trackedItemId, sourceKind, url]
-        : [trackedItemId, url],
+          ? [trackedItemId, sourceKind, url]
+          : [trackedItemId, url],
     );
     if (!selectedMirror) {
       return;
@@ -1220,10 +1278,9 @@ export class VaultTrackDatabase {
       matched_at: string;
       normalized_title: string;
       title: string;
-    }>(
-      `SELECT * FROM steam_matches WHERE tracked_item_id = ?`,
-      [trackedItemId],
-    );
+    }>(`SELECT * FROM steam_matches WHERE tracked_item_id = ?`, [
+      trackedItemId,
+    ]);
 
     if (!row) {
       return null;
@@ -1259,7 +1316,9 @@ export class VaultTrackDatabase {
   findSteamMatchByAppId(
     appId: number,
   ): (ConfirmedSteamMatch & { trackedItemId: string }) | null {
-    return this.listSteamMatches().find((match) => match.appId === appId) ?? null;
+    return (
+      this.listSteamMatches().find((match) => match.appId === appId) ?? null
+    );
   }
 
   upsertSteamMatch(trackedItemId: string, match: ConfirmedSteamMatch): void {
@@ -1427,10 +1486,9 @@ export class VaultTrackDatabase {
       last_successful_at: string | null;
       last_error: string | null;
       updated_at: string;
-    }>(
-      `SELECT * FROM steam_feed_checks WHERE tracked_item_id = ?`,
-      [trackedItemId],
-    );
+    }>(`SELECT * FROM steam_feed_checks WHERE tracked_item_id = ?`, [
+      trackedItemId,
+    ]);
     return row
       ? {
           feedUrl: row.feed_url,
@@ -1474,10 +1532,9 @@ export class VaultTrackDatabase {
       installed_at: string | null;
       install_path: string | null;
       updated_at: string;
-    }>(
-      `SELECT * FROM install_records WHERE tracked_item_id = ?`,
-      [trackedItemId],
-    );
+    }>(`SELECT * FROM install_records WHERE tracked_item_id = ?`, [
+      trackedItemId,
+    ]);
     return row
       ? {
           installedAt: row.installed_at,
@@ -1538,10 +1595,9 @@ export class VaultTrackDatabase {
       next_check_at: string;
       last_checked_at: string | null;
       expired_at: string | null;
-    }>(
-      `SELECT * FROM source_watches WHERE tracked_item_id = ?`,
-      [trackedItemId],
-    );
+    }>(`SELECT * FROM source_watches WHERE tracked_item_id = ?`, [
+      trackedItemId,
+    ]);
     return row
       ? {
           endsAt: row.ends_at,
@@ -1599,7 +1655,9 @@ export class VaultTrackDatabase {
   }
 
   clearWatch(trackedItemId: string): void {
-    this.exec(`DELETE FROM source_watches WHERE tracked_item_id = ?`, [trackedItemId]);
+    this.exec(`DELETE FROM source_watches WHERE tracked_item_id = ?`, [
+      trackedItemId,
+    ]);
   }
 
   expireWatch(trackedItemId: string, expiredAt: string): void {
@@ -1815,7 +1873,9 @@ export class VaultTrackDatabase {
     ];
 
     for (const table of childTables) {
-      this.exec(`DELETE FROM ${table} WHERE tracked_item_id = ?`, [trackedItemId]);
+      this.exec(`DELETE FROM ${table} WHERE tracked_item_id = ?`, [
+        trackedItemId,
+      ]);
     }
     this.exec(`DELETE FROM tracked_items WHERE id = ?`, [trackedItemId]);
   }
@@ -1824,7 +1884,9 @@ export class VaultTrackDatabase {
     encryptedPassword?: string | null;
     lastDailyPollAt?: string | null;
   } {
-    const rows = this.queryAll<{ key: string; value: string | null }>(`SELECT * FROM settings`);
+    const rows = this.queryAll<{ key: string; value: string | null }>(
+      `SELECT * FROM settings`,
+    );
     const map = new Map(rows.map((row) => [row.key, row.value]));
     const legacyRootPath = map.get('library.rootPath') ?? null;
     const libraryRoots = normalizeLibraryRoots(
@@ -1851,13 +1913,13 @@ export class VaultTrackDatabase {
       renameGameFoldersOnImport:
         map.get('import.renameGameFoldersOnImport') !== 'false',
       rootLibraryPath: primaryRoot?.path ?? legacyRootPath,
-      sourceWatchDurationDays: Number(
-        map.get('sourceWatch.durationDays') ?? 5,
-      ),
+      sourceWatchDurationDays: Number(map.get('sourceWatch.durationDays') ?? 5),
       sourceWatchIntervalHours: Number(
         map.get('sourceWatch.intervalHours') ?? 8,
       ),
-      themeMode: (map.get('appearance.themeMode') as SettingsRecord['themeMode']) ?? 'system',
+      themeMode:
+        (map.get('appearance.themeMode') as SettingsRecord['themeMode']) ??
+        'system',
     };
   }
 
@@ -1890,15 +1952,16 @@ export class VaultTrackDatabase {
       message: string;
       context_json: string | null;
       created_at: string;
-    }>(
-      `SELECT * FROM event_log ORDER BY created_at DESC LIMIT ?`,
-      [limit],
-    ).map((row) => ({
-      context: row.context_json ? (JSON.parse(row.context_json) as Record<string, unknown>) : undefined,
-      createdAt: row.created_at,
-      id: row.id,
-      level: row.level,
-      message: row.message,
-    }));
+    }>(`SELECT * FROM event_log ORDER BY created_at DESC LIMIT ?`, [limit]).map(
+      (row) => ({
+        context: row.context_json
+          ? (JSON.parse(row.context_json) as Record<string, unknown>)
+          : undefined,
+        createdAt: row.created_at,
+        id: row.id,
+        level: row.level,
+        message: row.message,
+      }),
+    );
   }
 }

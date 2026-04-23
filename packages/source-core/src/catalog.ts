@@ -107,7 +107,9 @@ function cleanupTitleForMatching(input: string): string {
 }
 
 function titleTokens(input: string): string[] {
-  return normalizeTitle(cleanupTitleForMatching(input)).split(' ').filter(Boolean);
+  return normalizeTitle(cleanupTitleForMatching(input))
+    .split(' ')
+    .filter(Boolean);
 }
 
 function significantTitleTokens(input: string): string[] {
@@ -132,7 +134,9 @@ function unmatchedSignificantTokenCount(
 ): number {
   const expected = new Set(expectedTokens);
   const candidate = new Set(candidateTokens);
-  const missing = expectedTokens.filter((token) => !candidate.has(token)).length;
+  const missing = expectedTokens.filter(
+    (token) => !candidate.has(token),
+  ).length;
   const extra = candidateTokens.filter((token) => !expected.has(token)).length;
   return missing + extra;
 }
@@ -151,11 +155,92 @@ function pushUnique(
   entries.push(entry);
 }
 
+function normalizedCatalogUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    url.hash = '';
+    return url.toString().replace(/\/$/, '').toLowerCase();
+  } catch {
+    return value.trim().replace(/\/$/, '').toLowerCase();
+  }
+}
+
+function mergeCatalogEntries(
+  existing: SourceCatalogEntry,
+  incoming: SourceCatalogEntry,
+): SourceCatalogEntry {
+  const incomingIsRecent = incoming.method === 'recent_updates';
+  const existingIsRecent = existing.method === 'recent_updates';
+  const incomingHasMetadata = Boolean(
+    incoming.listedBuildId || incoming.listedDate || incoming.listedVersion,
+  );
+  const shouldUseIncomingIdentity =
+    incomingHasMetadata ||
+    (incoming.title.length > 0 &&
+      incoming.title.length < existing.title.length);
+
+  return {
+    ...existing,
+    listedBuildId:
+      incomingIsRecent && incoming.listedBuildId
+        ? incoming.listedBuildId
+        : (existing.listedBuildId ?? incoming.listedBuildId ?? null),
+    listedDate:
+      incomingIsRecent && incoming.listedDate
+        ? incoming.listedDate
+        : (existing.listedDate ?? incoming.listedDate ?? null),
+    listedVersion:
+      incomingIsRecent && incoming.listedVersion
+        ? incoming.listedVersion
+        : (existing.listedVersion ?? incoming.listedVersion ?? null),
+    method:
+      existingIsRecent || incomingIsRecent ? 'recent_updates' : existing.method,
+    normalizedTitle: shouldUseIncomingIdentity
+      ? incoming.normalizedTitle
+      : existing.normalizedTitle,
+    title: shouldUseIncomingIdentity ? incoming.title : existing.title,
+  } satisfies SourceCatalogEntry;
+}
+
+function upsertCatalogEntry(
+  entries: SourceCatalogEntry[],
+  indexByKey: Map<string, number>,
+  entry: SourceCatalogEntry,
+): void {
+  if (!entry.title || !entry.sourceUrl) {
+    return;
+  }
+
+  const keys = [
+    `${entry.sourceKind}:url:${normalizedCatalogUrl(entry.sourceUrl)}`,
+    `${entry.sourceKind}:title:${entry.normalizedTitle}`,
+  ];
+  const existingIndex = keys
+    .map((key) => indexByKey.get(key))
+    .find((index): index is number => index != null);
+
+  if (existingIndex == null) {
+    const nextIndex = entries.length;
+    entries.push(entry);
+    for (const key of keys) {
+      indexByKey.set(key, nextIndex);
+    }
+    return;
+  }
+
+  const merged = mergeCatalogEntries(entries[existingIndex]!, entry);
+  entries[existingIndex] = merged;
+  for (const key of keys) {
+    indexByKey.set(key, existingIndex);
+  }
+}
+
 export function parseElAmigosCatalog(html: string): SourceCatalogEntry[] {
   const $ = load(html);
   const entries: SourceCatalogEntry[] = [];
-  const seen = new Set<string>();
+  const indexByKey = new Map<string, number>();
   let currentDate: string | null = null;
+  let inMasterList = false;
 
   function titleFromUrl(href: string): string {
     const path = href.split('/').pop() ?? href;
@@ -174,8 +259,16 @@ export function parseElAmigosCatalog(html: string): SourceCatalogEntry[] {
       return linkText;
     }
 
-    const parentText = compactText($(element).parent().text());
-    if (parentText && !/^download$/i.test(parentText)) {
+    const parent = $(element).parent();
+    const parentTagName = parent.prop('tagName')?.toString().toLowerCase();
+    const parentText = compactText(parent.text());
+    if (
+      parentText &&
+      !/^download$/i.test(parentText) &&
+      parentText.length <= 240 &&
+      parentTagName !== 'body' &&
+      parentTagName !== 'html'
+    ) {
       return parentText;
     }
 
@@ -184,15 +277,22 @@ export function parseElAmigosCatalog(html: string): SourceCatalogEntry[] {
   }
 
   $('body')
-    .find('h1,h2,h3,p,div,a,br')
+    .find('h1,h2,h3,h5,p,div,a,br,hr')
     .each((_index, element) => {
+      const tagName = element.tagName?.toLowerCase();
+      if (tagName === 'hr') {
+        inMasterList = true;
+        currentDate = null;
+        return;
+      }
+
       const text = compactText($(element).text());
       const date = normalizeSlashDate(text);
       if (date && text.length <= 30) {
         currentDate = date;
       }
 
-      if (element.tagName?.toLowerCase() !== 'a') {
+      if (tagName !== 'a') {
         return;
       }
 
@@ -203,12 +303,18 @@ export function parseElAmigosCatalog(html: string): SourceCatalogEntry[] {
 
       const catalogText = catalogTextForLink(element);
       const title = cleanupElAmigosTitle(catalogText) || titleFromUrl(href);
-      pushUnique(entries, seen, {
+      const normalizedTitle = normalizeTitle(title);
+      if (!inMasterList && normalizedTitle === '100 percent orange juice') {
+        inMasterList = true;
+      }
+
+      upsertCatalogEntry(entries, indexByKey, {
         listedBuildId: extractListedBuildId(catalogText),
         listedDate: currentDate,
         listedVersion: extractListedVersion(catalogText),
-        method: 'catalog_title',
-        normalizedTitle: normalizeTitle(title),
+        method:
+          !inMasterList && currentDate ? 'recent_updates' : 'catalog_title',
+        normalizedTitle,
         sourceKind: 'elamigos',
         sourceUrl: absoluteUrl(href, 'elamigos'),
         title,
@@ -226,7 +332,10 @@ export function parseSteamRipCatalog(html: string): SourceCatalogEntry[] {
   $('a[href]').each((_index, element) => {
     const href = $(element).attr('href') ?? '';
     const text = compactText($(element).text());
-    if (!/free\s+download/i.test(text) || /updated-games|games-list-page/i.test(href)) {
+    if (
+      !/free\s+download/i.test(text) ||
+      /updated-games|games-list-page/i.test(href)
+    ) {
       return;
     }
 
@@ -314,7 +423,9 @@ export function parseAnkerGamesCatalog(html: string): SourceCatalogEntry[] {
   return entries;
 }
 
-export function parseAnkerGamesRecentUpdates(html: string): SourceCatalogEntry[] {
+export function parseAnkerGamesRecentUpdates(
+  html: string,
+): SourceCatalogEntry[] {
   const entries = parseAnkerGamesCatalog(html);
   return entries.map((entry) => ({
     ...entry,
@@ -353,7 +464,10 @@ function levenshtein(left: string, right: string): number {
     return left.length;
   }
 
-  const previous = Array.from({ length: right.length + 1 }, (_value, index) => index);
+  const previous = Array.from(
+    { length: right.length + 1 },
+    (_value, index) => index,
+  );
   const current = Array.from({ length: right.length + 1 }, () => 0);
 
   for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
@@ -395,9 +509,11 @@ export function rankSourceTitleMatch(
   if (expected === candidate) {
     return {
       normalizedLength,
-      score: titleTokens(expectedTitle).join(' ') === titleTokens(candidateTitle).join(' ')
-        ? 1
-        : 0.99,
+      score:
+        titleTokens(expectedTitle).join(' ') ===
+        titleTokens(candidateTitle).join(' ')
+          ? 1
+          : 0.99,
       unmatchedSignificantTokens,
     };
   }

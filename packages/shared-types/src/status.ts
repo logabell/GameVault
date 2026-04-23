@@ -44,7 +44,10 @@ export interface PatchMetadataStatusInput {
   versionsBehindLatestIsLowerBound?: boolean | null;
 }
 
-function patchIdentityMatches(left: SteamPatchEntry, right: SteamPatchEntry): boolean {
+function patchIdentityMatches(
+  left: SteamPatchEntry,
+  right: SteamPatchEntry,
+): boolean {
   if (left.buildId && right.buildId) {
     return left.buildId === right.buildId;
   }
@@ -53,7 +56,9 @@ function patchIdentityMatches(left: SteamPatchEntry, right: SteamPatchEntry): bo
     return left.link === right.link;
   }
 
-  return left.patchDate === right.patchDate && left.patchTitle === right.patchTitle;
+  return (
+    left.patchDate === right.patchDate && left.patchTitle === right.patchTitle
+  );
 }
 
 function patchTimestamp(entry: SteamPatchEntry): number {
@@ -66,7 +71,9 @@ function patchTimestamp(entry: SteamPatchEntry): number {
   return Number.isNaN(dated) ? 0 : dated;
 }
 
-function hasMatchedSourceUpdate(sourceMatches: MatchedSourceView[] | null | undefined): boolean {
+function hasMatchedSourceUpdate(
+  sourceMatches: MatchedSourceView[] | null | undefined,
+): boolean {
   return Boolean(
     sourceMatches?.some(
       (source) =>
@@ -78,12 +85,13 @@ function hasMatchedSourceUpdate(sourceMatches: MatchedSourceView[] | null | unde
   );
 }
 
-function hasMatchedSourceBehind(sourceMatches: MatchedSourceView[] | null | undefined): boolean {
+function hasMatchedSourceBehind(
+  sourceMatches: MatchedSourceView[] | null | undefined,
+): boolean {
   return Boolean(
     sourceMatches?.some(
       (source) =>
-        source.match.usable &&
-        source.updateStatus === 'source_behind_upstream',
+        source.match.usable && source.updateStatus === 'source_behind_upstream',
     ),
   );
 }
@@ -98,6 +106,16 @@ function selectedPatchIsLatest(input: StatusComputationInput): boolean {
   }
 
   return patchIdentityMatches(input.selectedPatch, input.latestPatch);
+}
+
+function isDiscoveredDraft(input: StatusComputationInput): boolean {
+  return Boolean(
+    input.hasSteamMatch &&
+    !input.installRecord &&
+    !input.currentDownload &&
+    !input.finalPathExists &&
+    !input.hasKnownFinalPath,
+  );
 }
 
 export function derivePatchLag(
@@ -131,7 +149,9 @@ export function derivePatchLag(
     };
   }
 
-  feedEntries.sort((left, right) => patchTimestamp(right) - patchTimestamp(left));
+  feedEntries.sort(
+    (left, right) => patchTimestamp(right) - patchTimestamp(left),
+  );
   const selectedIndex = feedEntries.findIndex((entry) =>
     patchIdentityMatches(entry, input.selectedPatch!),
   );
@@ -216,6 +236,10 @@ export function deriveTrackedItemStatus(
     return TrackedItemStatus.FolderMissing;
   }
 
+  if (isDiscoveredDraft(input)) {
+    return TrackedItemStatus.Discovered;
+  }
+
   return TrackedItemStatus.New;
 }
 
@@ -228,6 +252,10 @@ export function deriveTrackedItemTrackingStatus(
 
   if (input.currentWatch?.expiredAt) {
     return TrackedItemTrackingStatus.WatchWindowExpired;
+  }
+
+  if (isDiscoveredDraft(input)) {
+    return TrackedItemTrackingStatus.WatchingSource;
   }
 
   if (selectedPatchIsLatest(input)) {

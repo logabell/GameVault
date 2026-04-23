@@ -59,6 +59,12 @@ describe('deriveTrackedItemStatus', () => {
     expect(
       deriveTrackedItemTrackingStatus({
         hasSteamMatch: true,
+        installRecord: {
+          installedBuildId: '4',
+          installedVersion: '1.2.0',
+          trackedItemId: 'item',
+          updatedAt: '2026-04-22T12:00:00.000Z',
+        },
         latestPatch: {
           appId: 123,
           link: '',
@@ -258,12 +264,42 @@ describe('deriveTrackedItemStatus', () => {
     ).toBe(TrackedItemStatus.Installed);
   });
 
-  it('marks brand new tracked items separately from source monitoring', () => {
+  it('marks Steam-matched draft-only items as discovered', () => {
     expect(
       deriveTrackedItemStatus({
         hasSteamMatch: true,
       }),
+    ).toBe(TrackedItemStatus.Discovered);
+  });
+
+  it('keeps unmatched brand new tracked items separate from source monitoring', () => {
+    expect(
+      deriveTrackedItemStatus({
+        hasSteamMatch: false,
+      }),
     ).toBe(TrackedItemStatus.New);
+  });
+
+  it('does not mark discovered drafts up to date without an install context', () => {
+    const latestPatch = {
+      appId: 123,
+      buildId: '3',
+      link: 'https://steamdb.info/patchnotes/3/',
+      patchDate: '04/20/2026',
+      patchTitle: 'Build 3',
+      publishedAt: '2026-04-20T12:00:00.000Z',
+      title: 'Build 3',
+      trackedItemId: 'item',
+    };
+
+    expect(
+      deriveTrackedItemTrackingStatus({
+        hasSteamMatch: true,
+        latestPatch,
+        selectedPatch: latestPatch,
+        versionsBehindLatest: 0,
+      }),
+    ).toBe(TrackedItemTrackingStatus.WatchingSource);
   });
 });
 
@@ -378,9 +414,7 @@ describe('derivePatchLag', () => {
       link: `https://steamdb.info/patchnotes/${30 - index}/`,
       patchDate: '04/20/2026',
       patchTitle: `Build ${30 - index}`,
-      publishedAt: new Date(
-        Date.UTC(2026, 3, 20, 12, 0 - index),
-      ).toISOString(),
+      publishedAt: new Date(Date.UTC(2026, 3, 20, 12, 0 - index)).toISOString(),
       selectionSource: 'steamdb_builds' as const,
       title: `Build ${30 - index}`,
       trackedItemId: 'item',
@@ -448,9 +482,7 @@ describe('derivePatchLag', () => {
       link: `https://steamdb.info/patchnotes/${30 - index}/`,
       patchDate: '09/03/2025',
       patchTitle: `Build ${30 - index}`,
-      publishedAt: new Date(
-        Date.UTC(2025, 8, 3, 12, 0 - index),
-      ).toISOString(),
+      publishedAt: new Date(Date.UTC(2025, 8, 3, 12, 0 - index)).toISOString(),
       selectionSource: 'steamdb_builds' as const,
       title: `Build ${30 - index}`,
       trackedItemId: 'item',

@@ -245,6 +245,76 @@ describe('source parsers', () => {
     ]);
   });
 
+  it('treats ElAmigos top-section-only rows as recent update catalog entries', () => {
+    expect(
+      parseElAmigosCatalog(`
+        <html><body>
+          <h2>21.04.2026</h2>
+          <h3>
+            Mouse PI for Hire Deluxe Edition ElAmigos +[Update 1.0.5.8168]
+            <a href="/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html">DOWNLOAD</a>
+          </h3>
+        </body></html>
+      `)[0],
+    ).toMatchObject({
+      listedDate: '04/21/2026',
+      listedVersion: '1.0.5.8168',
+      method: 'recent_updates',
+      sourceUrl:
+        'https://elamigos.site/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html',
+      title: 'Mouse PI for Hire Deluxe Edition',
+    });
+  });
+
+  it('merges duplicate ElAmigos recent and master entries without losing recent metadata', () => {
+    expect(
+      parseElAmigosCatalog(`
+        <html><body>
+          <h2>21.04.2026</h2>
+          <h3>
+            Mouse PI for Hire Deluxe Edition ElAmigos +[Update 1.0.5.8168]
+            <a href="/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html">DOWNLOAD</a>
+          </h3>
+          <hr>
+          <a href="/data/100_Percent_Orange_Juice_MULTi4_-_ElAmigos.html">100 Percent Orange Juice ElAmigos</a>
+          <a href="/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html">Mouse PI for Hire Deluxe Edition ElAmigos</a>
+        </body></html>
+      `).filter((entry) =>
+        entry.sourceUrl.includes('Mouse_PI_for_Hire_MULTi14'),
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        listedDate: '04/21/2026',
+        listedVersion: '1.0.5.8168',
+        method: 'recent_updates',
+        sourceUrl:
+          'https://elamigos.site/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html',
+      }),
+    ]);
+  });
+
+  it('does not let image-only featured links hide later ElAmigos recent update metadata', () => {
+    const mouseEntry = parseElAmigosCatalog(`
+      <html><body>
+        <a href="data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html"><img src="img/mouseP.jpg"></a>
+        <h1>22.04.2026</h1>
+        <h3>
+          Mouse PI for Hire Deluxe Edition ElAmigos +[Update 1.0.5.8168]
+          <a href="data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html">DOWNLOAD</a>
+        </h3>
+        <hr>
+        <h3>Mouse PI for Hire Deluxe Edition ElAmigos <a href="data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html">DOWNLOAD</a></h3>
+      </body></html>
+    `).find((entry) => entry.sourceUrl.includes('Mouse_PI_for_Hire_MULTi14'));
+
+    expect(mouseEntry).toMatchObject({
+      listedDate: '04/22/2026',
+      listedVersion: '1.0.5.8168',
+      method: 'recent_updates',
+      title: 'Mouse PI for Hire Deluxe Edition',
+    });
+  });
+
   it('generates AnkerGames slug candidates and scores fuzzy source titles', () => {
     expect(buildAnkerGamesSlugCandidates('Travellers Rest')).toContain(
       'travellers-rest',
@@ -271,10 +341,8 @@ describe('source parsers', () => {
     expect(
       rankSourceTitleMatch('ELDEN RING', 'Elden Ring Deluxe Edition').score,
     ).toBeGreaterThan(
-      rankSourceTitleMatch(
-        'ELDEN RING',
-        'Elden Ring Nightreign Deluxe Edition',
-      ).score,
+      rankSourceTitleMatch('ELDEN RING', 'Elden Ring Nightreign Deluxe Edition')
+        .score,
     );
   });
 
@@ -606,6 +674,30 @@ describe('source parsers', () => {
     expect(renderSignedDownloadPage).toHaveBeenCalledWith({
       signedPageUrl: 'https://ankergames.net/download/signed',
       sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+      stableDownloadUrl: 'https://ankergames.net/generate-download-url/2557',
+    });
+  });
+
+  it('uses the rendered Ankergames resolver when plain fetch is blocked', async () => {
+    const directUrl =
+      'https://node42.datanodes.to:8443/d/token/Shape-Of-Dreams-AnkerGames.zip';
+    const renderSignedDownloadPage = vi.fn(async () => directUrl);
+    const fetchMock = vi.fn(
+      async () => new Response('blocked', { status: 403 }),
+    );
+
+    await expect(
+      resolveAnkerGamesDownloadUrl({
+        fetch: fetchMock,
+        renderSignedDownloadPage,
+        sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+        stableDownloadUrl: 'https://ankergames.net/generate-download-url/2557',
+      }),
+    ).resolves.toBe(directUrl);
+    expect(renderSignedDownloadPage).toHaveBeenCalledWith({
+      signedPageUrl: null,
+      sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+      stableDownloadUrl: 'https://ankergames.net/generate-download-url/2557',
     });
   });
 

@@ -8,6 +8,7 @@ import type {
   ConfirmedSteamMatch,
   ParsedSourcePayload,
   SteamPatchCandidate,
+  SupportedSourceKind,
 } from '@vaulttrack/shared-types';
 import type {
   AnkerGamesSignedDownloadPageRenderer,
@@ -225,6 +226,21 @@ function steamRipSourceHtml(params: {
   `;
 }
 
+function elamigosMousePiHtml(): string {
+  return `
+    <html>
+      <body>
+        <title>MOUSE: P.I. For Hire / Mouse PI for Hire Deluxe Edition - ElAmigos official site</title>
+        <h2>Mouse PI for Hire Deluxe Edition (2026), 6.27GB</h2>
+        <h3>ElAmigos release. Updated to version 1.0.1.8044 (16.04.2026).</h3>
+        <a href="https://www.filecrypt.cc/Container/MOUSEFULL.html">FileCrypt</a>
+        <h2>Mouse PI for Hire update 1.0.1.8044 - 1.0.5.8168 (21.04.2026) & crack, 795MB</h2>
+        <a href="https://www.filecrypt.cc/Container/MOUSEPATCH.html">FileCrypt</a>
+      </body>
+    </html>
+  `;
+}
+
 function elamigosEldenRingHtml(params: {
   title: string;
   updateTo: string;
@@ -417,22 +433,21 @@ function seedReplacedSteamRipAlignmentScenario(
     normalizedTitle: 'replaced',
     title: 'REPLACED',
   });
-  const patchEntries =
-    params.patchEntries ?? [
-      {
-        buildId: '22862896',
-        patchDate: '04/21/2026',
-        patchTitle: 'REPLACED update for 21 April 2026',
-        publishedAt: '2026-04-21T12:00:00.000Z',
-      },
-      {
-        buildId: '22838087',
-        patchDate: '04/17/2026',
-        patchTitle: '1097 UPDATE - 17th April',
-        publishedAt: '2026-04-17T12:00:00.000Z',
-        version: '1.0.1097',
-      },
-    ];
+  const patchEntries = params.patchEntries ?? [
+    {
+      buildId: '22862896',
+      patchDate: '04/21/2026',
+      patchTitle: 'REPLACED update for 21 April 2026',
+      publishedAt: '2026-04-21T12:00:00.000Z',
+    },
+    {
+      buildId: '22838087',
+      patchDate: '04/17/2026',
+      patchTitle: '1097 UPDATE - 17th April',
+      publishedAt: '2026-04-17T12:00:00.000Z',
+      version: '1.0.1097',
+    },
+  ];
   database.upsertPatchEntries(
     patchEntries.map((entry) => ({
       appId: 1663850,
@@ -462,11 +477,11 @@ function seedReplacedSteamRipAlignmentScenario(
       catalogListedDate:
         params.includeSteamRipCatalogMetadata === false
           ? null
-          : params.steamRipListedDate ?? '04/22/2026',
+          : (params.steamRipListedDate ?? '04/22/2026'),
       catalogListedVersion:
         params.includeSteamRipCatalogMetadata === false
           ? null
-          : params.steamRipVersion ?? '1.0.1102',
+          : (params.steamRipVersion ?? '1.0.1102'),
       sourceKind: 'steamrip',
       sourceUrl: 'https://steamrip.com/replaced-free-download/',
       version: params.steamRipVersion ?? '1.0.1102',
@@ -712,9 +727,9 @@ describe('VaultTrackService import workflow', () => {
 
       const candidates = await createService(database).scanImportCandidates();
 
-      expect(candidates.map((candidate) => candidate.folderName).sort()).toEqual(
-        ['Duplicate Game', 'Keep Game'],
-      );
+      expect(
+        candidates.map((candidate) => candidate.folderName).sort(),
+      ).toEqual(['Duplicate Game', 'Keep Game']);
       expect(
         candidates.find((candidate) => candidate.folderName === 'Keep Game')
           ?.autoSelectedSteamMatch?.appId,
@@ -780,9 +795,7 @@ describe('VaultTrackService import workflow', () => {
 
       const imported = result.imported[0];
       expect(imported.item.sourceKind).toBe('manual');
-      expect(imported.item.sourceUrl).toBe(
-        `manual:import:${imported.item.id}`,
-      );
+      expect(imported.item.sourceUrl).toBe(`manual:import:${imported.item.id}`);
       expect(existsSync(folderPath)).toBe(false);
       await expect(readFile(join(finalPath, 'game.exe'), 'utf8')).resolves.toBe(
         'game',
@@ -884,7 +897,9 @@ describe('VaultTrackService import workflow', () => {
         patches: steamPatchEntries,
       });
 
-      await expect(service.refreshTrackedItem(imported.item.id)).resolves.toEqual(
+      await expect(
+        service.refreshTrackedItem(imported.item.id),
+      ).resolves.toEqual(
         expect.objectContaining({
           status: 'installed',
         }),
@@ -922,9 +937,12 @@ describe('VaultTrackService import workflow', () => {
         vi.fn(async (input: RequestInfo | URL) => {
           const url = new URL(String(input));
           if (url.hostname === 'api.steampowered.com') {
-            return new Response(steamCoverPayload(123456, 'library_hero_2x.jpg'), {
-              status: 200,
-            });
+            return new Response(
+              steamCoverPayload(123456, 'library_hero_2x.jpg'),
+              {
+                status: 200,
+              },
+            );
           }
           if (url.hostname === 'steamdb.info') {
             return new Response(rss([]), { status: 200 });
@@ -970,7 +988,9 @@ describe('VaultTrackService import workflow', () => {
         imported.item.id,
       ]);
 
-      await expect(service.refreshTrackedItem(imported.item.id)).resolves.toEqual(
+      await expect(
+        service.refreshTrackedItem(imported.item.id),
+      ).resolves.toEqual(
         expect.objectContaining({
           snapshot: null,
           status: 'installed',
@@ -996,9 +1016,12 @@ describe('VaultTrackService import workflow', () => {
         vi.fn(async (input: RequestInfo | URL) => {
           const url = new URL(String(input));
           if (url.hostname === 'api.steampowered.com') {
-            return new Response(steamCoverPayload(526870, 'library_hero_2x.jpg'), {
-              status: 200,
-            });
+            return new Response(
+              steamCoverPayload(526870, 'library_hero_2x.jpg'),
+              {
+                status: 200,
+              },
+            );
           }
           if (url.hostname === 'steamdb.info') {
             return new Response(rss([]), { status: 200 });
@@ -1141,7 +1164,9 @@ describe('VaultTrackService import workflow', () => {
         patches: [{ appId: 444 }],
         status: 'complete',
       });
-      expect(createService(database).requestSteamDbBuildLookup(444)).toMatchObject({
+      expect(
+        createService(database).requestSteamDbBuildLookup(444),
+      ).toMatchObject({
         appId: 444,
         patches: [{ appId: 444 }],
         status: 'complete',
@@ -1241,6 +1266,521 @@ describe('VaultTrackService SteamDB patch workflow', () => {
     }
   });
 
+  it('creates a matched draft without queueing a download', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL) => {
+          const url = new URL(String(input));
+          if (url.hostname === 'api.steampowered.com') {
+            return new Response(
+              steamCoverPayload(
+                steamMatch.appId,
+                'draft-cover/library_hero_2x.jpg',
+              ),
+              { status: 200 },
+            );
+          }
+
+          return new Response(rss([selectedPatch]), { status: 200 });
+        }),
+      );
+
+      const view = await createService(database).createMatchedDraft({
+        parsedSource,
+        steamMatch,
+      });
+
+      expect(view.item).toMatchObject({
+        sourceKind: 'steamrip',
+        steamAppId: steamMatch.appId,
+      });
+      expect(view.status).toBe('discovered');
+      expect(view.currentDownload).toBeNull();
+      expect(view.sourceSnapshot).toMatchObject({
+        observedVersion: '1.0.4',
+        sourceKind: 'steamrip',
+      });
+      expect(view.sourceMatches[0]).toMatchObject({
+        match: {
+          isPrimary: true,
+          sourceKind: 'steamrip',
+          status: 'verified',
+        },
+      });
+      expect(view.downloadMirrors).toEqual([
+        expect.objectContaining({
+          kind: 'full',
+          sourceKind: 'steamrip',
+          url: 'https://gofile.io/d/full',
+        }),
+      ]);
+      expect(view.latestPatch).toMatchObject({
+        buildId: selectedPatch.buildId,
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('reuses saved SteamDB entries when reopening an existing matched draft', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'mouse p i for hire',
+        sourceKind: 'steamrip',
+        sourceUrl: parsedSource.sourceUrl,
+        title: 'MOUSE: P.I. For Hire',
+      });
+      database.upsertSteamMatch(item.id, steamMatch);
+      database.upsertPatchEntries([
+        {
+          ...selectedPatch,
+          selectionSource: 'steamdb_builds',
+          trackedItemId: item.id,
+        },
+      ]);
+      const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+        const url = new URL(String(input));
+        if (url.hostname === 'api.steampowered.com') {
+          return new Response(
+            steamCoverPayload(
+              steamMatch.appId,
+              'draft-cover/library_hero_2x.jpg',
+            ),
+            { status: 200 },
+          );
+        }
+        throw new Error(`Unexpected fetch ${url.toString()}`);
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const view = await createService(database).createMatchedDraft({
+        parsedSource,
+        steamMatch,
+      });
+
+      expect(view.latestPatch).toMatchObject({
+        buildId: selectedPatch.buildId,
+        selectionSource: 'steamdb_builds',
+      });
+      expect(
+        fetchMock.mock.calls.some((call) =>
+          String(call[0]).includes('steamdb.info'),
+        ),
+      ).toBe(false);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('syncs backfilled patch history into draft source lag', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const service = createService(database);
+      const view = await service.createMatchedDraft({
+        parsedSource: ankergamesSource,
+        steamMatch,
+      });
+      const newerPatch: SteamPatchCandidate = {
+        ...selectedPatch,
+        appId: steamMatch.appId,
+        buildId: '22999999',
+        link: 'https://steamdb.info/patchnotes/22999999/',
+        patchDate: '04/22/2026',
+        patchTitle: 'MOUSE: P.I. For Hire update for 22 April 2026',
+        publishedAt: '2026-04-22T12:00:00.000Z',
+        selectionSource: 'steamdb_builds',
+        title: 'MOUSE: P.I. For Hire update for 22 April 2026',
+      };
+      const matchingPatch: SteamPatchCandidate = {
+        ...selectedPatch,
+        appId: steamMatch.appId,
+        buildId: ankergamesSource.latestSourceRelease.buildId,
+        selectionSource: 'steamdb_builds',
+      };
+
+      const updated = await service.syncTrackedSteamPatchEntries({
+        appId: steamMatch.appId,
+        patches: [newerPatch, matchingPatch],
+        trackedItemId: view.item.id,
+      });
+      const ankerSource = updated.sourceMatches.find(
+        (source) => source.match.sourceKind === 'ankergames',
+      );
+
+      expect(ankerSource).toMatchObject({
+        matchedPatch: {
+          buildId: ankergamesSource.latestSourceRelease.buildId,
+        },
+        versionsBehindLatest: 1,
+      });
+      expect(updated.latestPatch).toMatchObject({ buildId: '22999999' });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('does not report install-relative source update labels for uninstalled drafts', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'mouse p i for hire',
+        sourceKind: 'steamrip',
+        sourceUrl: parsedSource.sourceUrl,
+        title: 'MOUSE: P.I. For Hire',
+      });
+      database.upsertSteamMatch(item.id, steamMatch);
+      database.upsertPatchEntries([
+        {
+          ...selectedPatch,
+          trackedItemId: item.id,
+        },
+      ]);
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-04-22T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-04-22T12:00:00.000Z',
+        lastError: null,
+        method: 'recent_updates',
+        normalizedTitle: 'mouse p i for hire',
+        score: 1,
+        sourceKind: 'elamigos',
+        sourceTitle: 'Mouse PI for Hire Deluxe Edition',
+        sourceUrl:
+          'https://elamigos.site/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html',
+        status: 'probable',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-22T12:00:00.000Z',
+        usable: true,
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-22T12:00:00.000Z',
+        fingerprint: 'elamigos-mouse',
+        observedBuildId: null,
+        observedPatchDate: null,
+        observedPatchLink: null,
+        observedPatchTitle: null,
+        observedVersion: '1.0.5.8168',
+        patchSelectionSource: null,
+        sourceKind: 'elamigos',
+        sourceUrl:
+          'https://elamigos.site/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html',
+        trackedItemId: item.id,
+      });
+
+      const [view] = await createService(database).listTrackedItems();
+      const elamigos = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'elamigos',
+      );
+
+      expect(view?.status).toBe('discovered');
+      expect(view?.trackingStatus).not.toBe('up_to_date');
+      expect(elamigos?.updateStatus).toBe('unknown');
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('queues a matched draft from a non-current source using cached mirrors', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response(rss([selectedPatch]), { status: 200 })),
+      );
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9001,
+        packageName: 'queued-package',
+      }));
+      const service = createService(database, queueLinks);
+      const draft = await service.createMatchedDraft({
+        parsedSource: {
+          ...parsedSource,
+          sourceKind: 'elamigos',
+          sourceUrl:
+            'https://elamigos.site/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html',
+        },
+        steamMatch,
+      });
+      const steamRipSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fullDownloadUrls: [
+          {
+            kind: 'full',
+            label: 'GOFILE',
+            url: 'https://gofile.io/d/steamrip-new',
+          },
+        ],
+        sourceKind: 'steamrip',
+        sourceUrl: 'https://steamrip.com/mouse-p-i-for-hire-free-download/',
+      };
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-22T12:00:00.000Z',
+        fingerprint: steamRipSource.fingerprint,
+        observedBuildId: steamRipSource.latestSourceRelease.buildId ?? null,
+        observedPatchDate: steamRipSource.latestSourceRelease.patchDate ?? null,
+        observedPatchLink: null,
+        observedPatchTitle: null,
+        observedVersion: steamRipSource.latestSourceRelease.version,
+        patchSelectionSource: null,
+        sourceKind: 'steamrip',
+        sourceUrl: steamRipSource.sourceUrl,
+        trackedItemId: draft.item.id,
+      });
+      database.syncDownloadMirrors(
+        draft.item.id,
+        'steamrip',
+        steamRipSource.fullDownloadUrls,
+      );
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-04-22T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-04-22T12:00:00.000Z',
+        lastError: null,
+        method: 'steam_app_id',
+        normalizedTitle: steamRipSource.normalizedTitle,
+        score: 1,
+        sourceKind: 'steamrip',
+        sourceTitle: steamRipSource.title,
+        sourceUrl: steamRipSource.sourceUrl,
+        status: 'verified',
+        trackedItemId: draft.item.id,
+        updatedAt: '2026-04-22T12:00:00.000Z',
+        usable: true,
+      });
+
+      const queued = await service.queueDraftDownload({
+        selectedDownloads: { fullUrl: 'https://gofile.io/d/steamrip-new' },
+        selectedSteamPatch: selectedPatch,
+        sourceKind: 'steamrip',
+        steamPatchEntries: [selectedPatch],
+        trackedItemId: draft.item.id,
+      });
+
+      expect(queued.item.sourceKind).toBe('steamrip');
+      expect(queued.sourceSnapshot).toMatchObject({
+        observedBuildId: selectedPatch.buildId,
+        sourceKind: 'steamrip',
+      });
+      expect(database.getDownloadJob(draft.item.id)).toMatchObject({
+        selectedMirrorUrl: 'https://gofile.io/d/steamrip-new',
+      });
+      expect(queueLinks).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sourceKind: 'steamrip',
+          selectedDownloads: expect.objectContaining({
+            fullUrl: 'https://gofile.io/d/steamrip-new',
+          }),
+        }),
+      );
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('queues a matched draft from a non-current AnkerGames source with browser-rendered URL resolution', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const directUrl =
+        'https://node42.datanodes.to:8443/d/token/Mouse-PI-For-Hire-AnkerGames.zip';
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response(rss([selectedPatch]), { status: 200 })),
+      );
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9001,
+        packageName: 'queued-package',
+      }));
+      const sourceFetch = vi.fn(
+        async () => new Response('blocked', { status: 403 }),
+      );
+      const renderSignedDownloadPage = vi.fn(async () => directUrl);
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+        renderSignedDownloadPage,
+      );
+      const draft = await service.createMatchedDraft({
+        parsedSource: {
+          ...parsedSource,
+          sourceKind: 'elamigos',
+          sourceUrl:
+            'https://elamigos.site/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html',
+        },
+        steamMatch,
+      });
+      const ankerSourceUrl = 'https://ankergames.net/game/mouse-p-i-for-hire';
+      const ankerMirrorUrl =
+        'https://ankergames.net/generate-download-url/2726';
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-22T12:00:00.000Z',
+        fingerprint: 'ankergames-mouse-pi',
+        observedBuildId: selectedPatch.buildId ?? null,
+        observedPatchDate: selectedPatch.patchDate,
+        observedPatchLink: selectedPatch.link,
+        observedPatchTitle: selectedPatch.patchTitle,
+        observedVersion: 'V 1.0.5.8168',
+        patchSelectionSource: selectedPatch.selectionSource ?? 'rss',
+        sourceKind: 'ankergames',
+        sourceUrl: ankerSourceUrl,
+        trackedItemId: draft.item.id,
+      });
+      database.syncDownloadMirrors(draft.item.id, 'ankergames', [
+        {
+          kind: 'full',
+          label: 'DataNodes',
+          url: ankerMirrorUrl,
+        },
+      ]);
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-04-22T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-04-22T12:00:00.000Z',
+        lastError: null,
+        method: 'steam_app_id',
+        normalizedTitle: steamMatch.normalizedTitle,
+        score: 1,
+        sourceKind: 'ankergames',
+        sourceTitle: steamMatch.title,
+        sourceUrl: ankerSourceUrl,
+        status: 'verified',
+        trackedItemId: draft.item.id,
+        updatedAt: '2026-04-22T12:00:00.000Z',
+        usable: true,
+      });
+
+      const queued = await service.queueDraftDownload({
+        selectedDownloads: { fullUrl: ankerMirrorUrl },
+        selectedSteamPatch: selectedPatch,
+        sourceKind: 'ankergames',
+        steamPatchEntries: [selectedPatch],
+        trackedItemId: draft.item.id,
+      });
+
+      expect(renderSignedDownloadPage).toHaveBeenCalledWith({
+        signedPageUrl: null,
+        sourceUrl: ankerSourceUrl,
+        stableDownloadUrl: ankerMirrorUrl,
+      });
+      expect(queueLinks).toHaveBeenCalledWith(
+        expect.objectContaining({
+          selectedDownloads: {
+            fullUrl: directUrl,
+            patchUrl: null,
+          },
+          sourceKind: 'ankergames',
+        }),
+      );
+      expect(queued.currentDownload).toMatchObject({
+        selectedMirrorUrl: ankerMirrorUrl,
+        stage: 'queued',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('reuses an existing Steam app match when creating a draft', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response(rss([selectedPatch]), { status: 200 })),
+      );
+      const service = createService(database);
+      const first = await service.createMatchedDraft({
+        parsedSource,
+        steamMatch,
+      });
+      const second = await service.createMatchedDraft({
+        parsedSource: ankergamesSource,
+        steamMatch: {
+          ...steamMatch,
+          matchedAt: '2026-04-22T12:00:00.000Z',
+        },
+      });
+
+      expect(second.item.id).toBe(first.item.id);
+      expect(database.listTrackedItems()).toHaveLength(1);
+      expect(
+        second.sourceMatches.some(
+          (source) => source.match.sourceKind === 'ankergames',
+        ),
+      ).toBe(true);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('resolves discovered draft status from any matched source page URL', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        coverUrl: ankergamesSource.coverUrl,
+        normalizedTitle: steamMatch.normalizedTitle,
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.net/game/mouse-pi-for-hire',
+        title: steamMatch.title,
+      });
+      database.upsertSteamMatch(item.id, steamMatch);
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-04-22T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-04-22T12:00:00.000Z',
+        lastError: null,
+        method: 'recent_updates',
+        normalizedTitle: steamMatch.normalizedTitle,
+        score: 1,
+        sourceKind: 'elamigos',
+        sourceTitle: 'Mouse PI for Hire Deluxe Edition',
+        sourceUrl:
+          'https://elamigos.site/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html',
+        status: 'probable',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-22T12:00:00.000Z',
+        usable: true,
+      });
+
+      const view = await createService(
+        database,
+      ).getTrackedItemStatusBySourceUrl(
+        'https://elamigos.site/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html?utm=popup#download',
+      );
+
+      expect(view?.item.id).toBe(item.id);
+      expect(view?.status).toBe('discovered');
+      expect(view?.sourceMatches).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            match: expect.objectContaining({
+              sourceKind: 'elamigos',
+              sourceUrl:
+                'https://elamigos.site/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html',
+            }),
+          }),
+        ]),
+      );
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('stores the Steam landscape artwork when adding a matched item', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -1296,14 +1836,15 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       });
       vi.stubGlobal(
         'fetch',
-        vi.fn(async () =>
-          new Response(
-            steamCoverPayload(
-              steamMatch.appId,
-              'applied-cover/library_hero_2x.jpg',
+        vi.fn(
+          async () =>
+            new Response(
+              steamCoverPayload(
+                steamMatch.appId,
+                'applied-cover/library_hero_2x.jpg',
+              ),
+              { status: 200 },
             ),
-            { status: 200 },
-          ),
         ),
       );
 
@@ -1345,7 +1886,8 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       });
       database.upsertSteamMatch(matched.id, {
         appId: 111,
-        coverUrl: 'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/111/hash/capsule_231x87.jpg',
+        coverUrl:
+          'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/111/hash/capsule_231x87.jpg',
         matchedAt: '2026-04-20T12:00:00.000Z',
         normalizedTitle: 'matched game',
         title: 'Matched Game',
@@ -1360,7 +1902,9 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       });
       const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
         const url = new URL(String(input));
-        const inputJson = JSON.parse(url.searchParams.get('input_json') ?? '{}');
+        const inputJson = JSON.parse(
+          url.searchParams.get('input_json') ?? '{}',
+        );
         return new Response(
           steamCoverPayload(
             Number(inputJson.ids?.[0]?.appid),
@@ -1710,6 +2254,133 @@ describe('VaultTrackService SteamDB patch workflow', () => {
     }
   });
 
+  it('marks queueing failed when JDownloader does not return a package id', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response(rss([selectedPatch]), { status: 200 })),
+      );
+      const queueLinks = vi.fn(async () => ({
+        packageId: null,
+        packageName: 'Mouse P.I. For Hire_1.0',
+        parts: [
+          {
+            packageId: null,
+            packageName: 'Mouse P.I. For Hire_1.0',
+            role: 'full' as const,
+          },
+        ],
+      }));
+      const service = createService(database, queueLinks);
+
+      await expect(
+        service.addTrackedItem({
+          parsedSource,
+          queueDownload: true,
+          selectedDownloads: { fullUrl: 'https://gofile.io/d/full' },
+          selectedSteamPatch: selectedPatch,
+          steamMatch,
+        }),
+      ).rejects.toThrow('JDownloader did not add full package');
+
+      const trackedItem = database.listTrackedItems()[0];
+      expect(trackedItem).toBeDefined();
+      expect(database.getDownloadJob(trackedItem!.id)).toMatchObject({
+        errorMessage: expect.stringContaining(
+          'JDownloader did not add full package',
+        ),
+        selectedMirrorUrl: 'https://gofile.io/d/full',
+        stage: 'failed',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('does not show legacy queued jobs as queued without a JDownloader package id', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      const item = database.upsertTrackedItem({
+        normalizedTitle: parsedSource.normalizedTitle,
+        sourceKind: parsedSource.sourceKind,
+        sourceUrl: parsedSource.sourceUrl,
+        title: parsedSource.title,
+      });
+      database.upsertSteamMatch(item.id, steamMatch);
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-22T12:00:00.000Z',
+        fingerprint: parsedSource.fingerprint,
+        observedBuildId: selectedPatch.buildId ?? null,
+        observedPatchDate: selectedPatch.patchDate,
+        observedPatchLink: selectedPatch.link,
+        observedPatchTitle: selectedPatch.patchTitle,
+        observedVersion: parsedSource.latestSourceRelease.version,
+        patchSelectionSource: selectedPatch.selectionSource ?? 'rss',
+        sourceKind: parsedSource.sourceKind,
+        sourceUrl: parsedSource.sourceUrl,
+        trackedItemId: item.id,
+      });
+      database.upsertDownloadJob({
+        bytesLoaded: null,
+        bytesTotal: null,
+        completedParts: 0,
+        createdAt: '2026-04-22T12:00:00.000Z',
+        errorMessage: null,
+        etaSeconds: null,
+        finalPath: join(tempRoot, 'Library', parsedSource.title),
+        id: 'legacy-unconfirmed-job',
+        packageId: null,
+        packageName: 'Mouse P.I. For Hire_1.0',
+        parts: [
+          {
+            bytesLoaded: null,
+            bytesTotal: null,
+            createdAt: '2026-04-22T12:00:00.000Z',
+            errorMessage: null,
+            etaSeconds: null,
+            id: 'legacy-unconfirmed-job:full',
+            jobId: 'legacy-unconfirmed-job',
+            mirrorUrl: 'https://gofile.io/d/full',
+            packageId: null,
+            packageName: 'Mouse P.I. For Hire_1.0',
+            role: 'full',
+            speed: null,
+            stage: 'queued',
+            statusMessage: null,
+            trackedItemId: item.id,
+            updatedAt: '2026-04-22T12:00:00.000Z',
+          },
+        ],
+        selectedMirrorUrl: 'https://gofile.io/d/full',
+        speed: null,
+        stage: 'queued',
+        stagePath: join(tempRoot, 'Staging', 'Mouse P.I. For Hire_1.0'),
+        statusMessage: null,
+        totalParts: 1,
+        trackedItemId: item.id,
+        updatedAt: '2026-04-22T12:00:00.000Z',
+      });
+      const service = createService(database);
+
+      const view = await service.getTrackedItemStatusBySourceUrl(
+        parsedSource.sourceUrl,
+      );
+
+      expect(view).toMatchObject({
+        currentDownload: {
+          errorMessage: expect.stringContaining('JDownloader did not confirm'),
+          stage: 'failed',
+        },
+        status: 'failed',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('queues selected full and update links when the final SteamDB feed refresh fails', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -2000,6 +2671,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       expect(renderSignedDownloadPage).toHaveBeenCalledWith({
         signedPageUrl: 'https://ankergames.net/download/signed',
         sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+        stableDownloadUrl: 'https://ankergames.net/generate-download-url/2557',
       });
       expect(queueLinks).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -2989,18 +3661,18 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         title: 'Replaced',
       };
       const queueLinks = vi.fn(async () => ({
-        packageId: null,
+        packageId: 9301,
         packageName: 'REPLACED_22838087_full',
         parts: [
           {
             mirrorUrl: 'https://gofile.io/d/full',
-            packageId: null,
+            packageId: 9301,
             packageName: 'REPLACED_22838087_full',
             role: 'full',
           },
           {
             mirrorUrl: 'https://gofile.io/d/update',
-            packageId: null,
+            packageId: 9302,
             packageName: 'REPLACED_22838087_update',
             role: 'patch',
           },
@@ -3913,7 +4585,8 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       const item = database.upsertTrackedItem({
         normalizedTitle: 'mouse pi for hire deluxe',
         sourceKind: 'elamigos',
-        sourceUrl: 'https://elamigos.site/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html',
+        sourceUrl:
+          'https://elamigos.site/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html',
         title: 'Mouse PI for Hire Deluxe Edition',
       });
       database.upsertSteamMatch(item.id, steamMatch);
@@ -3930,7 +4603,9 @@ describe('VaultTrackService SteamDB patch workflow', () => {
           return new Response('', { status: 200 });
         }
 
-        if (input === 'https://steamrip.com/mouse-p-i-for-hire-free-download/') {
+        if (
+          input === 'https://steamrip.com/mouse-p-i-for-hire-free-download/'
+        ) {
           return new Response(
             steamRipSourceHtml({
               buildId: '22862861',
@@ -3970,6 +4645,184 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       expect(database.listDownloadMirrors(item.id, 'steamrip')).toEqual([
         expect.objectContaining({ url: 'https://gofile.io/d/newer' }),
       ]);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it.each<SupportedSourceKind>(['ankergames', 'steamrip'])(
+    'discovers ElAmigos top-section-only matches from a %s-origin draft',
+    async (originSourceKind) => {
+      const { database, tempRoot } = await openTestDatabase();
+      try {
+        const item = database.upsertTrackedItem({
+          normalizedTitle: 'mouse p i for hire',
+          sourceKind: originSourceKind,
+          sourceUrl:
+            originSourceKind === 'ankergames'
+              ? 'https://ankergames.net/game/mouse-p-i-for-hire'
+              : 'https://steamrip.com/mouse-p-i-for-hire-free-download/',
+          title: 'MOUSE: P.I. For Hire',
+        });
+        database.upsertSteamMatch(item.id, steamMatch);
+        database.upsertSourceMatch({
+          confidence: 1,
+          createdAt: '2026-04-22T12:00:00.000Z',
+          isPrimary: true,
+          lastCheckedAt: '2026-04-22T12:00:00.000Z',
+          lastError: null,
+          method: 'primary_source',
+          normalizedTitle: 'mouse p i for hire',
+          score: 1,
+          sourceKind: originSourceKind,
+          sourceTitle: 'MOUSE: P.I. For Hire',
+          sourceUrl: item.sourceUrl,
+          status: 'verified',
+          trackedItemId: item.id,
+          updatedAt: '2026-04-22T12:00:00.000Z',
+          usable: true,
+        });
+
+        const sourceFetch = vi.fn(async (input: string) => {
+          if (input === 'https://ankergames.net/game/mouse-p-i-for-hire') {
+            return originSourceKind === 'ankergames'
+              ? new Response(ankergamesSourceHtml(), { status: 200 })
+              : new Response('', { status: 429 });
+          }
+          if (input === 'https://ankergames.net/recent-updates') {
+            return new Response('', { status: 200 });
+          }
+          if (input === 'https://elamigos.site/') {
+            return new Response(
+              `
+                <h2>21.04.2026</h2>
+                <h3>
+                  Mouse PI for Hire Deluxe Edition ElAmigos +[Update 1.0.5.8168]
+                  <a href="/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html">DOWNLOAD</a>
+                </h3>
+              `,
+              { status: 200 },
+            );
+          }
+          if (
+            input ===
+            'https://elamigos.site/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html'
+          ) {
+            return new Response(elamigosMousePiHtml(), { status: 200 });
+          }
+          if (input === 'https://www.filecrypt.cc/Container/MOUSEFULL.html') {
+            return new Response(
+              `<a href="https://gofile.io/d/mouse-elamigos">GOFILE</a>`,
+              { status: 200 },
+            );
+          }
+          if (input === 'https://www.filecrypt.cc/Container/MOUSEPATCH.html') {
+            return new Response(
+              `<a href="https://gofile.io/d/mouse-elamigos-patch">GOFILE</a>`,
+              { status: 200 },
+            );
+          }
+          if (input === 'https://steamrip.com/games-list-page/') {
+            return new Response('', { status: 200 });
+          }
+          if (input === 'https://steamrip.com/updated-games/') {
+            return new Response('', { status: 200 });
+          }
+          return new Response('', { status: 404 });
+        });
+
+        const view = await createService(
+          database,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          sourceFetch,
+        ).discoverSourceMatches(item.id);
+        const elamigos = view.sourceMatches.find(
+          (source) => source.match.sourceKind === 'elamigos',
+        );
+
+        expect(elamigos).toMatchObject({
+          match: {
+            method: 'recent_updates',
+            status: 'probable',
+            usable: true,
+          },
+        });
+        expect(
+          database.getRawParsedSourcePayload(item.id, 'elamigos')
+            ?.catalogMetadata,
+        ).toMatchObject({
+          listedDate: '04/21/2026',
+          listedVersion: '1.0.5.8168',
+          method: 'recent_updates',
+        });
+        expect(database.listDownloadMirrors(item.id, 'elamigos')).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              kind: 'full',
+              url: 'https://www.filecrypt.cc/Container/MOUSEFULL.html',
+            }),
+          ]),
+        );
+      } finally {
+        await removeTempRootAfterPendingSave(tempRoot);
+      }
+    },
+  );
+
+  it('keeps a strong ElAmigos catalog candidate refreshable when detail parsing fails', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'mouse p i for hire',
+        sourceKind: 'steamrip',
+        sourceUrl: 'https://steamrip.com/mouse-p-i-for-hire-free-download/',
+        title: 'MOUSE: P.I. For Hire',
+      });
+      database.upsertSteamMatch(item.id, steamMatch);
+      const sourceFetch = vi.fn(async (input: string) => {
+        if (input === 'https://ankergames.net/game/mouse-p-i-for-hire') {
+          return new Response('', { status: 429 });
+        }
+        if (input === 'https://elamigos.site/') {
+          return new Response(
+            `
+              <h2>21.04.2026</h2>
+              <h3>
+                Mouse PI for Hire Deluxe Edition ElAmigos +[Update 1.0.5.8168]
+                <a href="/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html">DOWNLOAD</a>
+              </h3>
+            `,
+            { status: 200 },
+          );
+        }
+        if (
+          input ===
+          'https://elamigos.site/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html'
+        ) {
+          throw new Error('Detail parser timed out');
+        }
+        return new Response('', { status: 503 });
+      });
+
+      await createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      ).discoverSourceMatches(item.id);
+
+      expect(database.getSourceMatch(item.id, 'elamigos')).toMatchObject({
+        lastError: 'Detail parser timed out',
+        sourceUrl:
+          'https://elamigos.site/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html',
+        status: 'candidate',
+        usable: false,
+      });
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
@@ -4055,7 +4908,9 @@ describe('VaultTrackService SteamDB patch workflow', () => {
             { status: 200 },
           );
         }
-        if (input === 'https://steamrip.com/elden-ring-nightreign-free-download/') {
+        if (
+          input === 'https://steamrip.com/elden-ring-nightreign-free-download/'
+        ) {
           return new Response(
             steamRipEldenRingHtml({
               buildId: '19493301',
@@ -4305,17 +5160,16 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         versionsBehindLatest: 0,
       });
       expect(
-        database.getRawParsedSourcePayload(item.id, 'steamrip')?.catalogMetadata,
+        database.getRawParsedSourcePayload(item.id, 'steamrip')
+          ?.catalogMetadata,
       ).toMatchObject({
         listedDate: '04/22/2026',
         listedVersion: '1.0.1102',
         method: 'recent_updates',
       });
       expect(
-        database.getRawParsedSourcePayload(
-          item.id,
-          'steamrip',
-        )?.latestSourceRelease.patchDate,
+        database.getRawParsedSourcePayload(item.id, 'steamrip')
+          ?.latestSourceRelease.patchDate,
       ).toBeNull();
       expect(
         database.getSourceSnapshot(item.id, 'steamrip')?.observedPatchDate,
@@ -4334,11 +5188,12 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       const item = seedReplacedSteamRipAlignmentScenario(database, {
         includeSteamRipCatalogMetadata: false,
       });
-      const sourceFetch: SourceFetch = vi.fn(async (input: RequestInfo | URL) => {
-        const url = String(input);
-        if (url === 'https://steamrip.com/replaced-free-download/') {
-          return new Response(
-            `
+      const sourceFetch: SourceFetch = vi.fn(
+        async (input: RequestInfo | URL) => {
+          const url = String(input);
+          if (url === 'https://steamrip.com/replaced-free-download/') {
+            return new Response(
+              `
               <html><body>
                 <h1>REPLACED Free Download (v1.0.1102)</h1>
                 <h4>GAME INFO</h4>
@@ -4346,26 +5201,27 @@ describe('VaultTrackService SteamDB patch workflow', () => {
                 <a href="https://gofile.io/d/replaced">DOWNLOAD HERE</a>
               </body></html>
             `,
-            { status: 200 },
-          );
-        }
-        if (url === 'https://steamrip.com/games-list-page/') {
-          return new Response(
-            `<a href="/replaced-free-download/">REPLACED Free Download (v1.0.1102)</a>`,
-            { status: 200 },
-          );
-        }
-        if (url === 'https://steamrip.com/updated-games/') {
-          return new Response(
-            `
+              { status: 200 },
+            );
+          }
+          if (url === 'https://steamrip.com/games-list-page/') {
+            return new Response(
+              `<a href="/replaced-free-download/">REPLACED Free Download (v1.0.1102)</a>`,
+              { status: 200 },
+            );
+          }
+          if (url === 'https://steamrip.com/updated-games/') {
+            return new Response(
+              `
               <h2>04/22/2026</h2>
               <a href="/replaced-free-download/">REPLACED Free Download (v1.0.1102)</a>
             `,
-            { status: 200 },
-          );
-        }
-        return new Response('', { status: 404 });
-      });
+              { status: 200 },
+            );
+          }
+          return new Response('', { status: 404 });
+        },
+      );
 
       const view = await createService(
         database,
@@ -4393,17 +5249,16 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         updateStatus: 'matches_upstream',
       });
       expect(
-        database.getRawParsedSourcePayload(item.id, 'steamrip')?.catalogMetadata,
+        database.getRawParsedSourcePayload(item.id, 'steamrip')
+          ?.catalogMetadata,
       ).toMatchObject({
         listedDate: '04/22/2026',
         listedVersion: '1.0.1102',
         method: 'recent_updates',
       });
       expect(
-        database.getRawParsedSourcePayload(
-          item.id,
-          'steamrip',
-        )?.latestSourceRelease.patchDate,
+        database.getRawParsedSourcePayload(item.id, 'steamrip')
+          ?.latestSourceRelease.patchDate,
       ).toBeNull();
       expect(
         database.getSourceSnapshot(item.id, 'steamrip')?.observedPatchDate,

@@ -5,6 +5,7 @@ export type ItemActionStatus = 'idle' | 'pending' | 'complete' | 'failed';
 
 export enum TrackedItemStatus {
   New = 'new',
+  Discovered = 'discovered',
   Queued = 'queued',
   Downloading = 'downloading',
   Extracting = 'extracting',
@@ -410,6 +411,25 @@ export interface AddTrackedItemRequestPayload {
   steamPatchEntries?: SteamPatchCandidate[] | null;
   selectedDownloads: SelectedDownloads;
   queueDownload: boolean;
+}
+
+export interface CreateMatchedDraftPayload {
+  parsedSource: ParsedSourcePayload;
+  steamMatch: ConfirmedSteamMatch;
+}
+
+export interface SyncTrackedSteamPatchEntriesPayload {
+  appId: number;
+  patches: SteamPatchCandidate[];
+  trackedItemId: string;
+}
+
+export interface QueueDraftDownloadPayload {
+  selectedDownloads: SelectedDownloads;
+  selectedSteamPatch: SteamPatchCandidate;
+  sourceKind: SupportedSourceKind;
+  steamPatchEntries?: SteamPatchCandidate[] | null;
+  trackedItemId: string;
 }
 
 export interface SteamMatchResolutionPayload {

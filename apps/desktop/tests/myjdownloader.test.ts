@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { ParsedSourcePayload } from '@vaulttrack/shared-types';
 import {
@@ -822,6 +822,34 @@ describe('MyJDownloaderService queueLinks', () => {
       },
     ]);
     expect(client.findAll('/extraction/startExtractionNow')).toHaveLength(0);
+  });
+
+  it('rejects when JDownloader never exposes the moved package in downloads', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new FakeMyJDownloaderClient();
+      client.downloadPackages = [];
+      const service = createService(client);
+
+      const queue = service.queueLinks({
+        extractDirectory: 'C:\\Games\\_STAGING\\Mouse P.I. For Hire\\contents',
+        packageName: 'Mouse P.I. For Hire_1.0',
+        parsedSource,
+        selectedDownloads: {
+          fullUrl: 'https://example.invalid/full',
+        },
+        sourceKind: 'steamrip',
+        targetDirectory: 'C:\\Games\\_STAGING\\Mouse P.I. For Hire_1.0',
+      });
+      const queueExpectation = expect(queue).rejects.toThrow(
+        'JDownloader did not add full package',
+      );
+      await vi.advanceTimersByTimeAsync(5000);
+
+      await queueExpectation;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('starts extraction only after JDownloader reports archive files complete', async () => {

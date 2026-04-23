@@ -5,6 +5,7 @@ import {
   extractAnkerGamesDirectDownloadUrl,
   isAnkerGamesDirectDownloadUrl,
 } from '@vaulttrack/source-core';
+import type { RenderAnkerGamesSignedDownloadPageParams } from '@vaulttrack/source-core';
 import type { DownloadItem, Event as ElectronEvent } from 'electron';
 import {
   app,
@@ -80,12 +81,12 @@ function createWindow(options?: { showOnReady?: boolean }) {
   return mainWindow;
 }
 
-async function renderAnkerGamesSignedDownloadPage(params: {
-  signedPageUrl: string;
-  sourceUrl: string;
-}): Promise<string | null> {
+async function renderAnkerGamesSignedDownloadPage(
+  params: RenderAnkerGamesSignedDownloadPageParams,
+): Promise<string | null> {
   return new Promise((resolve, reject) => {
     let settled = false;
+    let mainFrameLoadIsFatal = false;
     let pollTimer: NodeJS.Timeout | null = null;
     let timeoutTimer: NodeJS.Timeout | null = null;
 
@@ -141,10 +142,7 @@ async function renderAnkerGamesSignedDownloadPage(params: {
       return false;
     };
 
-    function onWillDownload(
-      event: ElectronEvent,
-      item: DownloadItem,
-    ): void {
+    function onWillDownload(event: ElectronEvent, item: DownloadItem): void {
       const downloadCandidates = [
         ...item.getURLChain(),
         item.getURL(),
@@ -186,7 +184,9 @@ async function renderAnkerGamesSignedDownloadPage(params: {
           })()`,
           true,
         );
-        if (acceptCandidate(extractAnkerGamesDirectDownloadUrl(String(pageText)))) {
+        if (
+          acceptCandidate(extractAnkerGamesDirectDownloadUrl(String(pageText)))
+        ) {
           return;
         }
       } catch {
@@ -196,10 +196,101 @@ async function renderAnkerGamesSignedDownloadPage(params: {
       pollTimer = setTimeout(pollPage, ANKERGAMES_RENDER_POLL_MS);
     };
 
-    timeoutTimer = setTimeout(() => {
-      settle(
-        new Error('AnkerGames did not expose a DataNodes download URL.'),
+    const resolveSignedPageUrlInBrowser = async (): Promise<string | null> => {
+      if (!params.stableDownloadUrl) {
+        return params.signedPageUrl ?? null;
+      }
+
+      mainFrameLoadIsFatal = false;
+      await downloadWindow.loadURL(params.sourceUrl);
+      if (settled) {
+        return null;
+      }
+
+      const generatedUrl = await downloadWindow.webContents.executeJavaScript(
+        `(() => {
+            const stableDownloadUrl = ${JSON.stringify(params.stableDownloadUrl)};
+            return (async () => {
+              const csrfResponse = await fetch(new URL('/csrf-token', location.href).toString(), {
+                credentials: 'include',
+                headers: { Accept: 'application/json' },
+              });
+              if (!csrfResponse.ok) {
+                throw new Error('CSRF request failed with ' + csrfResponse.status);
+              }
+              const csrfPayload = await csrfResponse.json();
+              const csrfToken = csrfPayload && csrfPayload.token;
+              if (!csrfToken) {
+                throw new Error('CSRF response did not include a token.');
+              }
+              const generatedResponse = await fetch(stableDownloadUrl, {
+                body: JSON.stringify({ 'g-recaptcha-response': 'development-mode' }),
+                credentials: 'include',
+                headers: {
+                  Accept: 'application/json',
+                  'Content-Type': 'application/json',
+                  'X-CSRF-TOKEN': csrfToken,
+                },
+                method: 'POST',
+                referrer: location.href,
+              });
+              if (!generatedResponse.ok) {
+                throw new Error('Download URL request failed with ' + generatedResponse.status);
+              }
+              const generatedPayload = await generatedResponse.json();
+              return generatedPayload && generatedPayload.download_url
+                ? String(generatedPayload.download_url)
+                : null;
+            })();
+          })()`,
+        true,
       );
+      if (!generatedUrl) {
+        throw new Error(
+          'AnkerGames download response did not include a download URL.',
+        );
+      }
+
+      const normalizedUrl = new URL(
+        String(generatedUrl),
+        params.sourceUrl,
+      ).toString();
+      if (acceptCandidate(normalizedUrl)) {
+        return null;
+      }
+      return normalizedUrl;
+    };
+
+    const start = async () => {
+      let signedPageUrl = params.signedPageUrl ?? null;
+      if (params.stableDownloadUrl) {
+        try {
+          signedPageUrl =
+            (await resolveSignedPageUrlInBrowser()) ?? signedPageUrl;
+        } catch (error) {
+          if (!signedPageUrl) {
+            throw error;
+          }
+        }
+      }
+      if (settled) {
+        return;
+      }
+      if (!signedPageUrl) {
+        throw new Error(
+          'AnkerGames download response did not include a download URL.',
+        );
+      }
+
+      mainFrameLoadIsFatal = true;
+      await downloadWindow.loadURL(signedPageUrl, {
+        httpReferrer: params.sourceUrl,
+      });
+      await pollPage();
+    };
+
+    timeoutTimer = setTimeout(() => {
+      settle(new Error('AnkerGames did not expose a DataNodes download URL.'));
     }, ANKERGAMES_RENDER_TIMEOUT_MS);
 
     downloadSession.on('will-download', onWillDownload);
@@ -216,7 +307,7 @@ async function renderAnkerGamesSignedDownloadPage(params: {
     downloadWindow.webContents.on(
       'did-fail-load',
       (_event, errorCode, errorDescription, _validatedUrl, isMainFrame) => {
-        if (isMainFrame) {
+        if (isMainFrame && mainFrameLoadIsFatal) {
           settle(
             new Error(
               `AnkerGames signed page failed to render: ${
@@ -228,18 +319,13 @@ async function renderAnkerGamesSignedDownloadPage(params: {
       },
     );
 
-    void downloadWindow
-      .loadURL(params.signedPageUrl, {
-        httpReferrer: params.sourceUrl,
-      })
-      .then(() => pollPage())
-      .catch((error: unknown) => {
-        settle(
-          error instanceof Error
-            ? error
-            : new Error('AnkerGames signed page failed to render.'),
-        );
-      });
+    void start().catch((error: unknown) => {
+      settle(
+        error instanceof Error
+          ? error
+          : new Error('AnkerGames signed page failed to render.'),
+      );
+    });
   });
 }
 
@@ -399,8 +485,10 @@ async function bootstrap() {
   ipcMain.handle('vault:resolveSteamPatches', (_event, payload) =>
     service.resolveSteamPatches(payload.appId),
   );
-  ipcMain.handle('vault:listSteamPatchEntries', (_event, trackedItemId: string) =>
-    service.listSteamPatchEntries(trackedItemId),
+  ipcMain.handle(
+    'vault:listSteamPatchEntries',
+    (_event, trackedItemId: string) =>
+      service.listSteamPatchEntries(trackedItemId),
   );
   ipcMain.handle(
     'vault:applySteamMatch',
@@ -410,11 +498,13 @@ async function bootstrap() {
   ipcMain.handle('vault:refreshTrackedItem', (_event, trackedItemId: string) =>
     service.refreshTrackedItem(trackedItemId),
   );
-  ipcMain.handle('vault:discoverSourceMatches', (_event, trackedItemId: string) =>
-    service.discoverSourceMatches(trackedItemId, {
-      bypassBackoff: true,
-      forceCatalog: true,
-    }),
+  ipcMain.handle(
+    'vault:discoverSourceMatches',
+    (_event, trackedItemId: string) =>
+      service.discoverSourceMatches(trackedItemId, {
+        bypassBackoff: true,
+        forceCatalog: true,
+      }),
   );
   ipcMain.handle('vault:refreshMatchedSource', (_event, payload) =>
     service.refreshMatchedSource(payload.trackedItemId, payload.sourceKind),
@@ -433,10 +523,12 @@ async function bootstrap() {
     (_event, payload: { selectedDownloads?: unknown; trackedItemId: string }) =>
       service.retryDownload(
         payload.trackedItemId,
-        payload.selectedDownloads as {
-          fullUrl: string;
-          patchUrl?: string | null;
-        } | undefined,
+        payload.selectedDownloads as
+          | {
+              fullUrl: string;
+              patchUrl?: string | null;
+            }
+          | undefined,
       ),
   );
   ipcMain.handle('vault:markDownloadFailed', (_event, trackedItemId: string) =>
@@ -445,7 +537,11 @@ async function bootstrap() {
   ipcMain.handle(
     'vault:clearDownloadMirrorFailed',
     (_event, payload: { trackedItemId: string; url: string }) =>
-      service.markDownloadMirrorFailed(payload.trackedItemId, payload.url, false),
+      service.markDownloadMirrorFailed(
+        payload.trackedItemId,
+        payload.url,
+        false,
+      ),
   );
   ipcMain.handle(
     'vault:completeStagedInstall',

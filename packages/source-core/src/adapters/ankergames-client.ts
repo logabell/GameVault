@@ -13,8 +13,9 @@ interface AnkerGamesVersionStatus {
 }
 
 export interface RenderAnkerGamesSignedDownloadPageParams {
-  signedPageUrl: string;
+  signedPageUrl?: string | null;
   sourceUrl: string;
+  stableDownloadUrl?: string | null;
 }
 
 export type AnkerGamesSignedDownloadPageRenderer = (
@@ -145,7 +146,9 @@ export function extractAnkerGamesVersionRequest(html: string): {
   lazyToken: string;
   snapshot: string;
 } | null {
-  const tagMatches = html.matchAll(/<div\b(?=[^>]*wire:snapshot=)(?=[^>]*wire:id=)[^>]*>/g);
+  const tagMatches = html.matchAll(
+    /<div\b(?=[^>]*wire:snapshot=)(?=[^>]*wire:id=)[^>]*>/g,
+  );
 
   for (const match of tagMatches) {
     const tag = match[0];
@@ -192,7 +195,10 @@ export async function hydrateAnkerGamesVersionStatus(params: {
     throw new Error('AnkerGames version status component was not found.');
   }
 
-  const csrfToken = await fetchAnkerGamesCsrfToken(params.sourceUrl, params.fetch);
+  const csrfToken = await fetchAnkerGamesCsrfToken(
+    params.sourceUrl,
+    params.fetch,
+  );
   const response = await params.fetch(
     new URL('/livewire/update', params.sourceUrl).toString(),
     {
@@ -224,7 +230,9 @@ export async function hydrateAnkerGamesVersionStatus(params: {
     },
   );
   if (!response.ok) {
-    throw new Error(`AnkerGames version request failed with ${response.status}.`);
+    throw new Error(
+      `AnkerGames version request failed with ${response.status}.`,
+    );
   }
 
   const payload = asRecord(await readJson(response));
@@ -242,7 +250,9 @@ export async function hydrateAnkerGamesVersionStatus(params: {
   const version = getString(versionData?.current_version);
   const buildId = getString(versionData?.current_build);
   if (!version || !buildId) {
-    throw new Error('AnkerGames version response did not include current version and build.');
+    throw new Error(
+      'AnkerGames version response did not include current version and build.',
+    );
   }
 
   return {
@@ -313,7 +323,9 @@ export function isAnkerGamesDirectDownloadUrl(url: string): boolean {
   }
 }
 
-export function extractAnkerGamesDirectDownloadUrl(html: string): string | null {
+export function extractAnkerGamesDirectDownloadUrl(
+  html: string,
+): string | null {
   for (const text of textVariants(html)) {
     const candidates = [
       ...text.matchAll(RAW_URL_RE),
@@ -340,65 +352,19 @@ export async function resolveAnkerGamesDownloadUrl(params: {
   sourceUrl: string;
   stableDownloadUrl: string;
 }): Promise<string> {
-  const csrfToken = await fetchAnkerGamesCsrfToken(params.sourceUrl, params.fetch);
-  const generatedResponse = await params.fetch(params.stableDownloadUrl, {
-    body: JSON.stringify({
-      'g-recaptcha-response': 'development-mode',
-    }),
-    credentials: 'include',
-    headers: {
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-      'X-CSRF-TOKEN': csrfToken,
-    },
-    method: 'POST',
-    referrer: params.sourceUrl,
-  });
-  if (!generatedResponse.ok) {
-    throw new Error(
-      `AnkerGames download URL request failed with ${generatedResponse.status}.`,
-    );
-  }
+  const renderDirectUrl = async (
+    signedPageUrl: string | null,
+  ): Promise<string> => {
+    if (!params.renderSignedDownloadPage) {
+      throw new Error(
+        'AnkerGames signed page did not include a direct DataNodes download URL.',
+      );
+    }
 
-  const generatedPayload = asRecord(await readJson(generatedResponse));
-  const signedPageUrl = getString(generatedPayload?.download_url);
-  if (!signedPageUrl) {
-    throw new Error('AnkerGames download response did not include a download URL.');
-  }
-  const normalizedSignedPageUrl = normalizeAbsoluteUrl(
-    signedPageUrl,
-    params.sourceUrl,
-  );
-  if (!normalizedSignedPageUrl) {
-    throw new Error('AnkerGames download response included an invalid URL.');
-  }
-  if (isAnkerGamesDirectDownloadUrl(normalizedSignedPageUrl)) {
-    return normalizedSignedPageUrl;
-  }
-
-  const signedPageResponse = await params.fetch(normalizedSignedPageUrl, {
-    credentials: 'include',
-    headers: {
-      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    },
-    referrer: params.sourceUrl,
-  });
-  if (!signedPageResponse.ok) {
-    throw new Error(
-      `AnkerGames signed download page failed with ${signedPageResponse.status}.`,
-    );
-  }
-
-  const signedPageHtml = await signedPageResponse.text();
-  const directUrl = extractAnkerGamesDirectDownloadUrl(signedPageHtml);
-  if (directUrl) {
-    return directUrl;
-  }
-
-  if (params.renderSignedDownloadPage) {
     const renderedDirectUrl = await params.renderSignedDownloadPage({
-      signedPageUrl: normalizedSignedPageUrl,
+      signedPageUrl,
       sourceUrl: params.sourceUrl,
+      stableDownloadUrl: params.stableDownloadUrl,
     });
     if (renderedDirectUrl && isAnkerGamesDirectDownloadUrl(renderedDirectUrl)) {
       return renderedDirectUrl;
@@ -406,9 +372,84 @@ export async function resolveAnkerGamesDownloadUrl(params: {
     throw new Error(
       'AnkerGames render fallback did not return a DataNodes download URL.',
     );
+  };
+
+  let normalizedSignedPageUrl: string | null = null;
+
+  try {
+    const csrfToken = await fetchAnkerGamesCsrfToken(
+      params.sourceUrl,
+      params.fetch,
+    );
+    const generatedResponse = await params.fetch(params.stableDownloadUrl, {
+      body: JSON.stringify({
+        'g-recaptcha-response': 'development-mode',
+      }),
+      credentials: 'include',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'X-CSRF-TOKEN': csrfToken,
+      },
+      method: 'POST',
+      referrer: params.sourceUrl,
+    });
+    if (!generatedResponse.ok) {
+      throw new Error(
+        `AnkerGames download URL request failed with ${generatedResponse.status}.`,
+      );
+    }
+
+    const generatedPayload = asRecord(await readJson(generatedResponse));
+    const signedPageUrl = getString(generatedPayload?.download_url);
+    if (!signedPageUrl) {
+      throw new Error(
+        'AnkerGames download response did not include a download URL.',
+      );
+    }
+    normalizedSignedPageUrl = normalizeAbsoluteUrl(
+      signedPageUrl,
+      params.sourceUrl,
+    );
+    if (!normalizedSignedPageUrl) {
+      throw new Error('AnkerGames download response included an invalid URL.');
+    }
+  } catch (error) {
+    if (params.renderSignedDownloadPage) {
+      return renderDirectUrl(null);
+    }
+    throw error;
   }
 
-  throw new Error(
-    'AnkerGames signed page did not include a direct DataNodes download URL.',
-  );
+  if (isAnkerGamesDirectDownloadUrl(normalizedSignedPageUrl)) {
+    return normalizedSignedPageUrl;
+  }
+
+  try {
+    const signedPageResponse = await params.fetch(normalizedSignedPageUrl, {
+      credentials: 'include',
+      headers: {
+        Accept:
+          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+      referrer: params.sourceUrl,
+    });
+    if (!signedPageResponse.ok) {
+      throw new Error(
+        `AnkerGames signed download page failed with ${signedPageResponse.status}.`,
+      );
+    }
+
+    const signedPageHtml = await signedPageResponse.text();
+    const directUrl = extractAnkerGamesDirectDownloadUrl(signedPageHtml);
+    if (directUrl) {
+      return directUrl;
+    }
+  } catch (error) {
+    if (!params.renderSignedDownloadPage) {
+      throw error;
+    }
+  }
+
+  return renderDirectUrl(normalizedSignedPageUrl);
 }

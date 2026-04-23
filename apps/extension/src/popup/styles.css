@@ -292,6 +292,7 @@ select option {
 .library-card,
 .library-row,
 .mirror-row,
+.source-row,
 .candidate-row,
 .status-card,
 .note-card {
@@ -308,21 +309,14 @@ select option {
 
 .hero-card {
   position: relative;
+  min-height: 104px;
+  display: grid;
+  align-content: end;
+  gap: 8px;
   overflow: hidden;
   background-color: var(--panel);
   background-size: cover;
   background-position: center;
-}
-
-.hero-card.has-cover::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(
-    90deg,
-    rgba(8, 12, 13, 0.92),
-    rgba(8, 12, 13, 0.46)
-  );
 }
 
 .hero-card > * {
@@ -331,11 +325,12 @@ select option {
 
 .hero-title {
   display: -webkit-box;
-  margin: 7px 0 10px;
+  margin: 0;
+  padding-block: 1px;
   overflow: hidden;
   color: var(--ink);
   font-size: 22px;
-  line-height: 1.06;
+  line-height: 1.18;
   letter-spacing: 0;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
@@ -387,6 +382,7 @@ select option {
 
 .section-stack,
 .mirror-list,
+.source-comparison-list,
 .candidate-list,
 .library-list,
 .library-card-grid,
@@ -638,6 +634,13 @@ select option {
   background: color-mix(in srgb, var(--success) 12%, var(--panel-soft));
 }
 
+.status-chip.discovered,
+.library-presence-chip.is-discovered {
+  color: color-mix(in srgb, var(--accent) 72%, var(--ink));
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
+  background: color-mix(in srgb, var(--accent) 14%, var(--panel-soft));
+}
+
 .status-chip.failed,
 .status-chip.folder_missing,
 .mini-chip.is-danger {
@@ -767,6 +770,7 @@ select option {
 
 .candidate-row,
 .mirror-row,
+.source-row,
 .status-card,
 .note-card {
   padding: 12px;
@@ -782,15 +786,55 @@ select option {
 .selection-row:hover,
 .selection-row.is-selected,
 .mirror-row.is-selected,
+.source-row.is-selected,
 .candidate-row.is-selected {
   border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
   background: color-mix(in srgb, var(--accent-soft) 62%, var(--panel-strong));
 }
 
 .candidate-choice,
-.mirror-copy {
+.mirror-copy,
+.source-row__main > div:first-child {
   display: grid;
   gap: 5px;
+}
+
+.source-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.source-row__main {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 5px;
+  align-items: start;
+  padding: 0;
+  color: inherit;
+  text-align: left;
+  background: transparent;
+}
+
+.source-row__main span,
+.source-row__error {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.source-row__status {
+  display: flex;
+  justify-content: flex-start;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.source-row__error {
+  grid-column: 1 / -1;
+  margin: 0;
 }
 
 .candidate-title-row {

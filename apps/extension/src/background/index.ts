@@ -4,6 +4,7 @@ import type {
   NativeMessageRequest,
   NativeMessageResponse,
   ParsedSourcePayload,
+  SelectedDownloads,
   SettingsView,
   SteamCandidate,
   SteamDbBuildLookupAttentionKind,
@@ -11,6 +12,7 @@ import type {
   SteamDbBuildLookupState,
   SteamMatchResolutionPayload,
   SteamPatchCandidate,
+  SupportedSourceKind,
   ThemeMode,
   TrackedItemView,
 } from '@vaulttrack/shared-types';
@@ -28,7 +30,7 @@ const BRIDGE_HTTP_TIMEOUT_MS = 2500;
 const NATIVE_MESSAGE_TIMEOUT_MS = 75000;
 const ADD_TRACKED_ITEM_TIMEOUT_MS = 90000;
 const MYJD_AUTH_TIMEOUT_MS = 75000;
-const STEAM_PATCH_RESOLVE_TIMEOUT_MS = 18000;
+const STEAM_PATCH_RESOLVE_TIMEOUT_MS = 45000;
 const PREPARE_DRAFT_HEALTH_TIMEOUT_MS = 1500;
 const NATIVE_HOST_NAME = 'com.vaulttrack.desktop';
 const AUTO_OPEN_PREFIX = 'autoOpen';
@@ -107,6 +109,7 @@ interface SteamDbSelectionContext {
   sourceUrl?: string | null;
   tabId?: number | null;
   desktopLookupId?: string | null;
+  trackedItemId?: string | null;
 }
 
 interface PendingSteamDbConfirmation {
@@ -127,6 +130,7 @@ interface SteamDbBackfillState {
   status: SteamDbBackfillStatus;
   tabId?: number | null;
   desktopLookupId?: string | null;
+  trackedItemId?: string | null;
   attentionKind?: SteamDbBuildLookupAttentionKind | null;
   userAttention?: boolean;
 }
@@ -261,6 +265,12 @@ function withTimeout<T>(
       },
     );
   });
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException
+    ? error.name === 'AbortError'
+    : error instanceof Error && error.name === 'AbortError';
 }
 
 async function postBridgeRequest(
@@ -422,9 +432,7 @@ async function completeDesktopSteamDbLookup(
           attentionKind: state.attentionKind ?? null,
           appId: state.appId,
           errorKind:
-            state.status === 'failed'
-              ? (state.errorKind ?? 'unknown')
-              : null,
+            state.status === 'failed' ? (state.errorKind ?? 'unknown') : null,
           errorMessage: state.status === 'failed' ? state.message : null,
           lookupId,
           needsUserAttention: Boolean(state.userAttention),
@@ -871,10 +879,12 @@ async function sendDesktopRequest(
   request: NativeMessageRequest,
   options: {
     bridgeTimeoutMs?: number;
+    retryAfterTimeout?: boolean;
     retryBridgeTimeoutMs?: number;
   } = {},
 ): Promise<NativeMessageResponse> {
   const bridgeTimeoutMs = options.bridgeTimeoutMs ?? BRIDGE_HTTP_TIMEOUT_MS;
+  const retryAfterTimeout = options.retryAfterTimeout ?? true;
   const retryBridgeTimeoutMs =
     options.retryBridgeTimeoutMs ??
     Math.max(5000, bridgeTimeoutMs, BRIDGE_HTTP_TIMEOUT_MS);
@@ -883,7 +893,10 @@ async function sendDesktopRequest(
     const response = await postBridgeRequest(request, bridgeTimeoutMs);
     cacheHealthFromResponse(response);
     return response;
-  } catch {
+  } catch (error) {
+    if (!retryAfterTimeout && isAbortError(error)) {
+      throw error;
+    }
     // Fall through to single-flight desktop bootstrap.
   }
 
@@ -1068,28 +1081,52 @@ function normalizeSteamDbBuildLookupFailureKind(
 
 async function startSteamDbBackfill(
   appId: number,
-  options: { desktopLookupId?: string | null } = {},
+  options: {
+    desktopLookupId?: string | null;
+    trackedItemId?: string | null;
+  } = {},
 ): Promise<SteamDbBackfillState> {
   const existing = await getSteamDbBackfillState(appId);
   if (existing?.status === 'pending' || existing?.status === 'complete') {
-    if (options.desktopLookupId) {
+    if (options.desktopLookupId || options.trackedItemId) {
       if (existing.status === 'complete') {
-        void completeDesktopSteamDbLookup(existing, options.desktopLookupId);
-      } else if (existing.desktopLookupId !== options.desktopLookupId) {
+        if (options.desktopLookupId) {
+          void completeDesktopSteamDbLookup(existing, options.desktopLookupId);
+        }
+        if (options.trackedItemId && existing.patches.length > 0) {
+          void syncTrackedSteamPatchEntries({
+            appId,
+            patches: existing.patches,
+            trackedItemId: options.trackedItemId,
+          });
+        }
+      } else if (
+        existing.desktopLookupId !== options.desktopLookupId ||
+        existing.trackedItemId !== options.trackedItemId
+      ) {
         const nextState: SteamDbBackfillState = {
           ...existing,
-          desktopLookupId: options.desktopLookupId,
+          desktopLookupId:
+            options.desktopLookupId ?? existing.desktopLookupId ?? null,
+          trackedItemId:
+            options.trackedItemId ?? existing.trackedItemId ?? null,
         };
-        const existingContext =
-          await getSessionValue<SteamDbSelectionContext>(
-            getSteamDbSelectionContextKey(appId),
-          );
+        const existingContext = await getSessionValue<SteamDbSelectionContext>(
+          getSteamDbSelectionContextKey(appId),
+        );
         await Promise.all([
           setSessionValue(getSteamDbBackfillStateKey(appId), nextState),
           existingContext
             ? setSessionValue(getSteamDbSelectionContextKey(appId), {
                 ...existingContext,
-                desktopLookupId: options.desktopLookupId,
+                desktopLookupId:
+                  options.desktopLookupId ??
+                  existingContext.desktopLookupId ??
+                  null,
+                trackedItemId:
+                  options.trackedItemId ??
+                  existingContext.trackedItemId ??
+                  null,
               } satisfies SteamDbSelectionContext)
             : Promise.resolve(),
         ]);
@@ -1109,6 +1146,7 @@ async function startSteamDbBackfill(
     status: 'pending',
     tabId: null,
     desktopLookupId: options.desktopLookupId ?? null,
+    trackedItemId: options.trackedItemId ?? null,
     userAttention: false,
   };
   const context: SteamDbSelectionContext = {
@@ -1125,6 +1163,7 @@ async function startSteamDbBackfill(
     sourceUrl: null,
     tabId: null,
     desktopLookupId: options.desktopLookupId ?? null,
+    trackedItemId: options.trackedItemId ?? null,
   };
 
   await Promise.all([
@@ -1234,6 +1273,8 @@ async function attachManualSteamDbBackfillTab(
     sourceUrl: existingContext?.sourceUrl ?? null,
     tabId,
     desktopLookupId,
+    trackedItemId:
+      existingContext?.trackedItemId ?? existingState?.trackedItemId ?? null,
   };
   const state: SteamDbBackfillState = {
     appId,
@@ -1244,6 +1285,8 @@ async function attachManualSteamDbBackfillTab(
     status: 'pending',
     tabId,
     desktopLookupId,
+    trackedItemId:
+      existingContext?.trackedItemId ?? existingState?.trackedItemId ?? null,
     userAttention: true,
   };
 
@@ -1543,6 +1586,138 @@ async function completeDraft(params: {
   }
 
   return response;
+}
+
+async function createMatchedDraft(params: {
+  mode: 'active' | 'clipboard';
+  selectedAppId?: number | null;
+  selectedSteamCandidate?: SteamCandidate | null;
+  sourceUrl?: string | null;
+  tabId?: number | null;
+}) {
+  const target = await resolveDraftTarget({
+    mode: params.mode,
+    sourceUrl: params.sourceUrl,
+    tabId: params.tabId,
+  });
+  if (!target.url || target.tabId === undefined) {
+    throw new Error('Supported page parse is not available yet.');
+  }
+  const parsedSource = await ensureParsedSourceForTab({
+    tabId: target.tabId,
+    url: target.url,
+  });
+  let selectedCandidate =
+    params.selectedSteamCandidate &&
+    (!params.selectedAppId ||
+      params.selectedSteamCandidate.appId === params.selectedAppId)
+      ? params.selectedSteamCandidate
+      : null;
+
+  if (!selectedCandidate && params.selectedAppId) {
+    const matchResolution = await resolveSteamCandidates(parsedSource);
+    selectedCandidate =
+      matchResolution.candidates.find(
+        (candidate) => candidate.appId === params.selectedAppId,
+      ) ?? null;
+  }
+
+  if (!selectedCandidate) {
+    throw new Error('Select a Steam app before creating a draft.');
+  }
+
+  const steamMatch: ConfirmedSteamMatch = {
+    appId: selectedCandidate.appId,
+    coverUrl: selectedCandidate.coverUrl,
+    matchedAt: new Date().toISOString(),
+    normalizedTitle: selectedCandidate.normalizedTitle,
+    title: selectedCandidate.title,
+  };
+  const response = await sendDesktopRequest(
+    {
+      payload: {
+        parsedSource,
+        steamMatch,
+      },
+      type: 'createMatchedDraft',
+    },
+    {
+      bridgeTimeoutMs: ADD_TRACKED_ITEM_TIMEOUT_MS,
+      retryBridgeTimeoutMs: ADD_TRACKED_ITEM_TIMEOUT_MS,
+    },
+  );
+
+  if (response.ok) {
+    await writeTrackedStatusCache(
+      parsedSource.sourceUrl,
+      (response.payload ?? null) as TrackedItemView | null,
+    );
+  }
+
+  return response;
+}
+
+async function discoverSourceMatches(
+  trackedItemId: string,
+  options: { bypassBackoff?: boolean; forceCatalog?: boolean } = {},
+) {
+  return sendDesktopRequest(
+    {
+      payload: { options, trackedItemId },
+      type: 'discoverSourceMatches',
+    },
+    {
+      bridgeTimeoutMs: ADD_TRACKED_ITEM_TIMEOUT_MS,
+      retryBridgeTimeoutMs: ADD_TRACKED_ITEM_TIMEOUT_MS,
+    },
+  );
+}
+
+async function refreshMatchedSource(
+  trackedItemId: string,
+  sourceKind: SupportedSourceKind,
+) {
+  return sendDesktopRequest(
+    {
+      payload: { sourceKind, trackedItemId },
+      type: 'refreshMatchedSource',
+    },
+    {
+      bridgeTimeoutMs: ADD_TRACKED_ITEM_TIMEOUT_MS,
+      retryBridgeTimeoutMs: ADD_TRACKED_ITEM_TIMEOUT_MS,
+    },
+  );
+}
+
+async function syncTrackedSteamPatchEntries(params: {
+  appId: number;
+  patches: SteamPatchCandidate[];
+  trackedItemId: string;
+}) {
+  return sendDesktopRequest({
+    payload: params,
+    type: 'syncTrackedSteamPatchEntries',
+  });
+}
+
+async function queueDraftDownload(params: {
+  selectedDownloads: SelectedDownloads;
+  selectedSteamPatch: SteamPatchCandidate;
+  sourceKind: SupportedSourceKind;
+  steamPatchEntries?: SteamPatchCandidate[] | null;
+  trackedItemId: string;
+}) {
+  return sendDesktopRequest(
+    {
+      payload: params,
+      type: 'queueDraftDownload',
+    },
+    {
+      bridgeTimeoutMs: ADD_TRACKED_ITEM_TIMEOUT_MS,
+      retryAfterTimeout: false,
+      retryBridgeTimeoutMs: ADD_TRACKED_ITEM_TIMEOUT_MS,
+    },
+  );
 }
 
 async function setReadyBadge(tabId: number): Promise<void> {
@@ -1983,7 +2158,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
 
-      const state = await startSteamDbBackfill(appId);
+      const trackedItemId =
+        typeof message.trackedItemId === 'string'
+          ? message.trackedItemId
+          : null;
+      const state = await startSteamDbBackfill(appId, { trackedItemId });
       sendResponse({ ok: true, payload: state });
       return;
     }
@@ -2079,17 +2258,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (!isFreshSteamDbContext(context)) {
           context = await attachManualSteamDbBackfillTab(appId, tabId);
         } else if (typeof tabId === 'number' && context.tabId !== tabId) {
-          context = await attachManualSteamDbBackfillTab(
-            appId,
-            tabId,
-            context,
-          );
+          context = await attachManualSteamDbBackfillTab(appId, tabId, context);
         }
       } else if (appId && !isFreshSteamDbContext(context)) {
-        context = await attachManualSteamDbBackfillTab(
-          appId,
-          tabId,
-        );
+        context = await attachManualSteamDbBackfillTab(appId, tabId);
       }
       sendResponse({
         ok: true,
@@ -2202,6 +2374,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         patches,
         status: 'complete',
         tabId: null,
+        trackedItemId: context.trackedItemId ?? null,
       };
       await setSessionValue(getSteamDbBackfillStateKey(appId), completedState);
       await Promise.allSettled([
@@ -2210,6 +2383,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       ]);
       void cacheDesktopSteamDbBuildLookup(appId, patches);
       void completeDesktopSteamDbLookup(completedState);
+      if (context.trackedItemId && patches.length > 0) {
+        void syncTrackedSteamPatchEntries({
+          appId,
+          patches,
+          trackedItemId: context.trackedItemId,
+        });
+      }
 
       sendResponse({ ok: true, payload: completedState });
       return;
@@ -2232,7 +2412,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
 
-      const tabId = sender.tab?.id ?? existingState.tabId ?? context?.tabId ?? null;
+      const tabId =
+        sender.tab?.id ?? existingState.tabId ?? context?.tabId ?? null;
       const messageText =
         typeof message.message === 'string' && message.message.trim()
           ? message.message.trim()
@@ -2248,6 +2429,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         message: messageText,
         status: 'pending',
         tabId,
+        trackedItemId:
+          context?.trackedItemId ?? existingState.trackedItemId ?? null,
         userAttention: true,
       };
       await Promise.all([
@@ -2257,6 +2440,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               ...context,
               createdAt,
               tabId,
+              trackedItemId:
+                context.trackedItemId ?? existingState.trackedItemId ?? null,
             } satisfies SteamDbSelectionContext)
           : Promise.resolve(),
       ]);
@@ -2305,6 +2490,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           errorKind === 'rate_limited' ? getSteamDbRetryAfterHint(appId) : null,
         status: 'failed',
         tabId: null,
+        trackedItemId:
+          context?.trackedItemId ?? existingState.trackedItemId ?? null,
         userAttention: false,
       };
       await setSessionValue(getSteamDbBackfillStateKey(appId), failedState);
@@ -2342,6 +2529,128 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         );
       }
       sendResponse({ ok: true });
+      return;
+    }
+
+    if (message.type === 'vaulttrack:create-matched-draft') {
+      const result = await createMatchedDraft({
+        mode: (message.mode as 'active' | 'clipboard') ?? 'active',
+        selectedAppId:
+          typeof message.selectedAppId === 'number'
+            ? message.selectedAppId
+            : null,
+        selectedSteamCandidate:
+          typeof message.selectedSteamCandidate === 'object' &&
+          message.selectedSteamCandidate !== null
+            ? (message.selectedSteamCandidate as SteamCandidate)
+            : null,
+        sourceUrl:
+          typeof message.sourceUrl === 'string'
+            ? (message.sourceUrl as string)
+            : null,
+        tabId:
+          typeof message.tabId === 'number' ? (message.tabId as number) : null,
+      });
+      sendResponse(result);
+      return;
+    }
+
+    if (message.type === 'vaulttrack:discover-source-matches') {
+      const trackedItemId = String(message.trackedItemId ?? '');
+      if (!trackedItemId) {
+        sendResponse({
+          message: 'Create a matched draft before checking sources.',
+          ok: false,
+        });
+        return;
+      }
+      sendResponse(
+        await discoverSourceMatches(trackedItemId, {
+          bypassBackoff: true,
+          forceCatalog: true,
+        }),
+      );
+      return;
+    }
+
+    if (message.type === 'vaulttrack:refresh-matched-source') {
+      const trackedItemId = String(message.trackedItemId ?? '');
+      const sourceKind =
+        message.sourceKind === 'ankergames' ||
+        message.sourceKind === 'elamigos' ||
+        message.sourceKind === 'steamrip'
+          ? (message.sourceKind as SupportedSourceKind)
+          : null;
+      if (!trackedItemId || !sourceKind) {
+        sendResponse({
+          message: 'Choose a matched source before refreshing it.',
+          ok: false,
+        });
+        return;
+      }
+      sendResponse(await refreshMatchedSource(trackedItemId, sourceKind));
+      return;
+    }
+
+    if (message.type === 'vaulttrack:sync-tracked-steam-patches') {
+      const trackedItemId = String(message.trackedItemId ?? '');
+      const appId = typeof message.appId === 'number' ? message.appId : null;
+      if (!trackedItemId || !appId) {
+        sendResponse({
+          message: 'Create a matched draft before syncing patch history.',
+          ok: false,
+        });
+        return;
+      }
+      sendResponse(
+        await syncTrackedSteamPatchEntries({
+          appId,
+          patches: Array.isArray(message.patches)
+            ? (message.patches as SteamPatchCandidate[])
+            : [],
+          trackedItemId,
+        }),
+      );
+      return;
+    }
+
+    if (message.type === 'vaulttrack:queue-draft-download') {
+      const sourceKind =
+        message.sourceKind === 'ankergames' ||
+        message.sourceKind === 'elamigos' ||
+        message.sourceKind === 'steamrip'
+          ? (message.sourceKind as SupportedSourceKind)
+          : null;
+      const selectedSteamPatch =
+        typeof message.selectedSteamPatch === 'object' &&
+        message.selectedSteamPatch !== null
+          ? (message.selectedSteamPatch as SteamPatchCandidate)
+          : null;
+      if (!sourceKind || !selectedSteamPatch) {
+        sendResponse({
+          message: 'Choose a source and SteamDB patch before queueing.',
+          ok: false,
+        });
+        return;
+      }
+      sendResponse(
+        await queueDraftDownload({
+          selectedDownloads: {
+            fullUrl: String(message.selectedDownloads?.fullUrl ?? ''),
+            patchUrl:
+              typeof message.selectedDownloads?.patchUrl === 'string'
+                ? String(message.selectedDownloads.patchUrl)
+                : null,
+            sourceKind,
+          },
+          selectedSteamPatch,
+          sourceKind,
+          steamPatchEntries: Array.isArray(message.steamPatchEntries)
+            ? (message.steamPatchEntries as SteamPatchCandidate[])
+            : null,
+          trackedItemId: String(message.trackedItemId ?? ''),
+        }),
+      );
       return;
     }
 

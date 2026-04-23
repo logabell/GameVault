@@ -27,6 +27,7 @@ import {
 import type {
   ConnectionHealthSummary,
   MyJDownloaderDeviceSummary,
+  MatchedSourceView,
   PatchSelectionSource,
   ParsedSourcePayload,
   RemoveTrackedItemMode,
@@ -34,11 +35,25 @@ import type {
   SettingsView,
   SteamCandidate,
   SteamPatchCandidate,
+  SupportedSourceKind,
   ThemeMode,
   TrackedItemView,
 } from '@vaulttrack/shared-types';
 
-import { findLikelySteamPatch, getSteamPatchKey } from './patch-matching.js';
+import {
+  buildCreateMatchedDraftMessage,
+  findSharedPatchMirrorUrl,
+  getHeroPresenceState,
+  getLikelyPatchForSelectedSource,
+  getPatchKeyForSnapshot,
+  getSourceComparisonLabel,
+  getSourceDownloadSelection,
+  getSourceMatchPatchKey,
+  haveSharedMirrorUrls,
+  normalizeComparableUrl,
+  trackedItemMatchesSourceUrls,
+} from './add-game-workflow.js';
+import { getSteamPatchKey } from './patch-matching.js';
 import { mergeSteamPatchLists } from './patch-list.js';
 
 type PopupTab = 'game' | 'library' | 'settings';
@@ -53,7 +68,8 @@ type LibraryAction = {
   trackedItemId: string;
 } | null;
 
-const STEAM_PATCH_MESSAGE_TIMEOUT_MS = 20000;
+const STEAM_PATCH_MESSAGE_TIMEOUT_MS = 50000;
+const QUEUE_DOWNLOAD_MESSAGE_TIMEOUT_MS = 120000;
 const STEAMDB_BACKFILL_POLL_INTERVAL_MS = 750;
 const STEAMDB_BACKFILL_POLL_TIMEOUT_MS = 26000;
 const EXTENSION_LIBRARY_VIEW_STORAGE_KEY = 'vaulttrack:extension:library-view';
@@ -62,6 +78,7 @@ const STEAM_LEGACY_APP_ART_BASE =
 
 const lifecycleStatuses = new Set([
   'new',
+  'discovered',
   'queued',
   'downloading',
   'extracting',
@@ -128,6 +145,7 @@ interface SteamDbBackfillPayload {
   patches?: SteamPatchCandidate[];
   status: 'pending' | 'complete' | 'failed';
   tabId?: number | null;
+  trackedItemId?: string | null;
 }
 
 interface SourcePatchEditorState {
@@ -215,12 +233,11 @@ function formatEta(seconds: number | null | undefined): string {
 function sendRuntimeMessageWithTimeout<T>(
   message: unknown,
   timeoutMs = STEAM_PATCH_MESSAGE_TIMEOUT_MS,
+  timeoutMessage = 'SteamDB patch lookup timed out. Try again in a moment.',
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => {
-      reject(
-        new Error('SteamDB patch lookup timed out. Try again in a moment.'),
-      );
+      reject(new Error(timeoutMessage));
     }, timeoutMs);
     chrome.runtime.sendMessage(message).then(
       (response) => {
@@ -388,7 +405,8 @@ function createOlderThanAvailablePatch(appId: number): SteamPatchCandidate {
   return {
     appId,
     buildId: null,
-    description: 'Installed patch predates the available SteamDB patch history.',
+    description:
+      'Installed patch predates the available SteamDB patch history.',
     link: `vaulttrack:older-than-available:${appId}`,
     patchDate: '',
     patchTitle: 'Older than available / not listed',
@@ -510,38 +528,7 @@ function getSourceSnapshotPatchKey(
   item: TrackedItemView,
   patches: SteamPatchCandidate[],
 ): string | null {
-  const snapshot = item.sourceSnapshot;
-  if (!snapshot) return null;
-
-  const source = snapshot.patchSelectionSource ?? null;
-  const matchesSource = (patch: SteamPatchCandidate) =>
-    !source || (patch.selectionSource ?? 'rss') === source;
-
-  const buildMatch = snapshot.observedBuildId
-    ? (patches.find(
-        (patch) =>
-          patch.buildId === snapshot.observedBuildId && matchesSource(patch),
-      ) ?? patches.find((patch) => patch.buildId === snapshot.observedBuildId))
-    : null;
-  if (buildMatch) return getSteamPatchKey(buildMatch);
-
-  const linkMatch = snapshot.observedPatchLink
-    ? (patches.find(
-        (patch) =>
-          patch.link === snapshot.observedPatchLink && matchesSource(patch),
-      ) ?? patches.find((patch) => patch.link === snapshot.observedPatchLink))
-    : null;
-  if (linkMatch) return getSteamPatchKey(linkMatch);
-
-  const titleMatch = snapshot.observedPatchTitle
-    ? (patches.find(
-        (patch) =>
-          patch.patchTitle === snapshot.observedPatchTitle &&
-          matchesSource(patch),
-      ) ??
-      patches.find((patch) => patch.patchTitle === snapshot.observedPatchTitle))
-    : null;
-  return titleMatch ? getSteamPatchKey(titleMatch) : null;
+  return getPatchKeyForSnapshot(item.sourceSnapshot, patches);
 }
 
 function formatRelativeTime(value: string | null | undefined): string {
@@ -717,9 +704,14 @@ function getTrackingStatus(item: TrackedItemView): string {
 }
 
 function shouldShowTrackingStatus(item: TrackedItemView): boolean {
-  return !['queued', 'downloading', 'extracting', 'staged', 'failed'].includes(
-    getLifecycleStatus(item),
-  );
+  return ![
+    'discovered',
+    'queued',
+    'downloading',
+    'extracting',
+    'staged',
+    'failed',
+  ].includes(getLifecycleStatus(item));
 }
 
 function getLifecycleStatus(item: TrackedItemView): string {
@@ -736,67 +728,10 @@ function getLifecycleStatus(item: TrackedItemView): string {
   return getItemFileState(item).finalPathExists ? 'installed' : 'new';
 }
 
-function getPrimaryStatus(item: TrackedItemView): string {
-  const lifecycleStatus = getLifecycleStatus(item);
-  if (!['new', 'installed'].includes(lifecycleStatus)) {
-    return lifecycleStatus;
-  }
-
-  return getTrackingStatus(item);
-}
-
 function formatSourceScan(item: TrackedItemView): string {
   const activity = getItemActivity(item);
   return formatRelativeTime(
     activity.lastSourceWatchCheckedAt ?? activity.lastSourceScannedAt,
-  );
-}
-
-function normalizeComparableUrl(
-  value: string | null | undefined,
-): string | null {
-  if (!value) return null;
-  try {
-    const parsedUrl = new URL(value);
-    parsedUrl.hash = '';
-    return parsedUrl.toString().replace(/\/$/, '').toLowerCase();
-  } catch {
-    return value.trim().replace(/\/$/, '').toLowerCase() || null;
-  }
-}
-
-function haveSharedMirrorUrls(
-  fullRows: Array<{ url: string }>,
-  patchRows: Array<{ url: string }>,
-): boolean {
-  if (fullRows.length === 0 || patchRows.length === 0) {
-    return false;
-  }
-
-  const fullUrls = new Set(
-    fullRows
-      .map((row) => normalizeComparableUrl(row.url))
-      .filter((url): url is string => Boolean(url)),
-  );
-  return patchRows.every((row) => {
-    const url = normalizeComparableUrl(row.url);
-    return Boolean(url && fullUrls.has(url));
-  });
-}
-
-function findSharedPatchMirrorUrl(
-  fullUrl: string | null,
-  patchRows: Array<{ url: string }>,
-): string | null {
-  const normalizedFullUrl = normalizeComparableUrl(fullUrl);
-  if (!normalizedFullUrl) {
-    return null;
-  }
-
-  return (
-    patchRows.find(
-      (row) => normalizeComparableUrl(row.url) === normalizedFullUrl,
-    )?.url ?? null
   );
 }
 
@@ -912,14 +847,19 @@ function App() {
     readStoredLibraryViewMode(EXTENSION_LIBRARY_VIEW_STORAGE_KEY),
   );
   const [detailsItemId, setDetailsItemId] = useState<string | null>(null);
-  const [step, setStep] = useState<FlowStep>('game');
+  const [step, setStep] = useState<FlowStep>('steam');
   const [draftShell, setDraftShell] = useState<DraftShellPayload | null>(null);
   const [health, setHealth] = useState<ConnectionHealthSummary | null>(null);
   const [libraryItems, setLibraryItems] = useState<TrackedItemView[]>([]);
   const [steamCandidates, setSteamCandidates] = useState<SteamCandidate[]>([]);
   const [steamSearchQuery, setSteamSearchQuery] = useState('');
   const [steamPatches, setSteamPatches] = useState<SteamPatchCandidate[]>([]);
+  const [matchedDraftItemId, setMatchedDraftItemId] = useState<string | null>(
+    null,
+  );
   const [selectedAppId, setSelectedAppId] = useState<number | null>(null);
+  const [selectedSourceKind, setSelectedSourceKind] =
+    useState<SupportedSourceKind | null>(null);
   const [selectedSteamPatchKey, setSelectedSteamPatchKey] = useState<
     string | null
   >(null);
@@ -953,6 +893,9 @@ function App() {
   const [trackedStatusPending, setTrackedStatusPending] = useState(false);
   const [candidateLoading, setCandidateLoading] = useState(false);
   const [patchLoading, setPatchLoading] = useState(false);
+  const [sourceDiscoveryLoading, setSourceDiscoveryLoading] = useState(false);
+  const [refreshingSourceKind, setRefreshingSourceKind] =
+    useState<SupportedSourceKind | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [libraryAction, setLibraryAction] = useState<LibraryAction>(null);
@@ -978,6 +921,7 @@ function App() {
   const sourcePatchEditorRequestIdRef = useRef(0);
   const steamReleaseDateRefreshKeysRef = useRef<Set<string>>(new Set());
   const libraryRedirectTimerRef = useRef<number | null>(null);
+  const scrollStageRef = useRef<HTMLElement | null>(null);
 
   const resolvedTheme = resolveTheme(settings.themeMode, systemPrefersDark);
   const warningState = deriveWarningState(health);
@@ -989,20 +933,6 @@ function App() {
   ];
   const parsedSource = draftShell?.parsedSource ?? null;
   const parsePending = Boolean(draftShell?.parsePending);
-  const metadataDate =
-    parsedSource?.latestSourceRelease.patchDate ?? 'Date unavailable';
-  const sharedSourcePatchMirrors = Boolean(
-    parsedSource &&
-    haveSharedMirrorUrls(
-      parsedSource.fullDownloadUrls,
-      parsedSource.patchDownloadUrls,
-    ),
-  );
-  const requiresSourcePatchMirror = Boolean(
-    parsedSource &&
-    parsedSource.patchDownloadUrls.length > 0 &&
-    !sharedSourcePatchMirrors,
-  );
   const selectedSteamPatch =
     getSteamPatchOptions(steamPatches, selectedAppId).find(
       (patch) => getSteamPatchKey(patch) === selectedSteamPatchKey,
@@ -1010,16 +940,9 @@ function App() {
   const selectedPatchSourceLabel = formatPatchSourceLabel(
     selectedSteamPatch?.selectionSource,
   );
-  const likelySteamPatch = useMemo(
-    () => findLikelySteamPatch(parsedSource, steamPatches),
-    [parsedSource, steamPatches],
-  );
   const selectedSteamCandidate =
     steamCandidates.find((candidate) => candidate.appId === selectedAppId) ??
     null;
-  const canVisitSteamStep =
-    step === 'steam' || step === 'patch' || steamCandidates.length > 0;
-  const canVisitPatchStep = step === 'patch' || steamPatches.length > 0;
   const showMyJDownloaderLoginFirst =
     !settings.myJDownloaderPasswordConfigured ||
     health?.myJDownloader.color === 'red';
@@ -1038,17 +961,12 @@ function App() {
       return null;
     }
 
-    const sourceUrls = new Set(
-      [parsedSource.sourceUrl, draftShell?.sourceUrl]
-        .map((value) => normalizeComparableUrl(value))
-        .filter((value): value is string => Boolean(value)),
-    );
+    const sourceUrls = [parsedSource.sourceUrl, draftShell?.sourceUrl];
     const parsedTitle = normalizeComparableTitle(parsedSource.title);
 
     return (
       libraryItems.find((item) => {
-        const itemSourceUrl = normalizeComparableUrl(item.item.sourceUrl);
-        if (itemSourceUrl && sourceUrls.has(itemSourceUrl)) {
+        if (trackedItemMatchesSourceUrls(item, sourceUrls)) {
           return true;
         }
 
@@ -1064,12 +982,55 @@ function App() {
     libraryItems,
     parsedSource,
   ]);
-  const currentPagePrimaryStatus = currentPageTrackedItem
-    ? getPrimaryStatus(currentPageTrackedItem)
-    : null;
   const currentPageLifecycleStatus = currentPageTrackedItem
     ? getLifecycleStatus(currentPageTrackedItem)
     : null;
+  const currentPageHeroPresence = getHeroPresenceState(currentPageTrackedItem);
+  const activeDraftItem = useMemo(
+    () =>
+      (matchedDraftItemId
+        ? libraryItems.find((item) => item.item.id === matchedDraftItemId)
+        : null) ?? currentPageTrackedItem,
+    [currentPageTrackedItem, libraryItems, matchedDraftItemId],
+  );
+  const sourceRows = activeDraftItem?.sourceMatches ?? [];
+  const selectedSourceView =
+    sourceRows.find(
+      (source) => source.match.sourceKind === selectedSourceKind,
+    ) ??
+    sourceRows.find((source) => source.match.isPrimary) ??
+    sourceRows[0] ??
+    null;
+  const selectedSourceFullMirrors =
+    selectedSourceView?.downloadMirrors.filter(
+      (mirror) => mirror.kind === 'full',
+    ) ?? [];
+  const selectedSourcePatchMirrors =
+    selectedSourceView?.downloadMirrors.filter(
+      (mirror) => mirror.kind === 'patch',
+    ) ?? [];
+  const sharedSourcePatchMirrors = haveSharedMirrorUrls(
+    selectedSourceFullMirrors,
+    selectedSourcePatchMirrors,
+  );
+  const requiresSourcePatchMirror =
+    selectedSourcePatchMirrors.length > 0 && !sharedSourcePatchMirrors;
+  const likelySteamPatch = useMemo(
+    () =>
+      getLikelyPatchForSelectedSource(
+        parsedSource,
+        selectedSourceView,
+        steamPatches,
+      ),
+    [parsedSource, selectedSourceView, steamPatches],
+  );
+  const canVisitSteamStep = Boolean(parsedSource);
+  const canVisitGameStep =
+    step === 'game' || Boolean(activeDraftItem?.item.steamAppId);
+  const canVisitPatchStep =
+    step === 'patch' ||
+    Boolean(selectedAppId && selectedSourceFullMirrors.length > 0) ||
+    steamPatches.length > 0;
   const detailsItem = useMemo(
     () => libraryItems.find((item) => item.item.id === detailsItemId) ?? null,
     [detailsItemId, libraryItems],
@@ -1119,15 +1080,18 @@ function App() {
         return current;
       }
 
-      const currentSourceUrl = normalizeComparableUrl(
-        current.trackedStatus?.item.sourceUrl ??
-          current.sourceUrl ??
-          parsedSource?.sourceUrl,
-      );
-      const updatedSourceUrl = normalizeComparableUrl(updated.item.sourceUrl);
+      const currentSourceUrls = [
+        current.trackedStatus?.item.sourceUrl,
+        current.sourceUrl,
+        parsedSource?.sourceUrl,
+        ...(current.trackedStatus?.sourceMatches.flatMap((source) => [
+          source.match.sourceUrl,
+          source.snapshot?.sourceUrl,
+        ]) ?? []),
+      ];
       const matchesCurrent =
         current.trackedStatus?.item.id === updated.item.id ||
-        (Boolean(currentSourceUrl) && currentSourceUrl === updatedSourceUrl);
+        trackedItemMatchesSourceUrls(updated, currentSourceUrls);
 
       return matchesCurrent ? { ...current, trackedStatus: updated } : current;
     });
@@ -1187,13 +1151,12 @@ function App() {
       return patchUrl;
     }
 
-    if (!parsedSource || !sharedSourcePatchMirrors) {
+    if (!sharedSourcePatchMirrors) {
       return null;
     }
 
     return (
-      findSharedPatchMirrorUrl(fullUrl, parsedSource.patchDownloadUrls) ??
-      fullUrl
+      findSharedPatchMirrorUrl(fullUrl, selectedSourcePatchMirrors) ?? fullUrl
     );
   }
 
@@ -1567,6 +1530,12 @@ function App() {
   }, [resolvedTheme]);
 
   useEffect(() => {
+    if (activeTab === 'game') {
+      scrollStageRef.current?.scrollTo({ top: 0 });
+    }
+  }, [activeTab, step]);
+
+  useEffect(() => {
     try {
       window.localStorage.setItem(
         EXTENSION_LIBRARY_VIEW_STORAGE_KEY,
@@ -1675,6 +1644,31 @@ function App() {
   }, [shellLoading, mode, sourceUrl, tabId]);
 
   useEffect(() => {
+    if (
+      shellLoading ||
+      !parsedSource ||
+      step !== 'steam' ||
+      candidateLoading ||
+      steamCandidates.length > 0
+    ) {
+      return;
+    }
+
+    const defaultQuery = deriveSteamSearchQuery(parsedSource.title);
+    setSteamSearchQuery(defaultQuery);
+    setCandidateLoading(true);
+    void loadSteamCandidates(defaultQuery, {
+      syncSearchField: true,
+    }).finally(() => setCandidateLoading(false));
+  }, [
+    candidateLoading,
+    parsedSource,
+    shellLoading,
+    steamCandidates.length,
+    step,
+  ]);
+
+  useEffect(() => {
     if (!shouldPollDraftStatus) return undefined;
     const timer = window.setInterval(() => void refreshDraftStatus(), 1400);
     return () => window.clearInterval(timer);
@@ -1687,8 +1681,34 @@ function App() {
   }, [activeTab]);
 
   useEffect(() => {
+    const appId = activeDraftItem?.item.steamAppId;
+    if (!appId) return;
+    setMatchedDraftItemId((current) => current ?? activeDraftItem.item.id);
+    setSelectedAppId((current) => current ?? appId);
+    setSelectedSourceKind(
+      (current) =>
+        current ??
+        activeDraftItem.sourceMatches.find((source) => source.match.isPrimary)
+          ?.match.sourceKind ??
+        activeDraftItem.sourceMatches[0]?.match.sourceKind ??
+        null,
+    );
+  }, [activeDraftItem]);
+
+  useEffect(() => {
     steamPatchesRef.current = steamPatches;
   }, [steamPatches]);
+
+  useEffect(() => {
+    if (!selectedSourceView) {
+      return;
+    }
+    const sourcePatchKey = getSourceMatchPatchKey(
+      selectedSourceView,
+      steamPatches,
+    );
+    setSelectedSteamPatchKey(sourcePatchKey);
+  }, [selectedSourceView, steamPatches]);
 
   useEffect(() => {
     if (
@@ -1881,49 +1901,170 @@ function App() {
     }
   }
 
-  async function openSteamMatchFlow(
-    overrides: {
-      fullMirrorUrl?: string | null;
-      patchMirrorUrl?: string | null;
-    } = {},
+  function selectSourceForDownload(source: MatchedSourceView) {
+    const selection = getSourceDownloadSelection(source);
+
+    setSelectedSourceKind(source.match.sourceKind);
+    setSelectedFullMirrorUrl(selection.selectedFullUrl);
+    setSelectedPatchMirrorUrl(selection.selectedPatchUrl);
+
+    const sourcePatchKey = getSourceMatchPatchKey(source, steamPatches);
+    setSelectedSteamPatchKey(sourcePatchKey);
+  }
+
+  async function syncTrackedSteamPatches(
+    trackedItemId: string | null,
+    appId: number,
+    patches: SteamPatchCandidate[],
   ) {
-    if (!parsedSource) return;
-    const fullMirrorUrl = overrides.fullMirrorUrl ?? selectedFullMirrorUrl;
-    const patchMirrorUrl = overrides.patchMirrorUrl ?? selectedPatchMirrorUrl;
-    const effectivePatchMirrorUrl = getEffectivePatchMirrorUrl(
-      fullMirrorUrl,
-      patchMirrorUrl,
-    );
-    if (!fullMirrorUrl) {
-      setMessage('Choose a full download mirror first.');
-      return;
+    if (!trackedItemId || patches.length === 0) return;
+    const response = await chrome.runtime.sendMessage({
+      appId,
+      patches,
+      trackedItemId,
+      type: 'vaulttrack:sync-tracked-steam-patches',
+    });
+    if (response?.ok && response.payload) {
+      applyUpdatedTrackedItem(response.payload as TrackedItemView);
     }
-    if (requiresSourcePatchMirror && !effectivePatchMirrorUrl) {
-      setMessage('Choose an update mirror before continuing.');
-      return;
-    }
-    if (effectivePatchMirrorUrl && !patchMirrorUrl) {
-      setSelectedPatchMirrorUrl(effectivePatchMirrorUrl);
-    }
-    setBusy(true);
-    setCandidateLoading(true);
-    setMessage(null);
-    setSteamCandidates([]);
-    steamPatchesRef.current = [];
-    steamDbBackfillRequestIdRef.current += 1;
-    setSteamPatches([]);
-    setSelectedAppId(null);
-    setSelectedSteamPatchKey(null);
-    setSteamPatchFeedUrl(null);
-    setSteamDbBackfillStatus('idle');
-    const defaultQuery = deriveSteamSearchQuery(parsedSource.title);
-    setSteamSearchQuery(defaultQuery);
-    setStep('steam');
+  }
+
+  async function loadPersistedSteamPatches(
+    trackedItemId: string | null,
+    appId: number,
+  ): Promise<SteamPatchCandidate[]> {
+    if (!trackedItemId) return [];
+    const response = await chrome.runtime.sendMessage({
+      trackedItemId,
+      type: 'vaulttrack:list-steam-patch-entries',
+    });
+    return Array.isArray(response?.payload)
+      ? (response.payload as unknown[])
+          .map((entry) => normalizeSteamPatchCandidate(entry, appId))
+          .filter((entry): entry is SteamPatchCandidate => entry != null)
+      : [];
+  }
+
+  async function refreshSourceMatches(trackedItemId: string) {
+    setSourceDiscoveryLoading(true);
     try {
-      await loadSteamCandidates(defaultQuery, { syncSearchField: true });
+      const response = await chrome.runtime.sendMessage({
+        trackedItemId,
+        type: 'vaulttrack:discover-source-matches',
+      });
+      if (!response?.ok) {
+        setMessage(
+          response?.message ??
+            response?.error?.message ??
+            'Unable to check other sources.',
+        );
+        return;
+      }
+      const updated = response.payload as TrackedItemView;
+      applyUpdatedTrackedItem(updated);
+      setSelectedSourceKind((current) => {
+        if (
+          current &&
+          updated.sourceMatches.some(
+            (source) => source.match.sourceKind === current,
+          )
+        ) {
+          return current;
+        }
+        return (
+          updated.sourceMatches.find((source) => source.match.isPrimary)?.match
+            .sourceKind ??
+          updated.sourceMatches.find((source) => source.match.usable)?.match
+            .sourceKind ??
+          current
+        );
+      });
+    } finally {
+      setSourceDiscoveryLoading(false);
+    }
+  }
+
+  async function refreshSelectedSource(sourceKind: SupportedSourceKind) {
+    const trackedItemId = activeDraftItem?.item.id;
+    if (!trackedItemId) return;
+    setRefreshingSourceKind(sourceKind);
+    try {
+      const source = activeDraftItem.sourceMatches.find(
+        (candidate) => candidate.match.sourceKind === sourceKind,
+      );
+      if (!source?.match.sourceUrl) {
+        await refreshSourceMatches(trackedItemId);
+        return;
+      }
+
+      const response = await chrome.runtime.sendMessage({
+        sourceKind,
+        trackedItemId,
+        type: 'vaulttrack:refresh-matched-source',
+      });
+      if (!response?.ok) {
+        setMessage(
+          response?.message ??
+            response?.error?.message ??
+            `Unable to refresh ${formatSourceKind(sourceKind)}.`,
+        );
+        return;
+      }
+      applyUpdatedTrackedItem(response.payload as TrackedItemView);
+    } finally {
+      setRefreshingSourceKind(null);
+    }
+  }
+
+  async function createMatchedDraftFromSelection() {
+    if (!parsedSource || !selectedSteamCandidate) {
+      setMessage('Choose a Steam title match first.');
+      return;
+    }
+
+    setBusy(true);
+    setMessage(null);
+    try {
+      const response = await chrome.runtime.sendMessage(
+        buildCreateMatchedDraftMessage({
+          mode,
+          selectedAppId,
+          selectedSteamCandidate,
+          sourceUrl,
+          tabId: tabId ? Number(tabId) : null,
+        }),
+      );
+      if (!response?.ok) {
+        setMessage(
+          response?.message ??
+            response?.error?.message ??
+            'Unable to create matched draft.',
+        );
+        return;
+      }
+
+      const updated = response.payload as TrackedItemView;
+      applyUpdatedTrackedItem(updated);
+      setMatchedDraftItemId(updated.item.id);
+      const currentSource =
+        updated.sourceMatches.find(
+          (source) => source.match.sourceKind === parsedSource.sourceKind,
+        ) ??
+        updated.sourceMatches.find((source) => source.match.isPrimary) ??
+        updated.sourceMatches[0] ??
+        null;
+      if (currentSource) {
+        selectSourceForDownload(currentSource);
+      }
+      setStep('game');
+      setMessage(null);
+      void refreshSourceMatches(updated.item.id);
+      void loadSteamPatchHistory(selectedSteamCandidate.appId, {
+        goToPatch: false,
+        trackedItemId: updated.item.id,
+      });
     } finally {
       setBusy(false);
-      setCandidateLoading(false);
     }
   }
 
@@ -2067,6 +2208,7 @@ function App() {
   function applySteamDbBackfillPatches(
     appId: number,
     patches: SteamPatchCandidate[],
+    trackedItemId: string | null = activeDraftItem?.item.id ?? null,
   ) {
     const normalizedPatches = patches
       .map((entry) => normalizeSteamPatchCandidate(entry, appId))
@@ -2091,16 +2233,21 @@ function App() {
         return current;
       }
 
-      return (
-        findLikelySteamPatch(parsedSource, mergedPatchList)?.key ?? current
+      const likelyPatch = getLikelyPatchForSelectedSource(
+        parsedSource,
+        selectedSourceView,
+        mergedPatchList,
       );
+      return likelyPatch?.key ?? current;
     });
     setSteamDbBackfillStatus('loaded');
+    void syncTrackedSteamPatches(trackedItemId, appId, mergedPatchList);
   }
 
   async function pollSteamDbBackfill(
     appId: number,
     requestId: number,
+    trackedItemId: string | null,
   ): Promise<void> {
     const startedAt = Date.now();
 
@@ -2123,7 +2270,11 @@ function App() {
       }
 
       if (payload.status === 'complete') {
-        applySteamDbBackfillPatches(appId, payload.patches ?? []);
+        applySteamDbBackfillPatches(
+          appId,
+          payload.patches ?? [],
+          trackedItemId,
+        );
         return;
       }
 
@@ -2138,13 +2289,17 @@ function App() {
     }
   }
 
-  async function startSteamDbBackfill(appId: number): Promise<void> {
+  async function startSteamDbBackfill(
+    appId: number,
+    trackedItemId: string | null = activeDraftItem?.item.id ?? null,
+  ): Promise<void> {
     const requestId = ++steamDbBackfillRequestIdRef.current;
     setSteamDbBackfillStatus('loading');
 
     try {
       const response = await chrome.runtime.sendMessage({
         appId,
+        trackedItemId,
         type: 'vaulttrack:start-steamdb-build-backfill',
       });
       if (steamDbBackfillRequestIdRef.current !== requestId) {
@@ -2158,7 +2313,11 @@ function App() {
       }
 
       if (payload.status === 'complete') {
-        applySteamDbBackfillPatches(appId, payload.patches ?? []);
+        applySteamDbBackfillPatches(
+          appId,
+          payload.patches ?? [],
+          trackedItemId,
+        );
         return;
       }
 
@@ -2167,7 +2326,7 @@ function App() {
         return;
       }
 
-      await pollSteamDbBackfill(appId, requestId);
+      await pollSteamDbBackfill(appId, requestId, trackedItemId);
     } catch {
       if (steamDbBackfillRequestIdRef.current === requestId) {
         setSteamDbBackfillStatus('failed');
@@ -2489,7 +2648,9 @@ function App() {
     const selectedPatch = getSteamPatchOptions(
       sourcePatchEditor.patches,
       sourcePatchEditor.item.item.steamAppId,
-    ).find((patch) => getSteamPatchKey(patch) === sourcePatchEditor.selectedKey);
+    ).find(
+      (patch) => getSteamPatchKey(patch) === sourcePatchEditor.selectedKey,
+    );
     if (!selectedPatch) return;
 
     setBusy(true);
@@ -2530,22 +2691,49 @@ function App() {
     }
   }
 
-  async function openSteamPatchFlow() {
-    if (!selectedAppId) {
+  async function loadSteamPatchHistory(
+    appId: number,
+    options: { goToPatch: boolean; trackedItemId?: string | null },
+  ) {
+    if (!appId) {
       setMessage('Choose a Steam app before loading SteamDB patches.');
       return;
     }
-    const appId = selectedAppId;
-    setBusy(true);
+    if (options.goToPatch) {
+      setBusy(true);
+      setMessage(null);
+    }
+    const trackedItemId =
+      options.trackedItemId ?? activeDraftItem?.item.id ?? null;
     setPatchLoading(true);
-    setMessage(null);
     steamPatchesRef.current = [];
     setSteamPatches([]);
     setSelectedSteamPatchKey(null);
     setSteamPatchFeedUrl(null);
-    setStep('patch');
-    void startSteamDbBackfill(appId);
+    if (options.goToPatch) {
+      setStep('patch');
+    }
     try {
+      const persistedPatches = await loadPersistedSteamPatches(
+        trackedItemId,
+        appId,
+      );
+      if (persistedPatches.length > 0) {
+        const mergedPatches = mergeSteamPatches([], persistedPatches);
+        const likelyPatch = getLikelyPatchForSelectedSource(
+          parsedSource,
+          selectedSourceView,
+          mergedPatches,
+        );
+
+        steamPatchesRef.current = mergedPatches;
+        setSteamPatches(mergedPatches);
+        setSelectedSteamPatchKey(likelyPatch?.key ?? null);
+        setSteamDbBackfillStatus('loaded');
+        return;
+      }
+
+      void startSteamDbBackfill(appId, trackedItemId);
       const response = await sendRuntimeMessageWithTimeout<{
         errorMessage?: string | null;
         feedUrl?: string | null;
@@ -2557,11 +2745,13 @@ function App() {
         type: 'vaulttrack:resolve-steam-patches',
       });
       if (!response.ok || !Array.isArray(response.payload)) {
-        setMessage(
-          response.message ??
-            response.errorMessage ??
-            'Unable to load SteamDB patches.',
-        );
+        if (options.goToPatch) {
+          setMessage(
+            response.message ??
+              response.errorMessage ??
+              'Unable to load SteamDB patches.',
+          );
+        }
         return;
       }
       const normalizedPatches = Array.isArray(response.payload)
@@ -2569,12 +2759,16 @@ function App() {
             .map((entry) => normalizeSteamPatchCandidate(entry, appId))
             .filter((entry): entry is SteamPatchCandidate => entry != null)
         : [];
-      const likelyPatch = findLikelySteamPatch(parsedSource, normalizedPatches);
       const mergedPatches = mergeSteamPatches(
         normalizedPatches,
         steamPatchesRef.current.filter(
           (patch) => (patch.selectionSource ?? 'rss') !== 'rss',
         ),
+      );
+      const likelyPatch = getLikelyPatchForSelectedSource(
+        parsedSource,
+        selectedSourceView,
+        mergedPatches,
       );
 
       steamPatchesRef.current = mergedPatches;
@@ -2585,19 +2779,35 @@ function App() {
           ? (response.feedUrl as string)
           : null,
       );
-      if (response.errorMessage) {
+      void syncTrackedSteamPatches(trackedItemId, appId, mergedPatches);
+      if (response.errorMessage && options.goToPatch) {
         setMessage(response.errorMessage);
       }
     } catch (error) {
-      setMessage(
-        error instanceof Error
-          ? error.message
-          : 'Unable to load SteamDB patches.',
-      );
+      if (options.goToPatch) {
+        setMessage(
+          error instanceof Error
+            ? error.message
+            : 'Unable to load SteamDB patches.',
+        );
+      }
     } finally {
-      setBusy(false);
+      if (options.goToPatch) {
+        setBusy(false);
+      }
       setPatchLoading(false);
     }
+  }
+
+  async function openSteamPatchFlow() {
+    if (!selectedAppId) {
+      setMessage('Choose a Steam app before loading SteamDB patches.');
+      return;
+    }
+    await loadSteamPatchHistory(selectedAppId, {
+      goToPatch: true,
+      trackedItemId: activeDraftItem?.item.id ?? null,
+    });
   }
 
   function getSteamPatchEntriesForSelectedPatch():
@@ -2633,6 +2843,15 @@ function App() {
       window.clearTimeout(libraryRedirectTimerRef.current);
       libraryRedirectTimerRef.current = null;
     }
+    const trackedItemId = activeDraftItem?.item.id ?? null;
+    if (!trackedItemId) {
+      setMessage('Create a Steam-matched draft before queueing.');
+      return false;
+    }
+    if (!selectedSourceView) {
+      setMessage('Choose a download source first.');
+      return false;
+    }
     if (!selectedFullMirrorUrl) {
       setMessage('Choose a full download mirror first.');
       return false;
@@ -2652,21 +2871,26 @@ function App() {
     setBusy(true);
     setMessage(null);
     try {
-      const response = await chrome.runtime.sendMessage({
-        mode: steamDbConfirmation?.context.mode ?? mode,
-        selectedAppId,
-        selectedSteamCandidate,
-        selectedSteamPatch,
-        steamPatchEntries: getSteamPatchEntriesForSelectedPatch(),
-        selectedDownloads: {
-          fullUrl: selectedFullMirrorUrl,
-          patchUrl: effectivePatchMirrorUrl,
+      const response = await sendRuntimeMessageWithTimeout<{
+        error?: { message?: string | null } | null;
+        errorMessage?: string | null;
+        message?: string | null;
+        ok?: boolean;
+      }>(
+        {
+          selectedSteamPatch,
+          steamPatchEntries: getSteamPatchEntriesForSelectedPatch(),
+          selectedDownloads: {
+            fullUrl: selectedFullMirrorUrl,
+            patchUrl: effectivePatchMirrorUrl,
+          },
+          sourceKind: selectedSourceView.match.sourceKind,
+          trackedItemId,
+          type: 'vaulttrack:queue-draft-download',
         },
-        sourceUrl: steamDbConfirmation?.context.sourceUrl ?? sourceUrl,
-        tabId:
-          steamDbConfirmation?.context.tabId ?? (tabId ? Number(tabId) : null),
-        type: 'vaulttrack:complete-draft',
-      });
+        QUEUE_DOWNLOAD_MESSAGE_TIMEOUT_MS,
+        'Download queueing timed out. Check MyJDownloader, then try again if the package was not added.',
+      );
       if (!response.ok) {
         setMessage(
           response.message ??
@@ -3117,7 +3341,7 @@ function App() {
         </nav>
       </header>
 
-      <main className="scroll-stage">
+      <main className="scroll-stage" ref={scrollStageRef}>
         {message ? <div className="banner">{message}</div> : null}
 
         {activeTab === 'game' ? (
@@ -3128,35 +3352,34 @@ function App() {
               } ${parsedSource?.coverUrl ? 'has-cover' : ''}`}
               style={
                 parsedSource?.coverUrl
-                  ? { backgroundImage: `url(${parsedSource.coverUrl})` }
+                  ? {
+                      backgroundImage: `linear-gradient(90deg, rgba(8, 12, 13, 0.94), rgba(8, 12, 13, 0.5)), url(${parsedSource.coverUrl})`,
+                    }
                   : undefined
               }
             >
-              {currentPageTrackedItem ? (
+              {currentPageHeroPresence.presenceLabel ? (
                 <div className="kicker-row">
                   <div className="chip-row">
-                    <span className="library-presence-chip">In Library</span>
-                    {currentPagePrimaryStatus ? (
+                    <span
+                      className={`library-presence-chip ${
+                        currentPageHeroPresence.presenceLabel === 'Discovered'
+                          ? 'is-discovered'
+                          : ''
+                      }`}
+                    >
+                      {currentPageHeroPresence.presenceLabel}
+                    </span>
+                    {currentPageHeroPresence.statusLabel ? (
                       <span className="mini-chip">
-                        {formatLabel(currentPagePrimaryStatus)}
+                        {currentPageHeroPresence.statusLabel}
                       </span>
                     ) : null}
                   </div>
                 </div>
               ) : null}
               {parsedSource ? (
-                <>
-                  <h1 className="hero-title">{parsedSource.title}</h1>
-                  <div className="hero-meta">
-                    <span>{formatSourceKind(parsedSource.sourceKind)}</span>
-                    <span>
-                      Version{' '}
-                      {parsedSource.latestSourceRelease.version ??
-                        'Unavailable'}
-                    </span>
-                    <span>{metadataDate}</span>
-                  </div>
-                </>
+                <h1 className="hero-title">{parsedSource.title}</h1>
               ) : (
                 <div className="hero-loading">
                   <span className="spinner" aria-hidden="true" />
@@ -3207,15 +3430,6 @@ function App() {
                   aria-label="Add to Vault workflow"
                 >
                   <button
-                    aria-selected={step === 'game'}
-                    className={`step-tab ${step === 'game' ? 'is-active' : ''}`}
-                    onClick={() => setStep('game')}
-                    role="tab"
-                    type="button"
-                  >
-                    Download Link
-                  </button>
-                  <button
                     aria-selected={step === 'steam'}
                     className={`step-tab ${step === 'steam' ? 'is-active' : ''}`}
                     disabled={!canVisitSteamStep}
@@ -3224,6 +3438,16 @@ function App() {
                     type="button"
                   >
                     Title Match
+                  </button>
+                  <button
+                    aria-selected={step === 'game'}
+                    className={`step-tab ${step === 'game' ? 'is-active' : ''}`}
+                    disabled={!canVisitGameStep}
+                    onClick={() => setStep('game')}
+                    role="tab"
+                    type="button"
+                  >
+                    Download Link
                   </button>
                   <button
                     aria-selected={step === 'patch'}
@@ -3241,33 +3465,119 @@ function App() {
                   <div className="section-stack">
                     <div className="section-heading">
                       <div>
-                        <p className="section-title">Download link</p>
-                        {requiresSourcePatchMirror ? (
-                          <p className="muted-text">
-                            Choose a full mirror first, then choose the ElAmigos
-                            update mirror before continuing.
-                          </p>
-                        ) : sharedSourcePatchMirrors ? (
-                          <p className="muted-text">
-                            This ElAmigos mirror contains both full and update
-                            archives.
-                          </p>
-                        ) : null}
+                        <p className="section-title">Download source</p>
+                        <p className="muted-text">
+                          Compare matched sources, then choose the mirror to
+                          queue.
+                        </p>
+                      </div>
+                    </div>
+                    {!activeDraftItem ? (
+                      <p className="muted-text">
+                        Match a Steam title before choosing a download source.
+                      </p>
+                    ) : null}
+                    {sourceDiscoveryLoading ? (
+                      <div className="inline-loader steamdb-backfill-status">
+                        <span
+                          className="spinner spinner-sm"
+                          aria-hidden="true"
+                        />
+                        <span>Checking matched sources...</span>
+                      </div>
+                    ) : null}
+                    {activeDraftItem ? (
+                      <div className="source-comparison-list">
+                        {sourceRows.map((source) => {
+                          const sourceKind = source.match.sourceKind;
+                          const isSelected =
+                            selectedSourceView?.match.sourceKind === sourceKind;
+                          const fullMirrors = source.downloadMirrors.filter(
+                            (mirror) => mirror.kind === 'full',
+                          );
+                          const canSelect =
+                            source.match.usable && fullMirrors.length > 0;
+                          const lagLabel = getSourceComparisonLabel(
+                            source,
+                            activeDraftItem,
+                          );
+                          return (
+                            <div
+                              className={`source-row ${isSelected ? 'is-selected' : ''}`}
+                              key={sourceKind}
+                            >
+                              <button
+                                className="source-row__main"
+                                disabled={busy || !canSelect}
+                                onClick={() => selectSourceForDownload(source)}
+                                type="button"
+                              >
+                                <div>
+                                  <strong>
+                                    {formatSourceKind(sourceKind)}
+                                  </strong>
+                                  <span>
+                                    {source.snapshot?.observedVersion ??
+                                      source.match.sourceTitle ??
+                                      'Version unavailable'}
+                                  </span>
+                                  <span>
+                                    {source.snapshot?.observedBuildId
+                                      ? `Build ${source.snapshot.observedBuildId}`
+                                      : (source.snapshot?.observedPatchDate ??
+                                        'Build unavailable')}
+                                  </span>
+                                </div>
+                              </button>
+                              <div className="source-row__status">
+                                <span className="mini-chip">{lagLabel}</span>
+                                {isSelected ? (
+                                  <span className="mini-chip">Selected</span>
+                                ) : null}
+                                {!canSelect ? (
+                                  <span className="mini-chip is-danger">
+                                    {formatLabel(
+                                      source.match.status === 'candidate'
+                                        ? 'not_matched'
+                                        : source.match.status,
+                                    )}
+                                  </span>
+                                ) : null}
+                                <button
+                                  aria-label={`Refresh ${formatSourceKind(sourceKind)}`}
+                                  className="ghost-button compact-button"
+                                  disabled={
+                                    busy || refreshingSourceKind === sourceKind
+                                  }
+                                  onClick={() =>
+                                    void refreshSelectedSource(sourceKind)
+                                  }
+                                  type="button"
+                                >
+                                  {refreshingSourceKind === sourceKind
+                                    ? 'Refreshing'
+                                    : 'Refresh'}
+                                </button>
+                              </div>
+                              {source.match.lastError ? (
+                                <p className="source-row__error">
+                                  {source.match.lastError}
+                                </p>
+                              ) : null}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : null}
+                    <div className="section-heading">
+                      <div>
+                        <p className="section-title">Full mirrors</p>
                       </div>
                     </div>
                     <div className="mirror-list">
-                      {parsedSource.fullDownloadUrls.map((mirror) => {
-                        const persistedMirror =
-                          currentPageTrackedItem?.downloadMirrors.find(
-                            (entry) =>
-                              entry.url === mirror.url &&
-                              entry.kind === mirror.kind,
-                          );
-                        const isSelected =
-                          selectedFullMirrorUrl === mirror.url ||
-                          persistedMirror?.selectedAt != null;
-                        const isFailed =
-                          persistedMirror?.manuallyFailedAt != null;
+                      {selectedSourceFullMirrors.map((mirror) => {
+                        const isSelected = selectedFullMirrorUrl === mirror.url;
+                        const isFailed = mirror.manuallyFailedAt != null;
                         return (
                           <div
                             className={`mirror-row ${isSelected ? 'is-selected' : ''}`}
@@ -3287,44 +3597,16 @@ function App() {
                               </div>
                             </div>
                             <div className="mirror-actions">
-                              {currentPageTrackedItem ? (
-                                <button
-                                  className="primary-button"
-                                  disabled
-                                  type="button"
-                                >
-                                  In Library
-                                </button>
-                              ) : requiresSourcePatchMirror ? (
-                                <button
-                                  className="primary-button"
-                                  disabled={
-                                    busy || !isReadyForAutomation(health)
-                                  }
-                                  onClick={() =>
-                                    setSelectedFullMirrorUrl(mirror.url)
-                                  }
-                                  type="button"
-                                >
-                                  Choose Full
-                                </button>
-                              ) : (
-                                <button
-                                  className="primary-button"
-                                  disabled={
-                                    busy || !isReadyForAutomation(health)
-                                  }
-                                  onClick={() => {
-                                    setSelectedFullMirrorUrl(mirror.url);
-                                    void openSteamMatchFlow({
-                                      fullMirrorUrl: mirror.url,
-                                    });
-                                  }}
-                                  type="button"
-                                >
-                                  Add to Vault
-                                </button>
-                              )}
+                              <button
+                                className="primary-button"
+                                disabled={busy}
+                                onClick={() =>
+                                  setSelectedFullMirrorUrl(mirror.url)
+                                }
+                                type="button"
+                              >
+                                Choose
+                              </button>
                             </div>
                           </div>
                         );
@@ -3336,24 +3618,15 @@ function App() {
                           <div>
                             <p className="section-title">Update mirrors</p>
                             <p className="muted-text">
-                              Pick the ElAmigos update link that matches the
-                              latest patch.
+                              Choose the update mirror for this source.
                             </p>
                           </div>
                         </div>
                         <div className="mirror-list">
-                          {parsedSource.patchDownloadUrls.map((mirror) => {
-                            const persistedMirror =
-                              currentPageTrackedItem?.downloadMirrors.find(
-                                (entry) =>
-                                  entry.url === mirror.url &&
-                                  entry.kind === mirror.kind,
-                              );
+                          {selectedSourcePatchMirrors.map((mirror) => {
                             const isSelected =
-                              selectedPatchMirrorUrl === mirror.url ||
-                              persistedMirror?.selectedAt != null;
-                            const isFailed =
-                              persistedMirror?.manuallyFailedAt != null;
+                              selectedPatchMirrorUrl === mirror.url;
+                            const isFailed = mirror.manuallyFailedAt != null;
                             return (
                               <div
                                 className={`mirror-row ${isSelected ? 'is-selected' : ''}`}
@@ -3380,45 +3653,48 @@ function App() {
                                 <div className="mirror-actions">
                                   <button
                                     className="primary-button"
-                                    disabled={
-                                      Boolean(currentPageTrackedItem) ||
-                                      busy ||
-                                      !isReadyForAutomation(health)
-                                    }
+                                    disabled={busy}
                                     onClick={() =>
                                       setSelectedPatchMirrorUrl(mirror.url)
                                     }
                                     type="button"
                                   >
-                                    {currentPageTrackedItem
-                                      ? 'In Library'
-                                      : 'Choose Patch'}
+                                    Choose
                                   </button>
                                 </div>
                               </div>
                             );
                           })}
                         </div>
-                        <div className="step-actions">
-                          <button
-                            className="primary-button compact-button"
-                            disabled={
-                              Boolean(currentPageTrackedItem) ||
-                              busy ||
-                              !isReadyForAutomation(health) ||
-                              !selectedFullMirrorUrl ||
-                              !selectedPatchMirrorUrl
-                            }
-                            onClick={() => void openSteamMatchFlow()}
-                            type="button"
-                          >
-                            {currentPageTrackedItem
-                              ? 'Already in Library'
-                              : 'Next'}
-                          </button>
-                        </div>
                       </>
                     ) : null}
+                    {selectedSourceView && sharedSourcePatchMirrors ? (
+                      <p className="muted-text">
+                        The selected mirror provides both full and update
+                        archives.
+                      </p>
+                    ) : null}
+                    <div className="step-actions">
+                      <button
+                        className="ghost-button compact-button"
+                        onClick={() => setStep('game')}
+                        type="button"
+                      >
+                        Back
+                      </button>
+                      <button
+                        className="primary-button compact-button"
+                        disabled={
+                          busy ||
+                          !selectedFullMirrorUrl ||
+                          (requiresSourcePatchMirror && !selectedPatchMirrorUrl)
+                        }
+                        onClick={() => void openSteamPatchFlow()}
+                        type="button"
+                      >
+                        Next
+                      </button>
+                    </div>
                   </div>
                 ) : null}
 
@@ -3508,27 +3784,12 @@ function App() {
                     ) : null}
                     <div className="step-actions">
                       <button
-                        className="ghost-button compact-button"
-                        onClick={() => setStep('game')}
-                        type="button"
-                      >
-                        Back
-                      </button>
-                      <button
                         className="primary-button compact-button"
-                        disabled={
-                          busy ||
-                          candidateLoading ||
-                          !selectedAppId ||
-                          !selectedFullMirrorUrl ||
-                          (requiresSourcePatchMirror &&
-                            !selectedPatchMirrorUrl) ||
-                          !isReadyForAutomation(health)
-                        }
-                        onClick={() => void openSteamPatchFlow()}
+                        disabled={busy || candidateLoading || !selectedAppId}
+                        onClick={() => void createMatchedDraftFromSelection()}
                         type="button"
                       >
-                        {busy ? 'Loading...' : 'Next'}
+                        {busy ? 'Saving...' : 'Use Match'}
                       </button>
                     </div>
                   </div>
@@ -3571,56 +3832,55 @@ function App() {
                         </p>
                       ) : null}
                       {!patchLoading
-                        ? getSteamPatchOptions(
-                            steamPatches,
-                            selectedAppId,
-                          ).map((patch) => {
-                            const patchKey = getSteamPatchKey(patch);
-                            const patchSuggestion =
-                              likelySteamPatch?.key === patchKey
-                                ? likelySteamPatch
-                                : null;
-                            return (
-                              <button
-                                className={`candidate-row selection-row ${selectedSteamPatchKey === patchKey ? 'is-selected' : ''}`}
-                                key={patchKey}
-                                onClick={() =>
-                                  setSelectedSteamPatchKey(patchKey)
-                                }
-                                type="button"
-                              >
-                                <div className="candidate-choice">
-                                  <div>
-                                    <div className="candidate-title-row">
-                                      <strong>{patch.patchTitle}</strong>
-                                      {patchSuggestion ? (
-                                        <span
-                                          aria-label={patchSuggestion.label}
-                                          className="likely-match-chip"
-                                          title={patchSuggestion.label}
-                                        >
-                                          <FontAwesomeIcon
-                                            aria-hidden="true"
-                                            className="likely-match-icon"
-                                            icon={faCheck}
-                                          />
-                                          <span>Likely</span>
+                        ? getSteamPatchOptions(steamPatches, selectedAppId).map(
+                            (patch) => {
+                              const patchKey = getSteamPatchKey(patch);
+                              const patchSuggestion =
+                                likelySteamPatch?.key === patchKey
+                                  ? likelySteamPatch
+                                  : null;
+                              return (
+                                <button
+                                  className={`candidate-row selection-row ${selectedSteamPatchKey === patchKey ? 'is-selected' : ''}`}
+                                  key={patchKey}
+                                  onClick={() =>
+                                    setSelectedSteamPatchKey(patchKey)
+                                  }
+                                  type="button"
+                                >
+                                  <div className="candidate-choice">
+                                    <div>
+                                      <div className="candidate-title-row">
+                                        <strong>{patch.patchTitle}</strong>
+                                        {patchSuggestion ? (
+                                          <span
+                                            aria-label={patchSuggestion.label}
+                                            className="likely-match-chip"
+                                            title={patchSuggestion.label}
+                                          >
+                                            <FontAwesomeIcon
+                                              aria-hidden="true"
+                                              className="likely-match-icon"
+                                              icon={faCheck}
+                                            />
+                                            <span>Likely</span>
+                                          </span>
+                                        ) : null}
+                                      </div>
+                                      <div className="candidate-meta">
+                                        <span>{patch.patchDate}</span>
+                                        <span>
+                                          {patch.buildId
+                                            ? `Build ${patch.buildId}`
+                                            : 'Build unavailable'}
                                         </span>
-                                      ) : null}
-                                    </div>
-                                    <div className="candidate-meta">
-                                      <span>{patch.patchDate}</span>
-                                      <span>
-                                        {patch.buildId
-                                          ? `Build ${patch.buildId}`
-                                          : 'Build unavailable'}
-                                      </span>
+                                      </div>
                                     </div>
                                   </div>
-                                </div>
-                              </button>
-                            );
-                          })
+                                </button>
+                              );
+                            },
+                          )
                         : null}
                       {!patchLoading ? (
                         <button

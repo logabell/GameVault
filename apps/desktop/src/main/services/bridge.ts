@@ -91,6 +91,26 @@ export class NativeBridgeServer {
             payload: await this.service.addTrackedItem(request.payload),
             type: request.type,
           };
+        case 'createMatchedDraft':
+          return {
+            ok: true,
+            payload: await this.service.createMatchedDraft(request.payload),
+            type: request.type,
+          };
+        case 'syncTrackedSteamPatchEntries':
+          return {
+            ok: true,
+            payload: await this.service.syncTrackedSteamPatchEntries(
+              request.payload,
+            ),
+            type: request.type,
+          };
+        case 'queueDraftDownload':
+          return {
+            ok: true,
+            payload: await this.service.queueDraftDownload(request.payload),
+            type: request.type,
+          };
         case 'getTrackedItemStatus':
           return {
             ok: true,
@@ -163,6 +183,7 @@ export class NativeBridgeServer {
             ok: true,
             payload: await this.service.discoverSourceMatches(
               request.payload.trackedItemId,
+              request.payload.options,
             ),
             type: request.type,
           };

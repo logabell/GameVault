@@ -1750,12 +1750,14 @@ export class MyJDownloaderService {
       }
     }
 
-    if (!Array.from(queuedPackageIds.values()).some((entry) => entry != null)) {
-      await this.rawClient.callDevice<boolean>(
-        device.email,
-        device.password,
-        device.deviceId,
-        '/downloadcontroller/start',
+    const missingPackageRoles = requests
+      .filter((request) => queuedPackageIds.get(request.role) == null)
+      .map((request) => request.role);
+    if (missingPackageRoles.length > 0) {
+      throw new Error(
+        `JDownloader did not add ${missingPackageRoles.join(
+          ' and ',
+        )} package from the selected link. Check LinkGrabber for captcha/offline link state or try another mirror.`,
       );
     }
 

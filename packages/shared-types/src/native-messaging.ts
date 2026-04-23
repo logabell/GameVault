@@ -3,11 +3,14 @@ import type {
   CacheSteamDbBuildLookupPayload,
   CompleteSteamDbBuildLookupPayload,
   ConnectionHealthSummary,
+  CreateMatchedDraftPayload,
   RemoveTrackedItemPayload,
   RemoveTrackedItemResult,
+  QueueDraftDownloadPayload,
   RefreshResult,
   SelectedDownloads,
   SettingsView,
+  SyncTrackedSteamPatchEntriesPayload,
   SteamDbBuildLookupState,
   SteamPatchCandidate,
   SteamPatchEntry,
@@ -25,6 +28,18 @@ export type NativeMessageRequest =
   | {
       type: 'addTrackedItem';
       payload: AddTrackedItemRequestPayload;
+    }
+  | {
+      type: 'createMatchedDraft';
+      payload: CreateMatchedDraftPayload;
+    }
+  | {
+      type: 'syncTrackedSteamPatchEntries';
+      payload: SyncTrackedSteamPatchEntriesPayload;
+    }
+  | {
+      type: 'queueDraftDownload';
+      payload: QueueDraftDownloadPayload;
     }
   | {
       type: 'getTrackedItemStatus';
@@ -70,7 +85,13 @@ export type NativeMessageRequest =
     }
   | {
       type: 'discoverSourceMatches';
-      payload: { trackedItemId: string };
+      payload: {
+        options?: {
+          bypassBackoff?: boolean;
+          forceCatalog?: boolean;
+        };
+        trackedItemId: string;
+      };
     }
   | {
       type: 'refreshMatchedSource';
@@ -169,6 +190,21 @@ export type NativeMessageResponse =
   | {
       ok: true;
       type: 'addTrackedItem';
+      payload: TrackedItemView;
+    }
+  | {
+      ok: true;
+      type: 'createMatchedDraft';
+      payload: TrackedItemView;
+    }
+  | {
+      ok: true;
+      type: 'syncTrackedSteamPatchEntries';
+      payload: TrackedItemView;
+    }
+  | {
+      ok: true;
+      type: 'queueDraftDownload';
       payload: TrackedItemView;
     }
   | {
