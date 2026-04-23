@@ -142,6 +142,7 @@ CREATE TABLE IF NOT EXISTS download_jobs (
   stage_path TEXT NOT NULL,
   final_path TEXT NOT NULL,
   stage TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT 'jdownloader',
   package_id INTEGER,
   selected_mirror_url TEXT,
   selected_patch_mirror_url TEXT,
@@ -290,6 +291,7 @@ function normalizeLibraryRoots(
 
 function applyMigrations(db: SqlJsDatabase): void {
   const statements = [
+    `ALTER TABLE download_jobs ADD COLUMN provider TEXT`,
     `ALTER TABLE download_jobs ADD COLUMN selected_mirror_url TEXT`,
     `ALTER TABLE download_jobs ADD COLUMN selected_patch_mirror_url TEXT`,
     `ALTER TABLE download_jobs ADD COLUMN bytes_loaded INTEGER`,
@@ -1199,6 +1201,30 @@ export class VaultTrackDatabase {
     }
   }
 
+  deleteDownloadMirrorsByKindExceptUrls(params: {
+    kind: 'full' | 'patch';
+    sourceKind: SupportedSourceKind;
+    trackedItemId: string;
+    urls: string[];
+  }): void {
+    if (params.urls.length === 0) {
+      this.exec(
+        `DELETE FROM download_mirrors
+         WHERE tracked_item_id = ? AND source_kind = ? AND kind = ?`,
+        [params.trackedItemId, params.sourceKind, params.kind],
+      );
+      return;
+    }
+
+    const placeholders = params.urls.map(() => '?').join(', ');
+    this.exec(
+      `DELETE FROM download_mirrors
+       WHERE tracked_item_id = ? AND source_kind = ? AND kind = ?
+         AND url NOT IN (${placeholders})`,
+      [params.trackedItemId, params.sourceKind, params.kind, ...params.urls],
+    );
+  }
+
   selectDownloadMirror(
     trackedItemId: string,
     url: string,
@@ -1679,6 +1705,7 @@ export class VaultTrackDatabase {
       stage_path: string;
       final_path: string;
       stage: DownloadJobRecord['stage'];
+      provider: string | null;
       package_id: number | null;
       selected_mirror_url: string | null;
       selected_patch_mirror_url: string | null;
@@ -1709,6 +1736,10 @@ export class VaultTrackDatabase {
           parts: this.listDownloadJobParts(row.id),
           packageId: row.package_id,
           packageName: row.package_name,
+          provider:
+            row.provider === 'embedded_browser'
+              ? 'embedded_browser'
+              : 'jdownloader',
           selectedPatchMirrorUrl: row.selected_patch_mirror_url,
           selectedMirrorUrl: row.selected_mirror_url,
           speed: row.speed,
@@ -1809,16 +1840,17 @@ export class VaultTrackDatabase {
   upsertDownloadJob(job: DownloadJobRecord): void {
     this.exec(
       `INSERT INTO download_jobs (
-         id, tracked_item_id, package_name, stage_path, final_path, stage, package_id, selected_mirror_url,
+         id, tracked_item_id, package_name, stage_path, final_path, stage, provider, package_id, selected_mirror_url,
           selected_patch_mirror_url, bytes_loaded, bytes_total, speed, eta_seconds, status_message,
           completed_parts, total_parts, created_at, updated_at, error_message
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
           tracked_item_id = excluded.tracked_item_id,
           package_name = excluded.package_name,
           stage_path = excluded.stage_path,
           final_path = excluded.final_path,
           stage = excluded.stage,
+          provider = excluded.provider,
           package_id = excluded.package_id,
           selected_mirror_url = excluded.selected_mirror_url,
           selected_patch_mirror_url = excluded.selected_patch_mirror_url,
@@ -1838,6 +1870,7 @@ export class VaultTrackDatabase {
         job.stagePath,
         job.finalPath,
         job.stage,
+        job.provider ?? 'jdownloader',
         job.packageId ?? null,
         job.selectedMirrorUrl ?? null,
         job.selectedPatchMirrorUrl ?? null,
@@ -1853,6 +1886,19 @@ export class VaultTrackDatabase {
         job.errorMessage ?? null,
       ],
     );
+    if (job.parts) {
+      if (job.parts.length === 0) {
+        this.exec(`DELETE FROM download_job_parts WHERE job_id = ?`, [job.id]);
+      } else {
+        const placeholders = job.parts.map(() => '?').join(', ');
+        this.exec(
+          `DELETE FROM download_job_parts
+           WHERE job_id = ?
+             AND role NOT IN (${placeholders})`,
+          [job.id, ...job.parts.map((part) => part.role)],
+        );
+      }
+    }
     for (const part of job.parts ?? []) {
       this.upsertDownloadJobPart(part);
     }

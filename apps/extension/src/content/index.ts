@@ -58,4 +58,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       url: location.href,
     });
   }
+
+  return undefined;
 });

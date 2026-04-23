@@ -1,9 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  extractAnkerGamesDownloadCandidates,
   extractAnkerGamesDirectDownloadUrl,
   hydrateAnkerGamesVersionStatus,
   isAnkerGamesDirectDownloadUrl,
+  isAnkerGamesProxyDownloadUrl,
+  resolveAnkerGamesBrowserDownloadUrl,
   resolveAnkerGamesDownloadUrl,
 } from '../src/adapters/ankergames-client.js';
 import {
@@ -470,6 +473,53 @@ describe('source parsers', () => {
     ]);
   });
 
+  it('parses current Ankergames modal generateDownloadUrl actions', () => {
+    const parsed = parseSupportedPage(
+      'https://ankergames.net/game/mouse-p-i-for-hire',
+      `<html>
+        <head><title>MOUSE: P.I. For Hire Free Download - AnkerGames</title></head>
+        <body>
+          <h1>MOUSE: P.I. For Hire</h1>
+          <button @click="$dispatch('open-download-modal')">
+            <span>Download</span>
+          </button>
+          <div>
+            <h3>Download Link</h3>
+            <div>DataNodes</div>
+            <a href="#" class="download-button" @click.prevent="generateDownloadUrl(2726)">
+              <span>Download</span>
+            </a>
+          </div>
+        </body>
+      </html>`,
+    );
+
+    expect(parsed.fullDownloadUrls).toEqual([
+      {
+        kind: 'full',
+        label: 'DataNodes',
+        url: 'https://ankergames.net/generate-download-url/2726',
+      },
+    ]);
+  });
+
+  it('rejects Ankergames pages without a stable generated download endpoint', () => {
+    expect(() =>
+      parseSupportedPage(
+        'https://ankergames.net/game/shape-of-dreams',
+        ankerGamesHtml()
+          .replace(
+            '<div x-data="downloadManager()">',
+            '<section><h3>Download Link</h3><div>',
+          )
+          .replace(
+            '<a href="#" @click.prevent="generateDownloadUrl(2557)">Download</a>',
+            '<button type="button">Download</button>',
+          ),
+      ),
+    ).toThrow('Failed to parse AnkerGames detail page');
+  });
+
   it('parses Ankergames current build from the visible version status panel', () => {
     const parsed = parseSupportedPage(
       'https://ankergames.net/game/shape-of-dreams',
@@ -579,6 +629,29 @@ describe('source parsers', () => {
         `<script>window.copyUrl = "${escapedUrl}"</script>`,
       ),
     ).toBe(directUrl);
+    expect(
+      extractAnkerGamesDirectDownloadUrl(
+        `<script>location.href = "https://node7.datanodes.to/d/token?file=Shape-Of-Dreams-AnkerGames.zip"</script>`,
+      ),
+    ).toBe(
+      'https://node7.datanodes.to/d/token?file=Shape-Of-Dreams-AnkerGames.zip',
+    );
+  });
+
+  it('extracts Ankergames dlproxy candidates without accepting them as final links', () => {
+    const proxyUrl =
+      'https://tunnel1.dlproxy.uk/download/proxy-token?sig=proxy-signature';
+    const candidates = extractAnkerGamesDownloadCandidates(
+      `<button data-clipboard-text="${proxyUrl}">Copy Link</button>`,
+    );
+
+    expect(isAnkerGamesProxyDownloadUrl(proxyUrl)).toBe(true);
+    expect(isAnkerGamesDirectDownloadUrl(proxyUrl)).toBe(false);
+    expect(extractAnkerGamesDirectDownloadUrl(proxyUrl)).toBeNull();
+    expect(candidates).toEqual({
+      directUrls: [],
+      proxyUrls: [proxyUrl],
+    });
   });
 
   it('rejects non-DataNodes Ankergames download candidates', () => {
@@ -586,6 +659,10 @@ describe('source parsers', () => {
       'https://ankergames.net/download/signed',
       'https://ankergames.net/build/assets/s.js',
       'https://challenges.cloudflare.com/cdn-cgi/challenge-platform/scripts/jsd/main.js',
+      'https://datanodes.to/download/token?file=Shape-Of-Dreams-AnkerGames.zip',
+      'https://datanodes.to/d/token/Shape-Of-Dreams-AnkerGames.zip',
+      'https://node42.datanodes.to:8443/download/token/Shape-Of-Dreams-AnkerGames.zip',
+      'https://tunnel1.dlproxy.uk/download/proxy-token?sig=proxy-signature',
       'notaurl',
     ];
 
@@ -636,6 +713,136 @@ describe('source parsers', () => {
     ).resolves.toBe(directUrl);
   });
 
+  it('resolves Ankergames signed-page dlproxy links before returning DataNodes', async () => {
+    const proxyUrl =
+      'https://tunnel1.dlproxy.uk/download/proxy-token?sig=proxy-signature';
+    const directUrl =
+      'https://node42.datanodes.to:8443/d/token/Shape-Of-Dreams-AnkerGames.zip';
+    const fetchMock = vi.fn(async (input: string, init?: RequestInit) => {
+      if (input === 'https://ankergames.net/csrf-token') {
+        return new Response(JSON.stringify({ token: 'csrf-token' }), {
+          status: 200,
+        });
+      }
+
+      if (input === 'https://ankergames.net/generate-download-url/2557') {
+        expect(init?.method).toBe('POST');
+        return new Response(
+          JSON.stringify({
+            download_url: 'https://ankergames.net/download/signed',
+            success: true,
+          }),
+          { status: 200 },
+        );
+      }
+
+      if (input === 'https://ankergames.net/download/signed') {
+        return new Response(
+          `<button data-clipboard-text="${proxyUrl}">Copy Link</button>`,
+          { status: 200 },
+        );
+      }
+
+      if (input === proxyUrl) {
+        return new Response(
+          `<script>window.location.href = "${directUrl}"</script>`,
+          { status: 200 },
+        );
+      }
+
+      throw new Error(`Unexpected fetch ${input}`);
+    });
+
+    await expect(
+      resolveAnkerGamesDownloadUrl({
+        fetch: fetchMock,
+        sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+        stableDownloadUrl: 'https://ankergames.net/generate-download-url/2557',
+      }),
+    ).resolves.toBe(directUrl);
+    expect(fetchMock).toHaveBeenCalledWith(
+      proxyUrl,
+      expect.objectContaining({
+        referrer: 'https://ankergames.net/download/signed',
+      }),
+    );
+  });
+
+  it('resolves Ankergames generated download pages to browser-ready dlproxy links', async () => {
+    const proxyUrl =
+      'https://tunnel1.dlproxy.uk/download/proxy-token?sig=proxy-signature';
+    const fetchMock = vi.fn(async (input: string, init?: RequestInit) => {
+      if (input === 'https://ankergames.net/csrf-token') {
+        return new Response(JSON.stringify({ token: 'csrf-token' }), {
+          status: 200,
+        });
+      }
+
+      if (input === 'https://ankergames.net/generate-download-url/2557') {
+        expect(init?.method).toBe('POST');
+        return new Response(
+          JSON.stringify({
+            download_url: 'https://ankergames.net/download/signed',
+            success: true,
+          }),
+          { status: 200 },
+        );
+      }
+
+      expect(input).toBe('https://ankergames.net/download/signed');
+      return new Response(
+        `<button data-clipboard-text="${proxyUrl}">Copy Link</button>`,
+        { status: 200 },
+      );
+    });
+
+    await expect(
+      resolveAnkerGamesBrowserDownloadUrl({
+        fetch: fetchMock,
+        sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+        stableDownloadUrl: 'https://ankergames.net/generate-download-url/2557',
+      }),
+    ).resolves.toBe(proxyUrl);
+  });
+
+  it('rejects Ankergames dlproxy stable URLs instead of resolving them', async () => {
+    const proxyUrl =
+      'https://tunnel1.dlproxy.uk/download/proxy-token?sig=proxy-signature';
+    const fetchMock = vi.fn(async () => {
+      throw new Error('dlproxy should not be fetched as a stable URL');
+    });
+
+    await expect(
+      resolveAnkerGamesDownloadUrl({
+        fetch: fetchMock,
+        sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+        stableDownloadUrl: proxyUrl,
+      }),
+    ).rejects.toThrow('generated endpoint or direct DataNodes URL');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects current Ankergames interactive DataNodes triggers', async () => {
+    const directUrl =
+      'https://node42.datanodes.to:8443/d/token/Shape-Of-Dreams-AnkerGames.zip';
+    const renderSignedDownloadPage = vi.fn(async () => directUrl);
+    const fetchMock = vi.fn(async () => {
+      throw new Error('interactive trigger should not use source fetch');
+    });
+
+    await expect(
+      resolveAnkerGamesDownloadUrl({
+        fetch: fetchMock,
+        renderSignedDownloadPage,
+        sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+        stableDownloadUrl:
+          'https://ankergames.net/game/shape-of-dreams#datanodes',
+      }),
+    ).rejects.toThrow('generated endpoint or direct DataNodes URL');
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(renderSignedDownloadPage).not.toHaveBeenCalled();
+  });
+
   it('falls back to a rendered Ankergames countdown page when static HTML has no DataNodes link', async () => {
     const directUrl =
       'https://node42.datanodes.to:8443/d/token/Shape-Of-Dreams-AnkerGames.zip';
@@ -678,6 +885,60 @@ describe('source parsers', () => {
     });
   });
 
+  it('resolves rendered Ankergames proxy fallback links through dlproxy', async () => {
+    const proxyUrl =
+      'https://tunnel1.dlproxy.uk/download/proxy-token?sig=proxy-signature';
+    const directUrl =
+      'https://node42.datanodes.to:8443/d/token/Shape-Of-Dreams-AnkerGames.zip';
+    const renderSignedDownloadPage = vi.fn(async () => proxyUrl);
+    const fetchMock = vi.fn(async (input: string) => {
+      if (input === 'https://ankergames.net/csrf-token') {
+        return new Response(JSON.stringify({ token: 'csrf-token' }), {
+          status: 200,
+        });
+      }
+
+      if (input === 'https://ankergames.net/generate-download-url/2557') {
+        return new Response(
+          JSON.stringify({
+            download_url: 'https://ankergames.net/download/signed',
+            success: true,
+          }),
+          { status: 200 },
+        );
+      }
+
+      if (input === 'https://ankergames.net/download/signed') {
+        return new Response('<html><body>Countdown</body></html>', {
+          status: 200,
+        });
+      }
+
+      if (input === proxyUrl) {
+        return new Response(
+          `<button data-clipboard-text="${directUrl}">Copy Link</button>`,
+          { status: 200 },
+        );
+      }
+
+      throw new Error(`Unexpected fetch ${input}`);
+    });
+
+    await expect(
+      resolveAnkerGamesDownloadUrl({
+        fetch: fetchMock,
+        renderSignedDownloadPage,
+        sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+        stableDownloadUrl: 'https://ankergames.net/generate-download-url/2557',
+      }),
+    ).resolves.toBe(directUrl);
+    expect(renderSignedDownloadPage).toHaveBeenCalledWith({
+      signedPageUrl: 'https://ankergames.net/download/signed',
+      sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+      stableDownloadUrl: 'https://ankergames.net/generate-download-url/2557',
+    });
+  });
+
   it('uses the rendered Ankergames resolver when plain fetch is blocked', async () => {
     const directUrl =
       'https://node42.datanodes.to:8443/d/token/Shape-Of-Dreams-AnkerGames.zip';
@@ -701,7 +962,7 @@ describe('source parsers', () => {
     });
   });
 
-  it('rejects rendered Ankergames fallback URLs that are not direct DataNodes links', async () => {
+  it('rejects rendered Ankergames fallback URLs that are not DataNodes links', async () => {
     const fetchMock = vi.fn(async (input: string) => {
       if (input === 'https://ankergames.net/csrf-token') {
         return new Response(JSON.stringify({ token: 'csrf-token' }), {

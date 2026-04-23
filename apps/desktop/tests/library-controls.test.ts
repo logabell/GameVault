@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  canQueueSourceUpdate,
   filterLibraryItem,
+  getDeleteTrackedItemPrompt,
+  getLibraryAutomationWarning,
+  getMarkDownloadFailedPrompt,
   getScopedLibraryStatusFilterCounts,
   matchesLibraryStatusFilter,
   sortLibraryItems,
@@ -232,5 +236,98 @@ describe('library controls', () => {
       sourceBehind: 1,
       updates: 0,
     });
+  });
+
+  it('allows Ankergames source updates without MyJDownloader when the desktop and root path are ready', () => {
+    expect(
+      canQueueSourceUpdate({
+        connectionHealth: {
+          desktop: {
+            color: 'green',
+            label: 'Desktop ready',
+            message: 'Desktop bridge is ready.',
+          },
+          devices: [],
+          myJDownloader: {
+            color: 'red',
+            label: 'MyJDownloader unavailable',
+            message: 'Connect MyJDownloader.',
+          },
+          selectedDeviceId: null,
+        },
+        rootLibraryPath: 'D:/Games',
+        sourceKind: 'ankergames',
+      }),
+    ).toBe(true);
+    expect(
+      canQueueSourceUpdate({
+        connectionHealth: {
+          desktop: {
+            color: 'green',
+            label: 'Desktop ready',
+            message: 'Desktop bridge is ready.',
+          },
+          devices: [],
+          myJDownloader: {
+            color: 'red',
+            label: 'MyJDownloader unavailable',
+            message: 'Connect MyJDownloader.',
+          },
+          selectedDeviceId: null,
+        },
+        rootLibraryPath: 'D:/Games',
+        sourceKind: 'steamrip',
+      }),
+    ).toBe(false);
+  });
+
+  it('surfaces a provider-aware library warning when MyJDownloader is offline', () => {
+    expect(
+      getLibraryAutomationWarning({
+        connectionHealth: {
+          desktop: {
+            color: 'green',
+            label: 'Desktop ready',
+            message: 'Desktop bridge is ready.',
+          },
+          devices: [],
+          myJDownloader: {
+            color: 'red',
+            label: 'MyJDownloader unavailable',
+            message: 'Connect MyJDownloader.',
+          },
+          selectedDeviceId: null,
+        },
+        rootLibraryPath: 'D:/Games',
+      }),
+    ).toMatchObject({
+      label: 'MyJDownloader limited',
+      message:
+        'Connect MyJDownloader. SteamRIP and ElAmigos downloads still need MyJDownloader, but Ankergames browser downloads can still start.',
+    });
+  });
+
+  it('uses browser-specific confirmation copy for embedded Ankergames downloads', () => {
+    const item = makeItem('Shape of Dreams', {
+      currentDownload: {
+        createdAt: '2026-04-01T00:00:00.000Z',
+        finalPath: 'D:/Games/Shape of Dreams',
+        id: 'job-1',
+        packageName: 'Shape of Dreams_22630308',
+        provider: 'embedded_browser',
+        stage: TrackedItemStatus.Downloading,
+        stagePath: 'D:/Games/_STAGING/Shape of Dreams_22630308',
+        trackedItemId: 'shape-of-dreams',
+        updatedAt: '2026-04-01T00:00:00.000Z',
+      },
+      status: TrackedItemStatus.Downloading,
+    });
+
+    expect(getMarkDownloadFailedPrompt(item)).toBe(
+      'Mark Shape of Dreams as failed and stop its browser download?',
+    );
+    expect(getDeleteTrackedItemPrompt(item)).toBe(
+      'Delete Shape of Dreams from VaultTrack, stop its browser download, and delete staged/install files?',
+    );
   });
 });

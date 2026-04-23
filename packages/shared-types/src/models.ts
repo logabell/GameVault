@@ -34,6 +34,7 @@ export interface ReleaseDescriptor {
 
 export interface DownloadDescriptor {
   url: string;
+  browserDownloadUrl?: string | null;
   label: string;
   kind: 'full' | 'patch';
 }
@@ -255,6 +256,8 @@ export type DownloadStage =
   | 'failed'
   | 'complete';
 
+export type DownloadProvider = 'embedded_browser' | 'jdownloader';
+
 export interface DownloadJobPartRecord {
   id: string;
   jobId: string;
@@ -281,6 +284,7 @@ export interface DownloadJobRecord {
   stagePath: string;
   finalPath: string;
   stage: DownloadStage;
+  provider?: DownloadProvider | null;
   selectedMirrorUrl?: string | null;
   selectedPatchMirrorUrl?: string | null;
   packageId?: number | null;

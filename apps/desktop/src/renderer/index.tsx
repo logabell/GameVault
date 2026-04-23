@@ -76,8 +76,12 @@ import {
   type ImportBuildLookupPauseReason,
 } from './import-queue-timing.js';
 import {
+  canQueueSourceUpdate,
   filterLibraryItem,
   getDefaultLibrarySortDirection,
+  getDeleteTrackedItemPrompt,
+  getLibraryAutomationWarning,
+  getMarkDownloadFailedPrompt,
   getScopedLibraryStatusFilterCounts,
   getTrackingStatus,
   hasActionableSourceUpdate,
@@ -1443,12 +1447,10 @@ function App() {
     [detailsItemId, items],
   );
   const resolvedTheme = resolveTheme(settings.themeMode, systemPrefersDark);
-  const warningMessage =
-    connectionHealth?.desktop.color !== 'green'
-      ? connectionHealth?.desktop.message
-      : connectionHealth?.myJDownloader.color !== 'green'
-        ? connectionHealth?.myJDownloader.message
-        : null;
+  const libraryAutomationWarning = getLibraryAutomationWarning({
+    connectionHealth,
+    rootLibraryPath: settings.rootLibraryPath,
+  });
   const themeChoices: Array<Extract<ThemeMode, 'dark' | 'light'>> = [
     'dark',
     'light',
@@ -2864,9 +2866,7 @@ function App() {
   ) {
     const confirmed =
       mode === 'delete_files'
-        ? window.confirm(
-            `Delete ${item.item.title} from VaultTrack, remove it from JDownloader, and delete staged/install files?`,
-          )
+        ? window.confirm(getDeleteTrackedItemPrompt(item))
         : window.confirm(
             `Remove ${item.item.title} from VaultTrack tracking? Local files will stay in place.`,
           );
@@ -2886,9 +2886,7 @@ function App() {
   }
 
   async function markDownloadFailed(item: TrackedItemView) {
-    const confirmed = window.confirm(
-      `Mark ${item.item.title} as failed and remove its JDownloader package(s)?`,
-    );
+    const confirmed = window.confirm(getMarkDownloadFailedPrompt(item));
     if (!confirmed) {
       return;
     }
@@ -3840,6 +3838,11 @@ function App() {
                 const scanTime =
                   snapshot?.checkedAt ?? match?.lastCheckedAt ?? null;
                 const isRefreshing = sourceBusyKind === sourceKind;
+                const canDownloadSource = canQueueSourceUpdate({
+                  connectionHealth,
+                  rootLibraryPath: settings.rootLibraryPath,
+                  sourceKind,
+                });
                 return (
                   <article className="source-offer-card" key={sourceKind}>
                     <div className="source-offer-card__heading">
@@ -3941,7 +3944,7 @@ function App() {
                       ) : null}
                       {source?.isUpdateSource && fullMirror ? (
                         <button
-                          disabled={isRefreshing}
+                          disabled={isRefreshing || !canDownloadSource}
                           onClick={() => void queueSourceUpdate(sourceKind)}
                           type="button"
                         >
@@ -4289,15 +4292,11 @@ function App() {
       </header>
 
       <main className="desktop-content">
-        {warningMessage && section !== 'settings' ? (
+        {libraryAutomationWarning && section !== 'settings' ? (
           <section className="warning-banner">
             <div>
-              <strong>
-                {connectionHealth?.desktop.color !== 'green'
-                  ? connectionHealth?.desktop.label
-                  : connectionHealth?.myJDownloader.label}
-              </strong>
-              <p className="muted-text">{warningMessage}</p>
+              <strong>{libraryAutomationWarning.label}</strong>
+              <p className="muted-text">{libraryAutomationWarning.message}</p>
             </div>
             <button
               className="ghost-button"
@@ -4705,7 +4704,7 @@ function App() {
                   </strong>
                   <p className="muted-text">
                     {connectionHealth?.myJDownloader.message ??
-                      'Connect MyJDownloader to enable download automation.'}
+                      'Connect MyJDownloader for SteamRIP and ElAmigos automation. Ankergames uses the desktop browser.'}
                   </p>
                 </div>
               </div>

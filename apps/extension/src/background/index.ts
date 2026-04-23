@@ -19,6 +19,7 @@ import type {
 import { parseSupportedPageWithNetwork } from '@vaulttrack/source-core';
 
 import { isSupportedDetailPage } from '../support.js';
+import { enrichParsedSourceWithAnkergamesBrowserDownloads } from './ankergames-parse.js';
 import {
   buildSteamDbPatchnotesUrl,
   parseSteamDbAppIdFromUrl,
@@ -533,10 +534,16 @@ async function requestPageProbe(tabId: number): Promise<PageProbe> {
 
 async function requestPageHtml(
   tabId: number,
-): Promise<{ html: string; url: string }> {
+): Promise<{
+  html: string;
+  url: string;
+}> {
   return chrome.tabs.sendMessage(tabId, {
     type: 'vaulttrack:get-html',
-  }) as Promise<{ html: string; url: string }>;
+  }) as Promise<{
+    html: string;
+    url: string;
+  }>;
 }
 
 async function ensureContentScript(tabId: number, url: string): Promise<void> {
@@ -624,9 +631,12 @@ async function parseAndCachePage(params: {
   url: string;
 }): Promise<ParsedSourcePayload> {
   const canonicalUrl = canonicalizeSupportedUrl(params.url);
-  const parsedSource = await parseSupportedPageWithNetwork(
-    params.url,
-    params.html,
+  const parsedSource = await enrichParsedSourceWithAnkergamesBrowserDownloads(
+    await parseSupportedPageWithNetwork(
+      params.url,
+      params.html,
+      fetch,
+    ),
     fetch,
   );
   await writeParsedCache({
@@ -637,6 +647,18 @@ async function parseAndCachePage(params: {
     parsedSource,
   });
   return parsedSource;
+}
+
+async function parseAndCachePageFromTab(params: {
+  fingerprint: string;
+  tabId: number;
+}): Promise<ParsedSourcePayload> {
+  const result = await requestPageHtml(params.tabId);
+  return parseAndCachePage({
+    fingerprint: params.fingerprint,
+    html: result.html,
+    url: result.url,
+  });
 }
 
 async function ensureParsedSourceForTab(params: {
@@ -666,11 +688,9 @@ async function ensureParsedSourceForTab(params: {
       return freshCache.parsedSource;
     }
 
-    const result = await requestPageHtml(params.tabId);
-    return parseAndCachePage({
+    return parseAndCachePageFromTab({
       fingerprint: pageProbe.fingerprint,
-      html: result.html,
-      url: result.url,
+      tabId: params.tabId,
     });
   })().finally(() => {
     parseInFlight.delete(canonicalUrl);

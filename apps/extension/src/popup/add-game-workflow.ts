@@ -1,4 +1,5 @@
 import type {
+  ConnectionHealthSummary,
   DownloadMirrorRecord,
   MatchedSourceView,
   ParsedSourcePayload,
@@ -47,6 +48,113 @@ export interface SourceDownloadSelection {
 export interface HeroPresenceState {
   presenceLabel: 'Discovered' | 'In Library' | null;
   statusLabel: string | null;
+}
+
+export function sourceRequiresMyJDownloader(
+  sourceKind: SupportedSourceKind | null | undefined,
+): boolean {
+  return sourceKind === 'elamigos' || sourceKind === 'steamrip';
+}
+
+export function getDownloadAutomationWarning(params: {
+  health: ConnectionHealthSummary | null;
+  rootLibraryPath: string | null | undefined;
+  sourceKind: SupportedSourceKind | null | undefined;
+}): {
+  actionLabel: string;
+  body: string;
+  cta: 'refresh' | 'settings';
+  title: string;
+} | null {
+  const { health, rootLibraryPath, sourceKind } = params;
+  if (!health || !sourceKind) {
+    return null;
+  }
+
+  if (health.desktop.color !== 'green') {
+    return {
+      actionLabel:
+        health.desktop.color === 'yellow'
+          ? 'Check Settings'
+          : 'Retry in Settings',
+      body: health.desktop.message,
+      cta: 'settings',
+      title: health.desktop.label,
+    };
+  }
+
+  if (!rootLibraryPath?.trim()) {
+    return {
+      actionLabel: 'Set Root Library',
+      body:
+        'Choose a root library path in Settings before starting downloads.',
+      cta: 'settings',
+      title: 'Root library path required',
+    };
+  }
+
+  if (!sourceRequiresMyJDownloader(sourceKind)) {
+    return null;
+  }
+
+  if (health.myJDownloader.color === 'red') {
+    return {
+      actionLabel: 'Login to MyJDownloader',
+      body: health.myJDownloader.message,
+      cta: 'settings',
+      title: health.myJDownloader.label,
+    };
+  }
+
+  if (
+    health.myJDownloader.color === 'yellow' &&
+    health.devices.length > 1 &&
+    !health.selectedDeviceId
+  ) {
+    return {
+      actionLabel: 'Choose Device',
+      body: health.myJDownloader.message,
+      cta: 'settings',
+      title: 'JDownloader device required',
+    };
+  }
+
+  if (health.myJDownloader.color === 'yellow') {
+    return {
+      actionLabel: 'Refresh Status',
+      body: health.myJDownloader.message,
+      cta: 'refresh',
+      title: health.myJDownloader.label,
+    };
+  }
+
+  return null;
+}
+
+export function isSourceReadyForAutomation(params: {
+  health: ConnectionHealthSummary | null;
+  rootLibraryPath: string | null | undefined;
+  sourceKind: SupportedSourceKind | null | undefined;
+}): boolean {
+  return Boolean(
+    params.sourceKind && !getDownloadAutomationWarning(params),
+  );
+}
+
+export function getDownloadQueueSuccessMessage(
+  sourceKind: SupportedSourceKind | null | undefined,
+): string {
+  return sourceKind === 'ankergames'
+    ? 'Download is starting in the desktop browser.'
+    : 'Queued in MyJDownloader.';
+}
+
+export function getDownloadQueueTimeoutMessage(
+  sourceKind: SupportedSourceKind | null | undefined,
+): string {
+  return sourceKind === 'ankergames'
+    ? 'Download startup timed out. Check the VaultTrack desktop app, then try again if the browser download did not begin.'
+    : 'Download queueing timed out. Check MyJDownloader, then try again if the package was not added.';
 }
 
 export function normalizeComparableUrl(

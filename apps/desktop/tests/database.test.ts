@@ -6,6 +6,8 @@ import { join } from 'node:path';
 
 import { VaultTrackDatabase } from '../src/main/services/database.js';
 import type {
+  DownloadJobRecord,
+  DownloadJobPartRecord,
   ParsedSourcePayload,
   SourceMatch,
   SteamPatchCandidate,
@@ -389,6 +391,93 @@ describe('VaultTrackDatabase cleanup metadata', () => {
         observedVersion: 'V 5.0.2.2026.04.03',
         patchSelectionSource: null,
       });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('prunes stale download job parts that are omitted from a replacement job payload', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const trackedItemId = 'tracked-download-job';
+      const baseJob: DownloadJobRecord = {
+        createdAt: '2026-04-23T19:00:00.000Z',
+        errorMessage: null,
+        etaSeconds: null,
+        finalPath: 'D:\\High Seas\\Mouse PI',
+        id: 'job-1',
+        packageId: null,
+        packageName: 'MOUSE P.I. For Hire_22862861',
+        parts: [
+          {
+            bytesLoaded: null,
+            bytesTotal: null,
+            createdAt: '2026-04-23T19:00:00.000Z',
+            errorMessage: null,
+            etaSeconds: null,
+            id: 'job-1:full',
+            jobId: 'job-1',
+            mirrorUrl: 'https://tunnel1.dlproxy.uk/download/example',
+            packageId: null,
+            packageName: 'MOUSE P.I. For Hire_22862861',
+            role: 'full',
+            speed: null,
+            stage: 'queued',
+            statusMessage: 'Queued',
+            trackedItemId,
+            updatedAt: '2026-04-23T19:00:00.000Z',
+          },
+          {
+            bytesLoaded: null,
+            bytesTotal: null,
+            createdAt: '2026-04-23T18:00:00.000Z',
+            errorMessage: 'old patch failed',
+            etaSeconds: null,
+            id: 'job-1:patch',
+            jobId: 'job-1',
+            mirrorUrl: 'https://filecrypt.cc/Container/patch',
+            packageId: null,
+            packageName: 'MOUSE P.I. For Hire_22862861',
+            role: 'patch',
+            speed: null,
+            stage: 'failed',
+            statusMessage: 'old patch failed',
+            trackedItemId,
+            updatedAt: '2026-04-23T18:00:00.000Z',
+          },
+        ] satisfies DownloadJobPartRecord[],
+        provider: 'embedded_browser',
+        selectedMirrorUrl: 'https://tunnel1.dlproxy.uk/download/example',
+        selectedPatchMirrorUrl: null,
+        speed: null,
+        stage: 'failed',
+        stagePath: 'D:\\High Seas\\_STAGING\\MOUSE P.I. For Hire_22862861',
+        statusMessage: 'old patch failed',
+        totalParts: 2,
+        trackedItemId,
+        updatedAt: '2026-04-23T19:00:00.000Z',
+      };
+      database.upsertDownloadJob(baseJob);
+
+      database.upsertDownloadJob({
+        ...baseJob,
+        completedParts: 0,
+        errorMessage: null,
+        parts: [baseJob.parts![0]!],
+        stage: 'queued',
+        statusMessage: 'Starting hidden browser download',
+        totalParts: 1,
+        updatedAt: '2026-04-23T19:05:00.000Z',
+      });
+
+      expect(database.listDownloadJobParts('job-1')).toEqual([
+        expect.objectContaining({
+          jobId: 'job-1',
+          role: 'full',
+          stage: 'queued',
+          statusMessage: 'Queued',
+        }),
+      ]);
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }

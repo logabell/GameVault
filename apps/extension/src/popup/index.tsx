@@ -42,6 +42,9 @@ import type {
 
 import {
   buildCreateMatchedDraftMessage,
+  getDownloadAutomationWarning,
+  getDownloadQueueSuccessMessage,
+  getDownloadQueueTimeoutMessage,
   findSharedPatchMirrorUrl,
   getHeroPresenceState,
   getLikelyPatchForSelectedSource,
@@ -50,6 +53,7 @@ import {
   getSourceDownloadSelection,
   getSourceMatchPatchKey,
   haveSharedMirrorUrls,
+  isSourceReadyForAutomation,
   normalizeComparableUrl,
   trackedItemMatchesSourceUrls,
 } from './add-game-workflow.js';
@@ -70,6 +74,7 @@ type LibraryAction = {
 
 const STEAM_PATCH_MESSAGE_TIMEOUT_MS = 50000;
 const QUEUE_DOWNLOAD_MESSAGE_TIMEOUT_MS = 120000;
+const STATUS_REFRESH_MESSAGE_TIMEOUT_MS = 10000;
 const STEAMDB_BACKFILL_POLL_INTERVAL_MS = 750;
 const STEAMDB_BACKFILL_POLL_TIMEOUT_MS = 26000;
 const EXTENSION_LIBRARY_VIEW_STORAGE_KEY = 'vaulttrack:extension:library-view';
@@ -196,14 +201,6 @@ function normalizeSteamMatchPayload(payload: unknown): SteamMatchPayload {
       ? record.searchQueries
       : [],
   };
-}
-
-function isReadyForAutomation(health: ConnectionHealthSummary | null): boolean {
-  return Boolean(
-    health &&
-    health.desktop.color === 'green' &&
-    health.myJDownloader.color === 'green',
-  );
 }
 
 function formatBytes(value: number | null | undefined): string {
@@ -772,52 +769,6 @@ function handleArtworkFallback(event: SyntheticEvent<HTMLImageElement>) {
   }
 }
 
-function deriveWarningState(
-  health: ConnectionHealthSummary | null,
-): WarningState | null {
-  if (!health) return null;
-  if (health.desktop.color !== 'green') {
-    return {
-      actionLabel:
-        health.desktop.color === 'yellow'
-          ? 'Check Settings'
-          : 'Retry in Settings',
-      body: health.desktop.message,
-      cta: 'settings',
-      title: health.desktop.label,
-    };
-  }
-  if (health.myJDownloader.color === 'red') {
-    return {
-      actionLabel: 'Login to MyJDownloader',
-      body: health.myJDownloader.message,
-      cta: 'settings',
-      title: health.myJDownloader.label,
-    };
-  }
-  if (
-    health.myJDownloader.color === 'yellow' &&
-    health.devices.length > 1 &&
-    !health.selectedDeviceId
-  ) {
-    return {
-      actionLabel: 'Choose Device',
-      body: health.myJDownloader.message,
-      cta: 'settings',
-      title: 'JDownloader device required',
-    };
-  }
-  if (health.myJDownloader.color === 'yellow') {
-    return {
-      actionLabel: 'Refresh Status',
-      body: health.myJDownloader.message,
-      cta: 'refresh',
-      title: health.myJDownloader.label,
-    };
-  }
-  return null;
-}
-
 function resolveHealthSeverity(
   health: ConnectionHealthSummary | null,
 ): HealthSeverity {
@@ -924,14 +875,12 @@ function App() {
   const scrollStageRef = useRef<HTMLElement | null>(null);
 
   const resolvedTheme = resolveTheme(settings.themeMode, systemPrefersDark);
-  const warningState = deriveWarningState(health);
-  const navAlertSeverity = resolveHealthSeverity(health);
+  const parsedSource = draftShell?.parsedSource ?? null;
   const deviceChoices = health?.devices ?? [];
   const themeChoices: Array<Extract<ThemeMode, 'dark' | 'light'>> = [
     'dark',
     'light',
   ];
-  const parsedSource = draftShell?.parsedSource ?? null;
   const parsePending = Boolean(draftShell?.parsePending);
   const selectedSteamPatch =
     getSteamPatchOptions(steamPatches, selectedAppId).find(
@@ -1024,6 +973,19 @@ function App() {
       ),
     [parsedSource, selectedSourceView, steamPatches],
   );
+  const selectedDownloadSourceKind =
+    selectedSourceView?.match.sourceKind ?? parsedSource?.sourceKind ?? null;
+  const warningState: WarningState | null = getDownloadAutomationWarning({
+    health,
+    rootLibraryPath: settings.rootLibraryPath,
+    sourceKind: selectedDownloadSourceKind,
+  });
+  const navAlertSeverity = warningState ? resolveHealthSeverity(health) : null;
+  const canFinishSelectedSourceDownload = isSourceReadyForAutomation({
+    health,
+    rootLibraryPath: settings.rootLibraryPath,
+    sourceKind: selectedDownloadSourceKind,
+  });
   const canVisitSteamStep = Boolean(parsedSource);
   const canVisitGameStep =
     step === 'game' || Boolean(activeDraftItem?.item.steamAppId);
@@ -1099,12 +1061,23 @@ function App() {
   }
 
   async function refreshLibrary() {
-    const response = await chrome.runtime.sendMessage({
-      type: 'vaulttrack:list-library',
-    });
+    const response = await sendRuntimeMessageWithTimeout<{
+      ok?: boolean;
+      payload?: TrackedItemView[] | null;
+    }>(
+      {
+        type: 'vaulttrack:list-library',
+      },
+      STATUS_REFRESH_MESSAGE_TIMEOUT_MS,
+      'VaultTrack library refresh timed out.',
+    );
     if (response.ok && Array.isArray(response.payload)) {
       setLibraryItems(response.payload as TrackedItemView[]);
     }
+  }
+
+  function refreshPopupStateInBackground(): void {
+    void Promise.allSettled([refreshLibrary(), refreshDraftStatus()]);
   }
 
   function getRetryMirrorRows(
@@ -1128,14 +1101,15 @@ function App() {
           : [];
     if (sourceRows.length > 0) {
       return sourceRows.map((mirror) => {
+        const actionUrl = mirror.browserDownloadUrl ?? mirror.url;
         const persisted = item.downloadMirrors.find(
-          (entry) => entry.kind === kind && entry.url === mirror.url,
+          (entry) => entry.kind === kind && entry.url === actionUrl,
         );
         return {
           kind,
           label: mirror.label,
           manuallyFailedAt: persisted?.manuallyFailedAt ?? null,
-          url: mirror.url,
+          url: actionUrl,
         };
       });
     }
@@ -1384,12 +1358,20 @@ function App() {
   async function refreshDraftStatus() {
     setStatusLoading(true);
     try {
-      const response = await chrome.runtime.sendMessage({
-        mode,
-        sourceUrl,
-        tabId: tabId ? Number(tabId) : null,
-        type: 'vaulttrack:get-draft-status',
-      });
+      const response = await sendRuntimeMessageWithTimeout<{
+        message?: string | null;
+        ok?: boolean;
+        payload?: DraftStatusPayload | null;
+      }>(
+        {
+          mode,
+          sourceUrl,
+          tabId: tabId ? Number(tabId) : null,
+          type: 'vaulttrack:get-draft-status',
+        },
+        STATUS_REFRESH_MESSAGE_TIMEOUT_MS,
+        'VaultTrack draft status refresh timed out.',
+      );
 
       if (!response.ok || !response.payload) {
         if (response.message) {
@@ -2889,7 +2871,7 @@ function App() {
           type: 'vaulttrack:queue-draft-download',
         },
         QUEUE_DOWNLOAD_MESSAGE_TIMEOUT_MS,
-        'Download queueing timed out. Check MyJDownloader, then try again if the package was not added.',
+        getDownloadQueueTimeoutMessage(selectedSourceView.match.sourceKind),
       );
       if (!response.ok) {
         setMessage(
@@ -2901,9 +2883,11 @@ function App() {
         return false;
       }
       setFinishQueued(true);
-      setMessage('Queued in MyJDownloader.');
+      setMessage(
+        getDownloadQueueSuccessMessage(selectedSourceView.match.sourceKind),
+      );
       setStep('done');
-      await Promise.allSettled([refreshLibrary(), refreshDraftStatus()]);
+      refreshPopupStateInBackground();
       libraryRedirectTimerRef.current = window.setTimeout(() => {
         setActiveTab('library');
         libraryRedirectTimerRef.current = null;
@@ -3921,7 +3905,7 @@ function App() {
                           !selectedFullMirrorUrl ||
                           (requiresSourcePatchMirror &&
                             !selectedPatchMirrorUrl) ||
-                          !isReadyForAutomation(health)
+                          !canFinishSelectedSourceDownload
                         }
                         onClick={() => void confirmAdd()}
                         type="button"
@@ -4219,7 +4203,7 @@ function App() {
                     </strong>
                     <p className="muted-text">
                       {health?.myJDownloader.message ??
-                        'Sign in to MyJDownloader to enable download automation.'}
+                        'Sign in to MyJDownloader for SteamRIP and ElAmigos automation. Ankergames uses the desktop browser.'}
                     </p>
                   </div>
                 </div>
@@ -4230,7 +4214,8 @@ function App() {
                   <p className="muted-text">
                     If the desktop bridge is still waking up, wait a few seconds
                     and refresh. VaultTrack stores MyJDownloader credentials in
-                    the desktop app only.
+                    the desktop app only, and Ankergames downloads can still run
+                    there without MyJDownloader once your library root is set.
                   </p>
                 </div>
               ) : null}
@@ -4395,7 +4380,7 @@ function App() {
               </button>
               <button
                 className="primary-button"
-                disabled={busy || !isReadyForAutomation(health)}
+                disabled={busy || !canFinishSelectedSourceDownload}
                 onClick={() => void confirmAdd()}
                 type="button"
               >

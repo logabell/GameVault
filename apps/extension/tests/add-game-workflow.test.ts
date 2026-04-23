@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type {
+  ConnectionHealthSummary,
   DownloadMirrorRecord,
   MatchedSourceView,
   ParsedSourcePayload,
@@ -13,10 +14,13 @@ import type {
 
 import {
   buildCreateMatchedDraftMessage,
+  getDownloadAutomationWarning,
+  getDownloadQueueSuccessMessage,
   getHeroPresenceState,
   getLikelyPatchForSelectedSource,
   getSourceComparisonLabel,
   getSourceDownloadSelection,
+  isSourceReadyForAutomation,
   trackedItemMatchesSourceUrls,
 } from '../src/popup/add-game-workflow.js';
 import { getSteamPatchKey } from '../src/popup/patch-matching.js';
@@ -61,6 +65,21 @@ const parsedSource: ParsedSourcePayload = {
   sourceKind: 'elamigos',
   sourceUrl: 'https://elamigos.example.test/shape-of-dreams',
   title: 'Shape of Dreams',
+};
+
+const healthyDesktopOnly: ConnectionHealthSummary = {
+  desktop: {
+    color: 'green',
+    label: 'Desktop ready',
+    message: 'Desktop bridge is ready.',
+  },
+  devices: [],
+  myJDownloader: {
+    color: 'red',
+    label: 'MyJDownloader unavailable',
+    message: 'Connect MyJDownloader to queue external downloads.',
+  },
+  selectedDeviceId: null,
 };
 
 function patch(
@@ -338,5 +357,65 @@ describe('extension add-game workflow helpers', () => {
         },
       }),
     ).toBe('Possible Update');
+  });
+
+  it('allows Ankergames automation when the desktop is ready and MyJDownloader is offline', () => {
+    expect(
+      isSourceReadyForAutomation({
+        health: healthyDesktopOnly,
+        rootLibraryPath: 'D:/Games',
+        sourceKind: 'ankergames',
+      }),
+    ).toBe(true);
+    expect(
+      getDownloadAutomationWarning({
+        health: healthyDesktopOnly,
+        rootLibraryPath: 'D:/Games',
+        sourceKind: 'ankergames',
+      }),
+    ).toBeNull();
+    expect(getDownloadQueueSuccessMessage('ankergames')).toBe(
+      'Download is starting in the desktop browser.',
+    );
+  });
+
+  it('keeps SteamRIP and ElAmigos blocked until MyJDownloader is ready', () => {
+    expect(
+      isSourceReadyForAutomation({
+        health: healthyDesktopOnly,
+        rootLibraryPath: 'D:/Games',
+        sourceKind: 'steamrip',
+      }),
+    ).toBe(false);
+    expect(
+      getDownloadAutomationWarning({
+        health: healthyDesktopOnly,
+        rootLibraryPath: 'D:/Games',
+        sourceKind: 'elamigos',
+      }),
+    ).toMatchObject({
+      actionLabel: 'Login to MyJDownloader',
+      title: 'MyJDownloader unavailable',
+    });
+  });
+
+  it('requires a root library path before any automated download can start', () => {
+    expect(
+      getDownloadAutomationWarning({
+        health: {
+          ...healthyDesktopOnly,
+          myJDownloader: {
+            color: 'green',
+            label: 'Ready',
+            message: 'Ready.',
+          },
+        },
+        rootLibraryPath: '',
+        sourceKind: 'ankergames',
+      }),
+    ).toMatchObject({
+      actionLabel: 'Set Root Library',
+      title: 'Root library path required',
+    });
   });
 });

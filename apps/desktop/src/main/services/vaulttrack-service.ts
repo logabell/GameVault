@@ -4,6 +4,8 @@ import type {
   CompleteSteamDbBuildLookupPayload,
   ConnectionHealthSummary,
   ConfirmedSteamMatch,
+  DownloadDescriptor,
+  DownloadProvider,
   CreateMatchedDraftPayload,
   DownloadJobPartRecord,
   DownloadJobRecord,
@@ -52,6 +54,8 @@ import {
 import {
   isAnkerGamesDirectDownloadUrl,
   isAnkerGamesGeneratedDownloadUrl,
+  isAnkerGamesProxyDownloadUrl,
+  resolveAnkerGamesBrowserDownloadUrl,
   buildAnkerGamesSlugCandidates,
   parseAnkerGamesCatalog,
   parseAnkerGamesRecentUpdates,
@@ -59,7 +63,6 @@ import {
   parseSteamRipCatalog,
   parseSteamRipUpdatedGames,
   parseSupportedPageForKindWithNetwork,
-  resolveAnkerGamesDownloadUrl,
   rankSourceTitleMatch,
   type AnkerGamesSignedDownloadPageRenderer,
   type SourceFetch,
@@ -477,6 +480,49 @@ function getPortableArchiveExtractPath(params: {
   return planPortableArchiveExtractPathFromJob(params);
 }
 
+export interface EmbeddedBrowserDownloadProgressSnapshot {
+  bytesLoaded: number | null;
+  bytesTotal: number | null;
+  etaSeconds: number | null;
+  speed: number | null;
+  stage: Extract<DownloadJobPartRecord['stage'], 'downloading' | 'queued'>;
+  statusMessage?: string | null;
+}
+
+export interface EmbeddedBrowserDownloadResult {
+  fileName: string;
+  savePath: string;
+}
+
+export interface EmbeddedBrowserDownloadHandle {
+  cancel: (reason?: string) => Promise<void> | void;
+  completion: Promise<EmbeddedBrowserDownloadResult>;
+}
+
+export interface StartEmbeddedBrowserDownloadParams {
+  onProgress: (snapshot: EmbeddedBrowserDownloadProgressSnapshot) => void;
+  packageName: string;
+  sourceUrl: string;
+  stableDownloadUrl: string;
+  stagePath: string;
+}
+
+export type AnkerGamesEmbeddedBrowserDownloadRunner = (
+  params: StartEmbeddedBrowserDownloadParams,
+) => EmbeddedBrowserDownloadHandle;
+
+function getDownloadProvider(
+  sourceKind: ParsedSourcePayload['sourceKind'],
+): DownloadProvider {
+  return sourceKind === 'ankergames' ? 'embedded_browser' : 'jdownloader';
+}
+
+function isEmbeddedBrowserProvider(
+  provider: DownloadJobRecord['provider'] | null | undefined,
+): provider is 'embedded_browser' {
+  return provider === 'embedded_browser';
+}
+
 function buildDownloadJobParts(params: {
   jobId: string;
   packageName: string;
@@ -533,7 +579,11 @@ function downloadJobHasPackageId(job: DownloadJobRecord): boolean {
 }
 
 function isUnconfirmedQueuedDownload(job: DownloadJobRecord): boolean {
-  return job.stage === 'queued' && !downloadJobHasPackageId(job);
+  return (
+    !isEmbeddedBrowserProvider(job.provider) &&
+    job.stage === 'queued' &&
+    !downloadJobHasPackageId(job)
+  );
 }
 
 function markUnconfirmedQueuedDownloadFailed(
@@ -563,6 +613,23 @@ function mirrorUrlMatches(
   right: string,
 ): boolean {
   return (left ?? '').trim() === right;
+}
+
+function getAnkerGamesBrowserDownloadUrl(
+  mirror: DownloadDescriptor,
+): string | null {
+  const browserDownloadUrl = mirror.browserDownloadUrl?.trim() ?? '';
+  return browserDownloadUrl || null;
+}
+
+function getStoredMirrorUrl(
+  sourceKind: SupportedSourceKind,
+  mirror: DownloadDescriptor,
+): string {
+  if (sourceKind === 'ankergames' && mirror.kind === 'full') {
+    return getAnkerGamesBrowserDownloadUrl(mirror) ?? mirror.url;
+  }
+  return mirror.url;
 }
 
 function isExtractionErrorMessage(value: string | null | undefined): boolean {
@@ -752,6 +819,10 @@ async function fetchWithTimeout(
 
 export class VaultTrackService {
   private readonly downloadQueueLocks = new Map<string, Promise<void>>();
+  private readonly activeEmbeddedDownloads = new Map<
+    string,
+    EmbeddedBrowserDownloadHandle
+  >();
   private readonly steamDbBuildLookups = new Map<
     string,
     SteamDbBuildLookupState
@@ -778,6 +849,7 @@ export class VaultTrackService {
     private readonly sourceFetch: SourceFetch = (input, init) =>
       fetch(input, init),
     private readonly renderAnkerGamesSignedDownloadPage?: AnkerGamesSignedDownloadPageRenderer,
+    private readonly startAnkerGamesEmbeddedDownload?: AnkerGamesEmbeddedBrowserDownloadRunner,
     private readonly extractStagedZipArchive: typeof extractSingleStagedZipArchive = extractSingleStagedZipArchive,
     private readonly steamFetch: typeof fetch = (input, init) =>
       fetch(input, init),
@@ -874,6 +946,10 @@ export class VaultTrackService {
     trackedItemId: string,
     warningMessage: string,
   ): Promise<void> {
+    if (isEmbeddedBrowserProvider(job.provider)) {
+      return;
+    }
+
     await this.myJDownloader
       .removePackage({
         packageId: job.packageId ?? null,
@@ -892,6 +968,470 @@ export class VaultTrackService {
               : 'Unknown JDownloader cleanup error',
           trackedItemId,
         });
+      });
+  }
+
+  private getDownloadJobProvider(job: DownloadJobRecord): DownloadProvider {
+    return isEmbeddedBrowserProvider(job.provider)
+      ? 'embedded_browser'
+      : 'jdownloader';
+  }
+
+  private async cancelEmbeddedBrowserDownload(
+    trackedItemId: string,
+    reason?: string,
+  ): Promise<void> {
+    const handle = this.activeEmbeddedDownloads.get(trackedItemId);
+    if (!handle) {
+      return;
+    }
+    await handle.cancel(reason);
+  }
+
+  private updateEmbeddedBrowserDownloadProgress(params: {
+    jobId: string;
+    snapshot: EmbeddedBrowserDownloadProgressSnapshot;
+    trackedItemId: string;
+  }): void {
+    const job = this.database.getDownloadJob(params.trackedItemId);
+    if (
+      !job ||
+      job.id !== params.jobId ||
+      !isEmbeddedBrowserProvider(job.provider)
+    ) {
+      return;
+    }
+
+    const parts =
+      job.parts && job.parts.length > 0
+        ? job.parts
+        : buildDownloadJobParts({
+            jobId: job.id,
+            now: job.createdAt,
+            packageName: job.packageName,
+            selectedDownloads: {
+              fullUrl: job.selectedMirrorUrl ?? '',
+              patchUrl: job.selectedPatchMirrorUrl ?? null,
+            },
+            sourceKind: 'ankergames',
+            trackedItemId: job.trackedItemId,
+          });
+    const now = new Date().toISOString();
+    const nextParts = parts.map((part, index) =>
+      index === 0
+        ? {
+            ...part,
+            bytesLoaded: params.snapshot.bytesLoaded,
+            bytesTotal: params.snapshot.bytesTotal,
+            etaSeconds: params.snapshot.etaSeconds,
+            errorMessage: null,
+            speed: params.snapshot.speed,
+            stage: params.snapshot.stage,
+            statusMessage: params.snapshot.statusMessage ?? null,
+            updatedAt: now,
+          }
+        : part,
+    );
+    const summary = summarizeDownloadParts(nextParts, 'ankergames');
+    this.database.upsertDownloadJob({
+      ...job,
+      bytesLoaded: summary.bytesLoaded,
+      bytesTotal: summary.bytesTotal,
+      completedParts: summary.completedParts,
+      errorMessage: null,
+      etaSeconds: summary.etaSeconds,
+      parts: nextParts,
+      provider: 'embedded_browser',
+      speed: summary.speed,
+      stage: summary.stage,
+      statusMessage: params.snapshot.statusMessage ?? summary.statusMessage,
+      totalParts: summary.totalParts,
+      updatedAt: now,
+    });
+  }
+
+  private markDownloadJobFailed(params: {
+    job: DownloadJobRecord;
+    markMirrorsFailed?: boolean;
+    message: string;
+    trackedItemId: string;
+  }): void {
+    const now = new Date().toISOString();
+    const failedMirrorUrls = new Set(
+      [
+        params.job.selectedMirrorUrl,
+        params.job.selectedPatchMirrorUrl,
+        ...(params.job.parts ?? []).map((part) => part.mirrorUrl),
+      ].filter((url): url is string => Boolean(url)),
+    );
+    if (params.markMirrorsFailed) {
+      for (const url of failedMirrorUrls) {
+        this.database.markDownloadMirrorFailed(params.trackedItemId, url, now);
+      }
+    }
+
+    this.database.upsertDownloadJob({
+      ...params.job,
+      completedParts: params.job.completedParts ?? 0,
+      errorMessage: params.message,
+      parts: (params.job.parts ?? []).map((part) => ({
+        ...part,
+        errorMessage: params.message,
+        stage: 'failed',
+        statusMessage: params.message,
+        updatedAt: now,
+      })),
+      provider: this.getDownloadJobProvider(params.job),
+      stage: 'failed',
+      statusMessage: params.message,
+      updatedAt: now,
+    });
+  }
+
+  private getPortableArchiveCanonicalTitle(
+    item: TrackedItemRecord,
+    job: DownloadJobRecord,
+  ): string {
+    return sanitizePathSegment(
+      job.finalPath.split(/[\\/]/).filter(Boolean).at(-1) ?? item.title,
+    );
+  }
+
+  private async finalizePortableArchiveJob(params: {
+    item: TrackedItemRecord;
+    job: DownloadJobRecord;
+    sourceKind: 'ankergames' | 'steamrip';
+    statusMessage?: string | null;
+    updatedParts: DownloadJobPartRecord[];
+  }): Promise<DownloadJobRecord> {
+    const extractPath = getPortableArchiveExtractPath({
+      finalPath: params.job.finalPath,
+      sourceKind: params.sourceKind,
+      stagePath: params.job.stagePath,
+    });
+    await finalizePortableArchiveExtraction({
+      canonicalTitle: this.getPortableArchiveCanonicalTitle(
+        params.item,
+        params.job,
+      ),
+      extractPath,
+      finalPath: params.job.finalPath,
+      sourceKind: params.sourceKind,
+      stageRootPath: dirname(params.job.stagePath),
+    });
+
+    const now = new Date().toISOString();
+    const completedParts = params.updatedParts.map((part) => ({
+      ...part,
+      errorMessage: null,
+      etaSeconds: 0,
+      stage: 'complete' as const,
+      statusMessage: params.statusMessage ?? null,
+      updatedAt: now,
+    }));
+    const summary = summarizeDownloadParts(completedParts, params.sourceKind);
+    const nextJob: DownloadJobRecord = {
+      ...params.job,
+      bytesLoaded: summary.bytesLoaded,
+      bytesTotal: summary.bytesTotal,
+      completedParts: summary.completedParts,
+      errorMessage: null,
+      etaSeconds: 0,
+      parts: completedParts,
+      provider: this.getDownloadJobProvider(params.job),
+      speed: summary.speed,
+      stage: 'complete',
+      statusMessage: params.statusMessage ?? null,
+      totalParts: summary.totalParts,
+      updatedAt: now,
+    };
+
+    const sourceSnapshot = this.getItemSourceSnapshot(params.item);
+    if (sourceSnapshot) {
+      this.database.upsertInstallRecord({
+        installedAt: sourceSnapshot.observedPatchDate ?? dateStamp(),
+        installedBuildId: sourceSnapshot.observedBuildId ?? null,
+        installPath: params.job.finalPath,
+        installedVersion: sourceSnapshot.observedVersion,
+        trackedItemId: params.item.id,
+        updatedAt: now,
+      });
+      this.clearFailedStateForSelectedMirrors(params.item.id);
+    }
+
+    await this.removeJDownloaderPackagesForJob(
+      nextJob,
+      params.item.id,
+      'Unable to remove JDownloader package after archive install completion',
+    );
+
+    const settings = this.database.getSettings();
+    if (settings.rootLibraryPath) {
+      await removeKnownLibraryPaths({
+        rootLibraryPath: settings.rootLibraryPath,
+        stagePath: params.job.stagePath,
+      })
+        .then((deletedPaths) => {
+          this.appendEvent('info', 'Deleted staged archive files', {
+            deletedPaths,
+            trackedItemId: params.item.id,
+          });
+        })
+        .catch((error) => {
+          this.appendEvent(
+            'warn',
+            'Unable to delete staged archive files after install completion',
+            {
+              error:
+                error instanceof Error
+                  ? error.message
+                  : 'Unknown archive cleanup error',
+              trackedItemId: params.item.id,
+            },
+          );
+        });
+    } else {
+      this.appendEvent(
+        'warn',
+        'Root library path is not configured; staged archive files were not deleted',
+        { trackedItemId: params.item.id },
+      );
+    }
+
+    return nextJob;
+  }
+
+  private async recoverEmbeddedBrowserDownloadJob(
+    item: TrackedItemRecord,
+    job: DownloadJobRecord,
+  ): Promise<DownloadJobRecord> {
+    const extractPath = getPortableArchiveExtractPath({
+      finalPath: job.finalPath,
+      sourceKind: 'ankergames',
+      stagePath: job.stagePath,
+    });
+    const canonicalTitle = this.getPortableArchiveCanonicalTitle(item, job);
+    let hasExtractedGameFolder = await hasPortableArchiveContentFolder({
+      canonicalTitle,
+      extractPath,
+      sourceKind: 'ankergames',
+    });
+    let recoveredFromStagedZip = false;
+    if (!hasExtractedGameFolder) {
+      recoveredFromStagedZip =
+        (await this.extractStagedZipArchive({ extractPath }).catch(() => null)) !=
+        null;
+      if (recoveredFromStagedZip) {
+        hasExtractedGameFolder = await hasPortableArchiveContentFolder({
+          canonicalTitle,
+          extractPath,
+          sourceKind: 'ankergames',
+        });
+      }
+    }
+
+    if (!hasExtractedGameFolder) {
+      const message =
+        'AnkerGames browser download did not finish cleanly. Retry the download to continue.';
+      this.markDownloadJobFailed({
+        job,
+        markMirrorsFailed: false,
+        message,
+        trackedItemId: item.id,
+      });
+      return (
+        this.database.getDownloadJob(item.id) ?? {
+          ...job,
+          errorMessage: message,
+          provider: 'embedded_browser',
+          stage: 'failed',
+          statusMessage: message,
+        }
+      );
+    }
+
+    return this.finalizePortableArchiveJob({
+      item,
+      job,
+      sourceKind: 'ankergames',
+      statusMessage: recoveredFromStagedZip
+        ? 'Recovered from staged ZIP'
+        : 'Recovered extracted game files',
+      updatedParts:
+        job.parts && job.parts.length > 0
+          ? job.parts
+          : buildDownloadJobParts({
+              jobId: job.id,
+              now: job.createdAt,
+              packageName: job.packageName,
+              selectedDownloads: {
+                fullUrl: job.selectedMirrorUrl ?? '',
+                patchUrl: job.selectedPatchMirrorUrl ?? null,
+              },
+              sourceKind: 'ankergames',
+              trackedItemId: item.id,
+            }),
+    });
+  }
+
+  private async startEmbeddedBrowserDownloadForJob(params: {
+    job: DownloadJobRecord;
+    parsedSource: ParsedSourcePayload;
+    trackedItemId: string;
+  }): Promise<void> {
+    if (!this.startAnkerGamesEmbeddedDownload) {
+      throw new Error('Embedded AnkerGames browser downloads are unavailable.');
+    }
+
+    const stableDownloadUrl = params.job.selectedMirrorUrl?.trim() ?? '';
+    if (!stableDownloadUrl) {
+      throw new Error('AnkerGames download did not include a browser mirror URL.');
+    }
+
+    const handle = this.startAnkerGamesEmbeddedDownload({
+      onProgress: (snapshot) =>
+        this.updateEmbeddedBrowserDownloadProgress({
+          jobId: params.job.id,
+          snapshot,
+          trackedItemId: params.trackedItemId,
+        }),
+      packageName: params.job.packageName,
+      sourceUrl: params.parsedSource.sourceUrl,
+      stableDownloadUrl,
+      stagePath: params.job.stagePath,
+    });
+    this.activeEmbeddedDownloads.set(params.trackedItemId, handle);
+
+    const now = new Date().toISOString();
+    const parts =
+      params.job.parts && params.job.parts.length > 0
+        ? params.job.parts
+        : buildDownloadJobParts({
+            jobId: params.job.id,
+            now: params.job.createdAt,
+            packageName: params.job.packageName,
+            selectedDownloads: {
+              fullUrl: stableDownloadUrl,
+              patchUrl: null,
+            },
+            sourceKind: 'ankergames',
+            trackedItemId: params.trackedItemId,
+          });
+    this.database.upsertDownloadJob({
+      ...params.job,
+      parts,
+      provider: 'embedded_browser',
+      statusMessage: 'Starting hidden browser download',
+      updatedAt: now,
+    });
+
+    void handle.completion
+      .then(async () => {
+        const currentJob = this.database.getDownloadJob(params.trackedItemId);
+        const item = this.database.findTrackedItemById(params.trackedItemId);
+        if (
+          !item ||
+          !currentJob ||
+          currentJob.id !== params.job.id ||
+          !isEmbeddedBrowserProvider(currentJob.provider)
+        ) {
+          return;
+        }
+
+        const extractingAt = new Date().toISOString();
+        const extractingParts =
+          currentJob.parts && currentJob.parts.length > 0
+            ? currentJob.parts.map((part) => ({
+                ...part,
+                errorMessage: null,
+                etaSeconds: 0,
+                stage: 'extracting' as const,
+                statusMessage: 'Extracting staged ZIP',
+                updatedAt: extractingAt,
+              }))
+            : buildDownloadJobParts({
+                jobId: currentJob.id,
+                now: currentJob.createdAt,
+                packageName: currentJob.packageName,
+                selectedDownloads: {
+                  fullUrl: currentJob.selectedMirrorUrl ?? '',
+                  patchUrl: currentJob.selectedPatchMirrorUrl ?? null,
+                },
+                sourceKind: 'ankergames',
+                trackedItemId: params.trackedItemId,
+              }).map((part) => ({
+                ...part,
+                stage: 'extracting' as const,
+                statusMessage: 'Extracting staged ZIP',
+                updatedAt: extractingAt,
+              }));
+        this.database.upsertDownloadJob({
+          ...currentJob,
+          errorMessage: null,
+          etaSeconds: 0,
+          parts: extractingParts,
+          provider: 'embedded_browser',
+          stage: 'extracting',
+          statusMessage: 'Extracting staged ZIP',
+          updatedAt: extractingAt,
+        });
+
+        const extractPath = getPortableArchiveExtractPath({
+          finalPath: currentJob.finalPath,
+          sourceKind: 'ankergames',
+          stagePath: currentJob.stagePath,
+        });
+        if (
+          !(await this.extractStagedZipArchive({
+            extractPath,
+          }))
+        ) {
+          throw new Error(
+            'AnkerGames browser download completed, but no staged ZIP was found to extract.',
+          );
+        }
+
+        const completedJob = await this.finalizePortableArchiveJob({
+          item,
+          job: currentJob,
+          sourceKind: 'ankergames',
+          statusMessage: 'Downloaded and installed from hidden browser',
+          updatedParts: extractingParts,
+        });
+        this.database.upsertDownloadJob(completedJob);
+      })
+      .catch((error) => {
+        const currentJob = this.database.getDownloadJob(params.trackedItemId);
+        if (
+          !currentJob ||
+          currentJob.id !== params.job.id ||
+          currentJob.stage === 'complete' ||
+          currentJob.stage === 'failed'
+        ) {
+          return;
+        }
+
+        const message =
+          error instanceof Error
+            ? error.message
+            : 'AnkerGames browser download failed.';
+        this.markDownloadJobFailed({
+          job: currentJob,
+          markMirrorsFailed: true,
+          message,
+          trackedItemId: params.trackedItemId,
+        });
+        this.appendEvent('warn', 'AnkerGames browser download failed', {
+          error: message,
+          trackedItemId: params.trackedItemId,
+        });
+      })
+      .finally(() => {
+        if (
+          this.activeEmbeddedDownloads.get(params.trackedItemId) === handle
+        ) {
+          this.activeEmbeddedDownloads.delete(params.trackedItemId);
+        }
       });
   }
 
@@ -2186,6 +2726,10 @@ export class VaultTrackService {
     parsedSource: ParsedSourcePayload,
     selectedSteamPatch?: SteamPatchCandidate | null,
   ): SourceSnapshot {
+    const previousParsedSource = this.database.getRawParsedSourcePayload(
+      trackedItemId,
+      parsedSource.sourceKind,
+    );
     const snapshot = this.buildSnapshotFromParsedSource(
       trackedItemId,
       parsedSource,
@@ -2193,8 +2737,124 @@ export class VaultTrackService {
     );
     this.database.upsertSourceSnapshot(snapshot);
     this.database.setRawParsedSourcePayload(trackedItemId, parsedSource);
-    this.syncMirrorsFromParsedSource(trackedItemId, parsedSource);
+    this.syncMirrorsFromParsedSource(
+      trackedItemId,
+      parsedSource,
+      previousParsedSource,
+    );
     return snapshot;
+  }
+
+  private getStoredMirrorUrlForSelection(params: {
+    kind: 'full' | 'patch';
+    parsedSource: ParsedSourcePayload;
+    requestedUrl: string | null | undefined;
+  }): string {
+    const requestedUrl = params.requestedUrl?.trim() ?? '';
+    if (!requestedUrl) {
+      return requestedUrl;
+    }
+
+    const descriptors =
+      params.kind === 'full'
+        ? params.parsedSource.fullDownloadUrls
+        : params.parsedSource.patchDownloadUrls;
+    const matchingDescriptor = descriptors.find(
+      (mirror) =>
+        mirrorUrlMatches(mirror.url, requestedUrl) ||
+        mirrorUrlMatches(getAnkerGamesBrowserDownloadUrl(mirror), requestedUrl) ||
+        mirrorUrlMatches(
+          getStoredMirrorUrl(params.parsedSource.sourceKind, mirror),
+          requestedUrl,
+        ),
+    );
+    return matchingDescriptor
+      ? getStoredMirrorUrl(params.parsedSource.sourceKind, matchingDescriptor)
+      : requestedUrl;
+  }
+
+  private getSelectedDownloadsForPersistence(
+    parsedSource: ParsedSourcePayload,
+    selectedDownloads: SelectedDownloads,
+  ): SelectedDownloads {
+    return {
+      ...selectedDownloads,
+      fullUrl: this.getStoredMirrorUrlForSelection({
+        kind: 'full',
+        parsedSource,
+        requestedUrl: selectedDownloads.fullUrl,
+      }),
+      patchUrl: selectedDownloads.patchUrl
+        ? this.getStoredMirrorUrlForSelection({
+            kind: 'patch',
+            parsedSource,
+            requestedUrl: selectedDownloads.patchUrl,
+          })
+        : null,
+    };
+  }
+
+  private async hydrateAnkerGamesBrowserDownloadUrls(
+    parsedSource: ParsedSourcePayload,
+    trackedItemId?: string,
+  ): Promise<ParsedSourcePayload> {
+    if (parsedSource.sourceKind !== 'ankergames') {
+      return parsedSource;
+    }
+
+    let changed = false;
+    const fullDownloadUrls: DownloadDescriptor[] = [];
+    for (const mirror of parsedSource.fullDownloadUrls) {
+      const existingBrowserUrl = getAnkerGamesBrowserDownloadUrl(mirror);
+      if (
+        existingBrowserUrl ||
+        !isAnkerGamesGeneratedDownloadUrl(mirror.url)
+      ) {
+        fullDownloadUrls.push(mirror);
+        continue;
+      }
+
+      try {
+        const resolvedUrl = await resolveAnkerGamesBrowserDownloadUrl({
+          fetch: this.sourceFetch,
+          sourceUrl: parsedSource.sourceUrl,
+          stableDownloadUrl: mirror.url,
+        });
+        if (
+          isAnkerGamesDirectDownloadUrl(resolvedUrl) ||
+          isAnkerGamesProxyDownloadUrl(resolvedUrl)
+        ) {
+          fullDownloadUrls.push({
+            ...mirror,
+            browserDownloadUrl: resolvedUrl,
+          });
+          changed = true;
+          continue;
+        }
+      } catch (error) {
+        this.appendEvent(
+          'warn',
+          'Unable to resolve Ankergames browser-ready mirror during source refresh',
+          {
+            error:
+              error instanceof Error
+                ? error.message
+                : 'Unknown AnkerGames mirror resolution error',
+            trackedItemId,
+            url: mirror.url,
+          },
+        );
+      }
+
+      fullDownloadUrls.push(mirror);
+    }
+
+    return changed
+      ? {
+          ...parsedSource,
+          fullDownloadUrls,
+        }
+      : parsedSource;
   }
 
   private compareSourceTitleRanks(
@@ -2512,13 +3172,25 @@ export class VaultTrackService {
         forceCatalog: true,
       },
     );
+    parsedSource = await this.hydrateAnkerGamesBrowserDownloadUrls(
+      parsedSource,
+      params.trackedItemId,
+    );
     const snapshot = this.buildSnapshotFromParsedSource(
       params.trackedItemId,
       parsedSource,
     );
+    const previousParsedSource = this.database.getRawParsedSourcePayload(
+      params.trackedItemId,
+      parsedSource.sourceKind,
+    );
     this.database.upsertSourceSnapshot(snapshot);
     this.database.setRawParsedSourcePayload(params.trackedItemId, parsedSource);
-    this.syncMirrorsFromParsedSource(params.trackedItemId, parsedSource);
+    this.syncMirrorsFromParsedSource(
+      params.trackedItemId,
+      parsedSource,
+      previousParsedSource,
+    );
     this.database.upsertSourceMatch(
       this.sourceMatchFromParsedSource(
         params.trackedItemId,
@@ -2536,21 +3208,24 @@ export class VaultTrackService {
   private syncMirrorsFromParsedSource(
     trackedItemId: string,
     parsedSource: ParsedSourcePayload,
+    previousParsedSource?: ParsedSourcePayload | null,
   ): void {
     const mirrors = [
       ...parsedSource.fullDownloadUrls,
       ...parsedSource.patchDownloadUrls,
     ].map((mirror) => {
+      const storedUrl = getStoredMirrorUrl(parsedSource.sourceKind, mirror);
       if (
         parsedSource.sourceKind === 'ankergames' &&
         /^direct$/i.test(mirror.label.trim()) &&
         (isAnkerGamesGeneratedDownloadUrl(mirror.url) ||
-          isAnkerGamesDirectDownloadUrl(mirror.url))
+          isAnkerGamesDirectDownloadUrl(storedUrl) ||
+          isAnkerGamesProxyDownloadUrl(storedUrl))
       ) {
-        return { ...mirror, label: 'DataNodes' };
+        return { ...mirror, label: 'DataNodes', url: storedUrl };
       }
 
-      return mirror;
+      return { ...mirror, url: storedUrl };
     });
 
     this.database.syncDownloadMirrors(
@@ -2558,6 +3233,97 @@ export class VaultTrackService {
       parsedSource.sourceKind,
       mirrors,
     );
+
+    if (parsedSource.sourceKind !== 'ankergames') {
+      return;
+    }
+
+    const nextFullDescriptors = parsedSource.fullDownloadUrls;
+    const nextFullUrls = new Set(
+      nextFullDescriptors.map((mirror) =>
+        getStoredMirrorUrl(parsedSource.sourceKind, mirror),
+      ),
+    );
+    const nextFullUrlsByStableUrl = new Map(
+      nextFullDescriptors.map((mirror) => [
+        mirror.url,
+        getStoredMirrorUrl(parsedSource.sourceKind, mirror),
+      ]),
+    );
+    const previousDescriptors =
+      previousParsedSource?.sourceKind === 'ankergames'
+        ? previousParsedSource.fullDownloadUrls
+        : [];
+    const previousFullMirrors = this.database
+      .listDownloadMirrors(trackedItemId, 'ankergames')
+      .filter((mirror) => mirror.kind === 'full');
+
+    for (const previousMirror of previousFullMirrors) {
+      if (nextFullUrls.has(previousMirror.url)) {
+        continue;
+      }
+
+      const previousDescriptor = previousDescriptors.find(
+        (mirror) =>
+          mirrorUrlMatches(mirror.url, previousMirror.url) ||
+          mirrorUrlMatches(
+            getAnkerGamesBrowserDownloadUrl(mirror),
+            previousMirror.url,
+          ) ||
+          mirrorUrlMatches(
+            getStoredMirrorUrl(parsedSource.sourceKind, mirror),
+            previousMirror.url,
+          ),
+      );
+      const replacementUrl = previousDescriptor
+        ? nextFullUrlsByStableUrl.get(previousDescriptor.url) ?? null
+        : nextFullDescriptors.find(
+              (mirror) =>
+                mirrorUrlMatches(mirror.url, previousMirror.url) ||
+                mirrorUrlMatches(
+                  getAnkerGamesBrowserDownloadUrl(mirror),
+                  previousMirror.url,
+                ),
+            )
+          ? getStoredMirrorUrl(
+              parsedSource.sourceKind,
+              nextFullDescriptors.find(
+                (mirror) =>
+                  mirrorUrlMatches(mirror.url, previousMirror.url) ||
+                  mirrorUrlMatches(
+                    getAnkerGamesBrowserDownloadUrl(mirror),
+                    previousMirror.url,
+                  ),
+              )!,
+            )
+          : null;
+      if (!replacementUrl || replacementUrl === previousMirror.url) {
+        continue;
+      }
+
+      if (previousMirror.manuallyFailedAt) {
+        this.database.markDownloadMirrorFailed(
+          trackedItemId,
+          replacementUrl,
+          previousMirror.manuallyFailedAt,
+        );
+      }
+      if (previousMirror.selectedAt) {
+        this.database.selectDownloadMirror(
+          trackedItemId,
+          replacementUrl,
+          'full',
+          'ankergames',
+        );
+      }
+    }
+
+    this.database.deleteDownloadMirrorsByKindExceptUrls({
+      kind: 'full',
+      sourceKind: 'ankergames',
+      trackedItemId,
+      urls: Array.from(nextFullUrls),
+    });
   }
 
   private getSourceUpdateStatus(params: {
@@ -2832,6 +3598,10 @@ export class VaultTrackService {
     }
 
     const selectionSource = payload.selectedSteamPatch.selectionSource ?? 'rss';
+    const selectedDownloads = this.getSelectedDownloadsForPersistence(
+      parsedSource,
+      payload.selectedDownloads,
+    );
     const patchEntries = [
       ...(payload.steamPatchEntries ?? []),
       payload.selectedSteamPatch,
@@ -2869,14 +3639,14 @@ export class VaultTrackService {
     this.setPrimarySourceMatch(payload.trackedItemId, payload.sourceKind);
     this.database.selectDownloadMirror(
       payload.trackedItemId,
-      payload.selectedDownloads.fullUrl,
+      selectedDownloads.fullUrl,
       'full',
       payload.sourceKind,
     );
-    if (payload.selectedDownloads.patchUrl) {
+    if (selectedDownloads.patchUrl) {
       this.database.selectDownloadMirror(
         payload.trackedItemId,
-        payload.selectedDownloads.patchUrl,
+        selectedDownloads.patchUrl,
         'patch',
         payload.sourceKind,
       );
@@ -2888,7 +3658,7 @@ export class VaultTrackService {
       payload.trackedItemId,
       parsedSource,
       {
-        ...payload.selectedDownloads,
+        ...selectedDownloads,
         sourceKind: payload.sourceKind,
       },
       { force: true },
@@ -3333,31 +4103,88 @@ export class VaultTrackService {
     }
   }
 
-  private async resolveSelectedDownloadsForQueue(
-    parsedSource: ParsedSourcePayload,
-    selectedDownloads: SelectedDownloads,
-  ): Promise<SelectedDownloads> {
-    if (parsedSource.sourceKind !== 'ankergames') {
+  private async resolveSelectedDownloadsForQueue(params: {
+    parsedSource: ParsedSourcePayload;
+    selectedDownloads: SelectedDownloads;
+    trackedItemId: string;
+  }): Promise<SelectedDownloads> {
+    const selectedDownloads = {
+      fullUrl: this.getStoredMirrorUrlForSelection({
+        kind: 'full',
+        parsedSource: params.parsedSource,
+        requestedUrl: params.selectedDownloads.fullUrl,
+      }),
+      patchUrl: params.selectedDownloads.patchUrl ?? null,
+    };
+    if (params.parsedSource.sourceKind !== 'ankergames') {
       return selectedDownloads;
     }
 
-    const fullUrl = selectedDownloads.fullUrl.trim();
-    const resolvedFullUrl = isAnkerGamesGeneratedDownloadUrl(fullUrl)
-      ? await resolveAnkerGamesDownloadUrl({
-          fetch: (input, init) => this.fetchSource(input, init),
-          renderSignedDownloadPage: this.renderAnkerGamesSignedDownloadPage,
-          sourceUrl: parsedSource.sourceUrl,
+    let fullUrl = selectedDownloads.fullUrl;
+    if (isAnkerGamesGeneratedDownloadUrl(fullUrl)) {
+      try {
+        const browserDownloadUrl = await resolveAnkerGamesBrowserDownloadUrl({
+          fetch: this.sourceFetch,
+          sourceUrl: params.parsedSource.sourceUrl,
           stableDownloadUrl: fullUrl,
-        })
-      : fullUrl;
-    if (!isAnkerGamesDirectDownloadUrl(resolvedFullUrl)) {
-      throw new Error(
-        'AnkerGames download did not resolve to a DataNodes download URL.',
+        });
+        if (
+          isAnkerGamesDirectDownloadUrl(browserDownloadUrl) ||
+          isAnkerGamesProxyDownloadUrl(browserDownloadUrl)
+        ) {
+          fullUrl = browserDownloadUrl.trim();
+        }
+      } catch (error) {
+        this.appendEvent(
+          'warn',
+          'Unable to resolve AnkerGames browser-ready mirror before queueing',
+          {
+            error:
+              error instanceof Error
+                ? error.message
+                : 'Unknown AnkerGames mirror resolution error',
+            trackedItemId: params.trackedItemId,
+            url: fullUrl,
+          },
+        );
+      }
+    }
+
+    if (!mirrorUrlMatches(fullUrl, selectedDownloads.fullUrl)) {
+      const nextParsedSource = {
+        ...params.parsedSource,
+        fullDownloadUrls: params.parsedSource.fullDownloadUrls.map((mirror) =>
+          mirrorUrlMatches(mirror.url, params.selectedDownloads.fullUrl) ||
+          mirrorUrlMatches(
+            getAnkerGamesBrowserDownloadUrl(mirror),
+            params.selectedDownloads.fullUrl,
+          )
+            ? {
+                ...mirror,
+                browserDownloadUrl: fullUrl,
+              }
+            : mirror,
+        ),
+      };
+      this.database.setRawParsedSourcePayload(
+        params.trackedItemId,
+        nextParsedSource,
+      );
+      this.syncMirrorsFromParsedSource(
+        params.trackedItemId,
+        nextParsedSource,
+        params.parsedSource,
+      );
+      this.database.selectDownloadMirror(
+        params.trackedItemId,
+        fullUrl,
+        'full',
+        'ankergames',
       );
     }
 
     return {
-      fullUrl: resolvedFullUrl,
+      fullUrl,
       patchUrl: null,
     };
   }
@@ -3373,6 +4200,11 @@ export class VaultTrackService {
     if (!settings.rootLibraryPath) {
       throw new Error('Root library path is not configured');
     }
+    const queueSelectedDownloads = await this.resolveSelectedDownloadsForQueue({
+      parsedSource,
+      selectedDownloads,
+      trackedItemId,
+    });
 
     const canonicalTitle =
       trackedView.item.steamTitle ?? trackedView.item.title;
@@ -3384,8 +4216,10 @@ export class VaultTrackService {
     const packageName = sanitizePathSegment(
       `${canonicalTitle}_${releaseSuffix}`,
     );
+    const provider = getDownloadProvider(parsedSource.sourceKind);
     const primaryQueuePackageName =
-      parsedSource.sourceKind === 'elamigos' && selectedDownloads.patchUrl
+      parsedSource.sourceKind === 'elamigos' &&
+      queueSelectedDownloads.patchUrl
         ? `${packageName}_full`
         : packageName;
     const paths = await planLibraryPaths({
@@ -3394,7 +4228,7 @@ export class VaultTrackService {
       releaseSuffix,
       sourceKind: parsedSource.sourceKind,
     });
-    const selectedPatchMirrorUrl = selectedDownloads.patchUrl ?? null;
+    const selectedPatchMirrorUrl = queueSelectedDownloads.patchUrl ?? null;
     const queueKey = JSON.stringify([trackedItemId, packageName]);
     const existingQueue = this.downloadQueueLocks.get(queueKey);
     if (existingQueue) {
@@ -3452,7 +4286,7 @@ export class VaultTrackService {
         jobId,
         now,
         packageName,
-        selectedDownloads,
+        selectedDownloads: queueSelectedDownloads,
         sourceKind: parsedSource.sourceKind,
         trackedItemId,
       });
@@ -3474,8 +4308,9 @@ export class VaultTrackService {
         packageId: placeholderSummary.packageId,
         packageName: primaryQueuePackageName,
         parts: placeholderParts,
+        provider,
         selectedPatchMirrorUrl,
-        selectedMirrorUrl: selectedDownloads.fullUrl,
+        selectedMirrorUrl: queueSelectedDownloads.fullUrl,
         speed: placeholderSummary.speed,
         stage: placeholderSummary.stage,
         stagePath: paths.stagePath,
@@ -3500,11 +4335,30 @@ export class VaultTrackService {
           getElamigosPartStagePath(paths.stagePath, packageName, 'patch'),
         );
       }
-      const queueSelectedDownloads =
-        await this.resolveSelectedDownloadsForQueue(
+      if (provider === 'embedded_browser') {
+        const job: DownloadJobRecord = {
+          ...placeholderJob,
+          provider,
+          statusMessage: 'Preparing hidden browser download',
+          updatedAt: new Date().toISOString(),
+        };
+        this.database.upsertDownloadJob(job);
+        await this.startEmbeddedBrowserDownloadForJob({
+          job,
           parsedSource,
-          selectedDownloads,
+          trackedItemId,
+        });
+        this.appendEvent(
+          'info',
+          `Queued download for ${trackedView.item.title}`,
+          {
+            packageName,
+            trackedItemId,
+          },
         );
+        resolveQueueLock();
+        return;
+      }
       const queued = await this.myJDownloader.queueLinks({
         extractDirectory: paths.extractPath,
         packageName,
@@ -3572,6 +4426,7 @@ export class VaultTrackService {
         packageId: queuedSummary.packageId ?? queued.packageId,
         packageName: queuedPackageName,
         parts: queuedParts,
+        provider,
         speed: queuedSummary.speed,
         stage: queuedSummary.stage,
         statusMessage: queuedSummary.statusMessage,
@@ -3605,6 +4460,7 @@ export class VaultTrackService {
             statusMessage: errorMessage,
             updatedAt,
           })),
+          provider: placeholderJob.provider ?? provider,
           stage: 'failed',
           statusMessage: errorMessage,
           updatedAt,
@@ -3647,6 +4503,14 @@ export class VaultTrackService {
       sourceUrl: payload.parsedSource.sourceUrl,
       title: payload.parsedSource.title,
     });
+    const previousParsedSource = this.database.getRawParsedSourcePayload(
+      item.id,
+      payload.parsedSource.sourceKind,
+    );
+    const selectedDownloads = this.getSelectedDownloadsForPersistence(
+      payload.parsedSource,
+      payload.selectedDownloads,
+    );
     const snapshot = this.buildSnapshotFromParsedSource(
       item.id,
       payload.parsedSource,
@@ -3657,7 +4521,11 @@ export class VaultTrackService {
     this.database.upsertSourceMatch(
       this.sourceMatchFromParsedSource(item.id, payload.parsedSource, true),
     );
-    this.syncMirrorsFromParsedSource(item.id, payload.parsedSource);
+    this.syncMirrorsFromParsedSource(
+      item.id,
+      payload.parsedSource,
+      previousParsedSource,
+    );
     if (payload.steamPatchEntries?.length) {
       this.database.upsertPatchEntries(
         payload.steamPatchEntries
@@ -3672,14 +4540,14 @@ export class VaultTrackService {
     this.upsertSelectedSteamPatch(item.id, payload.selectedSteamPatch);
     this.database.selectDownloadMirror(
       item.id,
-      payload.selectedDownloads.fullUrl,
+      selectedDownloads.fullUrl,
       'full',
       payload.parsedSource.sourceKind,
     );
-    if (payload.selectedDownloads.patchUrl) {
+    if (selectedDownloads.patchUrl) {
       this.database.selectDownloadMirror(
         item.id,
-        payload.selectedDownloads.patchUrl,
+        selectedDownloads.patchUrl,
         'patch',
         payload.parsedSource.sourceKind,
       );
@@ -3706,7 +4574,7 @@ export class VaultTrackService {
       await this.queueDownload(
         item.id,
         payload.parsedSource,
-        payload.selectedDownloads,
+        selectedDownloads,
       );
     }
 
@@ -3773,6 +4641,10 @@ export class VaultTrackService {
         forceCatalog: true,
       },
     );
+    parsedSource = await this.hydrateAnkerGamesBrowserDownloadUrls(
+      parsedSource,
+      trackedItemId,
+    );
     if (
       parsedSource.sourceKind === 'ankergames' &&
       !parsedSource.latestSourceRelease.buildId
@@ -3783,12 +4655,20 @@ export class VaultTrackService {
       trackedItemId,
       parsedSource,
     );
+    const previousParsedSource = this.database.getRawParsedSourcePayload(
+      trackedItemId,
+      parsedSource.sourceKind,
+    );
     this.database.upsertSourceSnapshot(snapshot);
     this.database.setRawParsedSourcePayload(trackedItemId, parsedSource);
     this.database.upsertSourceMatch(
       this.sourceMatchFromParsedSource(trackedItemId, parsedSource, true),
     );
-    this.syncMirrorsFromParsedSource(trackedItemId, parsedSource);
+    this.syncMirrorsFromParsedSource(
+      trackedItemId,
+      parsedSource,
+      previousParsedSource,
+    );
 
     if (steamMatch) {
       const entries = await this.syncSteamPatchFeed(trackedItemId, steamMatch);
@@ -3888,6 +4768,10 @@ export class VaultTrackService {
         forceCatalog,
       },
     );
+    parsedSource = await this.hydrateAnkerGamesBrowserDownloadUrls(
+      parsedSource,
+      trackedItemId,
+    );
     const latestPatch = this.getLatestPatch(trackedItemId);
     const matchedPatch = this.findPatchForSourceRelease(
       parsedSource,
@@ -3922,19 +4806,22 @@ export class VaultTrackService {
       throw new Error('No cached source payload available for retry');
     }
 
+    const effectiveSelectedDownloads = selectedDownloads
+      ? this.getSelectedDownloadsForPersistence(parsedSource, selectedDownloads)
+      : null;
     const hasExplicitSelection = selectedDownloads != null;
-    if (selectedDownloads?.fullUrl) {
+    if (effectiveSelectedDownloads?.fullUrl) {
       this.database.selectDownloadMirror(
         trackedItemId,
-        selectedDownloads.fullUrl,
+        effectiveSelectedDownloads.fullUrl,
         'full',
         parsedSource.sourceKind,
       );
     }
-    if (selectedDownloads?.patchUrl) {
+    if (effectiveSelectedDownloads?.patchUrl) {
       this.database.selectDownloadMirror(
         trackedItemId,
-        selectedDownloads.patchUrl,
+        effectiveSelectedDownloads.patchUrl,
         'patch',
         parsedSource.sourceKind,
       );
@@ -3944,7 +4831,8 @@ export class VaultTrackService {
     if (
       !hasExplicitSelection &&
       parsedSource.sourceKind === 'ankergames' &&
-      existingJob?.stage === 'failed'
+      existingJob?.stage === 'failed' &&
+      !isEmbeddedBrowserProvider(existingJob.provider)
     ) {
       const restarted = await this.myJDownloader
         .restartExtraction({
@@ -3991,7 +4879,7 @@ export class VaultTrackService {
       ? mirrors.find(
           (mirror) =>
             mirror.kind === 'full' &&
-            mirrorUrlMatches(selectedDownloads.fullUrl, mirror.url),
+            mirrorUrlMatches(effectiveSelectedDownloads?.fullUrl, mirror.url),
         )
       : mirrors.find((mirror) => mirror.kind === 'full' && mirror.selectedAt);
     if (!selectedFullMirror) {
@@ -4000,11 +4888,11 @@ export class VaultTrackService {
       );
     }
     const selectedPatchMirror = hasExplicitSelection
-      ? selectedDownloads.patchUrl
+      ? effectiveSelectedDownloads?.patchUrl
         ? mirrors.find(
             (mirror) =>
               mirror.kind === 'patch' &&
-              mirrorUrlMatches(selectedDownloads.patchUrl, mirror.url),
+              mirrorUrlMatches(effectiveSelectedDownloads.patchUrl, mirror.url),
           )
         : null
       : mirrors.find((mirror) => mirror.kind === 'patch' && mirror.selectedAt);
@@ -4048,7 +4936,12 @@ export class VaultTrackService {
       params.sourceKind,
     );
     const selectedFull =
-      params.selectedDownloads?.fullUrl ??
+      (params.selectedDownloads
+        ? this.getSelectedDownloadsForPersistence(
+            parsedSource,
+            params.selectedDownloads,
+          ).fullUrl
+        : null) ??
       mirrors.find((mirror) => mirror.kind === 'full' && mirror.selectedAt)
         ?.url ??
       mirrors.find((mirror) => mirror.kind === 'full')?.url;
@@ -4058,7 +4951,12 @@ export class VaultTrackService {
       );
     }
     const selectedPatch =
-      params.selectedDownloads?.patchUrl ??
+      (params.selectedDownloads
+        ? this.getSelectedDownloadsForPersistence(
+            parsedSource,
+            params.selectedDownloads,
+          ).patchUrl
+        : null) ??
       mirrors.find((mirror) => mirror.kind === 'patch' && mirror.selectedAt)
         ?.url ??
       null;
@@ -4347,6 +5245,10 @@ export class VaultTrackService {
       throw new Error('Only active or staged downloads can be marked failed.');
     }
 
+    await this.cancelEmbeddedBrowserDownload(
+      trackedItemId,
+      'Marked failed manually',
+    ).catch(() => undefined);
     await this.removeJDownloaderPackagesForJob(
       job,
       trackedItemId,
@@ -4370,38 +5272,21 @@ export class VaultTrackService {
       );
     }
 
-    const now = new Date().toISOString();
-    const failedMirrorUrls = new Set(
-      [
-        job.selectedMirrorUrl,
-        job.selectedPatchMirrorUrl,
-        ...(job.parts ?? []).map((part) => part.mirrorUrl),
-      ].filter((url): url is string => Boolean(url)),
-    );
-    for (const url of failedMirrorUrls) {
-      this.database.markDownloadMirrorFailed(trackedItemId, url, now);
-    }
-
     const message = 'Marked failed manually';
-    this.database.upsertDownloadJob({
-      ...job,
-      completedParts: job.completedParts ?? 0,
-      errorMessage: message,
-      parts: (job.parts ?? []).map((part) => ({
-        ...part,
-        errorMessage: message,
-        stage: 'failed',
-        statusMessage: message,
-        updatedAt: now,
-      })),
-      stage: 'failed',
-      statusMessage: message,
-      updatedAt: now,
+    this.markDownloadJobFailed({
+      job,
+      markMirrorsFailed: true,
+      message,
+      trackedItemId,
     });
 
     this.appendEvent('warn', 'Marked download as failed', {
       trackedItemId,
-      urls: Array.from(failedMirrorUrls),
+      urls: [
+        job.selectedMirrorUrl,
+        job.selectedPatchMirrorUrl,
+        ...(job.parts ?? []).map((part) => part.mirrorUrl),
+      ].filter((url): url is string => Boolean(url)),
     });
     return this.buildTrackedItemView(trackedItemId);
   }
@@ -4420,6 +5305,28 @@ export class VaultTrackService {
       }
 
       try {
+        if (isEmbeddedBrowserProvider(job.provider)) {
+          if (item.sourceKind === 'ankergames') {
+            if (!this.activeEmbeddedDownloads.has(item.id)) {
+              const recoveredJob = await this.recoverEmbeddedBrowserDownloadJob(
+                item,
+                job,
+              );
+              this.database.upsertDownloadJob(recoveredJob);
+            }
+            continue;
+          }
+
+          const message = `Embedded browser downloads are not supported for ${item.sourceKind}.`;
+          this.markDownloadJobFailed({
+            job,
+            markMirrorsFailed: false,
+            message,
+            trackedItemId: item.id,
+          });
+          continue;
+        }
+
         const extractDirectory =
           item.sourceKind === 'ankergames' || item.sourceKind === 'steamrip'
             ? getPortableArchiveExtractPath({
@@ -4497,7 +5404,7 @@ export class VaultTrackService {
           });
         }
         const summary = summarizeDownloadParts(updatedParts, item.sourceKind);
-        const nextJob: DownloadJobRecord = {
+        let nextJob: DownloadJobRecord = {
           ...job,
           bytesLoaded: summary.bytesLoaded,
           bytesTotal: summary.bytesTotal,
@@ -4522,8 +5429,9 @@ export class VaultTrackService {
             item.sourceKind === 'ankergames' ||
             item.sourceKind === 'steamrip'
           ) {
-            const canonicalTitle = sanitizePathSegment(
-              job.finalPath.split(/[\\/]/).filter(Boolean).at(-1) ?? item.title,
+            const canonicalTitle = this.getPortableArchiveCanonicalTitle(
+              item,
+              job,
             );
             let hasExtractedGameFolder = await hasPortableArchiveContentFolder({
               canonicalTitle,
@@ -4563,85 +5471,28 @@ export class VaultTrackService {
                 statusMessage: message,
               }));
             } else {
-              await finalizePortableArchiveExtraction({
-                canonicalTitle,
-                extractPath: extractDirectory,
-                finalPath: job.finalPath,
+              nextJob = await this.finalizePortableArchiveJob({
+                item,
+                job,
                 sourceKind: item.sourceKind,
-                stageRootPath: dirname(job.stagePath),
+                statusMessage: recoveredFromStagedZip
+                  ? 'JDownloader reported Extraction error; recovered from staged ZIP'
+                  : portableExtractionError
+                    ? 'JDownloader reported Extraction error; staged files are present'
+                    : nextJob.statusMessage,
+                updatedParts:
+                  portableExtractionError || recoveredFromStagedZip
+                    ? updatedParts.map((part) => ({
+                        ...part,
+                        errorMessage: null,
+                        stage: 'extracting' as const,
+                        statusMessage:
+                          recoveredFromStagedZip || portableExtractionError
+                            ? 'Finalizing staged archive'
+                            : part.statusMessage,
+                      }))
+                    : updatedParts,
               });
-              if (recoveredFromStagedZip) {
-                nextJob.statusMessage =
-                  'JDownloader reported Extraction error; recovered from staged ZIP';
-              } else if (portableExtractionError) {
-                nextJob.statusMessage =
-                  'JDownloader reported Extraction error; staged files are present';
-              }
-              nextJob.errorMessage = null;
-              nextJob.stage = 'complete';
-              nextJob.parts = updatedParts.map((part) => ({
-                ...part,
-                errorMessage: null,
-                stage: 'complete',
-                statusMessage:
-                  portableExtractionError && part.statusMessage
-                    ? nextJob.statusMessage
-                    : part.statusMessage,
-              }));
-            }
-
-            if (nextJob.stage === 'complete') {
-              const sourceSnapshot = this.getItemSourceSnapshot(item);
-              if (sourceSnapshot) {
-                this.database.upsertInstallRecord({
-                  installedAt: sourceSnapshot.observedPatchDate ?? dateStamp(),
-                  installedBuildId: sourceSnapshot.observedBuildId ?? null,
-                  installPath: job.finalPath,
-                  installedVersion: sourceSnapshot.observedVersion,
-                  trackedItemId: item.id,
-                  updatedAt: new Date().toISOString(),
-                });
-                this.clearFailedStateForSelectedMirrors(item.id);
-              }
-
-              await this.removeJDownloaderPackagesForJob(
-                nextJob,
-                item.id,
-                'Unable to remove JDownloader package after archive install completion',
-              );
-
-              const settings = this.database.getSettings();
-              if (settings.rootLibraryPath) {
-                await removeKnownLibraryPaths({
-                  rootLibraryPath: settings.rootLibraryPath,
-                  stagePath: job.stagePath,
-                })
-                  .then((deletedPaths) => {
-                    this.appendEvent('info', 'Deleted staged archive files', {
-                      deletedPaths,
-                      trackedItemId: item.id,
-                    });
-                  })
-                  .catch((error) => {
-                    this.appendEvent(
-                      'warn',
-                      'Unable to delete staged archive files after install completion',
-                      {
-                        error:
-                          error instanceof Error
-                            ? error.message
-                            : 'Unknown archive cleanup error',
-                        trackedItemId: item.id,
-                      },
-                    );
-                  });
-              } else {
-                this.appendEvent(
-                  'warn',
-                  'Root library path is not configured; staged archive files were not deleted',
-                  { trackedItemId: item.id },
-                );
-              }
             }
           }
         }
@@ -5561,6 +6412,15 @@ export class VaultTrackService {
 
     const job = this.database.getDownloadJob(payload.trackedItemId);
     const view = await this.buildTrackedItemView(payload.trackedItemId);
+
+    if (job && isEmbeddedBrowserProvider(job.provider)) {
+      await this.cancelEmbeddedBrowserDownload(
+        payload.trackedItemId,
+        payload.mode === 'delete_files'
+          ? 'Tracked item deleted'
+          : 'Tracked item removed',
+      ).catch(() => undefined);
+    }
 
     if (payload.mode === 'delete_files') {
       if (job) {

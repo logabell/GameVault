@@ -1,4 +1,8 @@
-import type { TrackedItemView } from '@vaulttrack/shared-types';
+import type {
+  ConnectionHealthSummary,
+  SupportedSourceKind,
+  TrackedItemView,
+} from '@vaulttrack/shared-types';
 import {
   TrackedItemStatus,
   TrackedItemTrackingStatus,
@@ -42,6 +46,83 @@ export function getDefaultLibrarySortDirection(
   sortMode: LibrarySortMode,
 ): LibrarySortDirection {
   return sortMode === 'recentlyUpdated' ? 'desc' : 'asc';
+}
+
+export function sourceRequiresMyJDownloader(
+  sourceKind: SupportedSourceKind | null | undefined,
+): boolean {
+  return sourceKind === 'elamigos' || sourceKind === 'steamrip';
+}
+
+export function canQueueSourceUpdate(params: {
+  connectionHealth: ConnectionHealthSummary | null;
+  rootLibraryPath: string | null | undefined;
+  sourceKind: SupportedSourceKind | null | undefined;
+}): boolean {
+  const { connectionHealth, rootLibraryPath, sourceKind } = params;
+  if (
+    !sourceKind ||
+    !connectionHealth ||
+    connectionHealth.desktop.color !== 'green' ||
+    !rootLibraryPath?.trim()
+  ) {
+    return false;
+  }
+
+  if (!sourceRequiresMyJDownloader(sourceKind)) {
+    return true;
+  }
+
+  return connectionHealth.myJDownloader.color === 'green';
+}
+
+export function getLibraryAutomationWarning(params: {
+  connectionHealth: ConnectionHealthSummary | null;
+  rootLibraryPath: string | null | undefined;
+}): { label: string; message: string } | null {
+  const { connectionHealth, rootLibraryPath } = params;
+  if (!connectionHealth) {
+    return null;
+  }
+
+  if (connectionHealth.desktop.color !== 'green') {
+    return {
+      label: connectionHealth.desktop.label,
+      message: connectionHealth.desktop.message,
+    };
+  }
+
+  if (!rootLibraryPath?.trim()) {
+    return {
+      label: 'Root library path required',
+      message: 'Choose a root library path in Settings before starting downloads.',
+    };
+  }
+
+  if (connectionHealth.myJDownloader.color !== 'green') {
+    return {
+      label: 'MyJDownloader limited',
+      message: `${connectionHealth.myJDownloader.message} SteamRIP and ElAmigos downloads still need MyJDownloader, but Ankergames browser downloads can still start.`,
+    };
+  }
+
+  return null;
+}
+
+export function getDeleteTrackedItemPrompt(item: TrackedItemView): string {
+  if (item.currentDownload?.provider === 'embedded_browser') {
+    return `Delete ${item.item.title} from VaultTrack, stop its browser download, and delete staged/install files?`;
+  }
+
+  return `Delete ${item.item.title} from VaultTrack, remove it from JDownloader, and delete staged/install files?`;
+}
+
+export function getMarkDownloadFailedPrompt(item: TrackedItemView): string {
+  if (item.currentDownload?.provider === 'embedded_browser') {
+    return `Mark ${item.item.title} as failed and stop its browser download?`;
+  }
+
+  return `Mark ${item.item.title} as failed and remove its JDownloader package(s)?`;
 }
 
 export function getTrackingStatus(
