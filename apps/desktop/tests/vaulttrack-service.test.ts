@@ -241,6 +241,23 @@ function elamigosMousePiHtml(): string {
   `;
 }
 
+function elamigosBaldursGateHtml(): string {
+  return `
+    <html>
+      <body>
+        <title>Baldurs Gate III / Baldur's Gate 3 Deluxe Edition - ElAmigos official site</title>
+        <h2>Baldur's Gate III / Baldurs Gate 3 Deluxe Edition (2023), 108.96GB</h2>
+        <h3>ElAmigos release. Updated to version 6931813 (23.09.2025; Patch #8 Hotfix #34).</h3>
+        <h2>DDOWNLOAD</h2>
+        <a href="https://www.filecrypt.cc/Container/BG3FULL.html">FileCrypt</a>
+        <h2>Baldurs Gate 3 update 6931813 - 7209685 (26.03.2026) & crack, 152MB</h2>
+        <h2>DDOWNLOAD</h2>
+        <a href="https://www.filecrypt.cc/Container/BG3PATCH.html">FileCrypt</a>
+      </body>
+    </html>
+  `;
+}
+
 function elamigosEldenRingHtml(params: {
   title: string;
   updateTo: string;
@@ -4969,6 +4986,100 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       }
     },
   );
+
+  it('discovers Baldurs Gate ElAmigos matches with roman and numeric sequel titles', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'baldurs gate 3',
+        sourceKind: 'manual',
+        sourceUrl: null,
+        title: "Baldur's Gate 3",
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 1086940,
+        coverUrl: null,
+        matchedAt: '2026-04-22T12:00:00.000Z',
+        normalizedTitle: 'baldurs gate 3',
+        title: "Baldur's Gate 3",
+      });
+
+      const sourceFetch = vi.fn(async (input: string) => {
+        if (input === 'https://ankergames.net/game/baldurs-gate-3') {
+          return new Response('', { status: 404 });
+        }
+        if (input === 'https://ankergames.net/recent-updates') {
+          return new Response('', { status: 200 });
+        }
+        if (input === 'https://ankergames.net/games-list') {
+          return new Response('', { status: 200 });
+        }
+        if (input === 'https://elamigos.site/') {
+          return new Response(
+            `
+              <a href="/data/Baldurs_Gate_3_Deluxe_Edition_MULTi13_-_ElAmigos.html">
+                Baldur's Gate III / Baldurs Gate 3 Deluxe Edition ElAmigos
+              </a>
+            `,
+            { status: 200 },
+          );
+        }
+        if (
+          input ===
+          'https://elamigos.site/data/Baldurs_Gate_3_Deluxe_Edition_MULTi13_-_ElAmigos.html'
+        ) {
+          return new Response(elamigosBaldursGateHtml(), { status: 200 });
+        }
+        if (input === 'https://steamrip.com/games-list-page/') {
+          return new Response('', { status: 200 });
+        }
+        if (input === 'https://steamrip.com/updated-games/') {
+          return new Response('', { status: 200 });
+        }
+        return new Response('', { status: 404 });
+      });
+
+      const view = await createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      ).discoverSourceMatches(item.id);
+      const elamigos = view.sourceMatches.find(
+        (source) => source.match.sourceKind === 'elamigos',
+      );
+
+      expect(elamigos).toMatchObject({
+        match: {
+          sourceTitle: "Baldur's Gate III / Baldurs Gate 3 Deluxe Edition",
+          sourceUrl:
+            'https://elamigos.site/data/Baldurs_Gate_3_Deluxe_Edition_MULTi13_-_ElAmigos.html',
+          status: 'probable',
+          usable: true,
+        },
+        snapshot: {
+          observedPatchDate: '03/26/2026',
+          observedVersion: '7209685',
+        },
+      });
+      expect(database.listDownloadMirrors(item.id, 'elamigos')).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: 'full',
+            url: 'https://www.filecrypt.cc/Container/BG3FULL.html',
+          }),
+          expect.objectContaining({
+            kind: 'patch',
+            url: 'https://www.filecrypt.cc/Container/BG3PATCH.html',
+          }),
+        ]),
+      );
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
 
   it('keeps a strong ElAmigos catalog candidate refreshable when detail parsing fails', async () => {
     const { database, tempRoot } = await openTestDatabase();

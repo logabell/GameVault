@@ -16,6 +16,22 @@ const STANDALONE_NOISE_RE =
   /\b(?:game of the year|goty|deluxe|ultimate|complete|collector'?s?|gold|premium|special|standard|definitive|enhanced|anniversary|digital|supporter|edition|bundle|upgrade|build)\b/gi;
 const NON_BASE_GAME_RE =
   /\b(?:deluxe edition upgrade|upgrade|soundtrack|ost|demo|playtest|dedicated server|server|editor|tool|dlc|season pass|expansion pass)\b/i;
+const ROMAN_NUMERAL_TOKENS = new Map<string, string>([
+  ['ii', '2'],
+  ['iii', '3'],
+  ['iv', '4'],
+  ['v', '5'],
+  ['vi', '6'],
+  ['vii', '7'],
+  ['viii', '8'],
+  ['ix', '9'],
+  ['x', '10'],
+  ['xi', '11'],
+  ['xii', '12'],
+  ['xiii', '13'],
+  ['xiv', '14'],
+  ['xv', '15'],
+]);
 
 function compactTitle(input: string): string {
   return input.replace(/\s+/g, ' ').trim();
@@ -38,6 +54,13 @@ function stripEditionNoise(input: string): string {
   );
 }
 
+function normalizeRomanNumeralTokens(input: string): string {
+  return input
+    .split(/\s+/)
+    .map((token) => ROMAN_NUMERAL_TOKENS.get(token) ?? token)
+    .join(' ');
+}
+
 function uniqueSearchTexts(inputs: string[]): string[] {
   const seen = new Set<string>();
   const unique: string[] = [];
@@ -58,10 +81,12 @@ function uniqueSearchTexts(inputs: string[]): string[] {
 }
 
 export function normalizeSteamTitle(input: string): string {
-  return stripEditionNoise(input)
-    .toLowerCase()
-    .replace(/['`\u2018\u2019\u201a\u201b\u00b4]/g, '')
-    .replace(/[^a-z0-9]+/g, ' ')
+  return normalizeRomanNumeralTokens(
+    stripEditionNoise(input)
+      .toLowerCase()
+      .replace(/['`\u2018\u2019\u201a\u201b\u00b4]/g, '')
+      .replace(/[^a-z0-9]+/g, ' '),
+  )
     .replace(
       /\b(game of the year|goty|edition|complete|bundle|build|upgrade)\b/g,
       '',

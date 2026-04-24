@@ -2734,6 +2734,40 @@ function App() {
     );
   }, [section]);
 
+  function actionErrorMessage(error: unknown, fallback = 'Action failed.') {
+    return error instanceof Error ? error.message : fallback;
+  }
+
+  async function refreshTrackedItemAndMatches(
+    trackedItemId: string,
+  ): Promise<void> {
+    let primaryRefreshError: unknown = null;
+    try {
+      await window.vaultTrackApi.refreshTrackedItem(trackedItemId);
+    } catch (error) {
+      primaryRefreshError = error;
+    }
+
+    let updated: TrackedItemView;
+    try {
+      updated = await window.vaultTrackApi.discoverSourceMatches(trackedItemId);
+    } catch (error) {
+      if (primaryRefreshError) {
+        throw new Error(
+          `${actionErrorMessage(primaryRefreshError)} Source discovery also failed: ${actionErrorMessage(error)}`,
+        );
+      }
+      throw error;
+    }
+
+    const discoveredUsableSource = updated.sourceMatches.some(
+      (source) => !source.match.isPrimary && source.match.usable,
+    );
+    if (primaryRefreshError && !discoveredUsableSource) {
+      throw primaryRefreshError;
+    }
+  }
+
   async function runItemAction(
     trackedItemId: string,
     action: () => Promise<unknown>,
@@ -2745,7 +2779,7 @@ function App() {
       await action();
       await refreshItems();
     } catch (error) {
-      window.alert(error instanceof Error ? error.message : 'Action failed.');
+      window.alert(actionErrorMessage(error));
     } finally {
       setBusyId(null);
       setBusyAction(null);
@@ -3412,6 +3446,27 @@ function App() {
     );
   }
 
+  function isRefreshWorkflowBusy(item: TrackedItemView): boolean {
+    return (
+      busyId === item.item.id &&
+      (busyAction === 'refresh' || busyAction === 'sources')
+    );
+  }
+
+  function renderRefreshWorkflowOverlay(item: TrackedItemView) {
+    if (!isRefreshWorkflowBusy(item)) return null;
+    return (
+      <div className="library-refresh-overlay" role="status">
+        <div className="library-refresh-overlay__content">
+          <span aria-hidden="true" className="spinner" />
+          <span>
+            {busyAction === 'sources' ? 'Finding sources...' : 'Refreshing...'}
+          </span>
+        </div>
+      </div>
+    );
+  }
+
   function closeItemActionMenu(event: MouseEvent<HTMLElement>) {
     event.currentTarget
       .closest('.item-action-menu')
@@ -3526,8 +3581,7 @@ function App() {
             onClick={(event) =>
               runItemMenuAction(event, () => {
                 void runItemAction(item.item.id, async () => {
-                  await window.vaultTrackApi.refreshTrackedItem(item.item.id);
-                  await window.vaultTrackApi.discoverSourceMatches(item.item.id);
+                  await refreshTrackedItemAndMatches(item.item.id);
                 });
               })
             }
@@ -4046,10 +4100,15 @@ function App() {
     });
     const showUpdateButton = hasActionableSourceUpdate(item);
     const showResolvePatchButton = needsPatchMetadataAttention(item);
+    const refreshWorkflowBusy = isRefreshWorkflowBusy(item);
 
     if (libraryViewMode === 'list') {
       return (
-        <article className="game-row" key={item.item.id}>
+        <article
+          aria-busy={refreshWorkflowBusy}
+          className={`game-row ${refreshWorkflowBusy ? 'is-refreshing' : ''}`}
+          key={item.item.id}
+        >
           <div className="game-row__media">
             {renderLibraryArtwork(item, 'game-row__cover', 'cover')}
           </div>
@@ -4097,12 +4156,17 @@ function App() {
             ) : null}
             {details}
           </div>
+          {renderRefreshWorkflowOverlay(item)}
         </article>
       );
     }
 
     return (
-      <article className="game-card" key={item.item.id}>
+      <article
+        aria-busy={refreshWorkflowBusy}
+        className={`game-card ${refreshWorkflowBusy ? 'is-refreshing' : ''}`}
+        key={item.item.id}
+      >
         <div className="game-card__media">
           {renderLibraryArtwork(item, 'game-card__cover')}
           <div className="game-card__badges">
@@ -4159,6 +4223,7 @@ function App() {
             <FontAwesomeIcon aria-hidden="true" icon={faCircleInfo} />
           </button>
         </div>
+        {renderRefreshWorkflowOverlay(item)}
       </article>
     );
   }

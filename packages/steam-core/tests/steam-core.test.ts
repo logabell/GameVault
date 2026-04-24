@@ -6,6 +6,7 @@ import {
 } from '../src/covers.js';
 import {
   buildSteamSearchQueries,
+  normalizeSteamTitle,
   rankSteamCandidates,
   shouldAutoSelect,
 } from '../src/matching.js';
@@ -322,6 +323,23 @@ describe('steam matching', () => {
     ]);
 
     expect(ranked[0]?.appId).toBe(1);
+    expect(shouldAutoSelect(ranked)).toBe(true);
+  });
+
+  it('normalizes roman sequel numerals for slash-separated source titles', () => {
+    const sourceTitle =
+      "Baldur's Gate III / Baldurs Gate 3 Deluxe Edition";
+    const ranked = rankSteamCandidates(sourceTitle, [
+      {
+        appId: 1086940,
+        title: "Baldur's Gate 3",
+      },
+    ]);
+
+    expect(normalizeSteamTitle(sourceTitle)).toBe(
+      'baldurs gate 3 baldurs gate 3',
+    );
+    expect(ranked[0]?.score).toBeGreaterThanOrEqual(0.88);
     expect(shouldAutoSelect(ranked)).toBe(true);
   });
 

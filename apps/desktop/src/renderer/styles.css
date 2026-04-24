@@ -417,6 +417,7 @@ code {
 }
 
 .game-card {
+  position: relative;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   height: 100%;
@@ -603,6 +604,41 @@ code {
 .game-row .game-chip-row {
   gap: 6px;
   margin-bottom: 7px;
+}
+
+.game-card.is-refreshing,
+.game-row.is-refreshing {
+  border-color: color-mix(in srgb, var(--accent) 34%, var(--border));
+}
+
+.library-refresh-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 8;
+  display: grid;
+  place-items: center;
+  border-radius: inherit;
+  background: color-mix(in srgb, var(--overlay) 72%, transparent);
+  backdrop-filter: blur(2px);
+}
+
+.library-refresh-overlay__content {
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
+  border-radius: var(--radius-md);
+  background: var(--panel);
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.library-refresh-overlay .spinner {
+  width: 16px;
+  height: 16px;
 }
 
 .game-row h3 {
