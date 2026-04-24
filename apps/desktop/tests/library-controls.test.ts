@@ -238,7 +238,7 @@ describe('library controls', () => {
     });
   });
 
-  it('allows Ankergames source updates without MyJDownloader when the desktop and root path are ready', () => {
+  it('allows source updates without MyJDownloader when the desktop and root path are ready', () => {
     expect(
       canQueueSourceUpdate({
         connectionHealth: {
@@ -278,10 +278,10 @@ describe('library controls', () => {
         rootLibraryPath: 'D:/Games',
         sourceKind: 'steamrip',
       }),
-    ).toBe(false);
+    ).toBe(true);
   });
 
-  it('surfaces a provider-aware library warning when MyJDownloader is offline', () => {
+  it('does not warn when only optional MyJDownloader is offline', () => {
     expect(
       getLibraryAutomationWarning({
         connectionHealth: {
@@ -300,11 +300,7 @@ describe('library controls', () => {
         },
         rootLibraryPath: 'D:/Games',
       }),
-    ).toMatchObject({
-      label: 'MyJDownloader limited',
-      message:
-        'Connect MyJDownloader. SteamRIP and ElAmigos downloads still need MyJDownloader, but Ankergames curl downloads can still start.',
-    });
+    ).toBeNull();
   });
 
   it('uses browser-specific confirmation copy for embedded Ankergames downloads', () => {

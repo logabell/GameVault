@@ -331,11 +331,18 @@ export interface IgnoredImportFolderRecord {
   rootPath: string;
 }
 
+export interface JDownloaderSourcePreferences {
+  elamigos: boolean;
+  steamrip: boolean;
+}
+
 export interface SettingsRecord {
   rootLibraryPath?: string | null;
   libraryRoots?: LibraryRootRecord[];
   renameGameFoldersOnImport?: boolean;
   ignoredImportFolders?: IgnoredImportFolderRecord[];
+  jDownloaderEnabled?: boolean;
+  jDownloaderSourcePreferences?: JDownloaderSourcePreferences;
   myJDownloaderEmail?: string | null;
   myJDownloaderDeviceId?: string | null;
   pollDailyHourLocal?: number;
@@ -489,6 +496,7 @@ export interface SaveImportBatchRow {
   folderPath: string;
   installedAt?: string | null;
   installedBuildId?: string | null;
+  installedSourceKind?: SourceKind | null;
   installedVersion?: string | null;
   renameFolder?: boolean;
   rootId?: string | null;

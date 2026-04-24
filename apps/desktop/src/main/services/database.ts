@@ -231,6 +231,40 @@ function parseJsonArray<T>(value: string | null | undefined): T[] {
   }
 }
 
+function normalizeJDownloaderSourcePreferences(
+  value: string | null | undefined,
+): NonNullable<SettingsRecord['jDownloaderSourcePreferences']> {
+  if (!value) {
+    return {
+      elamigos: true,
+      steamrip: true,
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(value) as Partial<
+      NonNullable<SettingsRecord['jDownloaderSourcePreferences']>
+    >;
+    return {
+      elamigos: parsed.elamigos !== false,
+      steamrip: parsed.steamrip !== false,
+    };
+  } catch {
+    return {
+      elamigos: true,
+      steamrip: true,
+    };
+  }
+}
+
+function getDefaultJDownloaderEnabled(map: Map<string, string | null>): boolean {
+  if (map.has('download.jdownloader.enabled')) {
+    return map.get('download.jdownloader.enabled') === 'true';
+  }
+
+  return Boolean(map.get('myjd.email')?.trim() && map.get('myjd.password'));
+}
+
 function normalizeLibraryRootRecord(
   value: Partial<LibraryRootRecord>,
   index: number,
@@ -1993,6 +2027,10 @@ export class VaultTrackDatabase {
     return {
       encryptedPassword: map.get('myjd.password') ?? null,
       ignoredImportFolders,
+      jDownloaderEnabled: getDefaultJDownloaderEnabled(map),
+      jDownloaderSourcePreferences: normalizeJDownloaderSourcePreferences(
+        map.get('download.jdownloader.sources'),
+      ),
       lastDailyPollAt: map.get('scheduler.lastDailyPollAt') ?? null,
       libraryRoots,
       myJDownloaderDeviceId: map.get('myjd.deviceId') ?? null,

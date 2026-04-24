@@ -695,7 +695,7 @@ describe('extension add-game workflow helpers', () => {
     ).toBe('Possible Update');
   });
 
-  it('allows Ankergames automation when the desktop is ready and MyJDownloader is offline', () => {
+  it('allows source automation when the desktop is ready and MyJDownloader is offline', () => {
     expect(
       isSourceReadyForAutomation({
         health: healthyDesktopOnly,
@@ -715,24 +715,27 @@ describe('extension add-game workflow helpers', () => {
     );
   });
 
-  it('keeps SteamRIP and ElAmigos blocked until MyJDownloader is ready', () => {
+  it('allows SteamRIP and ElAmigos to use curl when MyJDownloader is not ready', () => {
     expect(
       isSourceReadyForAutomation({
         health: healthyDesktopOnly,
         rootLibraryPath: 'D:/Games',
         sourceKind: 'steamrip',
       }),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       getDownloadAutomationWarning({
         health: healthyDesktopOnly,
         rootLibraryPath: 'D:/Games',
         sourceKind: 'elamigos',
       }),
-    ).toMatchObject({
-      actionLabel: 'Login to MyJDownloader',
-      title: 'MyJDownloader unavailable',
-    });
+    ).toBeNull();
+    expect(getDownloadQueueSuccessMessage('steamrip')).toBe(
+      'Download is starting in the desktop app with curl.',
+    );
+    expect(getDownloadQueueSuccessMessage('steamrip', 'jdownloader')).toBe(
+      'Queued in MyJDownloader.',
+    );
   });
 
   it('requires a root library path before any automated download can start', () => {

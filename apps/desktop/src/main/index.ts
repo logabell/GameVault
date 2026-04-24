@@ -4,10 +4,6 @@ import { join } from 'node:path';
 
 import type { ConfirmedSteamMatch } from '@vaulttrack/shared-types';
 import {
-  isAnkerGamesDirectDownloadUrl,
-  isAnkerGamesProxyDownloadUrl,
-} from '@vaulttrack/source-core';
-import {
   app,
   BrowserWindow,
   Menu,
@@ -23,6 +19,8 @@ import {
 
 import {
   buildAnkerGamesDownloadSaveTarget,
+  buildDirectHttpDownloadSaveTarget,
+  extractDirectHttpDownloadFileName,
   extractAnkerGamesDownloadFileName,
 } from './ankergames-download.js';
 import { createVaultTrackService } from './create-vaulttrack-service.js';
@@ -41,20 +39,6 @@ let bridge: NativeBridgeServer | null = null;
 let scheduler: VaultTrackScheduler | null = null;
 let quitting = false;
 const backgroundLaunch = process.argv.includes('--background');
-
-function normalizeComparableUrl(value: string | null | undefined): string | null {
-  if (!value) {
-    return null;
-  }
-
-  try {
-    const parsed = new URL(value);
-    parsed.hash = '';
-    return parsed.toString().replace(/\/$/, '').toLowerCase();
-  } catch {
-    return value.trim().replace(/\/$/, '').toLowerCase() || null;
-  }
-}
 
 function createTrayIcon() {
   return nativeImage.createFromDataURL(
@@ -180,7 +164,7 @@ function probeCurlDownload(candidate: string): Promise<{
   });
 }
 
-function startAnkerGamesDirectHttpDownload(
+function startDirectHttpDownload(
   params: StartDirectHttpDownloadParams,
 ) {
   let settled = false;
@@ -248,20 +232,12 @@ function startAnkerGamesDirectHttpDownload(
         } else if (result) {
           resolve(result);
         } else {
-          reject(new Error('AnkerGames curl download ended unexpectedly.'));
+          reject(new Error('Curl download ended unexpectedly.'));
         }
       };
 
       const start = async () => {
         const normalized = params.url.trim();
-        if (
-          !isAnkerGamesDirectDownloadUrl(normalized) &&
-          !isAnkerGamesProxyDownloadUrl(normalized)
-        ) {
-          throw new Error(
-            'AnkerGames curl download did not receive a dlproxy or DataNodes URL.',
-          );
-        }
 
         emitProgress('queued', 'Starting curl download');
         let probeResult: {
@@ -274,15 +250,28 @@ function startAnkerGamesDirectHttpDownload(
           probeResult = null;
         }
 
-        const derivedFileName = extractAnkerGamesDownloadFileName({
-          contentDisposition: probeResult?.contentDisposition ?? null,
-          responseUrl: normalized,
-        });
-        const { fileName, savePath } = buildAnkerGamesDownloadSaveTarget({
-          fallbackBaseName: params.packageName,
-          fileName: derivedFileName,
-          stagePath: params.stagePath,
-        });
+        const derivedFileName =
+          params.sourceKind === 'ankergames'
+            ? extractAnkerGamesDownloadFileName({
+                contentDisposition: probeResult?.contentDisposition ?? null,
+                responseUrl: normalized,
+              })
+            : extractDirectHttpDownloadFileName({
+                contentDisposition: probeResult?.contentDisposition ?? null,
+                responseUrl: normalized,
+              });
+        const { fileName, savePath } =
+          params.sourceKind === 'ankergames'
+            ? buildAnkerGamesDownloadSaveTarget({
+                fallbackBaseName: params.packageName,
+                fileName: derivedFileName,
+                stagePath: params.stagePath,
+              })
+            : buildDirectHttpDownloadSaveTarget({
+                fallbackBaseName: params.packageName,
+                fileName: derivedFileName,
+                stagePath: params.stagePath,
+              });
         await rm(savePath, { force: true }).catch(() => undefined);
         activeSavePath = savePath;
         activeBytesLoaded = 0;
@@ -387,7 +376,7 @@ function startAnkerGamesDirectHttpDownload(
         settleDownload(
           error instanceof Error
             ? error
-            : new Error('AnkerGames curl download could not be started.'),
+            : new Error('Curl download could not be started.'),
         );
       });
     },
@@ -402,9 +391,7 @@ function startAnkerGamesDirectHttpDownload(
         void rm(activeSavePath, { force: true }).catch(() => undefined);
       }
       if (!settled) {
-        settleDownload(
-          new Error(reason ?? 'AnkerGames curl download was cancelled.'),
-        );
+        settleDownload(new Error(reason ?? 'Curl download was cancelled.'));
       }
     },
     completion,
@@ -476,7 +463,7 @@ async function bootstrap() {
       createWindow({ showOnReady: true }).focus();
     },
     sourceFetch: (input, init) => net.fetch(input, init),
-    startDirectHttpDownload: startAnkerGamesDirectHttpDownload,
+    startDirectHttpDownload,
     steamFetch: (input, init) =>
       net.fetch(input instanceof URL ? input.toString() : input, init),
   });

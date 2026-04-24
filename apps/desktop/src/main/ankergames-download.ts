@@ -1,18 +1,45 @@
 import { join } from 'node:path';
 
+function sanitizeDirectHttpDownloadFileName(
+  fileName: string | null | undefined,
+  fallbackBaseName: string,
+  fallbackExtension = '',
+): string {
+  const sanitized = (fileName ?? '')
+    .replace(/[<>:"/\\|?*]/g, '')
+    .split('')
+    .filter((character) => {
+      const codePoint = character.codePointAt(0);
+      return codePoint != null && codePoint >= 32;
+    })
+    .join('')
+    .trim();
+  if (sanitized) {
+    return sanitized;
+  }
+
+  const fallback = sanitizeDirectHttpDownloadFileName(
+    fallbackBaseName,
+    'download',
+  );
+  return fallbackExtension &&
+    !fallback.toLowerCase().endsWith(fallbackExtension.toLowerCase())
+    ? `${fallback}${fallbackExtension}`
+    : fallback;
+}
+
 function sanitizeAnkerGamesDownloadFileName(
   fileName: string | null | undefined,
   fallbackBaseName: string,
 ): string {
-  const sanitized = (fileName ?? '')
-    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '')
-    .trim();
-  if (sanitized) {
-    return sanitized.toLowerCase().endsWith('.zip')
-      ? sanitized
-      : `${sanitized}.zip`;
-  }
-  return `${fallbackBaseName}.zip`;
+  const sanitized = sanitizeDirectHttpDownloadFileName(
+    fileName,
+    fallbackBaseName,
+    '.zip',
+  );
+  return sanitized.toLowerCase().endsWith('.zip')
+    ? sanitized
+    : `${sanitized}.zip`;
 }
 
 function decodeContentDispositionValue(value: string): string {
@@ -61,6 +88,28 @@ export function extractAnkerGamesDownloadFileName(params: {
   } catch {
     return null;
   }
+}
+
+export function extractDirectHttpDownloadFileName(params: {
+  contentDisposition?: string | null;
+  responseUrl?: string | null;
+}): string | null {
+  return extractAnkerGamesDownloadFileName(params);
+}
+
+export function buildDirectHttpDownloadSaveTarget(params: {
+  fallbackBaseName: string;
+  fileName: string | null | undefined;
+  stagePath: string;
+}): { fileName: string; savePath: string } {
+  const fileName = sanitizeDirectHttpDownloadFileName(
+    params.fileName,
+    params.fallbackBaseName,
+  );
+  return {
+    fileName,
+    savePath: join(params.stagePath, fileName),
+  };
 }
 
 export function buildAnkerGamesDownloadSaveTarget(params: {

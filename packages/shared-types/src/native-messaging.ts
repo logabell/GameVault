@@ -172,6 +172,8 @@ export type NativeMessageRequest =
   | {
       type: 'saveSettings';
       payload: {
+        jDownloaderEnabled?: boolean;
+        jDownloaderSourcePreferences?: SettingsView['jDownloaderSourcePreferences'];
         libraryRoots?: SettingsView['libraryRoots'];
         renameGameFoldersOnImport?: boolean;
         pollDailyHourLocal?: number;

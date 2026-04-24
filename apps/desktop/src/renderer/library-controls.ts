@@ -29,9 +29,9 @@ export type {
 } from '@vaulttrack/shared-types';
 
 export function sourceRequiresMyJDownloader(
-  sourceKind: SupportedSourceKind | null | undefined,
+  _sourceKind: SupportedSourceKind | null | undefined,
 ): boolean {
-  return sourceKind === 'elamigos' || sourceKind === 'steamrip';
+  return false;
 }
 
 export function canQueueSourceUpdate(params: {
@@ -76,13 +76,6 @@ export function getLibraryAutomationWarning(params: {
     return {
       label: 'Root library path required',
       message: 'Choose a root library path in Settings before starting downloads.',
-    };
-  }
-
-  if (connectionHealth.myJDownloader.color !== 'green') {
-    return {
-      label: 'MyJDownloader limited',
-      message: `${connectionHealth.myJDownloader.message} SteamRIP and ElAmigos downloads still need MyJDownloader, but Ankergames curl downloads can still start.`,
     };
   }
 

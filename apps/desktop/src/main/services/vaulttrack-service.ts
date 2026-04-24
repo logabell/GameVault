@@ -50,6 +50,11 @@ import {
   derivePatchLag,
   deriveTrackedItemStatus,
   deriveTrackedItemTrackingStatus,
+  findSteamPatchByDateAndVersion,
+  findUniqueSteamPatchByTitleVersion,
+  getSteamPatchIdentityKey,
+  inferSourceComparisonRows,
+  normalizeSourceComparisonVersion,
 } from '@vaulttrack/shared-types';
 import {
   isAnkerGamesDirectDownloadUrl,
@@ -84,6 +89,7 @@ import {
   directoryHasEntries,
   dismountIsoImagesUnderPath,
   ensureDirectory,
+  extractDirectHttpArchives,
   extractSingleStagedZipArchive,
   finalizePortableArchiveExtraction,
   hasPortableArchiveContentFolder,
@@ -309,13 +315,7 @@ function numericSteamBuildId(value: string | null | undefined): string | null {
 function normalizeSourceVersion(
   value: string | null | undefined,
 ): string | null {
-  const normalized = value
-    ?.trim()
-    .toLowerCase()
-    .replace(/^version\s*:?\s*/i, '')
-    .replace(/^v\s*(?=\d)/i, '')
-    .replace(/\s+/g, ' ');
-  return normalized || null;
+  return normalizeSourceComparisonVersion(value);
 }
 
 function numericVersionSegments(
@@ -426,6 +426,14 @@ function manualImportSourceUrl(trackedItemId: string): string {
   return `manual:import:${trackedItemId}`;
 }
 
+function normalizeImportInstalledSourceKind(
+  value: SourceKind | null | undefined,
+): SourceKind {
+  return value === 'ankergames' || value === 'elamigos' || value === 'steamrip'
+    ? value
+    : 'manual';
+}
+
 function buildImportFingerprint(params: {
   folderPath: string;
   selectedPatch: SteamPatchCandidate;
@@ -501,6 +509,7 @@ export interface DirectHttpDownloadHandle {
 export interface StartDirectHttpDownloadParams {
   onProgress: (snapshot: DirectHttpDownloadProgressSnapshot) => void;
   packageName: string;
+  sourceKind: ParsedSourcePayload['sourceKind'];
   sourceUrl: string;
   url: string;
   stagePath: string;
@@ -510,16 +519,41 @@ export type DirectHttpDownloadRunner = (
   params: StartDirectHttpDownloadParams,
 ) => DirectHttpDownloadHandle;
 
-function getDownloadProvider(
+function getJDownloaderSourcePreferences(
+  settings: SettingsView | ReturnType<VaultTrackDatabase['getSettings']>,
+): NonNullable<SettingsView['jDownloaderSourcePreferences']> {
+  return {
+    elamigos: settings.jDownloaderSourcePreferences?.elamigos !== false,
+    steamrip: settings.jDownloaderSourcePreferences?.steamrip !== false,
+  };
+}
+
+function sourceSupportsJDownloader(
   sourceKind: ParsedSourcePayload['sourceKind'],
-): DownloadProvider {
-  return sourceKind === 'ankergames' ? 'direct_http' : 'jdownloader';
+): sourceKind is 'elamigos' | 'steamrip' {
+  return sourceKind === 'elamigos' || sourceKind === 'steamrip';
 }
 
 function isDirectHttpProvider(
   provider: DownloadJobRecord['provider'] | null | undefined,
 ): provider is 'direct_http' {
   return provider === 'direct_http';
+}
+
+function getDirectHttpPartStagePath(params: {
+  job: DownloadJobRecord;
+  part: DownloadJobPartRecord;
+  sourceKind: ParsedSourcePayload['sourceKind'];
+}): string {
+  if (
+    params.sourceKind === 'elamigos' &&
+    (params.part.packageName.endsWith('_full') ||
+      params.part.packageName.endsWith('_update'))
+  ) {
+    return join(params.job.stagePath, params.part.packageName);
+  }
+
+  return params.job.stagePath;
 }
 
 function buildDownloadJobParts(params: {
@@ -990,6 +1024,57 @@ export class VaultTrackService {
     return isDirectHttpProvider(job.provider) ? 'direct_http' : 'jdownloader';
   }
 
+  private async resolveDownloadProvider(params: {
+    settings: ReturnType<VaultTrackDatabase['getSettings']>;
+    sourceKind: ParsedSourcePayload['sourceKind'];
+    trackedItemId: string;
+  }): Promise<DownloadProvider> {
+    if (!sourceSupportsJDownloader(params.sourceKind)) {
+      return 'direct_http';
+    }
+
+    if (!params.settings.jDownloaderEnabled) {
+      return 'direct_http';
+    }
+
+    const preferences = getJDownloaderSourcePreferences(params.settings);
+    if (!preferences[params.sourceKind]) {
+      return 'direct_http';
+    }
+
+    try {
+      const health = await this.myJDownloader.getHealth();
+      if (health.color === 'green') {
+        return 'jdownloader';
+      }
+
+      this.appendEvent(
+        'info',
+        'Falling back to curl because JDownloader is not ready',
+        {
+          jDownloaderStatus: health.color,
+          sourceKind: params.sourceKind,
+          trackedItemId: params.trackedItemId,
+        },
+      );
+      return 'direct_http';
+    } catch (error) {
+      this.appendEvent(
+        'warn',
+        'Falling back to curl because JDownloader status could not be checked',
+        {
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Unknown JDownloader health error',
+          sourceKind: params.sourceKind,
+          trackedItemId: params.trackedItemId,
+        },
+      );
+      return 'direct_http';
+    }
+  }
+
   private async cancelDirectHttpDownload(
     trackedItemId: string,
     reason?: string,
@@ -1003,7 +1088,9 @@ export class VaultTrackService {
 
   private updateDirectHttpDownloadProgress(params: {
     jobId: string;
+    partId: string;
     snapshot: DirectHttpDownloadProgressSnapshot;
+    sourceKind: ParsedSourcePayload['sourceKind'];
     trackedItemId: string;
   }): void {
     const job = this.database.getDownloadJob(params.trackedItemId);
@@ -1026,12 +1113,12 @@ export class VaultTrackService {
               fullUrl: job.selectedMirrorUrl ?? '',
               patchUrl: job.selectedPatchMirrorUrl ?? null,
             },
-            sourceKind: 'ankergames',
+            sourceKind: params.sourceKind,
             trackedItemId: job.trackedItemId,
           });
     const now = new Date().toISOString();
-    const nextParts = parts.map((part, index) =>
-      index === 0
+    const nextParts = parts.map((part) =>
+      part.id === params.partId
         ? {
             ...part,
             bytesLoaded: params.snapshot.bytesLoaded,
@@ -1045,7 +1132,7 @@ export class VaultTrackService {
           }
         : part,
     );
-    const summary = summarizeDownloadParts(nextParts, 'ankergames');
+    const summary = summarizeDownloadParts(nextParts, params.sourceKind);
     this.database.upsertDownloadJob({
       ...job,
       bytesLoaded: summary.bytesLoaded,
@@ -1219,38 +1306,142 @@ export class VaultTrackService {
     return nextJob;
   }
 
+  private getDownloadJobParts(
+    job: DownloadJobRecord,
+    sourceKind: ParsedSourcePayload['sourceKind'],
+  ): DownloadJobPartRecord[] {
+    return job.parts && job.parts.length > 0
+      ? job.parts
+      : buildDownloadJobParts({
+          jobId: job.id,
+          now: job.createdAt,
+          packageName: job.packageName,
+          selectedDownloads: {
+            fullUrl: job.selectedMirrorUrl ?? '',
+            patchUrl: job.selectedPatchMirrorUrl ?? null,
+          },
+          sourceKind,
+          trackedItemId: job.trackedItemId,
+        });
+  }
+
+  private upsertDirectHttpJobWithParts(params: {
+    job: DownloadJobRecord;
+    parts: DownloadJobPartRecord[];
+    sourceKind: ParsedSourcePayload['sourceKind'];
+    statusMessage?: string | null;
+  }): DownloadJobRecord {
+    const summary = summarizeDownloadParts(params.parts, params.sourceKind);
+    const nextJob: DownloadJobRecord = {
+      ...params.job,
+      bytesLoaded: summary.bytesLoaded,
+      bytesTotal: summary.bytesTotal,
+      completedParts: summary.completedParts,
+      errorMessage: summary.errorMessage,
+      etaSeconds: summary.etaSeconds,
+      packageId: summary.packageId,
+      packageName: summary.packageName || params.job.packageName,
+      parts: params.parts,
+      provider: 'direct_http',
+      speed: summary.speed,
+      stage: summary.stage,
+      statusMessage: params.statusMessage ?? summary.statusMessage,
+      totalParts: summary.totalParts,
+      updatedAt: new Date().toISOString(),
+    };
+    this.database.upsertDownloadJob(nextJob);
+    return nextJob;
+  }
+
   private async recoverDirectHttpDownloadJob(
     item: TrackedItemRecord,
     job: DownloadJobRecord,
+    sourceKind: ParsedSourcePayload['sourceKind'],
   ): Promise<DownloadJobRecord> {
+    if (sourceKind === 'elamigos') {
+      const now = new Date().toISOString();
+      const recoveredParts = await Promise.all(
+        this.getDownloadJobParts(job, sourceKind).map(async (part) => {
+          const partPath = getDirectHttpPartStagePath({
+            job,
+            part,
+            sourceKind,
+          });
+          await extractDirectHttpArchives({
+            archiveRootPath: partPath,
+            destinationPath: partPath,
+          }).catch(() => []);
+          return {
+            ...part,
+            errorMessage: null,
+            etaSeconds: 0,
+            stage: (await directoryHasEntries(partPath))
+              ? ('staged' as const)
+              : ('failed' as const),
+            statusMessage: (await directoryHasEntries(partPath))
+              ? 'Staged files found'
+              : 'Curl download did not finish cleanly',
+            updatedAt: now,
+          };
+        }),
+      );
+      const recoveredJob = this.upsertDirectHttpJobWithParts({
+        job,
+        parts: recoveredParts,
+        sourceKind,
+      });
+      if (recoveredJob.stage === 'failed') {
+        this.markDownloadJobFailed({
+          job: recoveredJob,
+          markMirrorsFailed: false,
+          message:
+            'ElAmigos curl download did not finish cleanly. Retry the download to continue.',
+          trackedItemId: item.id,
+        });
+        return this.database.getDownloadJob(item.id) ?? recoveredJob;
+      }
+      return recoveredJob;
+    }
+
     const extractPath = getPortableArchiveExtractPath({
       finalPath: job.finalPath,
-      sourceKind: 'ankergames',
+      sourceKind,
       stagePath: job.stagePath,
     });
     const canonicalTitle = this.getPortableArchiveCanonicalTitle(item, job);
     let hasExtractedGameFolder = await hasPortableArchiveContentFolder({
       canonicalTitle,
       extractPath,
-      sourceKind: 'ankergames',
+      sourceKind,
     });
-    let recoveredFromStagedZip = false;
+    let recoveredFromArchive = false;
     if (!hasExtractedGameFolder) {
-      recoveredFromStagedZip =
-        (await this.extractStagedZipArchive({ extractPath }).catch(() => null)) !=
-        null;
-      if (recoveredFromStagedZip) {
+      if (sourceKind === 'ankergames') {
+        recoveredFromArchive =
+          (await this.extractStagedZipArchive({ extractPath }).catch(
+            () => null,
+          )) != null;
+      } else {
+        recoveredFromArchive =
+          (
+            await extractDirectHttpArchives({
+              archiveRootPath: job.stagePath,
+              destinationPath: extractPath,
+            }).catch(() => [])
+          ).length > 0;
+      }
+      if (recoveredFromArchive) {
         hasExtractedGameFolder = await hasPortableArchiveContentFolder({
           canonicalTitle,
           extractPath,
-          sourceKind: 'ankergames',
+          sourceKind,
         });
       }
     }
 
     if (!hasExtractedGameFolder) {
-      const message =
-        'AnkerGames curl download did not finish cleanly. Retry the download to continue.';
+      const label = sourceKind === 'ankergames' ? 'AnkerGames' : 'SteamRIP';
+      const message = `${label} curl download did not finish cleanly. Retry the download to continue.`;
       this.markDownloadJobFailed({
         job,
         markMirrorsFailed: false,
@@ -1271,29 +1462,19 @@ export class VaultTrackService {
     return this.finalizePortableArchiveJob({
       item,
       job,
-      sourceKind: 'ankergames',
-      statusMessage: recoveredFromStagedZip
-        ? 'Recovered from staged ZIP'
+      sourceKind,
+      statusMessage: recoveredFromArchive
+        ? sourceKind === 'ankergames'
+          ? 'Recovered from staged ZIP'
+          : 'Recovered from staged archive'
         : 'Recovered extracted game files',
-      updatedParts:
-        job.parts && job.parts.length > 0
-          ? job.parts
-          : buildDownloadJobParts({
-              jobId: job.id,
-              now: job.createdAt,
-              packageName: job.packageName,
-              selectedDownloads: {
-                fullUrl: job.selectedMirrorUrl ?? '',
-                patchUrl: job.selectedPatchMirrorUrl ?? null,
-              },
-              sourceKind: 'ankergames',
-              trackedItemId: item.id,
-            }),
+      updatedParts: this.getDownloadJobParts(job, sourceKind),
     });
   }
 
-  private async startDirectHttpDownloadForJob(params: {
+  private async runDirectHttpDownloadJob(params: {
     job: DownloadJobRecord;
+    onStarted?: () => void;
     parsedSource: ParsedSourcePayload;
     trackedItemId: string;
   }): Promise<void> {
@@ -1301,164 +1482,286 @@ export class VaultTrackService {
       throw new Error('Direct HTTP downloads are unavailable.');
     }
 
-    const directDownloadUrl = params.job.selectedMirrorUrl?.trim() ?? '';
-    if (!directDownloadUrl) {
-      throw new Error('AnkerGames download did not include a direct mirror URL.');
+    let notifyStarted = params.onStarted;
+    let job = params.job;
+    let parts = this.getDownloadJobParts(job, params.parsedSource.sourceKind);
+    if (parts.length === 0) {
+      throw new Error('Download did not include any mirror URLs.');
     }
-    if (
-      !isAnkerGamesDirectDownloadUrl(directDownloadUrl) &&
-      !isAnkerGamesProxyDownloadUrl(directDownloadUrl)
-    ) {
-      throw new Error(
-        'AnkerGames download did not resolve to a curl-ready dlproxy or DataNodes URL.',
-      );
-    }
-
-    const handle = this.startDirectHttpDownload({
-      onProgress: (snapshot) =>
-        this.updateDirectHttpDownloadProgress({
-          jobId: params.job.id,
-          snapshot,
-          trackedItemId: params.trackedItemId,
-        }),
-      packageName: params.job.packageName,
-      sourceUrl: params.parsedSource.sourceUrl,
-      url: directDownloadUrl,
-      stagePath: params.job.stagePath,
-    });
-    this.activeDirectHttpDownloads.set(params.trackedItemId, handle);
-
-    const now = new Date().toISOString();
-    const parts =
-      params.job.parts && params.job.parts.length > 0
-        ? params.job.parts
-        : buildDownloadJobParts({
-            jobId: params.job.id,
-            now: params.job.createdAt,
-            packageName: params.job.packageName,
-            selectedDownloads: {
-              fullUrl: directDownloadUrl,
-              patchUrl: null,
-            },
-            sourceKind: 'ankergames',
-            trackedItemId: params.trackedItemId,
-          });
-    this.database.upsertDownloadJob({
-      ...params.job,
+    job = this.upsertDirectHttpJobWithParts({
+      job,
       parts,
-      provider: 'direct_http',
+      sourceKind: params.parsedSource.sourceKind,
       statusMessage: 'Starting curl download',
-      updatedAt: now,
     });
 
-    void handle.completion
-      .then(async () => {
-        const currentJob = this.database.getDownloadJob(params.trackedItemId);
-        const item = this.database.findTrackedItemById(params.trackedItemId);
-        if (
-          !item ||
-          !currentJob ||
-          currentJob.id !== params.job.id ||
-          !isDirectHttpProvider(currentJob.provider)
-        ) {
-          return;
-        }
+    for (const part of parts) {
+      const directDownloadUrl = part.mirrorUrl?.trim() ?? '';
+      if (!directDownloadUrl) {
+        throw new Error('Download part did not include a mirror URL.');
+      }
+      if (
+        params.parsedSource.sourceKind === 'ankergames' &&
+        !isAnkerGamesDirectDownloadUrl(directDownloadUrl) &&
+        !isAnkerGamesProxyDownloadUrl(directDownloadUrl)
+      ) {
+        throw new Error(
+          'AnkerGames download did not resolve to a curl-ready dlproxy or DataNodes URL.',
+        );
+      }
 
-        const extractingAt = new Date().toISOString();
-        const extractingParts =
-          currentJob.parts && currentJob.parts.length > 0
-            ? currentJob.parts.map((part) => ({
-                ...part,
-                errorMessage: null,
-                etaSeconds: 0,
-                stage: 'extracting' as const,
-                statusMessage: 'Extracting staged ZIP',
-                updatedAt: extractingAt,
-              }))
-            : buildDownloadJobParts({
-                jobId: currentJob.id,
-                now: currentJob.createdAt,
-                packageName: currentJob.packageName,
-                selectedDownloads: {
-                  fullUrl: currentJob.selectedMirrorUrl ?? '',
-                  patchUrl: currentJob.selectedPatchMirrorUrl ?? null,
-                },
-                sourceKind: 'ankergames',
-                trackedItemId: params.trackedItemId,
-              }).map((part) => ({
-                ...part,
-                stage: 'extracting' as const,
-                statusMessage: 'Extracting staged ZIP',
-                updatedAt: extractingAt,
-              }));
-        this.database.upsertDownloadJob({
-          ...currentJob,
-          errorMessage: null,
-          etaSeconds: 0,
-          parts: extractingParts,
-          provider: 'direct_http',
-          stage: 'extracting',
-          statusMessage: 'Extracting staged ZIP',
-          updatedAt: extractingAt,
-        });
+      const targetPath = getDirectHttpPartStagePath({
+        job,
+        part,
+        sourceKind: params.parsedSource.sourceKind,
+      });
+      await ensureDirectory(targetPath);
+      const startingAt = new Date().toISOString();
+      parts = parts.map((candidate) =>
+        candidate.id === part.id
+          ? {
+              ...candidate,
+              errorMessage: null,
+              stage: 'queued' as const,
+              statusMessage: 'Starting curl download',
+              updatedAt: startingAt,
+            }
+          : candidate,
+      );
+      job = this.upsertDirectHttpJobWithParts({
+        job,
+        parts,
+        sourceKind: params.parsedSource.sourceKind,
+      });
 
-        const extractPath = getPortableArchiveExtractPath({
-          finalPath: currentJob.finalPath,
-          sourceKind: 'ankergames',
-          stagePath: currentJob.stagePath,
-        });
-        if (
-          !(await this.extractStagedZipArchive({
-            extractPath,
-          }))
-        ) {
-          throw new Error(
-            'AnkerGames curl download completed, but no staged ZIP was found to extract.',
-          );
-        }
-
-        const completedJob = await this.finalizePortableArchiveJob({
-          item,
-          job: currentJob,
-          sourceKind: 'ankergames',
-          statusMessage: 'Downloaded and installed with curl',
-          updatedParts: extractingParts,
-        });
-        this.database.upsertDownloadJob(completedJob);
-      })
-      .catch((error) => {
-        const currentJob = this.database.getDownloadJob(params.trackedItemId);
-        if (
-          !currentJob ||
-          currentJob.id !== params.job.id ||
-          currentJob.stage === 'complete' ||
-          currentJob.stage === 'failed'
-        ) {
-          return;
-        }
-
-        const message =
-          error instanceof Error
-            ? error.message
-            : 'AnkerGames curl download failed.';
-        this.markDownloadJobFailed({
-          job: currentJob,
-          markMirrorsFailed: true,
-          message,
-          trackedItemId: params.trackedItemId,
-        });
-        this.appendEvent('warn', 'AnkerGames curl download failed', {
-          error: message,
-          trackedItemId: params.trackedItemId,
-        });
-      })
-      .finally(() => {
+      const handle = this.startDirectHttpDownload({
+        onProgress: (snapshot) =>
+          this.updateDirectHttpDownloadProgress({
+            jobId: job.id,
+            partId: part.id,
+            snapshot,
+            sourceKind: params.parsedSource.sourceKind,
+            trackedItemId: params.trackedItemId,
+          }),
+        packageName: part.packageName,
+        sourceKind: params.parsedSource.sourceKind,
+        sourceUrl: params.parsedSource.sourceUrl,
+        url: directDownloadUrl,
+        stagePath: targetPath,
+      });
+      this.activeDirectHttpDownloads.set(params.trackedItemId, handle);
+      notifyStarted?.();
+      notifyStarted = undefined;
+      try {
+        await handle.completion;
+      } finally {
         if (
           this.activeDirectHttpDownloads.get(params.trackedItemId) === handle
         ) {
           this.activeDirectHttpDownloads.delete(params.trackedItemId);
         }
+      }
+
+      const currentJob = this.database.getDownloadJob(params.trackedItemId);
+      if (
+        !currentJob ||
+        currentJob.id !== params.job.id ||
+        !isDirectHttpProvider(currentJob.provider)
+      ) {
+        return;
+      }
+      job = currentJob;
+      parts = this.getDownloadJobParts(job, params.parsedSource.sourceKind);
+      const extractingAt = new Date().toISOString();
+      parts = parts.map((candidate) =>
+        candidate.id === part.id
+          ? {
+              ...candidate,
+              errorMessage: null,
+              etaSeconds: 0,
+              stage: 'extracting' as const,
+              statusMessage:
+                params.parsedSource.sourceKind === 'elamigos'
+                  ? 'Preparing staged files'
+                  : 'Extracting staged archive',
+              updatedAt: extractingAt,
+            }
+          : candidate,
+      );
+      job = this.upsertDirectHttpJobWithParts({
+        job,
+        parts,
+        sourceKind: params.parsedSource.sourceKind,
       });
+
+      if (params.parsedSource.sourceKind === 'ankergames') {
+        const extractPath = getPortableArchiveExtractPath({
+          finalPath: job.finalPath,
+          sourceKind: 'ankergames',
+          stagePath: job.stagePath,
+        });
+        if (!(await this.extractStagedZipArchive({ extractPath }))) {
+          throw new Error(
+            'AnkerGames curl download completed, but no staged ZIP was found to extract.',
+          );
+        }
+        const item = this.database.findTrackedItemById(params.trackedItemId);
+        if (!item) {
+          return;
+        }
+        const completedJob = await this.finalizePortableArchiveJob({
+          item,
+          job,
+          sourceKind: 'ankergames',
+          statusMessage: 'Downloaded and installed with curl',
+          updatedParts: parts,
+        });
+        this.database.upsertDownloadJob(completedJob);
+        return;
+      }
+
+      if (params.parsedSource.sourceKind === 'steamrip') {
+        const extractPath = getPortableArchiveExtractPath({
+          finalPath: job.finalPath,
+          sourceKind: 'steamrip',
+          stagePath: job.stagePath,
+        });
+        const extractedArchives = await extractDirectHttpArchives({
+          archiveRootPath: targetPath,
+          destinationPath: extractPath,
+        });
+        if (extractedArchives.length === 0) {
+          throw new Error(
+            'SteamRIP curl download completed, but no extractable archive was found.',
+          );
+        }
+        parts = parts.map((candidate) =>
+          candidate.id === part.id
+            ? {
+                ...candidate,
+                errorMessage: null,
+                etaSeconds: 0,
+                stage: 'extracting' as const,
+                statusMessage: 'Finalizing staged archive',
+                updatedAt: new Date().toISOString(),
+              }
+            : candidate,
+        );
+        job = this.upsertDirectHttpJobWithParts({
+          job,
+          parts,
+          sourceKind: params.parsedSource.sourceKind,
+        });
+        continue;
+      }
+
+      const extractedArchives = await extractDirectHttpArchives({
+        archiveRootPath: targetPath,
+        destinationPath: targetPath,
+      });
+      if (
+        extractedArchives.length === 0 &&
+        !(await directoryHasEntries(targetPath))
+      ) {
+        throw new Error(
+          'ElAmigos curl download completed, but no staged files were found.',
+        );
+      }
+      parts = parts.map((candidate) =>
+        candidate.id === part.id
+          ? {
+              ...candidate,
+              errorMessage: null,
+              etaSeconds: 0,
+              stage: 'staged' as const,
+              statusMessage:
+                extractedArchives.length > 0
+                  ? 'Extracted staged archive'
+                  : 'Staged files found',
+              updatedAt: new Date().toISOString(),
+            }
+          : candidate,
+      );
+      job = this.upsertDirectHttpJobWithParts({
+        job,
+        parts,
+        sourceKind: params.parsedSource.sourceKind,
+      });
+    }
+
+    if (params.parsedSource.sourceKind === 'steamrip') {
+      const item = this.database.findTrackedItemById(params.trackedItemId);
+      const currentJob = this.database.getDownloadJob(params.trackedItemId);
+      if (!item || !currentJob || currentJob.id !== params.job.id) {
+        return;
+      }
+      const completedJob = await this.finalizePortableArchiveJob({
+        item,
+        job: currentJob,
+        sourceKind: 'steamrip',
+        statusMessage: 'Downloaded and installed with curl',
+        updatedParts: this.getDownloadJobParts(currentJob, 'steamrip'),
+      });
+      this.database.upsertDownloadJob(completedJob);
+    }
+  }
+
+  private async startDirectHttpDownloadForJob(params: {
+    job: DownloadJobRecord;
+    parsedSource: ParsedSourcePayload;
+    trackedItemId: string;
+  }): Promise<void> {
+    let started = false;
+    let rejectStarted!: (error: unknown) => void;
+    const startedPromise = new Promise<void>((resolve, reject) => {
+      rejectStarted = reject;
+      void this.runDirectHttpDownloadJob({
+        ...params,
+        onStarted: () => {
+          started = true;
+          resolve();
+        },
+      }).catch((error) => {
+        if (!started) {
+          rejectStarted(error);
+        }
+        this.handleDirectHttpDownloadError(params, error);
+      });
+    });
+    await startedPromise;
+  }
+
+  private handleDirectHttpDownloadError(
+    params: {
+      job: DownloadJobRecord;
+      parsedSource: ParsedSourcePayload;
+      trackedItemId: string;
+    },
+    error: unknown,
+  ): void {
+    const currentJob = this.database.getDownloadJob(params.trackedItemId);
+    if (
+      !currentJob ||
+      currentJob.id !== params.job.id ||
+      currentJob.stage === 'complete' ||
+      currentJob.stage === 'failed'
+    ) {
+      return;
+    }
+
+    const message =
+      error instanceof Error ? error.message : 'Curl download failed.';
+    this.markDownloadJobFailed({
+      job: currentJob,
+      markMirrorsFailed: true,
+      message,
+      trackedItemId: params.trackedItemId,
+    });
+    this.appendEvent('warn', 'Curl download failed', {
+      error: message,
+      sourceKind: params.parsedSource.sourceKind,
+      trackedItemId: params.trackedItemId,
+    });
   }
 
   private async elamigosStagedContentExists(
@@ -1671,19 +1974,6 @@ export class VaultTrackService {
     };
   }
 
-  private findUniquePatchByDate(
-    patchEntries: SteamPatchEntry[],
-    patchDate: string | null | undefined,
-  ): SteamPatchEntry | null {
-    if (!patchDate) {
-      return null;
-    }
-    const matches = patchEntries.filter(
-      (entry) => entry.patchDate === patchDate,
-    );
-    return matches.length === 1 ? matches[0]! : null;
-  }
-
   private findUniquePatchByVersion(
     patchEntries: SteamPatchEntry[],
     version: string | null | undefined,
@@ -1800,7 +2090,18 @@ export class VaultTrackService {
     }
 
     if (snapshot.sourceKind === 'elamigos') {
-      return this.findUniquePatchByDate(patchEntries, signals.patchDate);
+      return findSteamPatchByDateAndVersion(
+        patchEntries,
+        signals.patchDate,
+        signals.version,
+      );
+    }
+
+    if (snapshot.sourceKind === 'ankergames' && signals.buildId) {
+      return findUniqueSteamPatchByTitleVersion(
+        patchEntries,
+        signals.version,
+      );
     }
 
     return null;
@@ -1829,95 +2130,9 @@ export class VaultTrackService {
     return this.findUniquePatchNearUploadDate(params.patchEntries, uploadDate);
   }
 
-  private inferSteamRipBuildIdFromAnkerGamesVersion(
-    trackedItemId: string,
-    patchEntries: SteamPatchEntry[],
-  ): void {
-    const steamRipSnapshot = this.database.getSourceSnapshot(
-      trackedItemId,
-      'steamrip',
-    );
-    if (
-      !steamRipSnapshot ||
-      numericSteamBuildId(steamRipSnapshot.observedBuildId)
-    ) {
-      return;
-    }
-    const parsedSteamRip = this.database.getRawParsedSourcePayload(
-      trackedItemId,
-      'steamrip',
-    );
-    const steamRipVersion = normalizeSourceVersion(
-      parsedSteamRip?.latestSourceRelease.version ??
-        steamRipSnapshot.observedVersion,
-    );
-    if (!steamRipVersion) {
-      return;
-    }
-
-    let ankerGamesBuildId: string | null = null;
-    const peerBuildIds = new Set<string>();
-    for (const sourceKind of ['ankergames', 'elamigos'] as const) {
-      const snapshot = this.database.getSourceSnapshot(
-        trackedItemId,
-        sourceKind,
-      );
-      if (!snapshot) {
-        continue;
-      }
-      const parsedSource = this.database.getRawParsedSourcePayload(
-        trackedItemId,
-        sourceKind,
-      );
-      const version = normalizeSourceVersion(
-        parsedSource?.latestSourceRelease.version ?? snapshot.observedVersion,
-      );
-      if (version !== steamRipVersion) {
-        continue;
-      }
-      const directPatch = this.findDirectPatchForSourceSnapshot(
-        snapshot,
-        patchEntries,
-        parsedSource,
-      );
-      const buildId =
-        numericSteamBuildId(parsedSource?.latestSourceRelease.buildId) ??
-        numericSteamBuildId(snapshot.observedBuildId) ??
-        numericSteamBuildId(directPatch?.buildId);
-      if (buildId) {
-        peerBuildIds.add(buildId);
-      }
-      if (sourceKind === 'ankergames') {
-        ankerGamesBuildId = buildId;
-      }
-    }
-
-    if (
-      !ankerGamesBuildId ||
-      peerBuildIds.size !== 1 ||
-      !peerBuildIds.has(ankerGamesBuildId)
-    ) {
-      return;
-    }
-
-    this.database.upsertSourceSnapshot({
-      ...steamRipSnapshot,
-      fingerprint: parsedSteamRip?.fingerprint ?? steamRipSnapshot.fingerprint,
-      observedBuildId: ankerGamesBuildId,
-      observedVersion:
-        parsedSteamRip?.latestSourceRelease.version ??
-        steamRipSnapshot.observedVersion,
-      sourceUrl: parsedSteamRip?.sourceUrl ?? steamRipSnapshot.sourceUrl,
-    });
-  }
-
   private reconcileSourcePatchAlignments(trackedItemId: string): void {
     const patchEntries = this.sortPatchEntries(
       this.database.listPatchEntries(trackedItemId),
-    );
-    this.inferSteamRipBuildIdFromAnkerGamesVersion(
-      trackedItemId,
-      patchEntries,
     );
     if (patchEntries.length === 0) {
       return;
@@ -1951,10 +2166,7 @@ export class VaultTrackService {
           const peerPatches =
             resolvedPeersByVersion.get(normalizedVersion) ??
             new Map<string, SteamPatchEntry>();
-          peerPatches.set(
-            existingPatch.buildId ?? existingPatch.link,
-            existingPatch,
-          );
+          peerPatches.set(getSteamPatchIdentityKey(existingPatch), existingPatch);
           resolvedPeersByVersion.set(normalizedVersion, peerPatches);
         }
         continue;
@@ -1985,10 +2197,7 @@ export class VaultTrackService {
           const peerPatches =
             resolvedPeersByVersion.get(normalizedVersion) ??
             new Map<string, SteamPatchEntry>();
-          peerPatches.set(
-            matchedPatch.buildId ?? matchedPatch.link,
-            matchedPatch,
-          );
+          peerPatches.set(getSteamPatchIdentityKey(matchedPatch), matchedPatch);
           resolvedPeersByVersion.set(normalizedVersion, peerPatches);
         }
       }
@@ -2103,7 +2312,7 @@ export class VaultTrackService {
     sourceSnapshot = this.getItemSourceSnapshot(item);
     sourceSnapshots = this.database.listSourceSnapshots(trackedItemId);
     const latestPatch = patchEntries[0] ?? null;
-    const matchedSourceViews = sourceMatches.map((match) => {
+    const rawMatchedSourceViews = sourceMatches.map((match) => {
       const snapshot =
         sourceSnapshots.find(
           (candidate) => candidate.sourceKind === match.sourceKind,
@@ -2153,6 +2362,13 @@ export class VaultTrackService {
           sourcePatchLag?.versionsBehindLatestIsLowerBound ?? false,
       };
     });
+    const matchedSourceViews = inferSourceComparisonRows(
+      {
+        item,
+        sourceMatches: rawMatchedSourceViews,
+      } as TrackedItemView,
+      patchEntries,
+    );
     const selectedPatch = this.getSelectedPatch(
       trackedItemId,
       steamMatch,
@@ -2872,7 +3088,10 @@ export class VaultTrackService {
     const matchingDescriptor = descriptors.find(
       (mirror) =>
         mirrorUrlMatches(mirror.url, requestedUrl) ||
-        mirrorUrlMatches(getAnkerGamesBrowserDownloadUrl(mirror), requestedUrl) ||
+        mirrorUrlMatches(
+          getAnkerGamesBrowserDownloadUrl(mirror),
+          requestedUrl,
+        ) ||
         mirrorUrlMatches(
           getStoredMirrorUrl(params.parsedSource.sourceKind, mirror),
           requestedUrl,
@@ -2962,10 +3181,7 @@ export class VaultTrackService {
     const fullDownloadUrls: DownloadDescriptor[] = [];
     for (const mirror of parsedSource.fullDownloadUrls) {
       const existingBrowserUrl = getAnkerGamesBrowserDownloadUrl(mirror);
-      if (
-        existingBrowserUrl ||
-        !isAnkerGamesGeneratedDownloadUrl(mirror.url)
-      ) {
+      if (existingBrowserUrl || !isAnkerGamesGeneratedDownloadUrl(mirror.url)) {
         fullDownloadUrls.push(mirror);
         continue;
       }
@@ -3432,7 +3648,7 @@ export class VaultTrackService {
           ),
       );
       const replacementUrl = previousDescriptor
-        ? nextFullUrlsByStableUrl.get(previousDescriptor.url) ?? null
+        ? (nextFullUrlsByStableUrl.get(previousDescriptor.url) ?? null)
         : nextFullDescriptors.find(
               (mirror) =>
                 mirrorUrlMatches(mirror.url, previousMirror.url) ||
@@ -4397,7 +4613,11 @@ export class VaultTrackService {
     const packageName = sanitizePathSegment(
       `${canonicalTitle}_${releaseSuffix}`,
     );
-    const provider = getDownloadProvider(parsedSource.sourceKind);
+    const provider = await this.resolveDownloadProvider({
+      settings,
+      sourceKind: parsedSource.sourceKind,
+      trackedItemId,
+    });
     const primaryQueuePackageName = getPrimaryQueuePackageName({
       packageName,
       selectedDownloads: queueSelectedDownloads,
@@ -4989,10 +5209,8 @@ export class VaultTrackService {
     const retrySourceKind =
       selectedDownloads?.sourceKind ?? existingJob?.sourceKind ?? null;
     const parsedSource =
-      this.database.getRawParsedSourcePayload(
-        trackedItemId,
-        retrySourceKind,
-      ) ?? this.database.getRawParsedSourcePayload(trackedItemId);
+      this.database.getRawParsedSourcePayload(trackedItemId, retrySourceKind) ??
+      this.database.getRawParsedSourcePayload(trackedItemId);
     if (!parsedSource) {
       throw new Error('No cached source payload available for retry');
     }
@@ -5515,24 +5733,14 @@ export class VaultTrackService {
 
       try {
         if (isDirectHttpProvider(job.provider)) {
-          if (jobSourceKind === 'ankergames') {
-            if (!this.activeDirectHttpDownloads.has(item.id)) {
-              const recoveredJob = await this.recoverDirectHttpDownloadJob(
-                item,
-                job,
-              );
-              this.database.upsertDownloadJob(recoveredJob);
-            }
-            continue;
+          if (!this.activeDirectHttpDownloads.has(item.id)) {
+            const recoveredJob = await this.recoverDirectHttpDownloadJob(
+              item,
+              job,
+              jobSourceKind,
+            );
+            this.database.upsertDownloadJob(recoveredJob);
           }
-
-          const message = `Direct HTTP downloads are not supported for ${jobSourceKind}.`;
-          this.markDownloadJobFailed({
-            job,
-            markMirrorsFailed: false,
-            message,
-            trackedItemId: item.id,
-          });
           continue;
         }
 
@@ -5634,10 +5842,7 @@ export class VaultTrackService {
           isExtractionErrorMessage(nextJob.statusMessage);
         if (nextJob.stage === 'complete' || portableExtractionError) {
           nextJob.etaSeconds = 0;
-          if (
-            jobSourceKind === 'ankergames' ||
-            jobSourceKind === 'steamrip'
-          ) {
+          if (jobSourceKind === 'ankergames' || jobSourceKind === 'steamrip') {
             const canonicalTitle = this.getPortableArchiveCanonicalTitle(
               item,
               job,
@@ -5900,6 +6105,11 @@ export class VaultTrackService {
     const settings = this.database.getSettings();
     return {
       ignoredImportFolders: settings.ignoredImportFolders ?? [],
+      jDownloaderEnabled: settings.jDownloaderEnabled ?? false,
+      jDownloaderSourcePreferences: settings.jDownloaderSourcePreferences ?? {
+        elamigos: true,
+        steamrip: true,
+      },
       libraryRoots: settings.libraryRoots ?? [],
       myJDownloaderDeviceId: settings.myJDownloaderDeviceId,
       myJDownloaderEmail: settings.myJDownloaderEmail,
@@ -5914,6 +6124,8 @@ export class VaultTrackService {
   }
 
   saveSettings(input: {
+    jDownloaderEnabled?: boolean;
+    jDownloaderSourcePreferences?: SettingsView['jDownloaderSourcePreferences'];
     libraryRoots?: LibraryRootRecord[];
     myJDownloaderDeviceId?: string | null;
     myJDownloaderEmail?: string | null;
@@ -5991,6 +6203,21 @@ export class VaultTrackService {
       this.database.setSetting(
         'appearance.themeMode',
         input.themeMode ?? 'system',
+      );
+    }
+    if (input.jDownloaderEnabled !== undefined) {
+      this.database.setSetting(
+        'download.jdownloader.enabled',
+        input.jDownloaderEnabled ? 'true' : 'false',
+      );
+    }
+    if (input.jDownloaderSourcePreferences !== undefined) {
+      this.database.setSetting(
+        'download.jdownloader.sources',
+        JSON.stringify({
+          elamigos: input.jDownloaderSourcePreferences.elamigos !== false,
+          steamrip: input.jDownloaderSourcePreferences.steamrip !== false,
+        }),
       );
     }
 
@@ -6272,6 +6499,9 @@ export class VaultTrackService {
           ...row,
           finalPath,
           folderPath: resolve(row.folderPath),
+          installedSourceKind: normalizeImportInstalledSourceKind(
+            row.installedSourceKind,
+          ),
           renameFolder,
           steamMatch: await this.withCanonicalSteamCover(row.steamMatch),
         };
@@ -6310,14 +6540,17 @@ export class VaultTrackService {
     const imported: TrackedItemView[] = [];
     for (const row of validatedRows) {
       const itemId = crypto.randomUUID();
+      const manualSourceUrl = manualImportSourceUrl(itemId);
       const item = this.database.upsertTrackedItem({
         coverUrl: row.steamMatch.coverUrl ?? null,
         id: itemId,
         normalizedTitle: row.steamMatch.normalizedTitle,
         sourceKind: 'manual',
-        sourceUrl: manualImportSourceUrl(itemId),
+        sourceUrl: manualSourceUrl,
         title: row.steamMatch.title,
       });
+      const installedSourceUrl =
+        row.installedSourceKind === 'manual' ? manualSourceUrl : null;
       const selectedPatch = row.selectedSteamPatch;
       const observedVersion =
         row.installedVersion?.trim() ||
@@ -6355,7 +6588,7 @@ export class VaultTrackService {
         observedVersion,
         patchSelectionSource: selectedPatch.selectionSource ?? 'rss',
         sourceKind: 'manual',
-        sourceUrl: manualImportSourceUrl(item.id),
+        sourceUrl: manualSourceUrl,
         trackedItemId: item.id,
       });
       this.database.upsertInstallRecord({
@@ -6364,8 +6597,8 @@ export class VaultTrackService {
           row.installedAt?.trim() || selectedPatch.patchDate || dateStamp(),
         installedBuildId:
           row.installedBuildId?.trim() || selectedPatch.buildId || null,
-        installedSourceKind: 'manual',
-        installedSourceUrl: manualImportSourceUrl(item.id),
+        installedSourceKind: row.installedSourceKind,
+        installedSourceUrl,
         installedVersion: observedVersion,
         trackedItemId: item.id,
         updatedAt: now.toISOString(),
@@ -6490,26 +6723,46 @@ export class VaultTrackService {
   async updateInstallRecord(params: {
     installedAt?: string | null;
     installedBuildId?: string | null;
+    installedSourceKind?: SourceKind | null;
     installPath?: string | null;
     installedVersion?: string | null;
     trackedItemId: string;
   }): Promise<TrackedItemView> {
     const existing = this.database.getInstallRecord(params.trackedItemId);
+    const installedSourceKind =
+      params.installedSourceKind === undefined
+        ? (existing?.installedSourceKind ?? null)
+        : normalizeImportInstalledSourceKind(params.installedSourceKind);
     const record: InstallRecord = {
-      installedAt: params.installedAt ?? null,
-      installedBuildId: params.installedBuildId ?? null,
+      installedAt:
+        params.installedAt !== undefined
+          ? params.installedAt
+          : (existing?.installedAt ?? null),
+      installedBuildId:
+        params.installedBuildId !== undefined
+          ? params.installedBuildId
+          : (existing?.installedBuildId ?? null),
       installPath:
         params.installPath !== undefined
           ? params.installPath
           : (existing?.installPath ?? null),
-      installedSourceKind: existing?.installedSourceKind ?? null,
-      installedSourceUrl: existing?.installedSourceUrl ?? null,
-      installedVersion: params.installedVersion ?? null,
+      installedSourceKind,
+      installedSourceUrl:
+        params.installedSourceKind === undefined
+          ? (existing?.installedSourceUrl ?? null)
+          : installedSourceKind === 'manual'
+            ? manualImportSourceUrl(params.trackedItemId)
+            : null,
+      installedVersion:
+        params.installedVersion !== undefined
+          ? params.installedVersion
+          : (existing?.installedVersion ?? null),
       trackedItemId: params.trackedItemId,
       updatedAt: new Date().toISOString(),
     };
     this.database.upsertInstallRecord(record);
     this.clearFailedStateForSelectedMirrors(params.trackedItemId);
+    this.reconcileSteamPatchWatch(params.trackedItemId);
     this.appendEvent('info', 'Updated installed metadata', {
       trackedItemId: params.trackedItemId,
     });
@@ -6524,7 +6777,9 @@ export class VaultTrackService {
     const currentJob = this.database.getDownloadJob(trackedItemId);
     const stagedSourceKind =
       currentJob?.sourceKind ??
-      (item.sourceKind && item.sourceKind !== 'manual' ? item.sourceKind : null);
+      (item.sourceKind && item.sourceKind !== 'manual'
+        ? item.sourceKind
+        : null);
     const sourceSnapshot = stagedSourceKind
       ? this.database.getSourceSnapshot(trackedItemId, stagedSourceKind)
       : this.getItemSourceSnapshot(item);

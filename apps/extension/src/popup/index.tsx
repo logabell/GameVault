@@ -984,13 +984,8 @@ function resolveHealthSeverity(
   health: ConnectionHealthSummary | null,
 ): HealthSeverity {
   if (!health) return null;
-  if (health.desktop.color === 'red' || health.myJDownloader.color === 'red')
-    return 'red';
-  if (
-    health.desktop.color === 'yellow' ||
-    health.myJDownloader.color === 'yellow'
-  )
-    return 'yellow';
+  if (health.desktop.color === 'red') return 'red';
+  if (health.desktop.color === 'yellow') return 'yellow';
   return null;
 }
 
@@ -3516,6 +3511,7 @@ function App() {
         errorMessage?: string | null;
         message?: string | null;
         ok?: boolean;
+        payload?: TrackedItemView | null;
       }>(
         {
           selectedSteamPatch,
@@ -3541,10 +3537,14 @@ function App() {
         return false;
       }
       setFinishQueued(true);
+      const queuedProvider = response.payload?.currentDownload?.provider;
       setMessage(
         isLibraryUpdateFlow
           ? 'Update queued.'
-          : getDownloadQueueSuccessMessage(selectedSourceView.match.sourceKind),
+          : getDownloadQueueSuccessMessage(
+              selectedSourceView.match.sourceKind,
+              queuedProvider,
+            ),
       );
       setStep('done');
       refreshPopupStateInBackground();
@@ -4917,7 +4917,7 @@ function App() {
                 <div>
                   <p className="section-title">Settings</p>
                   <p className="muted-text">
-                    Appearance and MyJDownloader setup live here.
+                    Appearance, library path, and optional JDownloader setup live here.
                   </p>
                 </div>
               </div>
@@ -5093,19 +5093,18 @@ function App() {
                     </strong>
                     <p className="muted-text">
                       {health?.myJDownloader.message ??
-                        'Sign in to MyJDownloader for SteamRIP and ElAmigos automation. Ankergames uses desktop curl.'}
+                        'Sign in to optionally prefer JDownloader for supported sources.'}
                     </p>
                   </div>
                 </div>
               </div>
-              {health?.desktop.color !== 'green' ||
-              health?.myJDownloader.color !== 'green' ? (
+              {health?.desktop.color !== 'green' ? (
                 <div className="note-card">
                   <p className="muted-text">
                     If the desktop bridge is still waking up, wait a few seconds
                     and refresh. VaultTrack stores MyJDownloader credentials in
-                    the desktop app only, and Ankergames downloads can still run
-                    there without MyJDownloader once your library root is set.
+                    the desktop app only, and downloads can still run there with
+                    curl once your library root is set.
                   </p>
                 </div>
               ) : null}

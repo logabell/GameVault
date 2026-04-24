@@ -321,6 +321,42 @@ export async function extractSingleStagedZipArchive(params: {
   return zipPath;
 }
 
+function isDirectHttpExtractableArchive(fileName: string): boolean {
+  const lower = fileName.toLowerCase();
+  return (
+    lower.endsWith('.zip') ||
+    lower.endsWith('.rar') ||
+    lower.endsWith('.7z')
+  );
+}
+
+export async function extractDirectHttpArchives(params: {
+  archiveRootPath: string;
+  destinationPath: string;
+  runExtract?: (archivePath: string, destinationPath: string) => Promise<void>;
+}): Promise<string[]> {
+  const archiveRootPath = resolve(params.archiveRootPath);
+  const destinationPath = resolve(params.destinationPath);
+  await ensureDirectory(destinationPath);
+
+  const entries = await readdir(archiveRootPath, { withFileTypes: true });
+  const archivePaths = entries
+    .filter(
+      (entry) => entry.isFile() && isDirectHttpExtractableArchive(entry.name),
+    )
+    .map((entry) => resolve(join(archiveRootPath, entry.name)));
+
+  for (const archivePath of archivePaths) {
+    assertPathInside(archiveRootPath, archivePath);
+    await (params.runExtract ?? extractZipArchive)(
+      archivePath,
+      destinationPath,
+    );
+  }
+
+  return archivePaths;
+}
+
 function isPortableArchiveExtraFolder(folderName: string): boolean {
   return ['_commonredist', '__macosx'].includes(folderName.toLowerCase());
 }

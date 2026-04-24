@@ -12,17 +12,29 @@ import { createRoot } from 'react-dom/client';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import {
   faArrowDownWideShort,
+  faBan,
+  faCalendarDays,
   faCheck,
   faCircleInfo,
+  faCircleQuestion,
+  faClock,
+  faCloudArrowDown,
+  faDesktop,
   faEllipsis,
   faFileImport,
   faFilter,
+  faFloppyDisk,
+  faFolder,
+  faFolderOpen,
   faGamepad,
   faGear,
   faList,
+  faLink,
   faMagnifyingGlass,
   faMoon,
   faPenToSquare,
+  faPlus,
+  faRotateLeft,
   faRotateRight,
   faScroll,
   faSort,
@@ -101,6 +113,7 @@ type LibraryViewMode = 'cards' | 'list';
 type ImportSortKey = 'folder' | 'patchMetadata' | 'steamMatch';
 type SortDirection = 'asc' | 'desc';
 type ResolvedTheme = 'light' | 'dark';
+type ImportInstalledSourceKind = SourceKind;
 type SettingsSaveStatus = 'idle' | 'saving' | 'saved';
 type ItemBusyAction =
   | 'clearMirrorFailed'
@@ -137,6 +150,7 @@ type ImportRowState = {
   included: boolean;
   installedAt: string;
   installedBuildId: string;
+  installedSourceKind: ImportInstalledSourceKind;
   installedVersion: string;
   manualQuery: string;
   needsUserAttention: boolean;
@@ -180,6 +194,34 @@ const SUPPORTED_RENDER_SOURCE_KINDS: SupportedSourceKind[] = [
   'steamrip',
   'ankergames',
 ];
+const IMPORT_INSTALLED_SOURCE_OPTIONS: Array<{
+  label: string;
+  value: ImportInstalledSourceKind;
+}> = [
+  { label: 'Unknown', value: 'manual' },
+  { label: 'ElAmigos', value: 'elamigos' },
+  { label: 'SteamRIP', value: 'steamrip' },
+  { label: 'AnkerGames', value: 'ankergames' },
+];
+const IMPORTED_SOURCE_EDIT_OPTIONS: Array<{
+  label: string;
+  value: ImportInstalledSourceKind;
+}> = [
+  { label: 'Imported', value: 'manual' },
+  { label: 'ElAmigos', value: 'elamigos' },
+  { label: 'SteamRIP', value: 'steamrip' },
+  { label: 'AnkerGames', value: 'ankergames' },
+];
+const DEFAULT_SETTINGS_DRAFT = {
+  jDownloaderEnabled: false,
+  jDownloaderSourcePreferences: {
+    elamigos: true,
+    steamrip: true,
+  },
+  pollDailyHourLocal: '9',
+  sourceWatchDurationDays: '5',
+  sourceWatchIntervalHours: '8',
+};
 
 declare global {
   interface Window {
@@ -237,6 +279,8 @@ declare global {
         trackedItemId: string;
       }): Promise<TrackedItemView>;
       saveSettings(payload: {
+        jDownloaderEnabled?: boolean;
+        jDownloaderSourcePreferences?: SettingsView['jDownloaderSourcePreferences'];
         libraryRoots?: LibraryRootRecord[];
         pollDailyHourLocal?: number;
         renameGameFoldersOnImport?: boolean;
@@ -270,6 +314,7 @@ declare global {
       updateInstallRecord(payload: {
         installedAt?: string | null;
         installedBuildId?: string | null;
+        installedSourceKind?: SourceKind | null;
         installedVersion?: string | null;
         trackedItemId: string;
       }): Promise<TrackedItemView>;
@@ -363,7 +408,8 @@ function createOlderThanAvailablePatch(appId: number): SteamPatchCandidate {
   return {
     appId,
     buildId: null,
-    description: 'Installed patch predates the available SteamDB patch history.',
+    description:
+      'Installed patch predates the available SteamDB patch history.',
     link: `vaulttrack:older-than-available:${appId}`,
     patchDate: '',
     patchTitle: 'Older than available / not listed',
@@ -399,9 +445,7 @@ function getPatchOptions(
   return [...availablePatches, existingOlderPatch ?? olderPatch];
 }
 
-function patchCandidateKey(
-  patch: SteamPatchCandidate,
-): string {
+function patchCandidateKey(patch: SteamPatchCandidate): string {
   return getPatchHistoryKey(patch);
 }
 
@@ -482,6 +526,45 @@ function normalizeSettingsLibraryRoots(
         },
       ]
     : [];
+}
+
+function hasConfiguredMyJDownloader(settings: SettingsView): boolean {
+  return Boolean(
+    settings.myJDownloaderEmail?.trim() &&
+    settings.myJDownloaderPasswordConfigured,
+  );
+}
+
+function createSettingsDraftFromSettings(loadedSettings: SettingsView): {
+  jDownloaderEnabled: boolean;
+  jDownloaderSourcePreferences: NonNullable<
+    SettingsView['jDownloaderSourcePreferences']
+  >;
+  pollDailyHourLocal: string;
+  sourceWatchDurationDays: string;
+  sourceWatchIntervalHours: string;
+} {
+  return {
+    jDownloaderEnabled:
+      loadedSettings.jDownloaderEnabled ??
+      hasConfiguredMyJDownloader(loadedSettings),
+    jDownloaderSourcePreferences: {
+      elamigos: loadedSettings.jDownloaderSourcePreferences?.elamigos !== false,
+      steamrip: loadedSettings.jDownloaderSourcePreferences?.steamrip !== false,
+    },
+    pollDailyHourLocal: String(
+      loadedSettings.pollDailyHourLocal ??
+        Number(DEFAULT_SETTINGS_DRAFT.pollDailyHourLocal),
+    ),
+    sourceWatchDurationDays: String(
+      loadedSettings.sourceWatchDurationDays ??
+        Number(DEFAULT_SETTINGS_DRAFT.sourceWatchDurationDays),
+    ),
+    sourceWatchIntervalHours: String(
+      loadedSettings.sourceWatchIntervalHours ??
+        Number(DEFAULT_SETTINGS_DRAFT.sourceWatchIntervalHours),
+    ),
+  };
 }
 
 function buildSteamDbPatchnotesUrl(appId: number): string {
@@ -961,16 +1044,33 @@ function formatPatchLag(item: TrackedItemView): string {
   return 'Unknown';
 }
 
-function formatPatchBehindCount(
+type SourcePatchComparisonTone =
+  | 'aligned'
+  | 'behind'
+  | 'blocked'
+  | 'failed'
+  | 'not_matched'
+  | 'unknown';
+
+function formatSourceLagLabel(
   count: number,
   isLowerBound?: boolean | null,
 ): string {
   if (count === 0) {
-    return 'Up to date';
+    return 'Aligned';
   }
-  return `${count}${isLowerBound ? '+' : ''} patch${
-    count === 1 ? '' : 'es'
-  } behind`;
+  return `${count}${isLowerBound ? '+' : ''} behind`;
+}
+
+function sourcePatchComparisonFromLag(
+  count: number,
+  isLowerBound?: boolean | null,
+): { label: string; rank: number; tone: SourcePatchComparisonTone } {
+  return {
+    label: formatSourceLagLabel(count, isLowerBound),
+    rank: count,
+    tone: count === 0 ? 'aligned' : 'behind',
+  };
 }
 
 function getPatchEditorTitle(item: TrackedItemView): string {
@@ -990,18 +1090,37 @@ function formatTrackedSourceKind(value: string | null | undefined): string {
   return formatLabel(value);
 }
 
-function isImportedInstall(item: TrackedItemView): boolean {
+function getInstalledSourceKind(item: TrackedItemView): SourceKind | null {
   return (
-    item.item.sourceKind === 'manual' ||
-    Boolean(item.installRecord && !item.item.sourceKind)
+    item.installRecord?.installedSourceKind ??
+    item.item.sourceKind ??
+    item.sourceSnapshot?.sourceKind ??
+    null
   );
 }
 
-function getInstalledSourceKind(item: TrackedItemView): SourceKind | null {
-  if (isImportedInstall(item)) {
-    return 'manual';
-  }
-  return item.item.sourceKind ?? item.sourceSnapshot?.sourceKind ?? null;
+function hasEditableImportedInstallSource(item: TrackedItemView): boolean {
+  const installedSourceUrl = item.installRecord?.installedSourceUrl?.trim();
+  return (
+    item.item.sourceKind === 'manual' &&
+    (!installedSourceUrl || installedSourceUrl.startsWith('manual:import:'))
+  );
+}
+
+function parseImportInstalledSourceKind(
+  value: string,
+): ImportInstalledSourceKind {
+  return value === 'ankergames' || value === 'elamigos' || value === 'steamrip'
+    ? value
+    : 'manual';
+}
+
+function formatIgnoredImportFolderPath(
+  ignored: IgnoredImportFolderRecord,
+): string {
+  const rootPath = ignored.rootPath.replace(/[\\/]+$/, '');
+  const separator = rootPath.includes('\\') ? '\\' : '/';
+  return `${rootPath}${separator}${ignored.folderName}`;
 }
 
 function formatOptionalValue(value: string | null | undefined): string {
@@ -1010,6 +1129,50 @@ function formatOptionalValue(value: string | null | undefined): string {
 
 function formatBuildValue(value: string | null | undefined): string {
   return value?.trim() ? `Build ${value}` : 'Build n/a';
+}
+
+function isPlaceholderPatchTitle(value: string | null | undefined): boolean {
+  const trimmed = value?.trim();
+  return !trimmed || /^no title$/i.test(trimmed);
+}
+
+function extractPatchVersionFromTitle(
+  title: string | null | undefined,
+): string | null {
+  const trimmed = title?.trim();
+  if (!trimmed || isPlaceholderPatchTitle(trimmed)) {
+    return null;
+  }
+
+  const labeledVersion = trimmed.match(
+    /\b(?:patch|hotfix|update|version|v)\s*(?<version>\d+(?:\.\d+)+(?:[a-z0-9.-]*)?)\b/i,
+  );
+  if (labeledVersion?.groups?.version) {
+    return labeledVersion.groups.version;
+  }
+
+  const parenthesizedVersion = trimmed.match(
+    /\((?<version>\d+(?:\.\d+)+(?:[a-z0-9.-]*)?)\)/i,
+  );
+  return parenthesizedVersion?.groups?.version ?? null;
+}
+
+function getPatchDisplayVersion(
+  patch:
+    | Pick<SteamPatchCandidate, 'patchTitle' | 'version'>
+    | null
+    | undefined,
+): string | null {
+  return patch?.version?.trim() || extractPatchVersionFromTitle(patch?.patchTitle);
+}
+
+function getPatchTitleDisplay(
+  patchTitle: string | null | undefined,
+  fallback: string | null | undefined,
+): string | null {
+  return isPlaceholderPatchTitle(patchTitle)
+    ? (fallback ?? null)
+    : (patchTitle ?? null);
 }
 
 function sourceSnapshotMatchesPatch(
@@ -1027,78 +1190,67 @@ function sourceSnapshotMatchesPatch(
   }
   return Boolean(
     snapshot.observedPatchDate &&
-      snapshot.observedPatchTitle &&
-      snapshot.observedPatchDate === patch.patchDate &&
-      snapshot.observedPatchTitle === patch.patchTitle,
+    snapshot.observedPatchTitle &&
+    snapshot.observedPatchDate === patch.patchDate &&
+    snapshot.observedPatchTitle === patch.patchTitle,
   );
 }
 
 function getSourcePatchComparison(
   item: TrackedItemView,
   source?: TrackedItemView['sourceMatches'][number],
-): { label: string; rank: number } {
+): { label: string; rank: number; tone: SourcePatchComparisonTone } {
   if (!source) {
-    return { label: 'Not matched', rank: 900 };
+    return { label: 'Not matched', rank: 900, tone: 'not_matched' };
   }
 
   const snapshot = source.snapshot;
   if (source.updateStatus === 'not_matched') {
-    return { label: 'Not matched', rank: 900 };
+    return { label: 'Not matched', rank: 900, tone: 'not_matched' };
   }
-  if (source.updateStatus === 'failed' || source.updateStatus === 'blocked') {
-    return { label: formatLabel(source.updateStatus), rank: 850 };
+  if (source.updateStatus === 'failed') {
+    return { label: 'Failed', rank: 850, tone: 'failed' };
   }
-  if (source.matchedPatch) {
-    if (source.versionsBehindLatest === 0) {
-      return { label: 'Aligned with upstream', rank: 0 };
-    }
-    if (typeof source.versionsBehindLatest === 'number') {
-      return {
-        label: formatPatchBehindCount(
-          source.versionsBehindLatest,
-          source.versionsBehindLatestIsLowerBound,
-        ),
-        rank: source.versionsBehindLatest,
-      };
-    }
+  if (source.updateStatus === 'blocked') {
+    return { label: 'Blocked', rank: 850, tone: 'blocked' };
+  }
+  if (typeof source.versionsBehindLatest === 'number') {
+    return sourcePatchComparisonFromLag(
+      source.versionsBehindLatest,
+      source.versionsBehindLatestIsLowerBound,
+    );
   }
   if (sourceSnapshotMatchesPatch(snapshot, item.latestPatch)) {
-    return { label: 'Aligned with upstream', rank: 0 };
+    return { label: 'Aligned', rank: 0, tone: 'aligned' };
   }
   if (sourceSnapshotMatchesPatch(snapshot, item.selectedPatch)) {
     if (typeof item.versionsBehindLatest === 'number') {
-      return {
-        label: formatPatchBehindCount(
-          item.versionsBehindLatest,
-          item.versionsBehindLatestIsLowerBound,
-        ),
-        rank: item.versionsBehindLatest,
-      };
+      return sourcePatchComparisonFromLag(
+        item.versionsBehindLatest,
+        item.versionsBehindLatestIsLowerBound,
+      );
     }
-    return { label: 'Same as installed', rank: 300 };
+    return { label: 'Unknown', rank: 300, tone: 'unknown' };
   }
 
   switch (source.updateStatus) {
     case 'matches_upstream':
-      return { label: 'Aligned with upstream', rank: 0 };
+      return { label: 'Aligned', rank: 0, tone: 'aligned' };
     case 'newer_than_installed':
-      return { label: 'Newer than installed', rank: 100 };
+      return { label: 'Unknown', rank: 100, tone: 'unknown' };
     case 'possible_update':
-      return { label: 'Possible update', rank: 150 };
+      return { label: 'Unknown', rank: 150, tone: 'unknown' };
     case 'same_as_installed':
       return typeof item.versionsBehindLatest === 'number'
-        ? {
-            label: formatPatchBehindCount(
-              item.versionsBehindLatest,
-              item.versionsBehindLatestIsLowerBound,
-            ),
-            rank: item.versionsBehindLatest,
-          }
-        : { label: 'Same as installed', rank: 300 };
+        ? sourcePatchComparisonFromLag(
+            item.versionsBehindLatest,
+            item.versionsBehindLatestIsLowerBound,
+          )
+        : { label: 'Unknown', rank: 300, tone: 'unknown' };
     case 'source_behind_upstream':
-      return { label: 'Source behind upstream', rank: 400 };
+      return { label: 'Unknown', rank: 400, tone: 'unknown' };
     default:
-      return { label: 'Unknown', rank: 700 };
+      return { label: 'Unknown', rank: 700, tone: 'unknown' };
   }
 }
 
@@ -1152,7 +1304,7 @@ function getUpstreamPatchSummary(item: TrackedItemView) {
     buildId: patch?.buildId ?? null,
     date: patch?.patchDate ?? null,
     patchLabel: patch?.patchTitle ?? 'Latest SteamDB patch unavailable',
-    version: patch?.version ?? null,
+    version: getPatchDisplayVersion(patch),
   };
 }
 
@@ -1161,14 +1313,8 @@ function isSourceCurrentForInstall(
   sourceKind: SupportedSourceKind,
   source?: TrackedItemView['sourceMatches'][number],
 ): boolean {
-  if (isImportedInstall(item)) {
-    return false;
-  }
   const installedSourceKind = getInstalledSourceKind(item);
-  return Boolean(
-    source?.match.isPrimary ||
-      installedSourceKind === sourceKind,
-  );
+  return Boolean(source?.match.isPrimary || installedSourceKind === sourceKind);
 }
 
 function getSourceOfferTags(
@@ -1191,20 +1337,16 @@ function getSourceOfferTags(
     tags.push('Manual');
   }
   if (
-    source.match.status === 'verified' ||
-    source.match.status === 'probable' ||
-    source.match.status === 'candidate'
+    source.match.status === 'candidate' ||
+    source.match.status === 'not_found'
   ) {
-    tags.push(formatLabel(source.match.status));
-  }
-  if (source.match.status === 'not_found') {
     tags.push('Not matched');
   }
   if (source.match.status === 'failed' || source.match.status === 'blocked') {
     tags.push(formatLabel(source.match.status));
   }
 
-  return tags.length ? tags : ['Unknown'];
+  return tags;
 }
 
 function isSubduedSourceIssue(
@@ -1212,8 +1354,8 @@ function isSubduedSourceIssue(
 ): boolean {
   return Boolean(
     source?.snapshot &&
-      source.match.lastError &&
-      /rate limited|retrying later/i.test(source.match.lastError),
+    source.match.lastError &&
+    /rate limited|retrying later/i.test(source.match.lastError),
   );
 }
 
@@ -1326,11 +1468,9 @@ function App() {
   });
   const [connectionHealth, setConnectionHealth] =
     useState<ConnectionHealthSummary | null>(null);
-  const [settingsDraft, setSettingsDraft] = useState({
-    pollDailyHourLocal: '9',
-    sourceWatchDurationDays: '5',
-    sourceWatchIntervalHours: '8',
-  });
+  const [settingsDraft, setSettingsDraft] = useState(() => ({
+    ...DEFAULT_SETTINGS_DRAFT,
+  }));
   const [libraryRootsDraft, setLibraryRootsDraft] = useState<
     LibraryRootRecord[]
   >([]);
@@ -1389,6 +1529,10 @@ function App() {
     manualSourceKind: SupportedSourceKind;
     manualUrl: string;
   } | null>(null);
+  const [importedSourceEditor, setImportedSourceEditor] = useState<{
+    item: TrackedItemView;
+    sourceKind: ImportInstalledSourceKind;
+  } | null>(null);
   const [sourceBusyKind, setSourceBusyKind] = useState<
     SupportedSourceKind | 'manual' | 'matches' | null
   >(null);
@@ -1414,11 +1558,7 @@ function App() {
   );
   const libraryStatusFilterCounts = useMemo(
     () =>
-      getScopedLibraryStatusFilterCounts(
-        items,
-        libraryFilter,
-        librarySearch,
-      ),
+      getScopedLibraryStatusFilterCounts(items, libraryFilter, librarySearch),
     [items, libraryFilter, librarySearch],
   );
   const visibleLibraryItems = useMemo(
@@ -1516,22 +1656,55 @@ function App() {
     }));
   }
 
+  function syncSettingsDrafts(loadedSettings: SettingsView): void {
+    setSettingsDraft(createSettingsDraftFromSettings(loadedSettings));
+    setLibraryRootsDraft(normalizeSettingsLibraryRoots(loadedSettings));
+    setRenameOnImportDraft(loadedSettings.renameGameFoldersOnImport ?? true);
+  }
+
+  function syncAuthDraft(loadedSettings: SettingsView): void {
+    setAuthDraft((current) => ({
+      ...current,
+      email: loadedSettings.myJDownloaderEmail ?? '',
+      selectedDeviceId:
+        loadedSettings.myJDownloaderDeviceId ?? current.selectedDeviceId,
+    }));
+  }
+
+  function cancelSettingsDraftChanges(): void {
+    syncSettingsDrafts(settings);
+    setSettingsSaveStatus('idle');
+  }
+
+  function resetSettingsDraftToDefaults(): void {
+    setSettingsDraft({
+      ...DEFAULT_SETTINGS_DRAFT,
+      jDownloaderEnabled: hasConfiguredMyJDownloader(settings),
+    });
+    setLibraryRootsDraft([]);
+    setRenameOnImportDraft(true);
+    setSettingsSaveStatus('idle');
+  }
+
+  function updateJDownloaderSourcePreference(
+    sourceKind: 'elamigos' | 'steamrip',
+    enabled: boolean,
+  ): void {
+    setSettingsDraft((current) => ({
+      ...current,
+      jDownloaderSourcePreferences: {
+        ...current.jDownloaderSourcePreferences,
+        [sourceKind]: enabled,
+      },
+    }));
+    setSettingsSaveStatus('idle');
+  }
+
   async function refreshSettings() {
     const nextSettings = await window.vaultTrackApi.getSettings();
     setSettings(nextSettings);
-    setSettingsDraft({
-      pollDailyHourLocal: String(nextSettings.pollDailyHourLocal ?? 9),
-      sourceWatchDurationDays: String(nextSettings.sourceWatchDurationDays ?? 5),
-      sourceWatchIntervalHours: String(nextSettings.sourceWatchIntervalHours ?? 8),
-    });
-    setLibraryRootsDraft(normalizeSettingsLibraryRoots(nextSettings));
-    setRenameOnImportDraft(nextSettings.renameGameFoldersOnImport ?? true);
-    setAuthDraft((current) => ({
-      ...current,
-      email: nextSettings.myJDownloaderEmail ?? '',
-      selectedDeviceId:
-        nextSettings.myJDownloaderDeviceId ?? current.selectedDeviceId,
-    }));
+    syncSettingsDrafts(nextSettings);
+    syncAuthDraft(nextSettings);
   }
 
   async function saveTheme(themeMode: ThemeMode) {
@@ -1549,6 +1722,9 @@ function App() {
     try {
       setSettings(
         await window.vaultTrackApi.saveSettings({
+          jDownloaderEnabled: settingsDraft.jDownloaderEnabled,
+          jDownloaderSourcePreferences:
+            settingsDraft.jDownloaderSourcePreferences,
           libraryRoots: libraryRootsDraft,
           pollDailyHourLocal: Number(settingsDraft.pollDailyHourLocal),
           renameGameFoldersOnImport: renameOnImportDraft,
@@ -1764,6 +1940,7 @@ function App() {
         included: !candidate.ignored,
         installedAt: '',
         installedBuildId: '',
+        installedSourceKind: 'manual',
         installedVersion: '',
         manualQuery: candidate.title,
         needsUserAttention: false,
@@ -1816,6 +1993,40 @@ function App() {
     } catch (error) {
       setImportMessage(
         error instanceof Error ? error.message : 'Unable to scan import roots.',
+      );
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
+  async function ignoreImportCandidate(candidate: ImportCandidate) {
+    setImportBusy(true);
+    setImportMessage(`Ignoring ${candidate.folderName}...`);
+    try {
+      const ignoredImportFolders =
+        await window.vaultTrackApi.ignoreImportFolder({
+          folderName: candidate.folderName,
+          rootPath: candidate.rootPath,
+        });
+      setSettings((current) => ({
+        ...current,
+        ignoredImportFolders,
+      }));
+      setImportCandidates((current) =>
+        current.filter((entry) => entry.id !== candidate.id),
+      );
+      setImportRows((current) => {
+        const next = { ...current };
+        delete next[candidate.id];
+        return next;
+      });
+      removeImportBuildLookup(candidate.id);
+      setImportMessage(`${candidate.folderName} will be ignored in scans.`);
+    } catch (error) {
+      setImportMessage(
+        error instanceof Error
+          ? error.message
+          : 'Unable to ignore import folder.',
       );
     } finally {
       setImportBusy(false);
@@ -2255,6 +2466,7 @@ function App() {
             installedAt: row.installedAt || selectedPatch.patchDate,
             installedBuildId:
               row.installedBuildId.trim() || selectedPatch.buildId,
+            installedSourceKind: row.installedSourceKind,
             installedVersion:
               row.installedVersion.trim() ||
               selectedPatch.version ||
@@ -2687,17 +2899,7 @@ function App() {
       setSettings(loadedSettings);
       setLogs(loadedLogs);
       setConnectionHealth(health);
-      setSettingsDraft({
-        pollDailyHourLocal: String(loadedSettings.pollDailyHourLocal ?? 9),
-        sourceWatchDurationDays: String(
-          loadedSettings.sourceWatchDurationDays ?? 5,
-        ),
-        sourceWatchIntervalHours: String(
-          loadedSettings.sourceWatchIntervalHours ?? 8,
-        ),
-      });
-      setLibraryRootsDraft(normalizeSettingsLibraryRoots(loadedSettings));
-      setRenameOnImportDraft(loadedSettings.renameGameFoldersOnImport ?? true);
+      syncSettingsDrafts(loadedSettings);
       setAuthDraft({
         email: loadedSettings.myJDownloaderEmail ?? '',
         password: '',
@@ -2794,6 +2996,35 @@ function App() {
       manualSourceKind: 'steamrip',
       manualUrl: '',
     });
+  }
+
+  function openImportedSourceEditor(item: TrackedItemView) {
+    setImportedSourceEditor({
+      item,
+      sourceKind: parseImportInstalledSourceKind(
+        getInstalledSourceKind(item) ?? 'manual',
+      ),
+    });
+  }
+
+  async function saveImportedSourceSelection() {
+    if (!importedSourceEditor) return;
+    const item = importedSourceEditor.item;
+    setBusyId(item.item.id);
+    setBusyAction('updateInstall');
+    try {
+      await window.vaultTrackApi.updateInstallRecord({
+        installedSourceKind: importedSourceEditor.sourceKind,
+        trackedItemId: item.item.id,
+      });
+      setImportedSourceEditor(null);
+      await refreshItems();
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : 'Action failed.');
+    } finally {
+      setBusyId(null);
+      setBusyAction(null);
+    }
   }
 
   async function refreshSourceMatches(item: TrackedItemView) {
@@ -3127,7 +3358,8 @@ function App() {
   ): Promise<void> {
     setPatchEditorBackfillStatus(appId, requestId, 'loading');
     try {
-      const lookup = await window.vaultTrackApi.requestSteamDbBuildLookup(appId);
+      const lookup =
+        await window.vaultTrackApi.requestSteamDbBuildLookup(appId);
       if (patchEditorRequestIdRef.current !== requestId) {
         return;
       }
@@ -3299,9 +3531,7 @@ function App() {
           {formatLabel(item.status)}
         </span>
         {showNeedsAttention ? (
-          <span className="tracking-chip needs_attention">
-            Needs attention
-          </span>
+          <span className="tracking-chip needs_attention">Needs attention</span>
         ) : null}
         {showTrackingStatus ? (
           <span className={`tracking-chip ${trackingStatus}`}>
@@ -3338,7 +3568,7 @@ function App() {
       >
         <div>
           <strong>Source</strong>
-          <span>{formatTrackedSourceKind(item.item.sourceKind)}</span>
+          <span>{formatTrackedSourceKind(getInstalledSourceKind(item))}</span>
         </div>
         <div>
           <strong>Installed Patch</strong>
@@ -3468,9 +3698,7 @@ function App() {
   }
 
   function closeItemActionMenu(event: MouseEvent<HTMLElement>) {
-    event.currentTarget
-      .closest('.item-action-menu')
-      ?.removeAttribute('open');
+    event.currentTarget.closest('.item-action-menu')?.removeAttribute('open');
   }
 
   function runItemMenuAction(
@@ -3519,6 +3747,24 @@ function App() {
             <FontAwesomeIcon aria-hidden="true" icon={faList} />
             <span>View Sources</span>
           </button>
+          {hasEditableImportedInstallSource(item) ? (
+            <button
+              aria-busy={itemBusyAction === 'updateInstall'}
+              disabled={itemBusy}
+              onClick={(event) =>
+                runItemMenuAction(event, () => openImportedSourceEditor(item))
+              }
+              role="menuitem"
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faFileImport} />
+              <span>
+                {itemBusyAction === 'updateInstall'
+                  ? 'Saving Source...'
+                  : 'Edit Imported Source'}
+              </span>
+            </button>
+          ) : null}
           {item.item.steamAppId ? (
             <>
               <button
@@ -3694,7 +3940,7 @@ function App() {
         <section
           aria-labelledby="details-modal-title"
           aria-modal="true"
-          className="details-modal"
+          className="details-modal library-details-modal"
           onMouseDown={(event) => event.stopPropagation()}
           role="dialog"
         >
@@ -3831,52 +4077,66 @@ function App() {
             </button>
           </div>
           <div className="details-modal__body">
-            <section className="source-install-panel">
-              <div className="source-install-panel__heading">
-                <div>
+            <section className="source-summary-grid">
+              <article className="source-summary-card">
+                <div className="source-summary-card__heading">
                   <p className="eyebrow">Current install</p>
                   <h3>{currentInstall.patchLabel}</h3>
                 </div>
-                <div>
+                <div className="source-summary-meta">
+                  <div>
+                    <strong>Source</strong>
+                    <span>
+                      {formatTrackedSourceKind(currentInstall.sourceKind)}
+                    </span>
+                  </div>
+                  <div>
+                    <strong>Patch Version</strong>
+                    <span>{formatOptionalValue(currentInstall.version)}</span>
+                  </div>
+                  <div>
+                    <strong>Build ID</strong>
+                    <span>{formatBuildValue(currentInstall.buildId)}</span>
+                  </div>
+                  <div>
+                    <strong>Release Date</strong>
+                    <span>{formatOptionalValue(currentInstall.date)}</span>
+                  </div>
+                  <div>
+                    <strong>Installed Path</strong>
+                    <span>{installedPathLabel}</span>
+                    <span>{fileState.finalPath ?? 'Root path not set'}</span>
+                  </div>
+                  <div>
+                    <strong>Patch Lag</strong>
+                    <span>{formatPatchLag(item)}</span>
+                  </div>
+                </div>
+              </article>
+              <article className="source-summary-card">
+                <div className="source-summary-card__heading">
                   <p className="eyebrow">Latest upstream</p>
                   <h3>{upstreamPatch.patchLabel}</h3>
                 </div>
-              </div>
-              <div className="source-install-grid">
-                <div>
-                  <strong>Source</strong>
-                  <span>{formatTrackedSourceKind(currentInstall.sourceKind)}</span>
+                <div className="source-summary-meta">
+                  <div>
+                    <strong>Patch Version</strong>
+                    <span>{formatOptionalValue(upstreamPatch.version)}</span>
+                  </div>
+                  <div>
+                    <strong>Build ID</strong>
+                    <span>{formatBuildValue(upstreamPatch.buildId)}</span>
+                  </div>
+                  <div>
+                    <strong>Release Date</strong>
+                    <span>{formatOptionalValue(upstreamPatch.date)}</span>
+                  </div>
+                  <div>
+                    <strong>Source</strong>
+                    <span>SteamDB</span>
+                  </div>
                 </div>
-                <div>
-                  <strong>Patch Version</strong>
-                  <span>{formatOptionalValue(currentInstall.version)}</span>
-                </div>
-                <div>
-                  <strong>Build ID</strong>
-                  <span>{formatBuildValue(currentInstall.buildId)}</span>
-                </div>
-                <div>
-                  <strong>Release Date</strong>
-                  <span>{formatOptionalValue(currentInstall.date)}</span>
-                </div>
-                <div>
-                  <strong>Installed Path</strong>
-                  <span>{installedPathLabel}</span>
-                  <span>{fileState.finalPath ?? 'Root path not set'}</span>
-                </div>
-                <div>
-                  <strong>Patch Lag</strong>
-                  <span>{formatPatchLag(item)}</span>
-                </div>
-                <div>
-                  <strong>Upstream Build</strong>
-                  <span>{formatBuildValue(upstreamPatch.buildId)}</span>
-                </div>
-                <div>
-                  <strong>Upstream Date</strong>
-                  <span>{formatOptionalValue(upstreamPatch.date)}</span>
-                </div>
-              </div>
+              </article>
             </section>
             <div className="source-offer-list">
               {rows.map(({ comparison, source, sourceKind }) => {
@@ -3900,28 +4160,26 @@ function App() {
                 return (
                   <article className="source-offer-card" key={sourceKind}>
                     <div className="source-offer-card__heading">
-                      <div>
+                      <div className="source-offer-card__title">
                         <h3>{formatTrackedSourceKind(sourceKind)}</h3>
-                        <p>
-                          {match?.status
-                            ? `${formatLabel(match.status)} ${Math.round(
-                                match.confidence * 100,
-                              )}%`
-                            : 'Not matched'}
-                        </p>
+                        <span className={`source-lag-chip ${comparison.tone}`}>
+                          {comparison.label}
+                        </span>
                       </div>
-                      <div className="source-tag-row">
-                        {tags.map((tag) => (
-                          <span
-                            className={`source-tag ${tag
-                              .toLowerCase()
-                              .replace(/[^a-z0-9]+/g, '_')}`}
-                            key={tag}
-                          >
-                            {tag}
-                          </span>
-                        ))}
-                      </div>
+                      {tags.length > 0 ? (
+                        <div className="source-tag-row">
+                          {tags.map((tag) => (
+                            <span
+                              className={`source-tag ${tag
+                                .toLowerCase()
+                                .replace(/[^a-z0-9]+/g, '_')}`}
+                              key={tag}
+                            >
+                              {tag}
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
                     </div>
                     <div className="source-offer-meta">
                       <div>
@@ -3940,7 +4198,8 @@ function App() {
                         <strong>Date</strong>
                         <span>
                           {formatOptionalValue(
-                            matchedPatch?.patchDate ?? snapshot?.observedPatchDate,
+                            matchedPatch?.patchDate ??
+                              snapshot?.observedPatchDate,
                           )}
                         </span>
                       </div>
@@ -3948,14 +4207,14 @@ function App() {
                         <strong>Patch</strong>
                         <span>
                           {formatOptionalValue(
-                            matchedPatch?.patchTitle ??
-                              snapshot?.observedPatchTitle,
+                            getPatchTitleDisplay(
+                              matchedPatch?.patchTitle ??
+                                snapshot?.observedPatchTitle,
+                              snapshot?.observedVersion ??
+                                matchedPatch?.buildId,
+                            ),
                           )}
                         </span>
-                      </div>
-                      <div>
-                        <strong>SteamDB</strong>
-                        <span>{comparison.label}</span>
                       </div>
                       <div>
                         <strong>Scanned</strong>
@@ -3964,59 +4223,59 @@ function App() {
                     </div>
                     <div className="source-offer-card__footer">
                       <div className="source-match-row__actions">
-                      {match?.sourceUrl ? (
-                        <button
-                          onClick={() =>
-                            void window.vaultTrackApi.openExternal(
-                              match.sourceUrl!,
-                            )
-                          }
-                          type="button"
-                        >
-                          <FontAwesomeIcon
-                            aria-hidden="true"
-                            icon={faUpRightFromSquare}
-                          />
-                          <span>Open</span>
-                        </button>
-                      ) : null}
-                      {match?.sourceUrl ? (
-                        <button
-                          aria-busy={isRefreshing}
-                          disabled={isRefreshing}
-                          onClick={() =>
-                            void refreshOneMatchedSource(sourceKind)
-                          }
-                          type="button"
-                        >
-                          <FontAwesomeIcon
-                            aria-hidden="true"
-                            icon={faRotateRight}
-                          />
-                          <span>{isRefreshing ? 'Refreshing...' : 'Refresh'}</span>
-                        </button>
-                      ) : null}
-                      {source?.isUpdateSource && fullMirror ? (
-                        <button
-                          disabled={isRefreshing || !canDownloadSource}
-                          onClick={() => void queueSourceUpdate(sourceKind)}
-                          type="button"
-                        >
-                          <FontAwesomeIcon
-                            aria-hidden="true"
-                            icon={faArrowDownWideShort}
-                          />
-                          <span>Download</span>
-                        </button>
-                      ) : null}
+                        {match?.sourceUrl ? (
+                          <button
+                            onClick={() =>
+                              void window.vaultTrackApi.openExternal(
+                                match.sourceUrl!,
+                              )
+                            }
+                            type="button"
+                          >
+                            <FontAwesomeIcon
+                              aria-hidden="true"
+                              icon={faUpRightFromSquare}
+                            />
+                            <span>Open</span>
+                          </button>
+                        ) : null}
+                        {match?.sourceUrl ? (
+                          <button
+                            aria-busy={isRefreshing}
+                            disabled={isRefreshing}
+                            onClick={() =>
+                              void refreshOneMatchedSource(sourceKind)
+                            }
+                            type="button"
+                          >
+                            <FontAwesomeIcon
+                              aria-hidden="true"
+                              icon={faRotateRight}
+                            />
+                            <span>
+                              {isRefreshing ? 'Refreshing...' : 'Refresh'}
+                            </span>
+                          </button>
+                        ) : null}
+                        {source?.isUpdateSource && fullMirror ? (
+                          <button
+                            disabled={isRefreshing || !canDownloadSource}
+                            onClick={() => void queueSourceUpdate(sourceKind)}
+                            type="button"
+                          >
+                            <FontAwesomeIcon
+                              aria-hidden="true"
+                              icon={faArrowDownWideShort}
+                            />
+                            <span>Download</span>
+                          </button>
+                        ) : null}
                       </div>
                     </div>
                     {sourceIssue ? (
                       <p
                         className={
-                          issueIsSubdued
-                            ? 'source-offer-notice'
-                            : 'form-error'
+                          issueIsSubdued ? 'source-offer-notice' : 'form-error'
                         }
                       >
                         {issueIsSubdued
@@ -4029,58 +4288,58 @@ function App() {
               })}
             </div>
             {sourcesModal.manualEditorOpen ? (
-            <div className="manual-source-panel settings-card">
-              <label>
-                <span>Source</span>
-                <select
-                  onChange={(event) =>
-                    setSourcesModal((current) =>
-                      current
-                        ? {
-                            ...current,
-                            manualSourceKind: event.currentTarget
-                              .value as SupportedSourceKind,
-                          }
-                        : current,
-                    )
+              <div className="manual-source-panel settings-card">
+                <label>
+                  <span>Source</span>
+                  <select
+                    onChange={(event) =>
+                      setSourcesModal((current) =>
+                        current
+                          ? {
+                              ...current,
+                              manualSourceKind: event.currentTarget
+                                .value as SupportedSourceKind,
+                            }
+                          : current,
+                      )
+                    }
+                    value={sourcesModal.manualSourceKind}
+                  >
+                    {SUPPORTED_RENDER_SOURCE_KINDS.map((sourceKind) => (
+                      <option key={sourceKind} value={sourceKind}>
+                        {formatTrackedSourceKind(sourceKind)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>Detail URL</span>
+                  <input
+                    onChange={(event) =>
+                      setSourcesModal((current) =>
+                        current
+                          ? { ...current, manualUrl: event.currentTarget.value }
+                          : current,
+                      )
+                    }
+                    placeholder="https://..."
+                    value={sourcesModal.manualUrl}
+                  />
+                </label>
+                <button
+                  disabled={
+                    sourceBusyKind === 'manual' ||
+                    !sourcesModal.manualUrl.trim()
                   }
-                  value={sourcesModal.manualSourceKind}
+                  onClick={() => void saveManualSourceMatch()}
+                  type="button"
                 >
-                  {SUPPORTED_RENDER_SOURCE_KINDS.map((sourceKind) => (
-                    <option key={sourceKind} value={sourceKind}>
-                      {formatTrackedSourceKind(sourceKind)}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                <span>Detail URL</span>
-                <input
-                  onChange={(event) =>
-                    setSourcesModal((current) =>
-                      current
-                        ? { ...current, manualUrl: event.currentTarget.value }
-                        : current,
-                    )
-                  }
-                  placeholder="https://..."
-                  value={sourcesModal.manualUrl}
-                />
-              </label>
-              <button
-                disabled={
-                  sourceBusyKind === 'manual' ||
-                  !sourcesModal.manualUrl.trim()
-                }
-                onClick={() => void saveManualSourceMatch()}
-                type="button"
-              >
-                <FontAwesomeIcon aria-hidden="true" icon={faCheck} />
-                <span>
-                  {sourceBusyKind === 'manual' ? 'Saving...' : 'Save URL'}
-                </span>
-              </button>
-            </div>
+                  <FontAwesomeIcon aria-hidden="true" icon={faCheck} />
+                  <span>
+                    {sourceBusyKind === 'manual' ? 'Saving...' : 'Save URL'}
+                  </span>
+                </button>
+              </div>
             ) : null}
           </div>
         </section>
@@ -4520,97 +4779,192 @@ function App() {
         ) : null}
 
         {section === 'settings' ? (
-          <section className="surface-panel settings-surface">
-            <div className="panel-heading">
-              <div>
-                <p className="panel-title">Settings</p>
-                <p className="muted-text">
-                  Appearance, MyJDownloader, root library path, and scheduler
-                  controls.
-                </p>
+          <section className="settings-page">
+            <header className="settings-page__header">
+              <h1>Settings</h1>
+              <p>Configure VaultTrack to fit your library and workflow.</p>
+            </header>
+
+            <section
+              aria-labelledby="settings-scheduler-title"
+              className="settings-card settings-card--scheduler"
+            >
+              <div className="settings-card__heading">
+                <span
+                  aria-hidden="true"
+                  className="settings-card__icon settings-card__icon--scheduler"
+                >
+                  <FontAwesomeIcon icon={faCalendarDays} />
+                </span>
+                <div>
+                  <h2 id="settings-scheduler-title">General / Scheduler</h2>
+                  <p>
+                    Control how VaultTrack checks for updates and monitors your
+                    sources.
+                  </p>
+                </div>
               </div>
-            </div>
-            <div className="settings-grid">
-              <label className="field">
-                <span className="field-label">Daily SteamDB poll hour</span>
-                <input
-                  max="23"
-                  min="0"
-                  onChange={(event) => {
-                    const pollDailyHourLocal = event.currentTarget.value;
-                    setSettingsDraft((current) => ({
-                      ...current,
-                      pollDailyHourLocal,
-                    }));
-                    setSettingsSaveStatus('idle');
-                  }}
-                  type="number"
-                  value={settingsDraft.pollDailyHourLocal}
-                />
-              </label>
-              <label className="field">
-                <span className="field-label">Source watch interval hours</span>
-                <input
-                  max="72"
-                  min="1"
-                  onChange={(event) => {
-                    const sourceWatchIntervalHours = event.currentTarget.value;
-                    setSettingsDraft((current) => ({
-                      ...current,
-                      sourceWatchIntervalHours,
-                    }));
-                    setSettingsSaveStatus('idle');
-                  }}
-                  type="number"
-                  value={settingsDraft.sourceWatchIntervalHours}
-                />
-              </label>
-              <label className="field">
-                <span className="field-label">Source watch duration days</span>
-                <input
-                  max="30"
-                  min="1"
-                  onChange={(event) => {
-                    const sourceWatchDurationDays = event.currentTarget.value;
-                    setSettingsDraft((current) => ({
-                      ...current,
-                      sourceWatchDurationDays,
-                    }));
-                    setSettingsSaveStatus('idle');
-                  }}
-                  type="number"
-                  value={settingsDraft.sourceWatchDurationDays}
-                />
-              </label>
-              <label className="toggle-field">
-                <input
-                  checked={renameOnImportDraft}
-                  onChange={(event) => {
-                    const checked = event.currentTarget.checked;
-                    setRenameOnImportDraft(checked);
-                    setSettingsSaveStatus('idle');
-                  }}
-                  type="checkbox"
-                />
-                <span>
-                  <strong>Rename Game Folders on Import</strong>
+              <div className="settings-scheduler-grid">
+                <label className="settings-number-field">
+                  <span className="settings-label-with-help">
+                    Daily SteamDB Poll Hour
+                    <span
+                      aria-label="0 to 23 using your local time"
+                      className="settings-help-icon"
+                      role="img"
+                      title="0 to 23 using your local time"
+                    >
+                      <FontAwesomeIcon
+                        aria-hidden="true"
+                        icon={faCircleQuestion}
+                      />
+                    </span>
+                  </span>
+                  <span className="settings-number-shell">
+                    <input
+                      max="23"
+                      min="0"
+                      onChange={(event) => {
+                        const pollDailyHourLocal = event.currentTarget.value;
+                        setSettingsDraft((current) => ({
+                          ...current,
+                          pollDailyHourLocal,
+                        }));
+                        setSettingsSaveStatus('idle');
+                      }}
+                      type="number"
+                      value={settingsDraft.pollDailyHourLocal}
+                    />
+                    <span aria-hidden="true" className="settings-number-icon">
+                      <FontAwesomeIcon icon={faClock} />
+                    </span>
+                  </span>
+                </label>
+                <label className="settings-number-field">
+                  <span className="settings-label-with-help">
+                    Source Watch Interval (Hours)
+                    <span
+                      aria-label="How often sources are checked"
+                      className="settings-help-icon"
+                      role="img"
+                      title="How often sources are checked"
+                    >
+                      <FontAwesomeIcon
+                        aria-hidden="true"
+                        icon={faCircleQuestion}
+                      />
+                    </span>
+                  </span>
+                  <span className="settings-number-shell">
+                    <input
+                      max="72"
+                      min="1"
+                      onChange={(event) => {
+                        const sourceWatchIntervalHours =
+                          event.currentTarget.value;
+                        setSettingsDraft((current) => ({
+                          ...current,
+                          sourceWatchIntervalHours,
+                        }));
+                        setSettingsSaveStatus('idle');
+                      }}
+                      type="number"
+                      value={settingsDraft.sourceWatchIntervalHours}
+                    />
+                    <span aria-hidden="true" className="settings-number-icon">
+                      <FontAwesomeIcon icon={faClock} />
+                    </span>
+                  </span>
+                </label>
+                <label className="settings-number-field">
+                  <span className="settings-label-with-help">
+                    Source Watch Duration (Days)
+                    <span
+                      aria-label="How long a new source match remains watched"
+                      className="settings-help-icon"
+                      role="img"
+                      title="How long a new source match remains watched"
+                    >
+                      <FontAwesomeIcon
+                        aria-hidden="true"
+                        icon={faCircleQuestion}
+                      />
+                    </span>
+                  </span>
+                  <span className="settings-number-shell">
+                    <input
+                      max="30"
+                      min="1"
+                      onChange={(event) => {
+                        const sourceWatchDurationDays =
+                          event.currentTarget.value;
+                        setSettingsDraft((current) => ({
+                          ...current,
+                          sourceWatchDurationDays,
+                        }));
+                        setSettingsSaveStatus('idle');
+                      }}
+                      type="number"
+                      value={settingsDraft.sourceWatchDurationDays}
+                    />
+                    <span aria-hidden="true" className="settings-number-icon">
+                      <FontAwesomeIcon icon={faClock} />
+                    </span>
+                  </span>
+                </label>
+                <label className="settings-toggle-field">
+                  <span className="settings-label-with-help">
+                    Rename Game Folders on Import
+                    <span
+                      aria-label="Uses the sanitized Steam title"
+                      className="settings-help-icon"
+                      role="img"
+                      title="Uses the sanitized Steam title"
+                    >
+                      <FontAwesomeIcon
+                        aria-hidden="true"
+                        icon={faCircleQuestion}
+                      />
+                    </span>
+                  </span>
+                  <input
+                    checked={renameOnImportDraft}
+                    className="settings-toggle-input"
+                    onChange={(event) => {
+                      const checked = event.currentTarget.checked;
+                      setRenameOnImportDraft(checked);
+                      setSettingsSaveStatus('idle');
+                    }}
+                    type="checkbox"
+                  />
+                  <span aria-hidden="true" className="settings-toggle-track" />
                   <small>
                     Use the sanitized Steam title when imports are saved.
                   </small>
+                </label>
+              </div>
+            </section>
+
+            <section
+              aria-labelledby="settings-library-roots-title"
+              className="settings-card settings-card--roots"
+            >
+              <div className="settings-card__heading settings-card__heading--actions">
+                <span
+                  aria-hidden="true"
+                  className="settings-card__icon settings-card__icon--roots"
+                >
+                  <FontAwesomeIcon icon={faFolder} />
                 </span>
-              </label>
-            </div>
-            <div className="library-roots-panel">
-              <div className="panel-heading">
                 <div>
-                  <strong>Library roots</strong>
-                  <p className="muted-text">
+                  <h2 id="settings-library-roots-title">Library Roots</h2>
+                  <p>
                     Scan one folder level under each root. The primary root is
                     mirrored for extension downloads.
                   </p>
                 </div>
                 <button
-                  className="ghost-button"
+                  className="primary-button settings-icon-text-button"
                   disabled={settingsSaveStatus === 'saving'}
                   onClick={async () => {
                     const picked = await window.vaultTrackApi.pickDirectory();
@@ -4628,281 +4982,563 @@ function App() {
                   }}
                   type="button"
                 >
-                  Add Root
+                  <FontAwesomeIcon aria-hidden="true" icon={faPlus} />
+                  <span>Add Root</span>
                 </button>
               </div>
-              {libraryRootsDraft.length ? (
-                <div className="library-roots-table">
-                  {libraryRootsDraft.map((root) => (
-                    <div className="library-root-row" key={root.id}>
-                      <label className="primary-radio">
-                        <input
-                          checked={root.isPrimary}
-                          name="primary-library-root"
-                          onChange={() => setPrimaryLibraryRoot(root.id)}
-                          type="radio"
-                        />
-                        Primary
-                      </label>
-                      <label className="field">
-                        <span className="field-label">Label</span>
-                        <input
-                          onChange={(event) => {
-                            const label = event.currentTarget.value;
-                            updateLibraryRoot(root.id, {
-                              label,
-                            });
-                          }}
-                          value={root.label}
-                        />
-                      </label>
-                      <label className="field">
-                        <span className="field-label">Path</span>
-                        <input
-                          onChange={(event) => {
-                            const path = event.currentTarget.value;
-                            updateLibraryRoot(root.id, {
-                              path,
-                            });
-                          }}
-                          value={root.path}
-                        />
-                      </label>
-                      <button
-                        className="ghost-button"
-                        onClick={async () => {
-                          const picked =
-                            await window.vaultTrackApi.pickDirectory();
-                          if (picked) {
-                            updateLibraryRoot(root.id, {
-                              label:
-                                root.label || libraryRootFallbackLabel(picked),
-                              path: picked,
-                            });
-                          }
-                        }}
-                        type="button"
+              <div className="settings-table-wrap">
+                <div
+                  aria-label="Library roots"
+                  className="settings-table settings-table--roots"
+                  role="table"
+                >
+                  <div className="settings-table__head" role="row">
+                    <span role="columnheader">Primary</span>
+                    <span role="columnheader">Label</span>
+                    <span role="columnheader">Path</span>
+                    <span role="columnheader">Actions</span>
+                  </div>
+                  {libraryRootsDraft.length ? (
+                    libraryRootsDraft.map((root) => (
+                      <div
+                        className="settings-table__row"
+                        key={root.id}
+                        role="row"
                       >
-                        Pick
-                      </button>
-                      <button
-                        className="danger-button"
-                        onClick={() => removeLibraryRoot(root.id)}
-                        type="button"
-                      >
-                        Remove
-                      </button>
+                        <span role="cell">
+                          <button
+                            aria-pressed={root.isPrimary}
+                            className={`settings-primary-pill ${
+                              root.isPrimary ? 'is-active' : ''
+                            }`}
+                            disabled={root.isPrimary}
+                            onClick={() => setPrimaryLibraryRoot(root.id)}
+                            type="button"
+                          >
+                            {root.isPrimary ? 'Primary' : 'Make Primary'}
+                          </button>
+                        </span>
+                        <span role="cell">
+                          <input
+                            aria-label={`Label for ${root.path || 'library root'}`}
+                            className="settings-table-input"
+                            onChange={(event) => {
+                              const label = event.currentTarget.value;
+                              updateLibraryRoot(root.id, {
+                                label,
+                              });
+                            }}
+                            value={root.label}
+                          />
+                        </span>
+                        <span role="cell">
+                          <input
+                            aria-label={`Path for ${root.label || 'library root'}`}
+                            className="settings-table-input settings-table-input--path"
+                            onChange={(event) => {
+                              const path = event.currentTarget.value;
+                              updateLibraryRoot(root.id, {
+                                path,
+                              });
+                            }}
+                            value={root.path}
+                          />
+                        </span>
+                        <span className="settings-table-actions" role="cell">
+                          <button
+                            className="ghost-button settings-icon-text-button"
+                            onClick={async () => {
+                              const picked =
+                                await window.vaultTrackApi.pickDirectory();
+                              if (picked) {
+                                updateLibraryRoot(root.id, {
+                                  label:
+                                    root.label ||
+                                    libraryRootFallbackLabel(picked),
+                                  path: picked,
+                                });
+                              }
+                            }}
+                            type="button"
+                          >
+                            <FontAwesomeIcon
+                              aria-hidden="true"
+                              icon={faFolderOpen}
+                            />
+                            <span>Pick</span>
+                          </button>
+                          <button
+                            className="danger-button settings-icon-text-button"
+                            onClick={() => removeLibraryRoot(root.id)}
+                            type="button"
+                          >
+                            <FontAwesomeIcon
+                              aria-hidden="true"
+                              icon={faTrash}
+                            />
+                            <span>Remove</span>
+                          </button>
+                        </span>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="settings-table-empty" role="row">
+                      <span role="cell">No library roots configured yet.</span>
                     </div>
-                  ))}
+                  )}
                 </div>
-              ) : (
-                <p className="muted-text">No library roots configured yet.</p>
-              )}
-            </div>
-            {settings.ignoredImportFolders?.length ? (
-              <div className="library-roots-panel">
-                <div className="panel-heading">
+              </div>
+            </section>
+
+            <section
+              aria-labelledby="settings-ignored-title"
+              className="settings-card settings-card--ignored"
+            >
+              <div className="settings-card__heading">
+                <span
+                  aria-hidden="true"
+                  className="settings-card__icon settings-card__icon--ignored"
+                >
+                  <FontAwesomeIcon icon={faBan} />
+                </span>
+                <div>
+                  <h2 id="settings-ignored-title">Ignored Import Folders</h2>
+                  <p>
+                    Restore a folder when you want it to appear in scans again.
+                  </p>
+                </div>
+              </div>
+              <div className="settings-table-wrap">
+                <div
+                  aria-label="Ignored import folders"
+                  className="settings-table settings-table--ignored"
+                  role="table"
+                >
+                  <div className="settings-table__head" role="row">
+                    <span role="columnheader">Label</span>
+                    <span role="columnheader">Path</span>
+                    <span role="columnheader">Actions</span>
+                  </div>
+                  {settings.ignoredImportFolders?.length ? (
+                    settings.ignoredImportFolders.map((ignored) => (
+                      <div
+                        className="settings-table__row"
+                        key={ignored.id}
+                        role="row"
+                      >
+                        <span role="cell">{ignored.folderName}</span>
+                        <span role="cell">
+                          {formatIgnoredImportFolderPath(ignored)}
+                        </span>
+                        <span className="settings-table-actions" role="cell">
+                          <button
+                            className="ghost-button settings-icon-text-button"
+                            onClick={async () => {
+                              await window.vaultTrackApi.restoreImportFolder({
+                                id: ignored.id,
+                              });
+                              await refreshSettings();
+                            }}
+                            type="button"
+                          >
+                            <FontAwesomeIcon
+                              aria-hidden="true"
+                              icon={faRotateLeft}
+                            />
+                            <span>Restore</span>
+                          </button>
+                        </span>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="settings-table-empty" role="row">
+                      <span role="cell">No ignored import folders.</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </section>
+
+            <section
+              aria-labelledby="settings-download-behavior-title"
+              className="settings-card settings-card--integrations"
+            >
+              <div className="settings-card__heading">
+                <span
+                  aria-hidden="true"
+                  className="settings-card__icon settings-card__icon--integrations"
+                >
+                  <FontAwesomeIcon icon={faLink} />
+                </span>
+                <div>
+                  <h2 id="settings-download-behavior-title">
+                    Download Behavior
+                  </h2>
+                  <p>Download method preferences and integration status.</p>
+                </div>
+              </div>
+              <div className="download-behavior-panel">
+                <label className="settings-toggle-field download-behavior-global">
+                  <span className="settings-label-with-help">
+                    Use JDownloader when available
+                    <span
+                      aria-label="Falls back to curl if JDownloader is not ready"
+                      className="settings-help-icon"
+                      role="img"
+                      title="Falls back to curl if JDownloader is not ready"
+                    >
+                      <FontAwesomeIcon
+                        aria-hidden="true"
+                        icon={faCircleQuestion}
+                      />
+                    </span>
+                  </span>
+                  <input
+                    checked={settingsDraft.jDownloaderEnabled}
+                    className="settings-toggle-input"
+                    onChange={(event) => {
+                      const jDownloaderEnabled = event.currentTarget.checked;
+                      setSettingsDraft((current) => ({
+                        ...current,
+                        jDownloaderEnabled,
+                      }));
+                      setSettingsSaveStatus('idle');
+                    }}
+                    type="checkbox"
+                  />
+                  <span aria-hidden="true" className="settings-toggle-track" />
+                  <small>
+                    When this is off, all sources use curl; source choices are
+                    remembered.
+                  </small>
+                </label>
+                <div className="download-source-grid">
+                  <div className="download-source-row">
+                    <div>
+                      <strong>Ankergames</strong>
+                      <span>Direct curl</span>
+                    </div>
+                    <span className="download-source-badge">
+                      JDownloader not supported
+                    </span>
+                  </div>
+                  <div className="download-source-row download-source-row--toggle">
+                    <div>
+                      <strong>ElAmigos</strong>
+                      <span>
+                        {settingsDraft.jDownloaderEnabled &&
+                        settingsDraft.jDownloaderSourcePreferences.elamigos
+                          ? 'JDownloader'
+                          : settingsDraft.jDownloaderEnabled
+                            ? 'Curl'
+                            : 'Direct curl'}
+                      </span>
+                    </div>
+                    <span
+                      aria-label="ElAmigos download method"
+                      className="download-source-method-toggle"
+                      role="group"
+                    >
+                      <button
+                        aria-pressed={
+                          !settingsDraft.jDownloaderSourcePreferences.elamigos
+                        }
+                        className={`download-source-method ${
+                          settingsDraft.jDownloaderSourcePreferences.elamigos
+                            ? ''
+                            : 'is-active'
+                        }`}
+                        onClick={() =>
+                          updateJDownloaderSourcePreference('elamigos', false)
+                        }
+                        type="button"
+                      >
+                        Curl
+                      </button>
+                      <button
+                        aria-pressed={
+                          settingsDraft.jDownloaderSourcePreferences.elamigos
+                        }
+                        className={`download-source-method ${
+                          settingsDraft.jDownloaderSourcePreferences.elamigos
+                            ? 'is-active'
+                            : ''
+                        }`}
+                        onClick={() =>
+                          updateJDownloaderSourcePreference('elamigos', true)
+                        }
+                        type="button"
+                      >
+                        JDownloader
+                      </button>
+                    </span>
+                  </div>
+                  <div className="download-source-row download-source-row--toggle">
+                    <div>
+                      <strong>SteamRIP</strong>
+                      <span>
+                        {settingsDraft.jDownloaderEnabled &&
+                        settingsDraft.jDownloaderSourcePreferences.steamrip
+                          ? 'JDownloader'
+                          : settingsDraft.jDownloaderEnabled
+                            ? 'Curl'
+                            : 'Direct curl'}
+                      </span>
+                    </div>
+                    <span
+                      aria-label="SteamRIP download method"
+                      className="download-source-method-toggle"
+                      role="group"
+                    >
+                      <button
+                        aria-pressed={
+                          !settingsDraft.jDownloaderSourcePreferences.steamrip
+                        }
+                        className={`download-source-method ${
+                          settingsDraft.jDownloaderSourcePreferences.steamrip
+                            ? ''
+                            : 'is-active'
+                        }`}
+                        onClick={() =>
+                          updateJDownloaderSourcePreference('steamrip', false)
+                        }
+                        type="button"
+                      >
+                        Curl
+                      </button>
+                      <button
+                        aria-pressed={
+                          settingsDraft.jDownloaderSourcePreferences.steamrip
+                        }
+                        className={`download-source-method ${
+                          settingsDraft.jDownloaderSourcePreferences.steamrip
+                            ? 'is-active'
+                            : ''
+                        }`}
+                        onClick={() =>
+                          updateJDownloaderSourcePreference('steamrip', true)
+                        }
+                        type="button"
+                      >
+                        JDownloader
+                      </button>
+                    </span>
+                  </div>
+                </div>
+              </div>
+              <div className="integration-status-grid">
+                <div className="integration-status-card">
+                  <span
+                    className={`health-dot ${connectionHealth?.desktop.color ?? 'red'}`}
+                  />
+                  <FontAwesomeIcon
+                    aria-hidden="true"
+                    className="integration-status-card__icon"
+                    icon={faDesktop}
+                  />
                   <div>
-                    <strong>Ignored import folders</strong>
+                    <strong>
+                      {connectionHealth?.desktop.label ?? 'Desktop unavailable'}
+                    </strong>
                     <p className="muted-text">
-                      Restore a folder when you want it to appear in scans
-                      again.
+                      {connectionHealth?.desktop.message ??
+                        'VaultTrack desktop bridge is unavailable.'}
                     </p>
                   </div>
                 </div>
-                <div className="ignored-list">
-                  {settings.ignoredImportFolders.map((ignored) => (
-                    <div className="ignored-row" key={ignored.id}>
-                      <span>
-                        <strong>{ignored.folderName}</strong>
-                        <small>{ignored.rootPath}</small>
-                      </span>
-                      <button
-                        className="ghost-button"
-                        onClick={async () => {
-                          await window.vaultTrackApi.restoreImportFolder({
-                            id: ignored.id,
-                          });
-                          await refreshSettings();
-                        }}
-                        type="button"
-                      >
-                        Restore
-                      </button>
-                    </div>
-                  ))}
+                <div className="integration-status-card">
+                  <span
+                    className={`health-dot ${
+                      connectionHealth?.myJDownloader.color ?? 'red'
+                    }`}
+                  />
+                  <FontAwesomeIcon
+                    aria-hidden="true"
+                    className="integration-status-card__icon"
+                    icon={faCloudArrowDown}
+                  />
+                  <div>
+                    <strong>
+                      {connectionHealth?.myJDownloader.label ?? 'Not connected'}
+                    </strong>
+                    <p className="muted-text">
+                      {connectionHealth?.myJDownloader.message ??
+                        'Connect MyJDownloader to optionally prefer it for supported sources.'}
+                    </p>
+                  </div>
                 </div>
               </div>
-            ) : null}
-            <div className="action-row">
+              <details className="integration-account-panel">
+                <summary>MyJDownloader Account</summary>
+                <div className="settings-grid integration-account-grid">
+                  <label className="field">
+                    <span className="field-label">MyJDownloader email</span>
+                    <input
+                      onChange={(event) => {
+                        const email = event.currentTarget.value;
+                        setAuthDraft((current) => ({
+                          ...current,
+                          email,
+                        }));
+                      }}
+                      value={authDraft.email}
+                    />
+                  </label>
+                  <label className="field">
+                    <span className="field-label">
+                      Password{' '}
+                      {settings.myJDownloaderPasswordConfigured
+                        ? '(configured)'
+                        : ''}
+                    </span>
+                    <input
+                      onChange={(event) => {
+                        const password = event.currentTarget.value;
+                        setAuthDraft((current) => ({
+                          ...current,
+                          password,
+                        }));
+                      }}
+                      type="password"
+                      value={authDraft.password}
+                    />
+                  </label>
+                </div>
+                {deviceChoices.length > 1 ? (
+                  <label className="field">
+                    <span className="field-label">JDownloader device</span>
+                    <select
+                      onChange={(event) => {
+                        const selectedDeviceId = event.currentTarget.value;
+                        setAuthDraft((current) => ({
+                          ...current,
+                          selectedDeviceId,
+                        }));
+                      }}
+                      value={authDraft.selectedDeviceId}
+                    >
+                      <option value="">Choose a device</option>
+                      {deviceChoices.map(
+                        (device: MyJDownloaderDeviceSummary) => (
+                          <option key={device.id} value={device.id}>
+                            {device.name}
+                          </option>
+                        ),
+                      )}
+                    </select>
+                  </label>
+                ) : null}
+                <div className="action-row integration-account-actions">
+                  <button
+                    className="primary-button"
+                    disabled={
+                      authBusy || !authDraft.email || !authDraft.password
+                    }
+                    onClick={async () => {
+                      setAuthBusy(true);
+                      try {
+                        setConnectionHealth(
+                          await window.vaultTrackApi.authenticateMyJDownloader({
+                            email: authDraft.email,
+                            password: authDraft.password,
+                          }),
+                        );
+                        setAuthDraft((current) => ({
+                          ...current,
+                          password: '',
+                        }));
+                        await refreshSettings();
+                      } finally {
+                        setAuthBusy(false);
+                      }
+                    }}
+                    type="button"
+                  >
+                    {authBusy ? 'Connecting...' : 'Connect'}
+                  </button>
+                  <button
+                    className="ghost-button"
+                    disabled={authBusy || !authDraft.selectedDeviceId}
+                    onClick={async () => {
+                      setAuthBusy(true);
+                      try {
+                        setConnectionHealth(
+                          await window.vaultTrackApi.selectMyJDownloaderDevice(
+                            authDraft.selectedDeviceId,
+                          ),
+                        );
+                      } finally {
+                        setAuthBusy(false);
+                      }
+                    }}
+                    type="button"
+                  >
+                    Use Device
+                  </button>
+                  <button
+                    className="ghost-button"
+                    disabled={authBusy}
+                    onClick={async () => {
+                      setAuthBusy(true);
+                      try {
+                        setConnectionHealth(
+                          await window.vaultTrackApi.disconnectMyJDownloader(),
+                        );
+                        setAuthDraft((current) => ({
+                          ...current,
+                          password: '',
+                          selectedDeviceId: '',
+                        }));
+                        await refreshSettings();
+                      } finally {
+                        setAuthBusy(false);
+                      }
+                    }}
+                    type="button"
+                  >
+                    Disconnect
+                  </button>
+                  <button
+                    className="ghost-button"
+                    disabled={authBusy}
+                    onClick={() => void refreshConnectionHealth()}
+                    type="button"
+                  >
+                    Refresh Status
+                  </button>
+                </div>
+              </details>
+            </section>
+
+            <div className="settings-action-bar">
               <button
-                className="primary-button"
+                className="primary-button settings-save-button settings-icon-text-button"
                 disabled={settingsSaveStatus === 'saving'}
                 onClick={() => void saveSettingsDraft()}
                 type="button"
               >
-                {settingsButtonLabel}
+                <FontAwesomeIcon aria-hidden="true" icon={faFloppyDisk} />
+                <span>{settingsButtonLabel}</span>
               </button>
-            </div>
-            <div className="settings-grid">
-              <div className="status-card">
-                <span
-                  className={`health-dot ${connectionHealth?.desktop.color ?? 'red'}`}
-                />
-                <div>
-                  <strong>
-                    {connectionHealth?.desktop.label ?? 'Desktop unavailable'}
-                  </strong>
-                  <p className="muted-text">
-                    {connectionHealth?.desktop.message ??
-                      'VaultTrack desktop bridge is unavailable.'}
-                  </p>
-                </div>
-              </div>
-              <div className="status-card">
-                <span
-                  className={`health-dot ${connectionHealth?.myJDownloader.color ?? 'red'}`}
-                />
-                <div>
-                  <strong>
-                    {connectionHealth?.myJDownloader.label ?? 'Not connected'}
-                  </strong>
-                  <p className="muted-text">
-                    {connectionHealth?.myJDownloader.message ??
-                      'Connect MyJDownloader for SteamRIP and ElAmigos automation. Ankergames uses desktop curl.'}
-                  </p>
-                </div>
-              </div>
-            </div>
-            <div className="settings-grid">
-              <label className="field">
-                <span className="field-label">MyJDownloader email</span>
-                <input
-                  onChange={(event) => {
-                    const email = event.currentTarget.value;
-                    setAuthDraft((current) => ({
-                      ...current,
-                      email,
-                    }));
-                  }}
-                  value={authDraft.email}
-                />
-              </label>
-              <label className="field">
-                <span className="field-label">
-                  Password{' '}
-                  {settings.myJDownloaderPasswordConfigured
-                    ? '(configured)'
-                    : ''}
-                </span>
-                <input
-                  onChange={(event) => {
-                    const password = event.currentTarget.value;
-                    setAuthDraft((current) => ({
-                      ...current,
-                      password,
-                    }));
-                  }}
-                  type="password"
-                  value={authDraft.password}
-                />
-              </label>
-            </div>
-            {deviceChoices.length > 1 ? (
-              <label className="field">
-                <span className="field-label">JDownloader device</span>
-                <select
-                  onChange={(event) => {
-                    const selectedDeviceId = event.currentTarget.value;
-                    setAuthDraft((current) => ({
-                      ...current,
-                      selectedDeviceId,
-                    }));
-                  }}
-                  value={authDraft.selectedDeviceId}
+              <div className="settings-action-bar__secondary">
+                <button
+                  className="ghost-button settings-icon-text-button"
+                  disabled={settingsSaveStatus === 'saving'}
+                  onClick={resetSettingsDraftToDefaults}
+                  type="button"
                 >
-                  <option value="">Choose a device</option>
-                  {deviceChoices.map((device: MyJDownloaderDeviceSummary) => (
-                    <option key={device.id} value={device.id}>
-                      {device.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            ) : null}
-            <div className="action-row">
-              <button
-                className="primary-button"
-                disabled={authBusy || !authDraft.email || !authDraft.password}
-                onClick={async () => {
-                  setAuthBusy(true);
-                  try {
-                    setConnectionHealth(
-                      await window.vaultTrackApi.authenticateMyJDownloader({
-                        email: authDraft.email,
-                        password: authDraft.password,
-                      }),
-                    );
-                    setAuthDraft((current) => ({ ...current, password: '' }));
-                    await refreshSettings();
-                  } finally {
-                    setAuthBusy(false);
-                  }
-                }}
-                type="button"
-              >
-                {authBusy ? 'Connecting...' : 'Connect'}
-              </button>
-              <button
-                className="ghost-button"
-                disabled={authBusy || !authDraft.selectedDeviceId}
-                onClick={async () => {
-                  setAuthBusy(true);
-                  try {
-                    setConnectionHealth(
-                      await window.vaultTrackApi.selectMyJDownloaderDevice(
-                        authDraft.selectedDeviceId,
-                      ),
-                    );
-                  } finally {
-                    setAuthBusy(false);
-                  }
-                }}
-                type="button"
-              >
-                Use Device
-              </button>
-              <button
-                className="ghost-button"
-                disabled={authBusy}
-                onClick={async () => {
-                  setAuthBusy(true);
-                  try {
-                    setConnectionHealth(
-                      await window.vaultTrackApi.disconnectMyJDownloader(),
-                    );
-                    setAuthDraft((current) => ({
-                      ...current,
-                      password: '',
-                      selectedDeviceId: '',
-                    }));
-                    await refreshSettings();
-                  } finally {
-                    setAuthBusy(false);
-                  }
-                }}
-                type="button"
-              >
-                Disconnect
-              </button>
-              <button
-                className="ghost-button"
-                disabled={authBusy}
-                onClick={() => void refreshConnectionHealth()}
-                type="button"
-              >
-                Refresh Status
-              </button>
+                  <FontAwesomeIcon aria-hidden="true" icon={faRotateLeft} />
+                  <span>Reset to Defaults</span>
+                </button>
+                <button
+                  className="ghost-button settings-cancel-button"
+                  disabled={settingsSaveStatus === 'saving'}
+                  onClick={cancelSettingsDraftChanges}
+                  type="button"
+                >
+                  Cancel
+                </button>
+              </div>
             </div>
           </section>
         ) : null}
@@ -4986,6 +5622,7 @@ function App() {
                   <tr>
                     <th className="import-table__use">Use</th>
                     <th>{renderImportSortHeader('folder', 'Folder')}</th>
+                    <th className="import-table__source">Installed Source</th>
                     <th>
                       {renderImportSortHeader('steamMatch', 'Steam Match')}
                     </th>
@@ -5041,22 +5678,66 @@ function App() {
                           key={candidate.id}
                         >
                           <td className="import-table__use-cell">
-                            <input
-                              className="import-use-checkbox"
-                              checked={Boolean(row?.included)}
-                              onChange={(event) => {
-                                const included = event.currentTarget.checked;
-                                updateImportRow(candidate.id, (currentRow) => ({
-                                  ...currentRow,
-                                  included,
-                                }));
-                              }}
-                              type="checkbox"
-                            />
+                            <div className="import-use-controls">
+                              <input
+                                aria-label={`Use ${candidate.folderName}`}
+                                className="import-use-checkbox"
+                                checked={Boolean(row?.included)}
+                                onChange={(event) => {
+                                  const included = event.currentTarget.checked;
+                                  updateImportRow(
+                                    candidate.id,
+                                    (currentRow) => ({
+                                      ...currentRow,
+                                      included,
+                                    }),
+                                  );
+                                }}
+                                type="checkbox"
+                              />
+                              <button
+                                aria-label={`Ignore ${candidate.folderName}`}
+                                className="inline-icon-button import-ignore-button"
+                                disabled={importBusy}
+                                onClick={() =>
+                                  void ignoreImportCandidate(candidate)
+                                }
+                                title="Ignore folder"
+                                type="button"
+                              >
+                                <FontAwesomeIcon
+                                  aria-hidden="true"
+                                  icon={faBan}
+                                />
+                              </button>
+                            </div>
                           </td>
                           <td className="import-folder-cell">
                             <strong>{candidate.folderName}</strong>
                             <small>{candidate.folderPath}</small>
+                          </td>
+                          <td className="import-source-cell">
+                            <select
+                              aria-label={`Installed source for ${candidate.folderName}`}
+                              className="import-source-select"
+                              onChange={(event) => {
+                                const installedSourceKind =
+                                  parseImportInstalledSourceKind(
+                                    event.currentTarget.value,
+                                  );
+                                updateImportRow(candidate.id, (currentRow) => ({
+                                  ...currentRow,
+                                  installedSourceKind,
+                                }));
+                              }}
+                              value={row?.installedSourceKind ?? 'manual'}
+                            >
+                              {IMPORT_INSTALLED_SOURCE_OPTIONS.map((option) => (
+                                <option key={option.value} value={option.value}>
+                                  {option.label}
+                                </option>
+                              ))}
+                            </select>
                           </td>
                           <td className="import-match-cell">
                             {row?.steamMatch ? (
@@ -5183,7 +5864,7 @@ function App() {
                     })
                   ) : (
                     <tr>
-                      <td colSpan={4}>
+                      <td colSpan={5}>
                         No scan results yet. Configure roots in Settings, then
                         scan library roots.
                       </td>
@@ -5634,6 +6315,80 @@ function App() {
             );
           })()
         : null}
+      {importedSourceEditor ? (
+        <div className="modal-backdrop" role="presentation">
+          <div
+            aria-modal="true"
+            className="modal-panel imported-source-modal"
+            role="dialog"
+          >
+            <div className="panel-heading retry-modal__heading">
+              <div>
+                <p className="panel-title">Edit Imported Source</p>
+                <p className="muted-text">
+                  {importedSourceEditor.item.item.title}
+                </p>
+              </div>
+              <button
+                aria-label="Close imported source editor"
+                className="modal-close-button"
+                onClick={() => setImportedSourceEditor(null)}
+                type="button"
+              >
+                <FontAwesomeIcon aria-hidden="true" icon={faXmark} />
+              </button>
+            </div>
+            <label className="select-field imported-source-modal__field">
+              <span className="field-label">Source</span>
+              <select
+                onChange={(event) => {
+                  const sourceKind = parseImportInstalledSourceKind(
+                    event.currentTarget.value,
+                  );
+                  setImportedSourceEditor((current) =>
+                    current
+                      ? {
+                          ...current,
+                          sourceKind,
+                        }
+                      : current,
+                  );
+                }}
+                value={importedSourceEditor.sourceKind}
+              >
+                {IMPORTED_SOURCE_EDIT_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="action-row">
+              <button
+                className="ghost-button"
+                onClick={() => setImportedSourceEditor(null)}
+                type="button"
+              >
+                Cancel
+              </button>
+              <button
+                className="primary-button"
+                disabled={
+                  busyId === importedSourceEditor.item.item.id &&
+                  busyAction === 'updateInstall'
+                }
+                onClick={() => void saveImportedSourceSelection()}
+                type="button"
+              >
+                {busyId === importedSourceEditor.item.item.id &&
+                busyAction === 'updateInstall'
+                  ? 'Saving...'
+                  : 'Save Source'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {patchEditor ? (
         <div className="modal-backdrop" role="presentation">
           <div
@@ -5663,7 +6418,8 @@ function App() {
             {patchEditor.error ? (
               <p className="muted-text">{patchEditor.error}</p>
             ) : null}
-            {!patchEditor.loading && patchEditor.backfillStatus === 'loading' ? (
+            {!patchEditor.loading &&
+            patchEditor.backfillStatus === 'loading' ? (
               <p className="muted-text">Loading SteamDB build table...</p>
             ) : null}
             {!patchEditor.loading && patchEditor.backfillStatus === 'failed' ? (
@@ -5676,7 +6432,9 @@ function App() {
                   className="ghost-button patch-toolbar__button"
                   onClick={() =>
                     void window.vaultTrackApi.openExternal(
-                      buildSteamDbPatchnotesUrl(patchEditor.item.item.steamAppId!),
+                      buildSteamDbPatchnotesUrl(
+                        patchEditor.item.item.steamAppId!,
+                      ),
                     )
                   }
                   type="button"

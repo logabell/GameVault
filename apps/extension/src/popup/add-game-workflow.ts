@@ -1,15 +1,18 @@
-import { derivePatchLag } from '@vaulttrack/shared-types';
 import type {
   ConnectionHealthSummary,
   DownloadMirrorRecord,
+  DownloadProvider,
   MatchedSourceView,
   ParsedSourcePayload,
   SelectedDownloads,
   SteamCandidate,
-  SteamPatchEntry,
   SteamPatchCandidate,
   SupportedSourceKind,
   TrackedItemView,
+} from '@vaulttrack/shared-types';
+export {
+  getSourceComparisonLabel,
+  inferSourceComparisonRows,
 } from '@vaulttrack/shared-types';
 
 import {
@@ -53,9 +56,9 @@ export interface HeroPresenceState {
 }
 
 export function sourceRequiresMyJDownloader(
-  sourceKind: SupportedSourceKind | null | undefined,
+  _sourceKind: SupportedSourceKind | null | undefined,
 ): boolean {
-  return sourceKind === 'elamigos' || sourceKind === 'steamrip';
+  return false;
 }
 
 export function getDownloadAutomationWarning(params: {
@@ -144,19 +147,21 @@ export function isSourceReadyForAutomation(params: {
 }
 
 export function getDownloadQueueSuccessMessage(
-  sourceKind: SupportedSourceKind | null | undefined,
+  _sourceKind: SupportedSourceKind | null | undefined,
+  provider?: DownloadProvider | null,
 ): string {
-  return sourceKind === 'ankergames'
-    ? 'Download is starting in the desktop app with curl.'
-    : 'Queued in MyJDownloader.';
+  return provider === 'jdownloader'
+    ? 'Queued in MyJDownloader.'
+    : 'Download is starting in the desktop app with curl.';
 }
 
 export function getDownloadQueueTimeoutMessage(
-  sourceKind: SupportedSourceKind | null | undefined,
+  _sourceKind: SupportedSourceKind | null | undefined,
+  provider?: DownloadProvider | null,
 ): string {
-  return sourceKind === 'ankergames'
-    ? 'Download startup timed out. Check the VaultTrack desktop app, then try again if the curl download did not begin.'
-    : 'Download queueing timed out. Check MyJDownloader, then try again if the package was not added.';
+  return provider === 'jdownloader'
+    ? 'Download queueing timed out. Check MyJDownloader, then try again if the package was not added.'
+    : 'Download startup timed out. Check the VaultTrack desktop app, then try again if the curl download did not begin.';
 }
 
 export function normalizeComparableUrl(
@@ -384,250 +389,6 @@ export function getSourceMatchPatchKey(
   return getPatchKeyForSnapshot(source.snapshot, patches);
 }
 
-function numericSourceBuildId(value: string | null | undefined): string | null {
-  const trimmed = value?.trim();
-  return trimmed && /^\d+$/.test(trimmed) ? trimmed : null;
-}
-
-function normalizeSourceVersion(
-  value: string | null | undefined,
-): string | null {
-  const normalized = value
-    ?.trim()
-    .toLowerCase()
-    .replace(/^version\s*:?\s*/i, '')
-    .replace(/^v\s*(?=\d)/i, '')
-    .replace(/\s+/g, ' ');
-  return normalized || null;
-}
-
-function sourceVersion(source: MatchedSourceView): string | null {
-  return normalizeSourceVersion(
-    source.snapshot?.observedVersion ?? source.matchedPatch?.version,
-  );
-}
-
-function sourceBuildId(source: MatchedSourceView): string | null {
-  return (
-    numericSourceBuildId(source.snapshot?.observedBuildId) ??
-    numericSourceBuildId(source.matchedPatch?.buildId)
-  );
-}
-
-function patchEntryFromCandidate(
-  trackedItemId: string,
-  patch: SteamPatchCandidate | SteamPatchEntry,
-): SteamPatchEntry {
-  return 'trackedItemId' in patch
-    ? patch
-    : {
-        ...patch,
-        trackedItemId,
-      };
-}
-
-function findPatchEntryByBuildId(
-  patches: SteamPatchEntry[],
-  buildId: string,
-): SteamPatchEntry | null {
-  return patches.find((patch) => patch.buildId === buildId) ?? null;
-}
-
-function normalizePatchDateKey(
-  value: string | null | undefined,
-): string | null {
-  if (!value) return null;
-  const trimmed = value.trim();
-  const slashMatch = trimmed.match(
-    /(?<month>\d{1,2})\/(?<day>\d{1,2})\/(?<year>\d{4})/,
-  );
-  if (slashMatch?.groups) {
-    return `${slashMatch.groups.year}-${slashMatch.groups.month.padStart(2, '0')}-${slashMatch.groups.day.padStart(2, '0')}`;
-  }
-
-  const dotMatch = trimmed.match(
-    /(?<day>\d{1,2})\.(?<month>\d{1,2})\.(?<year>\d{4})/,
-  );
-  if (dotMatch?.groups) {
-    return `${dotMatch.groups.year}-${dotMatch.groups.month.padStart(2, '0')}-${dotMatch.groups.day.padStart(2, '0')}`;
-  }
-
-  const timestamp = new Date(trimmed).getTime();
-  if (Number.isNaN(timestamp)) return null;
-  return new Date(timestamp).toISOString().slice(0, 10);
-}
-
-function findUniquePatchEntryByDate(
-  patches: SteamPatchEntry[],
-  patchDate: string | null | undefined,
-): SteamPatchEntry | null {
-  const dateKey = normalizePatchDateKey(patchDate);
-  if (!dateKey) return null;
-  const matches = patches.filter(
-    (patch) => normalizePatchDateKey(patch.patchDate) === dateKey,
-  );
-  return matches.length === 1 ? matches[0]! : null;
-}
-
-function canonicalizeSourceWithPatch(params: {
-  fallbackVersionsBehindLatest?: number | null;
-  patchEntries: SteamPatchEntry[];
-  source: MatchedSourceView;
-  matchedPatch: SteamPatchEntry;
-}): MatchedSourceView {
-  const patchLag = derivePatchLag({
-    feedEntries: params.patchEntries,
-    selectedPatch: params.matchedPatch,
-  });
-  const versionsBehindLatest =
-    patchLag.versionsBehindLatest ??
-    params.fallbackVersionsBehindLatest ??
-    params.source.versionsBehindLatest ??
-    null;
-
-  return {
-    ...params.source,
-    isUpdateSource:
-      params.source.isUpdateSource ||
-      (versionsBehindLatest === 0 && params.source.match.usable),
-    matchedPatch: params.matchedPatch,
-    snapshot: params.source.snapshot
-      ? {
-          ...params.source.snapshot,
-          observedBuildId:
-            params.matchedPatch.buildId ??
-            params.source.snapshot.observedBuildId,
-          observedPatchDate:
-            params.matchedPatch.patchDate ??
-            params.source.snapshot.observedPatchDate,
-          observedPatchLink:
-            params.matchedPatch.link ??
-            params.source.snapshot.observedPatchLink,
-          observedPatchTitle:
-            params.matchedPatch.patchTitle ??
-            params.source.snapshot.observedPatchTitle,
-        }
-      : params.source.snapshot,
-    updateStatus:
-      typeof versionsBehindLatest === 'number'
-        ? versionsBehindLatest === 0
-          ? 'matches_upstream'
-          : 'source_behind_upstream'
-        : params.source.updateStatus,
-    versionsBehindLatest,
-    versionsBehindLatestIsLowerBound:
-      patchLag.versionsBehindLatestIsLowerBound ??
-      params.source.versionsBehindLatestIsLowerBound,
-  };
-}
-
-export function inferSourceComparisonRows(
-  item: TrackedItemView | null | undefined,
-  patches: SteamPatchCandidate[],
-): MatchedSourceView[] {
-  if (!item) return [];
-
-  const patchEntries = patches.map((patch) =>
-    patchEntryFromCandidate(item.item.id, patch),
-  );
-  return item.sourceMatches.map((source) => {
-    if (
-      source.match.sourceKind === 'elamigos' &&
-      source.snapshot &&
-      !sourceBuildId(source)
-    ) {
-      const matchedPatch = findUniquePatchEntryByDate(
-        patchEntries,
-        source.snapshot.observedPatchDate,
-      );
-      if (matchedPatch?.buildId) {
-        return canonicalizeSourceWithPatch({
-          matchedPatch,
-          patchEntries,
-          source,
-        });
-      }
-    }
-
-    if (source.match.sourceKind !== 'steamrip' || !source.snapshot) {
-      return source;
-    }
-
-    const existingBuildId = sourceBuildId(source);
-    if (existingBuildId && source.snapshot.observedBuildId) {
-      return source;
-    }
-
-    const steamRipVersion = sourceVersion(source);
-    const matchingVersionPeers = steamRipVersion
-      ? item.sourceMatches.filter(
-          (peer) =>
-            (peer.match.sourceKind === 'ankergames' ||
-              peer.match.sourceKind === 'elamigos') &&
-            sourceVersion(peer) === steamRipVersion &&
-            sourceBuildId(peer),
-        )
-      : [];
-    const matchingAnkerGamesSources = matchingVersionPeers.filter(
-      (peer) => peer.match.sourceKind === 'ankergames',
-    );
-    const inferredBuildIds = new Set(
-      matchingVersionPeers
-        .map((peer) => sourceBuildId(peer))
-        .filter((buildId): buildId is string => Boolean(buildId)),
-    );
-    const ankerGamesBuildIds = new Set(
-      matchingAnkerGamesSources
-        .map((peer) => sourceBuildId(peer))
-        .filter((buildId): buildId is string => Boolean(buildId)),
-    );
-    const inferredBuildId =
-      existingBuildId ??
-      (inferredBuildIds.size === 1 && ankerGamesBuildIds.size === 1
-        ? Array.from(inferredBuildIds)[0]!
-        : null);
-    if (!inferredBuildId) {
-      return source;
-    }
-
-    const matchingPeer = matchingAnkerGamesSources.find(
-      (peer) => sourceBuildId(peer) === inferredBuildId,
-    );
-    const matchedPatch =
-      source.matchedPatch ??
-      (matchingPeer?.matchedPatch?.buildId === inferredBuildId
-        ? matchingPeer.matchedPatch
-        : null) ??
-      findPatchEntryByBuildId(patchEntries, inferredBuildId);
-    if (matchedPatch) {
-      return canonicalizeSourceWithPatch({
-        fallbackVersionsBehindLatest: matchingPeer?.versionsBehindLatest,
-        matchedPatch,
-        patchEntries,
-        source,
-      });
-    }
-
-    return {
-      ...source,
-      isUpdateSource:
-        source.isUpdateSource ||
-        Boolean(matchingPeer?.isUpdateSource),
-      matchedPatch: source.matchedPatch,
-      snapshot: {
-        ...source.snapshot,
-        observedBuildId: inferredBuildId,
-      },
-      updateStatus: matchingPeer?.updateStatus ?? source.updateStatus,
-      versionsBehindLatest:
-        matchingPeer?.versionsBehindLatest ?? source.versionsBehindLatest,
-      versionsBehindLatestIsLowerBound:
-        matchingPeer?.versionsBehindLatestIsLowerBound ??
-        source.versionsBehindLatestIsLowerBound,
-    };
-  });
-}
-
 export function getLikelyPatchForSelectedSource(
   parsedSource: ParsedSourcePayload | null,
   source: MatchedSourceView | null | undefined,
@@ -660,12 +421,6 @@ function getLifecycleStatus(item: TrackedItemView): string {
     return status;
   }
   return item.currentDownload?.stage ?? 'new';
-}
-
-export function hasInstallComparisonContext(
-  item: TrackedItemView | null | undefined,
-): boolean {
-  return Boolean(item?.installRecord || item?.fileState?.finalPathExists);
 }
 
 export function getHeroPresenceState(
@@ -704,32 +459,6 @@ export function getHeroPresenceState(
     presenceLabel: null,
     statusLabel: null,
   };
-}
-
-export function getSourceComparisonLabel(
-  source: MatchedSourceView,
-  item: TrackedItemView | null | undefined,
-): string {
-  if (typeof source.versionsBehindLatest === 'number') {
-    return source.versionsBehindLatest === 0
-      ? 'Latest'
-      : `${source.versionsBehindLatest}${
-          source.versionsBehindLatestIsLowerBound ? '+' : ''
-        } behind`;
-  }
-
-  const installRelativeStatuses = new Set([
-    'possible_update',
-    'newer_than_installed',
-    'same_as_installed',
-  ]);
-  const status =
-    !hasInstallComparisonContext(item) &&
-    installRelativeStatuses.has(source.updateStatus)
-      ? 'unknown'
-      : source.updateStatus;
-
-  return formatStatusLabel(status);
 }
 
 export function getSourceDownloadSelection(

@@ -580,15 +580,18 @@ function createService(
   extractStagedZipArchive: typeof extractSingleStagedZipArchive = vi.fn(
     async () => null,
   ),
-  startDirectHttpDownload: DirectHttpDownloadRunner = vi.fn(
-    () => ({
-      cancel: vi.fn(),
-      completion: new Promise<{ fileName: string; savePath: string }>(
-        () => undefined,
-      ),
-    }),
-  ),
+  startDirectHttpDownload: DirectHttpDownloadRunner = vi.fn(() => ({
+    cancel: vi.fn(),
+    completion: new Promise<{ fileName: string; savePath: string }>(
+      () => undefined,
+    ),
+  })),
+  jDownloaderEnabled = true,
 ): VaultTrackService {
+  database.setSetting(
+    'download.jdownloader.enabled',
+    jDownloaderEnabled ? 'true' : 'false',
+  );
   const myJDownloader = {
     getHealth: async () => ({
       color: 'green',
@@ -620,14 +623,17 @@ function createService(
   );
 }
 
-function createEmbeddedBrowserRunner(params: {
-  cancel?: ReturnType<typeof vi.fn>;
-  completion?: Promise<{ fileName: string; savePath: string }>;
-} = {}) {
+function createEmbeddedBrowserRunner(
+  params: {
+    cancel?: ReturnType<typeof vi.fn>;
+    completion?: Promise<{ fileName: string; savePath: string }>;
+  } = {},
+) {
   return vi.fn<DirectHttpDownloadRunner>(() => ({
     cancel: params.cancel ?? vi.fn(),
     completion:
-      params.completion ?? new Promise<{ fileName: string; savePath: string }>(() => undefined),
+      params.completion ??
+      new Promise<{ fileName: string; savePath: string }>(() => undefined),
   }));
 }
 
@@ -660,6 +666,53 @@ afterEach(() => {
 });
 
 describe('VaultTrackService import workflow', () => {
+  it('defaults JDownloader behavior from credential state and preserves credentials when saving preferences', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      expect(database.getSettings()).toMatchObject({
+        jDownloaderEnabled: false,
+        jDownloaderSourcePreferences: {
+          elamigos: true,
+          steamrip: true,
+        },
+      });
+      database.setSetting('myjd.email', 'logan@example.test');
+      database.setSetting('myjd.password', 'encrypted-secret');
+      expect(database.getSettings()).toMatchObject({
+        jDownloaderEnabled: true,
+        jDownloaderSourcePreferences: {
+          elamigos: true,
+          steamrip: true,
+        },
+      });
+      const service = createService(database);
+
+      const saved = service.saveSettings({
+        jDownloaderEnabled: false,
+        jDownloaderSourcePreferences: {
+          elamigos: false,
+          steamrip: true,
+        },
+      });
+
+      expect(saved).toMatchObject({
+        jDownloaderEnabled: false,
+        jDownloaderSourcePreferences: {
+          elamigos: false,
+          steamrip: true,
+        },
+        myJDownloaderEmail: 'logan@example.test',
+        myJDownloaderPasswordConfigured: true,
+      });
+      expect(database.getSettings()).toMatchObject({
+        encryptedPassword: 'encrypted-secret',
+        myJDownloaderEmail: 'logan@example.test',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('migrates a single root into library roots and mirrors the primary root', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -883,6 +936,8 @@ describe('VaultTrackService import workflow', () => {
       expect(database.getInstallRecord(imported.item.id)).toMatchObject({
         installPath: finalPath,
         installedBuildId: '333999',
+        installedSourceKind: 'manual',
+        installedSourceUrl: `manual:import:${imported.item.id}`,
         installedVersion: '1.2.3',
       });
       expect(database.listPatchEntries(imported.item.id)).toEqual(
@@ -893,6 +948,148 @@ describe('VaultTrackService import workflow', () => {
           }),
         ]),
       );
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('saves imports with a selected installed source tag', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootPath = join(tempRoot, 'Library');
+      const folderPath = join(rootPath, 'SteamRip Folder');
+      await mkdir(folderPath, { recursive: true });
+      await writeFile(join(folderPath, 'game.exe'), 'game');
+      vi.stubGlobal('fetch', mockSteamNetwork([]));
+      const service = createService(database);
+      const patch: SteamPatchCandidate = {
+        appId: 335,
+        buildId: '335999',
+        link: 'manual:patch',
+        patchDate: '2026-04-21',
+        patchTitle: 'Version 2.0',
+        publishedAt: '2026-04-21T00:00:00.000Z',
+        selectionSource: 'manual',
+        title: 'Tagged Game patch',
+        version: '2.0',
+      };
+
+      const result = await service.saveImportBatch({
+        rows: [
+          {
+            folderName: 'SteamRip Folder',
+            folderPath,
+            installedSourceKind: 'steamrip',
+            renameFolder: false,
+            rootPath,
+            selectedSteamPatch: patch,
+            steamMatch: {
+              appId: 335,
+              coverUrl: null,
+              matchedAt: '2026-04-21T00:00:00.000Z',
+              normalizedTitle: 'tagged game',
+              title: 'Tagged Game',
+            },
+            steamPatchEntries: [patch],
+          },
+        ],
+      });
+
+      const imported = result.imported[0]!;
+      expect(imported.item.sourceKind).toBe('manual');
+      expect(database.getSourceSnapshot(imported.item.id)).toMatchObject({
+        sourceKind: 'manual',
+        sourceUrl: `manual:import:${imported.item.id}`,
+      });
+      expect(database.getInstallRecord(imported.item.id)).toMatchObject({
+        installPath: folderPath,
+        installedSourceKind: 'steamrip',
+        installedSourceUrl: null,
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('updates an imported install source tag without clearing install metadata', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootPath = join(tempRoot, 'Library');
+      const folderPath = join(rootPath, 'Unknown Source Folder');
+      await mkdir(folderPath, { recursive: true });
+      await writeFile(join(folderPath, 'game.exe'), 'game');
+      vi.stubGlobal('fetch', mockSteamNetwork([]));
+      const service = createService(database);
+      const patch: SteamPatchCandidate = {
+        appId: 336,
+        buildId: '336999',
+        link: 'manual:patch',
+        patchDate: '2026-04-22',
+        patchTitle: 'Version 3.0',
+        publishedAt: '2026-04-22T00:00:00.000Z',
+        selectionSource: 'manual',
+        title: 'Retagged Game patch',
+        version: '3.0',
+      };
+
+      const result = await service.saveImportBatch({
+        rows: [
+          {
+            folderName: 'Unknown Source Folder',
+            folderPath,
+            renameFolder: false,
+            rootPath,
+            selectedSteamPatch: patch,
+            steamMatch: {
+              appId: 336,
+              coverUrl: null,
+              matchedAt: '2026-04-22T00:00:00.000Z',
+              normalizedTitle: 'retagged game',
+              title: 'Retagged Game',
+            },
+            steamPatchEntries: [patch],
+          },
+        ],
+      });
+
+      const imported = result.imported[0]!;
+      expect(imported.installRecord).toMatchObject({
+        installPath: folderPath,
+        installedBuildId: '336999',
+        installedSourceKind: 'manual',
+        installedSourceUrl: `manual:import:${imported.item.id}`,
+        installedVersion: '3.0',
+      });
+
+      const updated = await service.updateInstallRecord({
+        installedSourceKind: 'steamrip',
+        trackedItemId: imported.item.id,
+      });
+
+      expect(updated.item.sourceKind).toBe('manual');
+      expect(updated.sourceSnapshot).toMatchObject({
+        sourceKind: 'manual',
+        sourceUrl: `manual:import:${imported.item.id}`,
+      });
+      expect(updated.installRecord).toMatchObject({
+        installPath: folderPath,
+        installedBuildId: '336999',
+        installedSourceKind: 'steamrip',
+        installedSourceUrl: null,
+        installedVersion: '3.0',
+      });
+
+      const reset = await service.updateInstallRecord({
+        installedSourceKind: 'manual',
+        trackedItemId: imported.item.id,
+      });
+
+      expect(reset.installRecord).toMatchObject({
+        installedBuildId: '336999',
+        installedSourceKind: 'manual',
+        installedSourceUrl: `manual:import:${imported.item.id}`,
+        installedVersion: '3.0',
+      });
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
@@ -1758,6 +1955,105 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         provider: 'direct_http',
         selectedMirrorUrl: ankerMirrorUrl,
         stage: 'queued',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('defaults SteamRIP downloads to the direct HTTP provider when JDownloader is disabled', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response(rss([selectedPatch]), { status: 200 })),
+      );
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9001,
+        packageName: 'queued-package',
+      }));
+      const startDirectHttpDownload = createEmbeddedBrowserRunner();
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        undefined,
+        undefined,
+        fetch,
+        undefined,
+        undefined,
+        undefined,
+        startDirectHttpDownload,
+      );
+      database.setSetting('download.jdownloader.enabled', 'false');
+
+      const queued = await service.addTrackedItem({
+        parsedSource,
+        queueDownload: true,
+        selectedDownloads: { fullUrl: 'https://gofile.io/d/full' },
+        selectedSteamPatch: selectedPatch,
+        steamMatch,
+      });
+
+      expect(queueLinks).not.toHaveBeenCalled();
+      expect(startDirectHttpDownload).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sourceKind: 'steamrip',
+          url: 'https://gofile.io/d/full',
+        }),
+      );
+      expect(queued.currentDownload).toMatchObject({
+        provider: 'direct_http',
+        selectedMirrorUrl: 'https://gofile.io/d/full',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('uses JDownloader for SteamRIP when the optional integration is enabled and ready', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response(rss([selectedPatch]), { status: 200 })),
+      );
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9001,
+        packageName: 'queued-package',
+      }));
+      const startDirectHttpDownload = createEmbeddedBrowserRunner();
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        undefined,
+        undefined,
+        fetch,
+        undefined,
+        undefined,
+        undefined,
+        startDirectHttpDownload,
+      );
+
+      const queued = await service.addTrackedItem({
+        parsedSource,
+        queueDownload: true,
+        selectedDownloads: { fullUrl: 'https://gofile.io/d/full' },
+        selectedSteamPatch: selectedPatch,
+        steamMatch,
+      });
+
+      expect(queueLinks).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sourceKind: 'steamrip',
+        }),
+      );
+      expect(startDirectHttpDownload).not.toHaveBeenCalled();
+      expect(queued.currentDownload).toMatchObject({
+        provider: 'jdownloader',
       });
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
@@ -2735,7 +3031,9 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         vi.fn(async () => new Response('', { status: 503 })),
       );
       const sourceFetch = vi.fn(async () => {
-        throw new Error('Ankergames queueing should not resolve mirrors eagerly.');
+        throw new Error(
+          'Ankergames queueing should not resolve mirrors eagerly.',
+        );
       });
       const queueLinks = vi.fn(async (_params: unknown) => ({
         packageId: 9001,
@@ -2774,7 +3072,9 @@ describe('VaultTrackService SteamDB patch workflow', () => {
             title: 'Shape of Dreams',
           },
         }),
-      ).rejects.toThrow('Unable to resolve AnkerGames dlproxy link before queueing');
+      ).rejects.toThrow(
+        'Unable to resolve AnkerGames dlproxy link before queueing',
+      );
 
       expect(sourceFetch).toHaveBeenCalledWith(
         'https://ankergames.net/csrf-token',
@@ -2897,22 +3197,25 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         },
       });
 
-      expect(database.getRawParsedSourcePayload(draft.item.id, 'ankergames'))
-        .toMatchObject({
-          fullDownloadUrls: [
-            expect.objectContaining({
-              browserDownloadUrl: ankergamesProxyUrl,
-              url: 'https://ankergames.net/generate-download-url/2557',
-            }),
-          ],
-        });
-      expect(database.listDownloadMirrors(draft.item.id, 'ankergames')).toEqual([
-        expect.objectContaining({
-          kind: 'full',
-          label: 'DataNodes',
-          url: ankergamesProxyUrl,
-        }),
-      ]);
+      expect(
+        database.getRawParsedSourcePayload(draft.item.id, 'ankergames'),
+      ).toMatchObject({
+        fullDownloadUrls: [
+          expect.objectContaining({
+            browserDownloadUrl: ankergamesProxyUrl,
+            url: 'https://ankergames.net/generate-download-url/2557',
+          }),
+        ],
+      });
+      expect(database.listDownloadMirrors(draft.item.id, 'ankergames')).toEqual(
+        [
+          expect.objectContaining({
+            kind: 'full',
+            label: 'DataNodes',
+            url: ankergamesProxyUrl,
+          }),
+        ],
+      );
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
@@ -2927,7 +3230,9 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         vi.fn(async () => new Response('', { status: 503 })),
       );
       const sourceFetch = vi.fn(async () => {
-        throw new Error('Direct-ready Ankergames mirrors should skip queue-time resolution.');
+        throw new Error(
+          'Direct-ready Ankergames mirrors should skip queue-time resolution.',
+        );
       });
       const startEmbeddedBrowserDownload = createEmbeddedBrowserRunner();
       const service = createService(
@@ -3046,13 +3351,15 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         'ankergames',
       );
 
-      expect(database.listDownloadMirrors(draft.item.id, 'ankergames')).toEqual([
-        expect.objectContaining({
-          kind: 'full',
-          selectedAt: expect.any(String),
-          url: ankergamesProxyUrl,
-        }),
-      ]);
+      expect(database.listDownloadMirrors(draft.item.id, 'ankergames')).toEqual(
+        [
+          expect.objectContaining({
+            kind: 'full',
+            selectedAt: expect.any(String),
+            url: ankergamesProxyUrl,
+          }),
+        ],
+      );
       expect(
         database.getRawParsedSourcePayload(draft.item.id, 'ankergames'),
       ).toMatchObject({
@@ -5423,7 +5730,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
           observedBuildId: '19493300',
           observedVersion: '1.16.1',
         },
-        updateStatus: 'newer_than_installed',
+        updateStatus: 'source_behind_upstream',
         versionsBehindLatest: 1,
       });
       expect(steamrip).toMatchObject({
@@ -5434,8 +5741,376 @@ describe('VaultTrackService SteamDB patch workflow', () => {
           observedBuildId: '19493300',
           observedVersion: '1.16.1',
         },
-        updateStatus: 'newer_than_installed',
+        updateStatus: 'source_behind_upstream',
         versionsBehindLatest: 1,
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('uses a same-date AnkerGames peer to resolve ElAmigos upstream lag', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'baldurs gate 3',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:baldurs-gate-3',
+        title: "Baldur's Gate 3",
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 1086940,
+        coverUrl: null,
+        matchedAt: '2026-04-22T12:00:00.000Z',
+        normalizedTitle: 'baldurs gate 3',
+        title: "Baldur's Gate 3",
+      });
+      database.upsertPatchEntries([
+        {
+          appId: 1086940,
+          buildId: '22517190',
+          link: 'https://steamdb.info/patchnotes/22517190/',
+          patchDate: '03/26/2026',
+          patchTitle: 'Hotfix #36 Now Live!',
+          publishedAt: '2026-03-26T18:00:00.000Z',
+          title: 'Hotfix #36 Now Live!',
+          trackedItemId: item.id,
+        },
+        {
+          appId: 1086940,
+          buildId: '22510000',
+          link: 'https://steamdb.info/patchnotes/22510000/',
+          patchDate: '03/26/2026',
+          patchTitle: 'Hotfix #35 Now Live!',
+          publishedAt: '2026-03-26T12:00:00.000Z',
+          title: 'Hotfix #35 Now Live!',
+          trackedItemId: item.id,
+        },
+        {
+          appId: 1086940,
+          buildId: '18533399',
+          link: 'https://steamdb.info/patchnotes/18533399/',
+          patchDate: '05/20/2025',
+          patchTitle:
+            'Community Update #34 - Connecting With Cross-Play & Hotfix #32',
+          publishedAt: '2025-05-20T12:00:00.000Z',
+          title:
+            'Community Update #34 - Connecting With Cross-Play & Hotfix #32',
+          trackedItemId: item.id,
+        },
+      ]);
+      database.upsertInstallRecord({
+        installedAt: '05/20/2025',
+        installedBuildId: '18533399',
+        installedVersion:
+          'Community Update #34 - Connecting With Cross-Play & Hotfix #32',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-22T12:00:00.000Z',
+      });
+      for (const sourceKind of ['ankergames', 'elamigos'] as const) {
+        database.upsertSourceMatch({
+          confidence: 1,
+          createdAt: '2026-04-22T12:00:00.000Z',
+          isPrimary: false,
+          lastCheckedAt: '2026-04-22T12:00:00.000Z',
+          lastError: null,
+          method: 'fuzzy_title',
+          normalizedTitle: 'baldurs gate 3',
+          score: 1,
+          sourceKind,
+          sourceTitle: "Baldur's Gate 3",
+          sourceUrl: `https://${sourceKind}.example.test/baldurs-gate-3`,
+          status: 'probable',
+          trackedItemId: item.id,
+          updatedAt: '2026-04-22T12:00:00.000Z',
+          usable: true,
+        });
+      }
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-22T12:00:00.000Z',
+        fingerprint: 'ankergames-bg3',
+        observedBuildId: '22517190',
+        observedPatchDate: null,
+        observedVersion: 'V 4.1.1.7209685',
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.example.test/baldurs-gate-3',
+        trackedItemId: item.id,
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-22T12:00:00.000Z',
+        fingerprint: 'elamigos-bg3',
+        observedBuildId: null,
+        observedPatchDate: '03/26/2026',
+        observedVersion: '7209685',
+        sourceKind: 'elamigos',
+        sourceUrl: 'https://elamigos.example.test/baldurs-gate-3',
+        trackedItemId: item.id,
+      });
+
+      const [view] = await createService(database).listTrackedItems();
+      const anker = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'ankergames',
+      );
+      const elamigos = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'elamigos',
+      );
+
+      expect(anker).toMatchObject({
+        matchedPatch: {
+          buildId: '22517190',
+          patchTitle: 'Hotfix #36 Now Live!',
+        },
+        updateStatus: 'matches_upstream',
+        versionsBehindLatest: 0,
+      });
+      expect(elamigos).toMatchObject({
+        matchedPatch: {
+          buildId: '22517190',
+          patchDate: '03/26/2026',
+          patchTitle: 'Hotfix #36 Now Live!',
+        },
+        snapshot: {
+          observedBuildId: '22517190',
+          observedPatchTitle: 'Hotfix #36 Now Live!',
+          observedVersion: '7209685',
+        },
+        updateStatus: 'matches_upstream',
+        versionsBehindLatest: 0,
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('canonicalizes AnkerGames from patch-title version when the listed build is invalid', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'against the storm',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:against-the-storm',
+        title: 'Against the Storm',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 1336490,
+        coverUrl: null,
+        matchedAt: '2026-04-22T12:00:00.000Z',
+        normalizedTitle: 'against the storm',
+        title: 'Against the Storm',
+      });
+      database.upsertPatchEntries([
+        {
+          appId: 1336490,
+          buildId: '22562969',
+          link: 'https://steamdb.info/patchnotes/22562969/',
+          patchDate: '03/30/2026',
+          patchTitle: 'Patch 1.9.8 (Improvements, Orders icon)',
+          publishedAt: '2026-03-30T14:28:02.000Z',
+          title: 'Patch 1.9.8 (Improvements, Orders icon)',
+          trackedItemId: item.id,
+        },
+      ]);
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-04-22T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-04-22T12:00:00.000Z',
+        lastError: null,
+        method: 'fuzzy_title',
+        normalizedTitle: 'against the storm',
+        score: 1,
+        sourceKind: 'ankergames',
+        sourceTitle: 'Against the Storm',
+        sourceUrl: 'https://ankergames.net/game/against-the-storm',
+        status: 'probable',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-22T12:00:00.000Z',
+        usable: true,
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-22T12:00:00.000Z',
+        fingerprint: 'ankergames-against-the-storm',
+        observedBuildId: '22563044',
+        observedPatchDate: null,
+        observedPatchLink: null,
+        observedPatchTitle: null,
+        observedVersion: 'V 1.9.8R',
+        patchSelectionSource: null,
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.net/game/against-the-storm',
+        trackedItemId: item.id,
+      });
+
+      const [view] = await createService(database).listTrackedItems();
+      const ankergames = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'ankergames',
+      );
+
+      expect(ankergames).toMatchObject({
+        matchedPatch: {
+          buildId: '22562969',
+          patchDate: '03/30/2026',
+          patchTitle: 'Patch 1.9.8 (Improvements, Orders icon)',
+        },
+        snapshot: {
+          observedBuildId: '22562969',
+          observedPatchDate: '03/30/2026',
+          observedPatchTitle: 'Patch 1.9.8 (Improvements, Orders icon)',
+          observedVersion: 'V 1.9.8R',
+        },
+        updateStatus: 'matches_upstream',
+        versionsBehindLatest: 0,
+      });
+      expect(database.getSourceSnapshot(item.id, 'ankergames')).toMatchObject({
+        observedBuildId: '22562969',
+        observedPatchDate: '03/30/2026',
+        observedPatchTitle: 'Patch 1.9.8 (Improvements, Orders icon)',
+        observedVersion: 'V 1.9.8R',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('canonicalizes ElAmigos first so SteamRIP inherits a matching resolved patch', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'against the storm',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:against-the-storm',
+        title: 'Against the Storm',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 1336490,
+        coverUrl: null,
+        matchedAt: '2026-04-22T12:00:00.000Z',
+        normalizedTitle: 'against the storm',
+        title: 'Against the Storm',
+      });
+      database.upsertPatchEntries([
+        {
+          appId: 1336490,
+          buildId: '22562969',
+          link: 'https://steamdb.info/patchnotes/22562969/',
+          patchDate: '03/30/2026',
+          patchTitle: 'Patch 1.9.8 (Improvements, Orders icon)',
+          publishedAt: '2026-03-30T14:28:02.000Z',
+          title: 'Patch 1.9.8 (Improvements, Orders icon)',
+          trackedItemId: item.id,
+        },
+        {
+          appId: 1336490,
+          buildId: '19434067',
+          link: 'https://steamdb.info/patchnotes/19434067/',
+          patchDate: '07/31/2025',
+          patchTitle: 'Hotfix 1.8.5 (Mine, Workplaces)',
+          publishedAt: '2025-07-31T19:37:00.000Z',
+          title: 'Hotfix 1.8.5 (Mine, Workplaces)',
+          trackedItemId: item.id,
+        },
+        {
+          appId: 1336490,
+          buildId: '19396572',
+          link: 'https://steamdb.info/patchnotes/19396572/',
+          patchDate: '07/31/2025',
+          patchTitle: 'No title',
+          publishedAt: '2025-07-31T16:55:00.000Z',
+          title: 'No title',
+          trackedItemId: item.id,
+        },
+      ]);
+      for (const sourceKind of ['elamigos', 'steamrip'] as const) {
+        database.upsertSourceMatch({
+          confidence: 1,
+          createdAt: '2026-04-22T12:00:00.000Z',
+          isPrimary: false,
+          lastCheckedAt: '2026-04-22T12:00:00.000Z',
+          lastError: null,
+          method: 'fuzzy_title',
+          normalizedTitle: 'against the storm',
+          score: 1,
+          sourceKind,
+          sourceTitle: 'Against the Storm',
+          sourceUrl: `https://${sourceKind}.example.test/against-the-storm`,
+          status: 'probable',
+          trackedItemId: item.id,
+          updatedAt: '2026-04-22T12:00:00.000Z',
+          usable: true,
+        });
+      }
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-22T12:00:00.000Z',
+        fingerprint: 'elamigos-against-the-storm',
+        observedBuildId: null,
+        observedPatchDate: '07/31/2025',
+        observedPatchLink: null,
+        observedPatchTitle: null,
+        observedVersion: '1.8.4',
+        patchSelectionSource: null,
+        sourceKind: 'elamigos',
+        sourceUrl: 'https://elamigos.example.test/against-the-storm',
+        trackedItemId: item.id,
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-22T12:00:00.000Z',
+        fingerprint: 'steamrip-against-the-storm',
+        observedBuildId: null,
+        observedPatchDate: null,
+        observedPatchLink: null,
+        observedPatchTitle: null,
+        observedVersion: '1.8.4R',
+        patchSelectionSource: null,
+        sourceKind: 'steamrip',
+        sourceUrl: 'https://steamrip.example.test/against-the-storm',
+        trackedItemId: item.id,
+      });
+
+      const [view] = await createService(database).listTrackedItems();
+      const elamigos = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'elamigos',
+      );
+      const steamrip = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'steamrip',
+      );
+
+      expect(elamigos).toMatchObject({
+        matchedPatch: {
+          buildId: '19396572',
+          patchDate: '07/31/2025',
+          patchTitle: 'No title',
+        },
+        snapshot: {
+          observedBuildId: '19396572',
+          observedPatchDate: '07/31/2025',
+          observedPatchTitle: 'No title',
+          observedVersion: '1.8.4',
+        },
+        updateStatus: 'source_behind_upstream',
+        versionsBehindLatest: 2,
+      });
+      expect(steamrip).toMatchObject({
+        matchedPatch: {
+          buildId: '19396572',
+          patchDate: '07/31/2025',
+          patchTitle: 'No title',
+        },
+        snapshot: {
+          observedBuildId: '19396572',
+          observedPatchDate: '07/31/2025',
+          observedPatchTitle: 'No title',
+          observedVersion: '1.8.4R',
+        },
+        updateStatus: 'source_behind_upstream',
+        versionsBehindLatest: 2,
+      });
+      expect(database.getSourceSnapshot(item.id, 'elamigos')).toMatchObject({
+        observedBuildId: '19396572',
+        observedPatchTitle: 'No title',
+      });
+      expect(database.getSourceSnapshot(item.id, 'steamrip')).toMatchObject({
+        observedBuildId: '19396572',
+        observedPatchTitle: 'No title',
       });
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
@@ -5537,7 +6212,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       expect(initialSteamRip).toMatchObject({
         matchedPatch: null,
         snapshot: {
-          observedBuildId: '20514355',
+          observedBuildId: null,
           observedVersion: '7.0.0.1243375',
         },
         versionsBehindLatest: null,
