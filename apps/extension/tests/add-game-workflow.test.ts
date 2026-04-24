@@ -25,6 +25,7 @@ import {
   getSourceDownloadSelection,
   hasActionableSourceUpdate,
   inferSourceComparisonRows,
+  isSourceCurrentForInstall,
   isSourceReadyForAutomation,
   trackedItemMatchesSourceUrls,
 } from '../src/popup/add-game-workflow.js';
@@ -357,6 +358,26 @@ describe('extension add-game workflow helpers', () => {
     ).toBe('elamigos');
   });
 
+  it('identifies the currently installed source for library update rows', () => {
+    const current = sourceView('steamrip', { observedBuildId: '200' }, []);
+    const alternate = sourceView('ankergames', { observedBuildId: '200' }, []);
+    const item = trackedItem({
+      installRecord: {
+        installedAt: now,
+        installedBuildId: '200',
+        installedSourceKind: null,
+        installedSourceUrl: `${current.match.sourceUrl}?from=library#source`,
+        installedVersion: '1.0',
+        trackedItemId: 'tracked-1',
+        updatedAt: now,
+      },
+      sourceMatches: [alternate, current],
+    });
+
+    expect(isSourceCurrentForInstall(item, current)).toBe(true);
+    expect(isSourceCurrentForInstall(item, alternate)).toBe(false);
+  });
+
   it('changes the patch suggestion when the selected source changes', () => {
     const olderPatch = patch('111', 'Older source build');
     const newerPatch = patch('222', 'Newer source build');
@@ -540,6 +561,59 @@ describe('extension add-game workflow helpers', () => {
       },
       updateStatus: 'unknown',
       versionsBehindLatest: null,
+    });
+  });
+
+  it('matches an ElAmigos date-only release to a SteamDB build', () => {
+    const latestPatch = {
+      ...patch('22425508', 'House Party update for 28 February 2026'),
+      patchDate: '02/28/2026',
+      publishedAt: '2026-02-28T12:00:00.000Z',
+    };
+    const elamigos = {
+      ...sourceView(
+        'elamigos',
+        {
+          observedBuildId: null,
+          observedPatchDate: '02/28/2026',
+          observedVersion: '1.5.2.13934',
+        },
+        [
+          mirror(
+            'elamigos',
+            'full',
+            'https://elamigos.example.test/full',
+            'Full',
+          ),
+        ],
+      ),
+      matchedPatch: null,
+      updateStatus: 'newer_than_installed' as const,
+      versionsBehindLatest: null,
+    };
+
+    const rows = inferSourceComparisonRows(
+      trackedItem({
+        sourceMatches: [elamigos],
+      }),
+      [latestPatch],
+    );
+    const inferredElamigos = rows.find(
+      (source) => source.match.sourceKind === 'elamigos',
+    );
+
+    expect(inferredElamigos).toMatchObject({
+      isUpdateSource: true,
+      matchedPatch: {
+        buildId: latestPatch.buildId,
+      },
+      snapshot: {
+        observedBuildId: latestPatch.buildId,
+        observedPatchDate: latestPatch.patchDate,
+        observedVersion: '1.5.2.13934',
+      },
+      updateStatus: 'matches_upstream',
+      versionsBehindLatest: 0,
     });
   });
 

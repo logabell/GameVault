@@ -9,16 +9,21 @@ import {
 import { createRoot } from 'react-dom/client';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import {
+  faArrowDownWideShort,
   faArrowLeft,
   faCheck,
   faCircleInfo,
   faEllipsis,
   faFileImport,
+  faFilter,
   faGamepad,
   faGear,
   faList,
+  faMagnifyingGlass,
   faPenToSquare,
   faRotateRight,
+  faSortDown,
+  faSortUp,
   faTableCellsLarge,
   faTrash,
   faTriangleExclamation,
@@ -28,6 +33,9 @@ import {
 
 import type {
   ConnectionHealthSummary,
+  LibrarySortDirection,
+  LibrarySortMode,
+  LibraryStatusFilter,
   MyJDownloaderDeviceSummary,
   MatchedSourceView,
   PatchSelectionSource,
@@ -40,6 +48,16 @@ import type {
   SupportedSourceKind,
   ThemeMode,
   TrackedItemView,
+} from '@vaulttrack/shared-types';
+import {
+  filterLibraryItem,
+  getDefaultLibrarySortDirection,
+  getScopedLibraryStatusFilterCounts,
+  hasActionableSourceUpdate,
+  LIBRARY_STATUS_FILTER_OPTIONS,
+  matchesLibrarySearch,
+  matchesLibraryStatusFilter,
+  sortLibraryItems,
 } from '@vaulttrack/shared-types';
 
 import {
@@ -57,8 +75,8 @@ import {
   getSourceDownloadSelection,
   getSourceMatchPatchKey,
   haveSharedMirrorUrls,
-  hasActionableSourceUpdate,
   inferSourceComparisonRows,
+  isSourceCurrentForInstall,
   isSourceReadyForAutomation,
   normalizeComparableUrl,
   trackedItemMatchesSourceUrls,
@@ -174,6 +192,7 @@ interface SourcePatchEditorState {
 
 interface StoredPopupState {
   activeTab: PopupTab;
+  libraryUpdateItemId: string | null;
   matchedDraftItemId: string | null;
   savedAt: number;
   selectedAppId: number | null;
@@ -194,6 +213,7 @@ type StoredPopupStateOverrides = Partial<
   Pick<
     StoredPopupState,
     | 'activeTab'
+    | 'libraryUpdateItemId'
     | 'selectedFullMirrorUrl'
     | 'selectedPatchMirrorUrl'
     | 'selectedSourceKind'
@@ -664,6 +684,10 @@ function readStoredPopupStateForKey(
       typeof record.selectedAppId === 'number' ? record.selectedAppId : null;
     return {
       activeTab: isPopupTab(record.activeTab) ? record.activeTab : 'game',
+      libraryUpdateItemId:
+        typeof record.libraryUpdateItemId === 'string'
+          ? record.libraryUpdateItemId
+          : null,
       matchedDraftItemId:
         typeof record.matchedDraftItemId === 'string'
           ? record.matchedDraftItemId
@@ -984,6 +1008,12 @@ function App() {
   const [libraryViewMode, setLibraryViewMode] = useState<LibraryViewMode>(() =>
     readStoredLibraryViewMode(EXTENSION_LIBRARY_VIEW_STORAGE_KEY),
   );
+  const [librarySearch, setLibrarySearch] = useState('');
+  const [librarySort, setLibrarySort] = useState<LibrarySortMode>('name');
+  const [librarySortDirection, setLibrarySortDirection] =
+    useState<LibrarySortDirection>('asc');
+  const [libraryStatusFilter, setLibraryStatusFilter] =
+    useState<LibraryStatusFilter>('all');
   const [detailsItemId, setDetailsItemId] = useState<string | null>(null);
   const [step, setStep] = useState<FlowStep>('steam');
   const [draftShell, setDraftShell] = useState<DraftShellPayload | null>(null);
@@ -1134,6 +1164,35 @@ function App() {
           null)
         : null,
     [libraryItems, libraryUpdateItemId],
+  );
+  const libraryStatusFilterCounts = useMemo(
+    () =>
+      getScopedLibraryStatusFilterCounts(
+        libraryItems,
+        'tracked',
+        librarySearch,
+      ),
+    [libraryItems, librarySearch],
+  );
+  const visibleLibraryItems = useMemo(
+    () =>
+      sortLibraryItems(
+        libraryItems.filter(
+          (item) =>
+            filterLibraryItem(item, 'tracked') &&
+            matchesLibraryStatusFilter(item, libraryStatusFilter) &&
+            matchesLibrarySearch(item, librarySearch),
+        ),
+        librarySort,
+        librarySortDirection,
+      ),
+    [
+      libraryItems,
+      librarySearch,
+      librarySort,
+      librarySortDirection,
+      libraryStatusFilter,
+    ],
   );
   const isLibraryUpdateFlow = Boolean(libraryUpdateItem);
   const baseActiveDraftItem = useMemo(
@@ -1322,6 +1381,7 @@ function App() {
 
       const snapshot: StoredPopupState = {
         activeTab,
+        libraryUpdateItemId,
         matchedDraftItemId,
         savedAt: Date.now(),
         selectedAppId,
@@ -1347,6 +1407,7 @@ function App() {
     },
     [
       activeTab,
+      libraryUpdateItemId,
       matchedDraftItemId,
       selectedAppId,
       selectedFullMirrorUrl,
@@ -1830,6 +1891,7 @@ function App() {
     skipNextPopupStatePersistKeyRef.current = storageKey;
     steamSearchRequestIdRef.current += 1;
     setActiveTab(storedState.activeTab);
+    setLibraryUpdateItemId(storedState.libraryUpdateItemId);
     setMatchedDraftItemId(storedState.matchedDraftItemId);
     setSelectedAppId(storedState.selectedAppId);
     setSelectedFullMirrorUrl(storedState.selectedFullMirrorUrl);
@@ -2445,6 +2507,7 @@ function App() {
     const sourcePatchKey = getSourceMatchPatchKey(source, steamPatches);
     const targetState: StoredPopupStateOverrides = {
       activeTab: 'game',
+      libraryUpdateItemId: isLibraryUpdateFlow ? libraryUpdateItemId : null,
       selectedFullMirrorUrl: selection.selectedFullUrl,
       selectedPatchMirrorUrl: selection.selectedPatchUrl,
       selectedSourceKind: source.match.sourceKind,
@@ -2454,8 +2517,8 @@ function App() {
     const currentSourceUrl = draftShell?.sourceUrl ?? sourceUrl;
     if (!isLibraryUpdateFlow) {
       writePopupStateForSourceUrl(currentSourceUrl);
-      writePopupStateForSourceUrl(source.match.sourceUrl, targetState);
     }
+    writePopupStateForSourceUrl(source.match.sourceUrl, targetState);
     setActiveTab('game');
     setStep('game');
     selectSourceForDownload(source);
@@ -3783,6 +3846,7 @@ function App() {
     const lifecycleStatus = getLifecycleStatus(item);
     const showTrackingStatus = shouldShowTrackingStatus(item);
     const showUpdateButton = hasActionableSourceUpdate(item);
+    const showResolvePatchButton = needsPatchMetadataAttention(item);
     const detailGrid = renderLibraryDetailGrid(item, 'list');
     const progressBlock =
       showProgress && item.currentDownload ? (
@@ -3837,17 +3901,33 @@ function App() {
               {renderLibraryActionMenu(item)}
             </div>
             {progressBlock}
-            {showUpdateButton ? (
+            {showUpdateButton || showResolvePatchButton ? (
               <div className="library-item-actions">
-                <button
-                  className="primary-button compact-button library-update-action"
-                  disabled={busy}
-                  onClick={() => openLibraryUpdateFlow(item)}
-                  type="button"
-                >
-                  <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
-                  <span>Update</span>
-                </button>
+                {showUpdateButton ? (
+                  <button
+                    className="primary-button compact-button library-update-action"
+                    disabled={busy}
+                    onClick={() => openLibraryUpdateFlow(item)}
+                    type="button"
+                  >
+                    <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
+                    <span>Update</span>
+                  </button>
+                ) : null}
+                {showResolvePatchButton ? (
+                  <button
+                    className="primary-button compact-button library-update-action patch-attention-button"
+                    disabled={busy}
+                    onClick={() => void openSourcePatchEditor(item)}
+                    type="button"
+                  >
+                    <FontAwesomeIcon
+                      aria-hidden="true"
+                      icon={faTriangleExclamation}
+                    />
+                    <span>Resolve Patch</span>
+                  </button>
+                ) : null}
               </div>
             ) : null}
             {detailGrid}
@@ -3895,13 +3975,28 @@ function App() {
               <span>Update</span>
             </button>
           ) : null}
+          {showResolvePatchButton ? (
+            <button
+              className="primary-button compact-button library-update-action patch-attention-button"
+              disabled={busy}
+              onClick={() => void openSourcePatchEditor(item)}
+              type="button"
+            >
+              <FontAwesomeIcon
+                aria-hidden="true"
+                icon={faTriangleExclamation}
+              />
+              <span>Resolve Patch</span>
+            </button>
+          ) : null}
           <button
+            aria-label="Additional details"
             className="detail-toggle-button"
             onClick={() => setDetailsItemId(item.item.id)}
+            title="Additional details"
             type="button"
           >
             <FontAwesomeIcon aria-hidden="true" icon={faCircleInfo} />
-            <span>Additional Details</span>
           </button>
         </div>
       </article>
@@ -4135,6 +4230,8 @@ function App() {
                           const sourceKind = source.match.sourceKind;
                           const isSelected =
                             selectedSourceView?.match.sourceKind === sourceKind;
+                          const isCurrentInstallSource =
+                            isSourceCurrentForInstall(activeDraftItem, source);
                           const fullMirrors = source.downloadMirrors.filter(
                             (mirror) => mirror.kind === 'full',
                           );
@@ -4196,6 +4293,9 @@ function App() {
                               </div>
                               <div className="source-row__status">
                                 <span className="mini-chip">{lagLabel}</span>
+                                {isCurrentInstallSource ? (
+                                  <span className="mini-chip">Current</span>
+                                ) : null}
                                 {isSelected ? (
                                   <span className="mini-chip">Selected</span>
                                 ) : null}
@@ -4653,7 +4753,7 @@ function App() {
               <div>
                 <p className="section-title">Tracked library</p>
                 <p className="muted-text">
-                  {libraryItems.length} current VaultTrack items.
+                  {visibleLibraryItems.length} of {libraryItems.length} shown.
                 </p>
               </div>
               <div className="library-heading__actions">
@@ -4692,6 +4792,96 @@ function App() {
                 </button>
               </div>
             </div>
+            <div className="library-controls">
+              <label className="search-field">
+                <FontAwesomeIcon aria-hidden="true" icon={faMagnifyingGlass} />
+                <input
+                  aria-label="Search library"
+                  onChange={(event) =>
+                    setLibrarySearch(event.currentTarget.value)
+                  }
+                  placeholder="Search"
+                  value={librarySearch}
+                />
+              </label>
+              <div className="library-controls__row">
+                <div className="sort-control">
+                  <label className="select-field">
+                    <span className="field-label">
+                      <FontAwesomeIcon
+                        aria-hidden="true"
+                        icon={faArrowDownWideShort}
+                      />
+                      Sort
+                    </span>
+                    <select
+                      aria-label="Sort library"
+                      onChange={(event) => {
+                        const nextSort = event.currentTarget
+                          .value as LibrarySortMode;
+                        setLibrarySort(nextSort);
+                        setLibrarySortDirection(
+                          getDefaultLibrarySortDirection(nextSort),
+                        );
+                      }}
+                      value={librarySort}
+                    >
+                      <option value="name">Name</option>
+                      <option value="status">Status</option>
+                      <option value="recentlyUpdated">Recently updated</option>
+                    </select>
+                  </label>
+                  <button
+                    aria-label={`Sort ${
+                      librarySortDirection === 'asc'
+                        ? 'ascending'
+                        : 'descending'
+                    }`}
+                    className="sort-direction-button"
+                    onClick={() =>
+                      setLibrarySortDirection((current) =>
+                        current === 'asc' ? 'desc' : 'asc',
+                      )
+                    }
+                    title={
+                      librarySortDirection === 'asc'
+                        ? 'Ascending'
+                        : 'Descending'
+                    }
+                    type="button"
+                  >
+                    <FontAwesomeIcon
+                      aria-hidden="true"
+                      icon={
+                        librarySortDirection === 'asc' ? faSortUp : faSortDown
+                      }
+                    />
+                  </button>
+                </div>
+                <label className="select-field">
+                  <span className="field-label">
+                    <FontAwesomeIcon aria-hidden="true" icon={faFilter} />
+                    Filter
+                  </span>
+                  <select
+                    aria-label="Filter library status"
+                    onChange={(event) =>
+                      setLibraryStatusFilter(
+                        event.currentTarget.value as LibraryStatusFilter,
+                      )
+                    }
+                    value={libraryStatusFilter}
+                  >
+                    {LIBRARY_STATUS_FILTER_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label} (
+                        {libraryStatusFilterCounts[option.value]})
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            </div>
             <div
               className={
                 libraryViewMode === 'cards'
@@ -4706,8 +4896,15 @@ function App() {
                     Add a supported page or import from the desktop app.
                   </p>
                 </div>
+              ) : visibleLibraryItems.length === 0 ? (
+                <div className="empty-state">
+                  <strong>No games match this view.</strong>
+                  <p className="muted-text">
+                    Try another filter, sort, or search.
+                  </p>
+                </div>
               ) : (
-                libraryItems.map((item) => renderLibraryItem(item))
+                visibleLibraryItems.map((item) => renderLibraryItem(item))
               )}
             </div>
           </section>

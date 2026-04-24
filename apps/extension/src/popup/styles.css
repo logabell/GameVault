@@ -22,6 +22,8 @@
   --accent-soft: rgba(32, 149, 77, 0.14);
   --success: #20954d;
   --warning: #b7771e;
+  --warning-button: #895b10;
+  --warning-button-border: #704806;
   --danger: #c74955;
   --overlay: rgba(247, 250, 250, 0.94);
 }
@@ -43,6 +45,8 @@
   --accent-soft: rgba(66, 199, 104, 0.16);
   --success: #42c768;
   --warning: #e8b057;
+  --warning-button: #9a650d;
+  --warning-button-border: #c47f12;
   --danger: #e06775;
   --overlay: rgba(17, 23, 25, 0.95);
 }
@@ -240,6 +244,12 @@ select option {
   background: var(--success);
 }
 
+.primary-button.patch-attention-button {
+  border: 1px solid var(--warning-button-border);
+  background: var(--warning-button);
+  color: #fffaf0;
+}
+
 .ghost-button,
 .danger-button {
   min-height: 36px;
@@ -403,6 +413,71 @@ select option {
 
 .library-heading {
   align-items: start;
+}
+
+.library-controls {
+  display: grid;
+  gap: 8px;
+  margin-block: 10px;
+}
+
+.library-controls__row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px;
+  align-items: end;
+}
+
+.search-field {
+  min-height: 38px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding-left: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--panel-soft);
+  color: var(--muted);
+}
+
+.search-field input {
+  min-height: 36px;
+  padding-left: 0;
+  border: 0;
+  background: transparent;
+}
+
+.select-field {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.select-field .field-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.sort-control {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 38px;
+  gap: 6px;
+  align-items: end;
+}
+
+.sort-direction-button {
+  width: 38px;
+  height: 38px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--panel-soft);
+  color: var(--muted);
+  font-weight: 900;
 }
 
 .view-toggle {
@@ -603,12 +678,12 @@ select option {
 
 .detail-toggle-button {
   align-self: end;
-  width: fit-content;
+  width: 31px;
+  height: 31px;
   min-height: 31px;
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  padding: 6px 8px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--panel-soft);
@@ -649,9 +724,9 @@ select option {
 
 .status-chip.discovered,
 .library-presence-chip.is-discovered {
-  color: color-mix(in srgb, var(--accent) 72%, var(--ink));
-  border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
-  background: color-mix(in srgb, var(--accent) 14%, var(--panel-soft));
+  color: var(--muted-strong);
+  border-color: color-mix(in srgb, var(--muted) 28%, var(--border));
+  background: color-mix(in srgb, var(--muted) 10%, var(--panel-soft));
 }
 
 .status-chip.failed,

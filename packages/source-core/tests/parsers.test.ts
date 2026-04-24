@@ -1282,6 +1282,36 @@ describe('source parsers', () => {
     ]);
   });
 
+  it('parses ElAmigos full-release header dates when no update blocks exist', () => {
+    const html = `
+      <html>
+        <head>
+          <title>House Party - ElAmigos official site</title>
+        </head>
+        <body>
+          <h2>House Party (2022), 4.75GB</h2>
+          <h3>ElAmigos release, unprotected game (crack is not necessary). Updated to version 1.5.2.13934 (28.02.2026).</h3>
+          <h2>DDOWNLOAD</h2>
+          <h3><a href="https://www.filecrypt.cc/Container/735593036A.html">https://www.filecrypt.cc/Container/735593036A.html</a></h3>
+          <h2>RAPIDGATOR</h2>
+          <h3><a href="https://www.keeplinks.org/p16/62d995fd05aad">https://www.keeplinks.org/p16/62d995fd05aad</a></h3>
+        </body>
+      </html>
+    `;
+
+    const parsed = parseSupportedPage(
+      'https://elamigos.site/data/House_Party_MULTi8_-_ElAmigos.html',
+      html,
+    );
+
+    expect(parsed.sourceKind).toBe('elamigos');
+    expect(parsed.title).toBe('House Party');
+    expect(parsed.latestSourceRelease.version).toBe('1.5.2.13934');
+    expect(parsed.latestSourceRelease.patchDate).toBe('02/28/2026');
+    expect(parsed.patchDownloadUrls).toHaveLength(0);
+    expect(parsed.fullDownloadUrls).toHaveLength(2);
+  });
+
   it('parses ElAmigos pages that only expose an updated-till date', () => {
     const html = `
       <html>

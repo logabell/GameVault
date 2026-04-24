@@ -22,6 +22,8 @@
   --accent-soft: rgba(32, 149, 77, 0.14);
   --success: #20954d;
   --warning: #b7771e;
+  --warning-button: #895b10;
+  --warning-button-border: #704806;
   --danger: #c74955;
   --overlay: rgba(247, 250, 250, 0.92);
 }
@@ -43,6 +45,8 @@
   --accent-soft: rgba(66, 199, 104, 0.16);
   --success: #42c768;
   --warning: #e8b057;
+  --warning-button: #9a650d;
+  --warning-button-border: #c47f12;
   --danger: #e06775;
   --overlay: rgba(17, 23, 25, 0.94);
 }
@@ -1532,9 +1536,9 @@ code {
 }
 
 .primary-inline-button.patch-attention-button {
-  border-color: color-mix(in srgb, var(--warning) 54%, var(--border));
-  background: color-mix(in srgb, var(--warning) 92%, var(--accent));
-  color: var(--ink);
+  border-color: var(--warning-button-border);
+  background: var(--warning-button);
+  color: #fffaf0;
 }
 
 .source-modal-menu {

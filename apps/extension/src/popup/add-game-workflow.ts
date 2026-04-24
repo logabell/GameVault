@@ -225,6 +225,34 @@ export function trackedItemMatchesSourceUrls(
   );
 }
 
+export function isSourceCurrentForInstall(
+  item: TrackedItemView | null | undefined,
+  source: MatchedSourceView | null | undefined,
+): boolean {
+  const installRecord = item?.installRecord;
+  if (!installRecord || !source) {
+    return false;
+  }
+
+  if (installRecord.installedSourceKind === source.match.sourceKind) {
+    return true;
+  }
+
+  const installedUrls = comparableSourcePageUrlVariants(
+    installRecord.installedSourceUrl,
+  );
+  if (installedUrls.length === 0) {
+    return false;
+  }
+
+  const sourceUrls = [
+    source.match.sourceUrl,
+    source.snapshot?.sourceUrl,
+  ].flatMap((url) => comparableSourcePageUrlVariants(url));
+
+  return sourceUrls.some((url) => installedUrls.includes(url));
+}
+
 export function haveSharedMirrorUrls(
   fullRows: Array<{ url: string }>,
   patchRows: Array<{ url: string }>,
@@ -405,6 +433,94 @@ function findPatchEntryByBuildId(
   return patches.find((patch) => patch.buildId === buildId) ?? null;
 }
 
+function normalizePatchDateKey(
+  value: string | null | undefined,
+): string | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  const slashMatch = trimmed.match(
+    /(?<month>\d{1,2})\/(?<day>\d{1,2})\/(?<year>\d{4})/,
+  );
+  if (slashMatch?.groups) {
+    return `${slashMatch.groups.year}-${slashMatch.groups.month.padStart(2, '0')}-${slashMatch.groups.day.padStart(2, '0')}`;
+  }
+
+  const dotMatch = trimmed.match(
+    /(?<day>\d{1,2})\.(?<month>\d{1,2})\.(?<year>\d{4})/,
+  );
+  if (dotMatch?.groups) {
+    return `${dotMatch.groups.year}-${dotMatch.groups.month.padStart(2, '0')}-${dotMatch.groups.day.padStart(2, '0')}`;
+  }
+
+  const timestamp = new Date(trimmed).getTime();
+  if (Number.isNaN(timestamp)) return null;
+  return new Date(timestamp).toISOString().slice(0, 10);
+}
+
+function findUniquePatchEntryByDate(
+  patches: SteamPatchEntry[],
+  patchDate: string | null | undefined,
+): SteamPatchEntry | null {
+  const dateKey = normalizePatchDateKey(patchDate);
+  if (!dateKey) return null;
+  const matches = patches.filter(
+    (patch) => normalizePatchDateKey(patch.patchDate) === dateKey,
+  );
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+function canonicalizeSourceWithPatch(params: {
+  fallbackVersionsBehindLatest?: number | null;
+  patchEntries: SteamPatchEntry[];
+  source: MatchedSourceView;
+  matchedPatch: SteamPatchEntry;
+}): MatchedSourceView {
+  const patchLag = derivePatchLag({
+    feedEntries: params.patchEntries,
+    selectedPatch: params.matchedPatch,
+  });
+  const versionsBehindLatest =
+    patchLag.versionsBehindLatest ??
+    params.fallbackVersionsBehindLatest ??
+    params.source.versionsBehindLatest ??
+    null;
+
+  return {
+    ...params.source,
+    isUpdateSource:
+      params.source.isUpdateSource ||
+      (versionsBehindLatest === 0 && params.source.match.usable),
+    matchedPatch: params.matchedPatch,
+    snapshot: params.source.snapshot
+      ? {
+          ...params.source.snapshot,
+          observedBuildId:
+            params.matchedPatch.buildId ??
+            params.source.snapshot.observedBuildId,
+          observedPatchDate:
+            params.matchedPatch.patchDate ??
+            params.source.snapshot.observedPatchDate,
+          observedPatchLink:
+            params.matchedPatch.link ??
+            params.source.snapshot.observedPatchLink,
+          observedPatchTitle:
+            params.matchedPatch.patchTitle ??
+            params.source.snapshot.observedPatchTitle,
+        }
+      : params.source.snapshot,
+    updateStatus:
+      typeof versionsBehindLatest === 'number'
+        ? versionsBehindLatest === 0
+          ? 'matches_upstream'
+          : 'source_behind_upstream'
+        : params.source.updateStatus,
+    versionsBehindLatest,
+    versionsBehindLatestIsLowerBound:
+      patchLag.versionsBehindLatestIsLowerBound ??
+      params.source.versionsBehindLatestIsLowerBound,
+  };
+}
+
 export function inferSourceComparisonRows(
   item: TrackedItemView | null | undefined,
   patches: SteamPatchCandidate[],
@@ -415,6 +531,24 @@ export function inferSourceComparisonRows(
     patchEntryFromCandidate(item.item.id, patch),
   );
   return item.sourceMatches.map((source) => {
+    if (
+      source.match.sourceKind === 'elamigos' &&
+      source.snapshot &&
+      !sourceBuildId(source)
+    ) {
+      const matchedPatch = findUniquePatchEntryByDate(
+        patchEntries,
+        source.snapshot.observedPatchDate,
+      );
+      if (matchedPatch?.buildId) {
+        return canonicalizeSourceWithPatch({
+          matchedPatch,
+          patchEntries,
+          source,
+        });
+      }
+    }
+
     if (source.match.sourceKind !== 'steamrip' || !source.snapshot) {
       return source;
     }
@@ -465,43 +599,29 @@ export function inferSourceComparisonRows(
         ? matchingPeer.matchedPatch
         : null) ??
       findPatchEntryByBuildId(patchEntries, inferredBuildId);
-    const patchLag = matchedPatch
-      ? derivePatchLag({
-          feedEntries: patchEntries,
-          selectedPatch: matchedPatch,
-        })
-      : null;
-    const versionsBehindLatest =
-      patchLag?.versionsBehindLatest ??
-      matchingPeer?.versionsBehindLatest ??
-      source.versionsBehindLatest ??
-      null;
+    if (matchedPatch) {
+      return canonicalizeSourceWithPatch({
+        fallbackVersionsBehindLatest: matchingPeer?.versionsBehindLatest,
+        matchedPatch,
+        patchEntries,
+        source,
+      });
+    }
 
     return {
       ...source,
       isUpdateSource:
         source.isUpdateSource ||
-        Boolean(matchingPeer?.isUpdateSource) ||
-        (versionsBehindLatest === 0 && source.match.usable),
-      matchedPatch: matchedPatch ?? source.matchedPatch,
+        Boolean(matchingPeer?.isUpdateSource),
+      matchedPatch: source.matchedPatch,
       snapshot: {
         ...source.snapshot,
         observedBuildId: inferredBuildId,
-        observedPatchDate:
-          matchedPatch?.patchDate ?? source.snapshot.observedPatchDate,
-        observedPatchLink: matchedPatch?.link ?? source.snapshot.observedPatchLink,
-        observedPatchTitle:
-          matchedPatch?.patchTitle ?? source.snapshot.observedPatchTitle,
       },
-      updateStatus:
-        typeof versionsBehindLatest === 'number'
-          ? versionsBehindLatest === 0
-            ? 'matches_upstream'
-            : 'source_behind_upstream'
-          : (matchingPeer?.updateStatus ?? source.updateStatus),
-      versionsBehindLatest,
+      updateStatus: matchingPeer?.updateStatus ?? source.updateStatus,
+      versionsBehindLatest:
+        matchingPeer?.versionsBehindLatest ?? source.versionsBehindLatest,
       versionsBehindLatestIsLowerBound:
-        patchLag?.versionsBehindLatestIsLowerBound ??
         matchingPeer?.versionsBehindLatestIsLowerBound ??
         source.versionsBehindLatestIsLowerBound,
     };
@@ -658,13 +778,7 @@ export function getSourceDownloadSelection(
   };
 }
 
-export function hasActionableSourceUpdate(item: TrackedItemView): boolean {
-  return (
-    item.patchMetadataStatus !== 'needs_attention' &&
-    ((item as Partial<TrackedItemView>).trackingStatus ??
-      'watching_source') === 'update_available'
-  );
-}
+export { hasActionableSourceUpdate } from '@vaulttrack/shared-types';
 
 function sourceHasSelectableFullMirror(source: MatchedSourceView): boolean {
   return Boolean(
