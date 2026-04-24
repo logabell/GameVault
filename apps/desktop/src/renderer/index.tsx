@@ -57,6 +57,7 @@ import type {
   ImportCandidate,
   ImportScanPayload,
   LibraryRootRecord,
+  MatchedSourceView,
   MyJDownloaderDeviceSummary,
   RemoveTrackedItemMode,
   SaveImportBatchPayload,
@@ -107,6 +108,18 @@ import {
   type LibrarySortMode,
   type LibraryStatusFilter,
 } from './library-controls.js';
+import {
+  findSharedPatchMirrorUrl,
+  formatEtaLabel,
+  getLikelyPatchForUpdateSource,
+  haveSharedMirrorUrls,
+  planUpdateMirrorSelection,
+  selectedDownloadsFromUpdatePlan,
+  updatePlanFullUrl,
+  updatePlanPatchUrl,
+  type SteamPatchSuggestion,
+  type UpdateMirrorSelectionPlan,
+} from './update-flow.js';
 
 type Section = 'library' | 'imports' | 'logs' | 'settings';
 type LibraryViewMode = 'cards' | 'list';
@@ -116,6 +129,7 @@ type ResolvedTheme = 'light' | 'dark';
 type ImportInstalledSourceKind = SourceKind;
 type SettingsSaveStatus = 'idle' | 'saving' | 'saved';
 type ItemBusyAction =
+  | 'cancelDownload'
   | 'clearMirrorFailed'
   | 'completeInstall'
   | 'deleteFiles'
@@ -130,6 +144,18 @@ type RetryMirrorOption = Pick<
   DownloadMirrorRecord,
   'kind' | 'label' | 'manuallyFailedAt' | 'url'
 >;
+type UpdateFlowState = {
+  error: string | null;
+  item: TrackedItemView;
+  likelyPatch: SteamPatchSuggestion | null;
+  loadingPatches: boolean;
+  mirrorPlan: UpdateMirrorSelectionPlan;
+  patches: SteamPatchCandidate[];
+  phase: 'manual' | 'mirrors' | 'patch';
+  selectedPatchKey: string | null;
+  source: MatchedSourceView;
+  sourceKind: SupportedSourceKind;
+};
 type ImportPatchHistoryStatus =
   | 'gathering'
   | 'idle'
@@ -238,6 +264,7 @@ declare global {
         trackedItemId: string;
         match: ConfirmedSteamMatch;
       }): Promise<TrackedItemView>;
+      cancelDownload(trackedItemId: string): Promise<TrackedItemView>;
       completeStagedInstall(trackedItemId: string): Promise<TrackedItemView>;
       disconnectMyJDownloader(): Promise<ConnectionHealthSummary>;
       getConnectionHealth(): Promise<ConnectionHealthSummary>;
@@ -325,6 +352,7 @@ declare global {
       }): Promise<TrackedItemView>;
       updateSourcePatch(payload: {
         selectedSteamPatch: SteamPatchCandidate;
+        sourceKind?: SupportedSourceKind;
         steamPatchEntries?: SteamPatchCandidate[] | null;
         trackedItemId: string;
       }): Promise<TrackedItemView>;
@@ -402,6 +430,31 @@ function formatLabel(value: string | null | undefined): string {
   return String(value)
     .replaceAll('_', ' ')
     .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function pathBasename(value: string | null | undefined): string {
+  if (!value) return '';
+  return value.split(/[\\/]/).filter(Boolean).at(-1) ?? '';
+}
+
+function pathDirname(value: string | null | undefined): string {
+  if (!value) return '';
+  const separator = value.includes('\\') ? '\\' : '/';
+  const parts = value.split(/[\\/]/).filter(Boolean);
+  if (parts.length <= 1) return value;
+  const prefix = /^[a-z]:/i.test(parts[0] ?? '') ? '' : value.startsWith(separator) ? separator : '';
+  return `${prefix}${parts.slice(0, -1).join(separator)}`;
+}
+
+function joinDisplayPath(
+  base: string | null | undefined,
+  ...segments: string[]
+): string {
+  if (!base) return segments.filter(Boolean).join('\\');
+  const separator = base.includes('\\') ? '\\' : '/';
+  return [base.replace(/[\\/]+$/, ''), ...segments.filter(Boolean)]
+    .filter(Boolean)
+    .join(separator);
 }
 
 function createOlderThanAvailablePatch(appId: number): SteamPatchCandidate {
@@ -770,54 +823,6 @@ function patchSummary(patch: SteamPatchCandidate): string {
     .join(' | ');
 }
 
-function normalizeComparableUrl(
-  value: string | null | undefined,
-): string | null {
-  if (!value) return null;
-  try {
-    const parsedUrl = new URL(value);
-    parsedUrl.hash = '';
-    return parsedUrl.toString().replace(/\/$/, '').toLowerCase();
-  } catch {
-    return value.trim().replace(/\/$/, '').toLowerCase() || null;
-  }
-}
-
-function haveSharedMirrorUrls(
-  fullRows: Array<{ url: string }>,
-  patchRows: Array<{ url: string }>,
-): boolean {
-  if (fullRows.length === 0 || patchRows.length === 0) {
-    return false;
-  }
-
-  const fullUrls = new Set(
-    fullRows
-      .map((row) => normalizeComparableUrl(row.url))
-      .filter((url): url is string => Boolean(url)),
-  );
-  return patchRows.every((row) => {
-    const url = normalizeComparableUrl(row.url);
-    return Boolean(url && fullUrls.has(url));
-  });
-}
-
-function findSharedPatchMirrorUrl(
-  fullUrl: string | null,
-  patchRows: Array<{ url: string }>,
-): string | null {
-  const normalizedFullUrl = normalizeComparableUrl(fullUrl);
-  if (!normalizedFullUrl) {
-    return null;
-  }
-
-  return (
-    patchRows.find(
-      (row) => normalizeComparableUrl(row.url) === normalizedFullUrl,
-    )?.url ?? null
-  );
-}
-
 function formatRelativeTime(value: string | null | undefined): string {
   if (!value) return 'Never';
   const timestamp = new Date(value).getTime();
@@ -849,6 +854,7 @@ function formatRelativeFuture(value: string | null | undefined): string {
 function hasActiveProgress(item: TrackedItemView): boolean {
   return Boolean(
     item.currentDownload &&
+    item.currentDownload.provider !== 'manual' &&
     ['queued', 'downloading', 'extracting', 'staged'].includes(
       item.currentDownload.stage,
     ),
@@ -869,6 +875,46 @@ function canMarkDownloadFailed(item: TrackedItemView): boolean {
       item.currentDownload.stage,
     ),
   );
+}
+
+function canCancelDownload(item: TrackedItemView): boolean {
+  return Boolean(
+    item.currentDownload && item.currentDownload.stage !== 'complete',
+  );
+}
+
+function canCompleteManualInstall(item: TrackedItemView): boolean {
+  return Boolean(
+    item.currentDownload?.provider === 'manual' &&
+      item.currentDownload.stage !== 'complete' &&
+      item.currentDownload.stage !== 'failed',
+  );
+}
+
+function canConfirmElamigosStagedInstall(item: TrackedItemView): boolean {
+  return Boolean(
+    item.currentDownload?.sourceKind === 'elamigos' &&
+      item.currentDownload.provider !== 'manual' &&
+      (item.currentDownload.stage === 'staged' ||
+        (item.currentDownload.stage === 'extracting' &&
+          item.currentDownload.statusMessage ===
+            'Waiting for JDownloader extraction to finish')),
+  );
+}
+
+function canConfirmInstall(item: TrackedItemView): boolean {
+  return (
+    item.status === 'staged' ||
+    canCompleteManualInstall(item) ||
+    canConfirmElamigosStagedInstall(item)
+  );
+}
+
+function getConfirmInstallButtonLabel(item: TrackedItemView): string {
+  if (item.currentDownload?.provider === 'manual') {
+    return 'Confirm Manual Install';
+  }
+  return 'Confirm Install';
 }
 
 function renderFailedMirrorBadge(props: { onClear?: () => void } = {}) {
@@ -1529,6 +1575,7 @@ function App() {
     manualSourceKind: SupportedSourceKind;
     manualUrl: string;
   } | null>(null);
+  const [updateFlow, setUpdateFlow] = useState<UpdateFlowState | null>(null);
   const [importedSourceEditor, setImportedSourceEditor] = useState<{
     item: TrackedItemView;
     sourceKind: ImportInstalledSourceKind;
@@ -1644,6 +1691,26 @@ function App() {
     startTransition(() => {
       setItems(trackedItems);
       setLogs(loadedLogs);
+    });
+  }
+
+  function mergeTrackedItemView(updated: TrackedItemView) {
+    startTransition(() => {
+      setItems((current) =>
+        current.map((item) =>
+          item.item.id === updated.item.id ? updated : item,
+        ),
+      );
+      setSourcesModal((current) =>
+        current?.item.item.id === updated.item.id
+          ? { ...current, item: updated }
+          : current,
+      );
+      setUpdateFlow((current) =>
+        current?.item.item.id === updated.item.id
+          ? { ...current, item: updated }
+          : current,
+      );
     });
   }
 
@@ -3102,22 +3169,279 @@ function App() {
     }
   }
 
-  async function queueSourceUpdate(sourceKind: SupportedSourceKind) {
-    if (!sourcesModal) return;
-    setBusyId(sourcesModal.item.item.id);
-    setBusyAction('retry');
-    setSourceBusyKind(sourceKind);
-    try {
-      const updated = await window.vaultTrackApi.queueUpdateFromSource({
-        sourceKind,
-        trackedItemId: sourcesModal.item.item.id,
-      });
-      setSourcesModal((current) =>
-        current ? { ...current, item: updated } : current,
+  function getUpdatePatchSelection(
+    item: TrackedItemView,
+    source: MatchedSourceView,
+    patches: SteamPatchCandidate[],
+  ): {
+    likelyPatch: SteamPatchSuggestion | null;
+    selectedPatchKey: string | null;
+  } {
+    const patchOptions = getPatchOptions(patches, item.item.steamAppId);
+    const likelyPatch = getLikelyPatchForUpdateSource(source, patchOptions);
+    return {
+      likelyPatch,
+      selectedPatchKey:
+        likelyPatch?.key ??
+        getTrackedPatchKey(item, patchOptions) ??
+        (patchOptions[0] ? patchCandidateKey(patchOptions[0]) : null),
+    };
+  }
+
+  function buildUpdateFlowState(params: {
+    item: TrackedItemView;
+    mirrorPlan: UpdateMirrorSelectionPlan;
+    phase: UpdateFlowState['phase'];
+    source: MatchedSourceView;
+    sourceKind: SupportedSourceKind;
+  }): UpdateFlowState {
+    const seedCandidates: Array<SteamPatchCandidate | null | undefined> = [
+      params.source.matchedPatch,
+      params.item.selectedPatch,
+      params.item.latestPatch,
+    ];
+    const seedPatches = mergePatchCandidates(
+      seedCandidates.filter(
+        (patch): patch is SteamPatchCandidate => Boolean(patch),
+      ),
+    );
+    const patchSelection = getUpdatePatchSelection(
+      params.item,
+      params.source,
+      seedPatches,
+    );
+    return {
+      error: null,
+      item: params.item,
+      likelyPatch: patchSelection.likelyPatch,
+      loadingPatches: false,
+      mirrorPlan: params.mirrorPlan,
+      patches: seedPatches,
+      phase: params.phase,
+      selectedPatchKey: patchSelection.selectedPatchKey,
+      source: params.source,
+      sourceKind: params.sourceKind,
+    };
+  }
+
+  function getMissingUpdateMirrorMessage(plan: UpdateMirrorSelectionPlan) {
+    if (plan.requiresFull && !plan.fullUrl) {
+      return plan.sourceKind === 'elamigos'
+        ? 'Select an ElAmigos full mirror before queueing this update.'
+        : 'Select a full download mirror before queueing this update.';
+    }
+    if (plan.requiresPatch && !plan.patchUrl) {
+      return 'Select an ElAmigos update mirror before queueing this update.';
+    }
+    return 'Select a download mirror before queueing this update.';
+  }
+
+  function sourceUsesManualDownload(sourceKind: SupportedSourceKind): boolean {
+    if (sourceKind === 'elamigos') {
+      return (
+        !settings.jDownloaderEnabled ||
+        settings.jDownloaderSourcePreferences?.elamigos === false
       );
+    }
+    if (sourceKind === 'steamrip') {
+      return (
+        !settings.jDownloaderEnabled ||
+        settings.jDownloaderSourcePreferences?.steamrip === false
+      );
+    }
+    return false;
+  }
+
+  function updateFlowMirrorPlan(
+    current: UpdateFlowState,
+    nextPlan: UpdateMirrorSelectionPlan,
+  ): UpdateFlowState {
+    return {
+      ...current,
+      error: null,
+      mirrorPlan: nextPlan,
+    };
+  }
+
+  async function copyManualUpdateText(value: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+    } catch {
+      window.alert('Unable to copy to clipboard.');
+    }
+  }
+
+  async function loadUpdatePatchChoices(flow: UpdateFlowState) {
+    if (!flow.item.item.steamAppId) {
+      await queueUpdateFlowDownload(flow);
+      return;
+    }
+
+    const loadingFlow = {
+      ...flow,
+      error: null,
+      loadingPatches: true,
+      phase: 'patch' as const,
+    };
+    setUpdateFlow(loadingFlow);
+    setBusyId(flow.item.item.id);
+    setBusyAction('updatePatch');
+    setSourceBusyKind(flow.sourceKind);
+    let patches = flow.patches;
+    try {
+      const persistedPatches = await window.vaultTrackApi.listSteamPatchEntries(
+        flow.item.item.id,
+      );
+      patches = mergePatchCandidates([...patches, ...persistedPatches]);
+      let selection = getUpdatePatchSelection(flow.item, flow.source, patches);
+      setUpdateFlow((current) =>
+        current
+          ? {
+              ...current,
+              likelyPatch: selection.likelyPatch,
+              patches,
+              selectedPatchKey: selection.selectedPatchKey,
+            }
+          : current,
+      );
+
+      const resolvedPatches = await window.vaultTrackApi.resolveSteamPatches({
+        appId: flow.item.item.steamAppId,
+      });
+      patches = mergePatchCandidates([...patches, ...resolvedPatches.patches]);
+      selection = getUpdatePatchSelection(flow.item, flow.source, patches);
+      setUpdateFlow((current) =>
+        current
+          ? {
+              ...current,
+              error: null,
+              likelyPatch: selection.likelyPatch,
+              loadingPatches: false,
+              patches,
+              selectedPatchKey: selection.selectedPatchKey,
+            }
+          : current,
+      );
+    } catch (error) {
+      setUpdateFlow((current) =>
+        current
+          ? {
+              ...current,
+              error:
+                error instanceof Error
+                  ? error.message
+                  : 'Unable to load SteamDB patches.',
+              loadingPatches: false,
+            }
+          : current,
+      );
+    } finally {
+      setBusyId(null);
+      setBusyAction(null);
+      setSourceBusyKind(null);
+    }
+  }
+
+  async function startSourceUpdate(sourceKind: SupportedSourceKind) {
+    if (!sourcesModal) return;
+
+    const source = sourcesModal.item.sourceMatches.find(
+      (entry) => entry.match.sourceKind === sourceKind,
+    );
+    if (!source) {
+      window.alert(
+        `No cached ${formatTrackedSourceKind(sourceKind)} source is available.`,
+      );
+      return;
+    }
+
+    const mirrorPlan = planUpdateMirrorSelection({
+      installedSourceKind: getInstalledSourceKind(sourcesModal.item),
+      mirrors: source.downloadMirrors,
+      sourceKind,
+    });
+    if (!selectedDownloadsFromUpdatePlan(mirrorPlan)) {
+      window.alert(getMissingUpdateMirrorMessage(mirrorPlan));
+      return;
+    }
+
+    const flow = buildUpdateFlowState({
+      item: sourcesModal.item,
+      mirrorPlan,
+      phase:
+        mirrorPlan.showFullRows || mirrorPlan.showPatchRows
+          ? 'mirrors'
+          : 'patch',
+      source,
+      sourceKind,
+    });
+
+    if (flow.phase === 'mirrors') {
+      setUpdateFlow(flow);
+      return;
+    }
+
+    await loadUpdatePatchChoices(flow);
+  }
+
+  async function queueUpdateFlowDownload(flow: UpdateFlowState) {
+    const selectedDownloads = selectedDownloadsFromUpdatePlan(flow.mirrorPlan);
+    if (!selectedDownloads) {
+      window.alert(getMissingUpdateMirrorMessage(flow.mirrorPlan));
+      return;
+    }
+
+    const selectedPatch = flow.item.item.steamAppId
+      ? getPatchOptions(flow.patches, flow.item.item.steamAppId).find(
+          (patch) => patchCandidateKey(patch) === flow.selectedPatchKey,
+        )
+      : null;
+    if (flow.item.item.steamAppId && !selectedPatch) {
+      return;
+    }
+
+    setBusyId(flow.item.item.id);
+    setBusyAction('retry');
+    setSourceBusyKind(flow.sourceKind);
+    try {
+      if (selectedPatch) {
+        const patchedItem = await window.vaultTrackApi.updateSourcePatch({
+          selectedSteamPatch: selectedPatch,
+          sourceKind: flow.sourceKind,
+          steamPatchEntries: flow.patches,
+          trackedItemId: flow.item.item.id,
+        });
+        mergeTrackedItemView(patchedItem);
+      }
+      const updated = await window.vaultTrackApi.queueUpdateFromSource({
+        selectedDownloads,
+        sourceKind: flow.sourceKind,
+        trackedItemId: flow.item.item.id,
+      });
+      mergeTrackedItemView(updated);
+      setSourcesModal(null);
+      if (updated.currentDownload?.provider === 'manual') {
+        setUpdateFlow({
+          ...flow,
+          error: null,
+          item: updated,
+          loadingPatches: false,
+          phase: 'manual',
+        });
+      } else {
+        setUpdateFlow(null);
+      }
       await refreshItems();
     } catch (error) {
-      window.alert(error instanceof Error ? error.message : 'Action failed.');
+      setUpdateFlow((current) =>
+        current
+          ? {
+              ...current,
+              error: error instanceof Error ? error.message : 'Action failed.',
+              loadingPatches: false,
+            }
+          : current,
+      );
     } finally {
       setBusyId(null);
       setBusyAction(null);
@@ -3192,6 +3516,21 @@ function App() {
       setBusyId(null);
       setBusyAction(null);
     }
+  }
+
+  async function cancelDownload(item: TrackedItemView) {
+    const confirmed = window.confirm(
+      `Cancel the current download for ${item.item.title}? Staged files will be deleted, and the JDownloader package will be removed if it exists. Installed library files will stay in place.`,
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    await runItemAction(
+      item.item.id,
+      () => window.vaultTrackApi.cancelDownload(item.item.id),
+      'cancelDownload',
+    );
   }
 
   function openRetrySelector(item: TrackedItemView) {
@@ -3650,11 +3989,14 @@ function App() {
     if (!hasActiveProgress(item) || !item.currentDownload) return null;
     return (
       <div className="progress-block">
-        <div className="progress-track">
-          <div
-            className="progress-fill"
-            style={{ width: `${progress ?? 0}%` }}
-          />
+        <div className="progress-header">
+          <div className="progress-track">
+            <div
+              className="progress-fill"
+              style={{ width: `${progress ?? 0}%` }}
+            />
+          </div>
+          {renderCancelDownloadButton(item, 'progress')}
         </div>
         <div className="progress-meta">
           <span>{formatDownloadSummary(item, progress)}</span>
@@ -3664,6 +4006,7 @@ function App() {
               ? `${formatBytes(item.currentDownload.speed)}/s`
               : 'Waiting'}
           </span>
+          <span>{formatEtaLabel(item.currentDownload.etaSeconds)}</span>
         </div>
         {item.currentDownload.parts && item.currentDownload.parts.length > 1 ? (
           <div className="progress-parts">
@@ -3673,6 +4016,56 @@ function App() {
           </div>
         ) : null}
       </div>
+    );
+  }
+
+  function renderCancelDownloadButton(
+    item: TrackedItemView,
+    variant: 'action' | 'progress' = 'action',
+  ) {
+    if (!canCancelDownload(item)) return null;
+    const itemBusy = busyId === item.item.id;
+    const cancelling = itemBusy && busyAction === 'cancelDownload';
+    return (
+      <button
+        aria-busy={cancelling}
+        aria-label={`Cancel download for ${item.item.title}`}
+        className={`inline-icon-button cancel-download-button ${
+          variant === 'progress' ? 'is-progress' : ''
+        }`}
+        disabled={itemBusy}
+        onClick={() => void cancelDownload(item)}
+        title="Cancel download and delete staged files"
+        type="button"
+      >
+        <FontAwesomeIcon aria-hidden="true" icon={faXmark} />
+      </button>
+    );
+  }
+
+  function renderConfirmInstallButton(item: TrackedItemView) {
+    if (!canConfirmInstall(item)) return null;
+    const itemBusy = busyId === item.item.id;
+    const completing = itemBusy && busyAction === 'completeInstall';
+    return (
+      <button
+        aria-busy={completing}
+        className="primary-inline-button confirm-install-button"
+        disabled={itemBusy}
+        onClick={() =>
+          void runItemAction(
+            item.item.id,
+            () => window.vaultTrackApi.completeStagedInstall(item.item.id),
+            'completeInstall',
+          )
+        }
+        type="button"
+      >
+        <FontAwesomeIcon aria-hidden="true" icon={faCheck} />
+        <span>
+          {completing ? 'Completing...' : getConfirmInstallButtonLabel(item)}
+        </span>
+      </button>
     );
   }
 
@@ -3872,7 +4265,26 @@ function App() {
                 : 'Mark Failed'}
             </button>
           ) : null}
-          {item.status === 'staged' ? (
+          {canCancelDownload(item) ? (
+            <button
+              aria-busy={itemBusyAction === 'cancelDownload'}
+              className="is-danger"
+              disabled={itemBusy}
+              onClick={(event) =>
+                runItemMenuAction(event, () => {
+                  void cancelDownload(item);
+                })
+              }
+              role="menuitem"
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faXmark} />
+              {itemBusyAction === 'cancelDownload'
+                ? 'Cancelling...'
+                : 'Cancel Download'}
+            </button>
+          ) : null}
+          {canConfirmInstall(item) ? (
             <button
               aria-busy={itemBusyAction === 'completeInstall'}
               disabled={itemBusy}
@@ -3892,7 +4304,9 @@ function App() {
               <FontAwesomeIcon aria-hidden="true" icon={faCheck} />
               {itemBusyAction === 'completeInstall'
                 ? 'Completing Install...'
-                : 'Mark Install Complete'}
+                : item.currentDownload?.provider === 'manual'
+                  ? 'Confirm Manual Install'
+                  : 'Mark Install Complete'}
             </button>
           ) : null}
           <button
@@ -4143,8 +4557,9 @@ function App() {
                 const match = source?.match;
                 const snapshot = source?.snapshot;
                 const matchedPatch = source?.matchedPatch;
-                const fullMirror = source?.downloadMirrors.find(
-                  (mirror) => mirror.kind === 'full',
+                const hasDownloadMirror = source?.downloadMirrors.some(
+                  (mirror) =>
+                    mirror.kind === 'full' || mirror.kind === 'patch',
                 );
                 const tags = getSourceOfferTags(item, sourceKind, source);
                 const sourceIssue = match?.lastError;
@@ -4257,10 +4672,10 @@ function App() {
                             </span>
                           </button>
                         ) : null}
-                        {source?.isUpdateSource && fullMirror ? (
+                        {source?.isUpdateSource && hasDownloadMirror ? (
                           <button
                             disabled={isRefreshing || !canDownloadSource}
-                            onClick={() => void queueSourceUpdate(sourceKind)}
+                            onClick={() => void startSourceUpdate(sourceKind)}
                             type="button"
                           >
                             <FontAwesomeIcon
@@ -4347,6 +4762,364 @@ function App() {
     );
   }
 
+  function getManualUpdateLinks(flow: UpdateFlowState) {
+    const selectedDownloads = selectedDownloadsFromUpdatePlan(flow.mirrorPlan);
+    const job = flow.item.currentDownload;
+    return [
+      {
+        label: 'Full link',
+        url: job?.selectedMirrorUrl || selectedDownloads?.fullUrl || '',
+      },
+      {
+        label: 'Update link',
+        url:
+          job?.selectedPatchMirrorUrl || selectedDownloads?.patchUrl || '',
+      },
+    ].filter((entry) => entry.url.trim().length > 0);
+  }
+
+  function getManualUpdateSteps(flow: UpdateFlowState): string[] {
+    const job = flow.item.currentDownload;
+    const stagePath = job?.stagePath ?? flow.item.fileState.stagePath ?? '';
+    const finalPath = job?.finalPath ?? flow.item.fileState.finalPath ?? '';
+    const finalFolderName =
+      pathBasename(finalPath) ||
+      flow.item.item.steamTitle ||
+      flow.item.item.title;
+
+    if (flow.sourceKind === 'steamrip') {
+      const extractPath =
+        stagePath && finalPath
+          ? joinDisplayPath(pathDirname(stagePath), finalFolderName, 'contents')
+          : stagePath;
+      return [
+        `Save the downloaded SteamRIP archive from the selected page into ${stagePath || 'the staging folder'}.`,
+        `Extract the game folder into ${extractPath || 'the SteamRIP contents folder'} and name it ${finalFolderName}.`,
+        'Use Confirm Manual Install on the library card after the extracted folder is ready.',
+      ];
+    }
+
+    const partNames =
+      job?.parts
+        ?.map((part) => part.packageName)
+        .filter((name, index, names) => names.indexOf(name) === index) ?? [];
+    const stagingTarget =
+      partNames.length > 1
+        ? partNames.map((name) => joinDisplayPath(stagePath, name)).join(' and ')
+        : stagePath;
+    return [
+      `Save the ElAmigos installer files into ${stagingTarget || 'the staging folder'}.`,
+      `Run the installer/update manually and install into ${finalPath || `the ${finalFolderName} library folder`}.`,
+      'Use Confirm Manual Install on the library card after the installed game folder exists.',
+    ];
+  }
+
+  function renderUpdateFlowModal() {
+    if (!updateFlow) return null;
+
+    if (updateFlow.phase === 'manual') {
+      const job = updateFlow.item.currentDownload;
+      const manualLinks = getManualUpdateLinks(updateFlow);
+      const manualSteps = getManualUpdateSteps(updateFlow);
+      return (
+        <div
+          className="modal-backdrop modal-backdrop--stacked"
+          role="presentation"
+        >
+          <div
+            className="modal-panel manual-update-modal"
+            role="dialog"
+            aria-modal="true"
+          >
+            <div className="panel-heading retry-modal__heading">
+              <div>
+                <p className="panel-title">Manual Download Required</p>
+                <p className="muted-text">{updateFlow.item.item.title}</p>
+              </div>
+              <button
+                aria-label="Close manual update instructions"
+                className="modal-close-button"
+                onClick={() => setUpdateFlow(null)}
+                type="button"
+              >
+                <FontAwesomeIcon aria-hidden="true" icon={faXmark} />
+              </button>
+            </div>
+            <div className="manual-link-list">
+              {manualLinks.map((entry) => (
+                <div className="manual-link-row" key={entry.label}>
+                  <div>
+                    <strong>{entry.label}</strong>
+                    <span>{entry.url}</span>
+                  </div>
+                  <span className="manual-link-actions">
+                    <button
+                      className="ghost-button"
+                      onClick={() => void copyManualUpdateText(entry.url)}
+                      type="button"
+                    >
+                      <FontAwesomeIcon aria-hidden="true" icon={faLink} />
+                      <span>Copy Link</span>
+                    </button>
+                    <button
+                      className="ghost-button"
+                      onClick={() =>
+                        void window.vaultTrackApi.openExternal(entry.url)
+                      }
+                      type="button"
+                    >
+                      <FontAwesomeIcon
+                        aria-hidden="true"
+                        icon={faUpRightFromSquare}
+                      />
+                      <span>Open Page</span>
+                    </button>
+                  </span>
+                </div>
+              ))}
+            </div>
+            <section className="manual-update-notes">
+              <p className="panel-title">Important Notes</p>
+              <ol>
+                {manualSteps.map((step) => (
+                  <li key={step}>{step}</li>
+                ))}
+              </ol>
+              {job?.stagePath ? (
+                <button
+                  className="ghost-button manual-copy-path"
+                  onClick={() => void copyManualUpdateText(job.stagePath)}
+                  type="button"
+                >
+                  <FontAwesomeIcon aria-hidden="true" icon={faFolderOpen} />
+                  <span>Copy Staging Path</span>
+                </button>
+              ) : null}
+            </section>
+            {sourceUsesManualDownload(updateFlow.sourceKind) ? null : (
+              <p className="muted-text">
+                JDownloader was not ready, so this update was prepared for
+                manual handling.
+              </p>
+            )}
+            <div className="action-row">
+              <button
+                className="primary-button"
+                onClick={() => setUpdateFlow(null)}
+                type="button"
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    if (updateFlow.phase === 'mirrors') {
+      const plan = updateFlow.mirrorPlan;
+      const showPatchRows = plan.showPatchRows;
+      const showFullRows = plan.showFullRows;
+      return (
+        <div
+          className="modal-backdrop modal-backdrop--stacked"
+          role="presentation"
+        >
+          <div
+            className={`modal-panel retry-modal ${
+              showPatchRows && showFullRows ? '' : 'is-single-choice'
+            }`}
+            role="dialog"
+            aria-modal="true"
+          >
+            <div className="panel-heading retry-modal__heading">
+              <div>
+                <p className="panel-title">Select Update Mirror</p>
+                <p className="muted-text">{updateFlow.item.item.title}</p>
+              </div>
+              <button
+                aria-label="Close update mirror selector"
+                className="modal-close-button"
+                onClick={() => setUpdateFlow(null)}
+                type="button"
+              >
+                <FontAwesomeIcon aria-hidden="true" icon={faXmark} />
+              </button>
+            </div>
+            <div
+              className={`settings-grid ${
+                showPatchRows && showFullRows ? '' : 'is-single-choice'
+              }`}
+            >
+              {showFullRows
+                ? renderRetryMirrorDropdown({
+                    label: 'Full download',
+                    mirrors: plan.fullRows,
+                    onChange: (url) =>
+                      setUpdateFlow((current) =>
+                        current
+                          ? updateFlowMirrorPlan(
+                              current,
+                              updatePlanFullUrl(current.mirrorPlan, url),
+                            )
+                          : current,
+                      ),
+                    placeholder: 'Choose full mirror',
+                    value: plan.fullUrl,
+                  })
+                : null}
+              {showPatchRows
+                ? renderRetryMirrorDropdown({
+                    label: 'Update download',
+                    mirrors: plan.patchRows,
+                    onChange: (url) =>
+                      setUpdateFlow((current) =>
+                        current
+                          ? updateFlowMirrorPlan(
+                              current,
+                              updatePlanPatchUrl(current.mirrorPlan, url),
+                            )
+                          : current,
+                      ),
+                    placeholder: 'Choose update mirror',
+                    value: plan.patchUrl,
+                  })
+                : null}
+            </div>
+            <div className="action-row">
+              <button
+                className="ghost-button"
+                onClick={() => setUpdateFlow(null)}
+                type="button"
+              >
+                Cancel
+              </button>
+              <button
+                className="primary-button"
+                disabled={!selectedDownloadsFromUpdatePlan(plan)}
+                onClick={() =>
+                  void loadUpdatePatchChoices({
+                    ...updateFlow,
+                    phase: 'patch',
+                  })
+                }
+                type="button"
+              >
+                Continue
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    const patchOptions = getPatchOptions(
+      updateFlow.patches,
+      updateFlow.item.item.steamAppId,
+    );
+    return (
+      <div
+        className="modal-backdrop modal-backdrop--stacked"
+        role="presentation"
+      >
+        <div
+          className="modal-panel patch-modal"
+          role="dialog"
+          aria-modal="true"
+        >
+          <div className="panel-heading retry-modal__heading">
+            <div>
+              <p className="panel-title">Select Update Patch</p>
+              <p className="muted-text">{updateFlow.item.item.title}</p>
+            </div>
+            <button
+              aria-label="Close update patch selector"
+              className="modal-close-button"
+              onClick={() => setUpdateFlow(null)}
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faXmark} />
+            </button>
+          </div>
+          {updateFlow.loadingPatches ? (
+            <p className="muted-text">Loading SteamDB patches...</p>
+          ) : null}
+          {updateFlow.error ? (
+            <p className="update-flow-error">{updateFlow.error}</p>
+          ) : null}
+          {!updateFlow.loadingPatches && patchOptions.length === 0 ? (
+            <p className="muted-text">No SteamDB patches are loaded yet.</p>
+          ) : null}
+          <div className="patch-list" role="listbox">
+            {patchOptions.map((patch) => {
+              const key = patchCandidateKey(patch);
+              const selected = key === updateFlow.selectedPatchKey;
+              const patchSuggestion =
+                updateFlow.likelyPatch?.key === key
+                  ? updateFlow.likelyPatch
+                  : null;
+              return (
+                <button
+                  aria-selected={selected}
+                  className={`patch-option ${selected ? 'is-selected' : ''}`}
+                  key={key}
+                  onClick={() =>
+                    setUpdateFlow((current) =>
+                      current ? { ...current, selectedPatchKey: key } : current,
+                    )
+                  }
+                  role="option"
+                  type="button"
+                >
+                  <span className="patch-option__title">
+                    <span>{patch.patchTitle}</span>
+                    {patchSuggestion ? (
+                      <span
+                        aria-label={patchSuggestion.label}
+                        className="likely-match-chip"
+                        title={patchSuggestion.label}
+                      >
+                        <FontAwesomeIcon aria-hidden="true" icon={faCheck} />
+                        <span>Likely</span>
+                      </span>
+                    ) : null}
+                  </span>
+                  <small>{patchSummary(patch)}</small>
+                </button>
+              );
+            })}
+          </div>
+          <div className="action-row">
+            <button
+              className="ghost-button"
+              onClick={() => setUpdateFlow(null)}
+              type="button"
+            >
+              Cancel
+            </button>
+            <button
+              className="primary-button"
+              disabled={
+                updateFlow.loadingPatches ||
+                busyId === updateFlow.item.item.id ||
+                (Boolean(updateFlow.item.item.steamAppId) &&
+                  !updateFlow.selectedPatchKey)
+              }
+              onClick={() => void queueUpdateFlowDownload(updateFlow)}
+              type="button"
+            >
+              {busyId === updateFlow.item.item.id && busyAction === 'retry'
+                ? 'Queueing...'
+                : sourceUsesManualDownload(updateFlow.sourceKind)
+                  ? 'Prepare Manual Steps'
+                  : 'Queue Update'}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   function renderLibraryItem(item: TrackedItemView) {
     const progress = progressPercent(item);
     const activity = getItemActivity(item);
@@ -4359,6 +5132,9 @@ function App() {
     });
     const showUpdateButton = hasActionableSourceUpdate(item);
     const showResolvePatchButton = needsPatchMetadataAttention(item);
+    const showConfirmInstallButton = canConfirmInstall(item);
+    const showCancelDownloadButton =
+      canCancelDownload(item) && !hasActiveProgress(item);
     const refreshWorkflowBusy = isRefreshWorkflowBusy(item);
 
     if (libraryViewMode === 'list') {
@@ -4383,8 +5159,15 @@ function App() {
               </div>
             </div>
             {renderLibraryProgress(item, progress)}
-            {showUpdateButton || showResolvePatchButton ? (
+            {showUpdateButton ||
+            showResolvePatchButton ||
+            showCancelDownloadButton ||
+            showConfirmInstallButton ? (
               <div className="game-row__actions">
+                {showCancelDownloadButton
+                  ? renderCancelDownloadButton(item)
+                  : null}
+                {renderConfirmInstallButton(item)}
                 {showUpdateButton ? (
                   <button
                     className="primary-inline-button"
@@ -4443,8 +5226,15 @@ function App() {
             {renderLibraryActionMenu(item)}
           </div>
           {renderLibraryProgress(item, progress)}
-          {showUpdateButton || showResolvePatchButton ? (
+          {showUpdateButton ||
+          showResolvePatchButton ||
+          showCancelDownloadButton ||
+          showConfirmInstallButton ? (
             <div className="game-card__actions">
+              {showCancelDownloadButton
+                ? renderCancelDownloadButton(item)
+                : null}
+              {renderConfirmInstallButton(item)}
               {showUpdateButton ? (
                 <button
                   className="primary-inline-button"
@@ -5182,10 +5972,10 @@ function App() {
                   <span className="settings-label-with-help">
                     Use JDownloader when available
                     <span
-                      aria-label="Falls back to curl if JDownloader is not ready"
+                      aria-label="Falls back to manual download steps if JDownloader is not ready"
                       className="settings-help-icon"
                       role="img"
-                      title="Falls back to curl if JDownloader is not ready"
+                      title="Falls back to manual download steps if JDownloader is not ready"
                     >
                       <FontAwesomeIcon
                         aria-hidden="true"
@@ -5208,8 +5998,8 @@ function App() {
                   />
                   <span aria-hidden="true" className="settings-toggle-track" />
                   <small>
-                    When this is off, all sources use curl; source choices are
-                    remembered.
+                    When this is off, SteamRIP and ElAmigos use manual steps;
+                    AnkerGames still uses curl.
                   </small>
                 </label>
                 <div className="download-source-grid">
@@ -5229,9 +6019,7 @@ function App() {
                         {settingsDraft.jDownloaderEnabled &&
                         settingsDraft.jDownloaderSourcePreferences.elamigos
                           ? 'JDownloader'
-                          : settingsDraft.jDownloaderEnabled
-                            ? 'Curl'
-                            : 'Direct curl'}
+                          : 'Manual'}
                       </span>
                     </div>
                     <span
@@ -5253,7 +6041,7 @@ function App() {
                         }
                         type="button"
                       >
-                        Curl
+                        Manual
                       </button>
                       <button
                         aria-pressed={
@@ -5280,9 +6068,7 @@ function App() {
                         {settingsDraft.jDownloaderEnabled &&
                         settingsDraft.jDownloaderSourcePreferences.steamrip
                           ? 'JDownloader'
-                          : settingsDraft.jDownloaderEnabled
-                            ? 'Curl'
-                            : 'Direct curl'}
+                          : 'Manual'}
                       </span>
                     </div>
                     <span
@@ -5304,7 +6090,7 @@ function App() {
                         }
                         type="button"
                       >
-                        Curl
+                        Manual
                       </button>
                       <button
                         aria-pressed={
@@ -6209,6 +6995,7 @@ function App() {
       ) : null}
       {renderLibraryDetailsModal()}
       {renderSourcesModal()}
+      {renderUpdateFlowModal()}
       {retrySelection
         ? (() => {
             const fullRows = retrySelection.item.downloadMirrors.filter(

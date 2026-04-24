@@ -2,7 +2,7 @@ import { describe, expect, it, vi, afterEach } from 'vitest';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 import type {
   ConfirmedSteamMatch,
@@ -1758,6 +1758,284 @@ describe('VaultTrackService SteamDB patch workflow', () => {
     }
   });
 
+  it('does not mark an installed SteamRIP source as updateable when only SteamDB is newer', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'alina of the arena',
+        sourceKind: 'steamrip',
+        sourceUrl: 'https://steamrip.com/alina-of-the-arena-free-download/',
+        title: 'Alina of the Arena',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 1668690,
+        coverUrl: null,
+        matchedAt: '2026-04-24T12:00:00.000Z',
+        normalizedTitle: 'alina of the arena',
+        title: 'Alina of the Arena',
+      });
+      database.upsertPatchEntries([
+        {
+          appId: 1668690,
+          buildId: '20395701',
+          link: 'https://steamdb.info/patchnotes/20395701/',
+          patchDate: '10/15/2025',
+          patchTitle: 'Fixed Unity security vulnerability',
+          publishedAt: '2025-10-15T12:00:00.000Z',
+          title: 'Fixed Unity security vulnerability',
+          trackedItemId: item.id,
+        },
+        {
+          appId: 1668690,
+          buildId: '15000000',
+          link: 'https://steamdb.info/patchnotes/15000000/',
+          patchDate: '06/01/2024',
+          patchTitle: 'Alina of the Arena update for 1 June 2024',
+          publishedAt: '2024-06-01T12:00:00.000Z',
+          title: 'Alina of the Arena update for 1 June 2024',
+          trackedItemId: item.id,
+        },
+        {
+          appId: 1668690,
+          buildId: '12000000',
+          link: 'https://steamdb.info/patchnotes/12000000/',
+          patchDate: '03/01/2023',
+          patchTitle: 'Alina of the Arena update for 1 March 2023',
+          publishedAt: '2023-03-01T12:00:00.000Z',
+          title: 'Alina of the Arena update for 1 March 2023',
+          trackedItemId: item.id,
+        },
+        {
+          appId: 1668690,
+          buildId: '10529269',
+          link: 'https://steamdb.info/patchnotes/10529269/',
+          patchDate: '02/11/2023',
+          patchTitle: 'v1.1.4 Update Steam Deck Verified',
+          publishedAt: '2023-02-11T12:00:00.000Z',
+          title: 'v1.1.4 Update Steam Deck Verified',
+          trackedItemId: item.id,
+          version: '1.1.4',
+        },
+      ]);
+      database.upsertInstallRecord({
+        installedAt: '02/11/2023',
+        installedBuildId: '10529269',
+        installedSourceKind: 'steamrip',
+        installedSourceUrl:
+          'https://steamrip.com/alina-of-the-arena-free-download/',
+        installedVersion: 'v1.1.4 Update Steam Deck Verified',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-24T12:00:00.000Z',
+      });
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-04-24T12:00:00.000Z',
+        isPrimary: true,
+        lastCheckedAt: '2026-04-24T12:00:00.000Z',
+        lastError: null,
+        method: 'fuzzy_title',
+        normalizedTitle: 'alina of the arena',
+        score: 1,
+        sourceKind: 'steamrip',
+        sourceTitle: 'Alina of the Arena',
+        sourceUrl: 'https://steamrip.com/alina-of-the-arena-free-download/',
+        status: 'probable',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-24T12:00:00.000Z',
+        usable: true,
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-24T12:00:00.000Z',
+        fingerprint: 'steamrip-alina',
+        observedBuildId: null,
+        observedPatchDate: '02/11/2023',
+        observedPatchLink: null,
+        observedPatchTitle: 'v1.1.4 Update Steam Deck Verified',
+        observedVersion: '1.1.4',
+        patchSelectionSource: null,
+        sourceKind: 'steamrip',
+        sourceUrl: 'https://steamrip.com/alina-of-the-arena-free-download/',
+        trackedItemId: item.id,
+      });
+      await mkdir(join(tempRoot, 'Library', 'Alina of the Arena'), {
+        recursive: true,
+      });
+
+      const [view] = await createService(database).listTrackedItems();
+      const steamrip = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'steamrip',
+      );
+
+      expect(view?.status).toBe('installed');
+      expect(view?.versionsBehindLatest).toBe(3);
+      expect(view?.trackingStatus).toBe('source_behind_upstream');
+      expect(steamrip).toMatchObject({
+        isUpdateSource: false,
+        matchedPatch: {
+          buildId: '10529269',
+        },
+        updateStatus: 'source_behind_upstream',
+        versionsBehindLatest: 3,
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('marks an update available when another source is newer than installed but still behind upstream', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'ziggurat 2',
+        sourceKind: 'steamrip',
+        sourceUrl: 'https://steamrip.com/ziggurat-2-free-download-1r/',
+        title: 'Ziggurat 2',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 1159560,
+        coverUrl: null,
+        matchedAt: '2026-04-24T12:00:00.000Z',
+        normalizedTitle: 'ziggurat 2',
+        title: 'Ziggurat 2',
+      });
+      database.upsertPatchEntries(
+        Array.from({ length: 31 }, (_, index) => {
+          const buildId =
+            index === 0
+              ? '21683138'
+              : index === 5
+                ? '10454348'
+                : index === 30
+                  ? '7873732'
+                  : String(21683138 - index);
+          const patchDate =
+            index === 5
+              ? '02/01/2023'
+              : index === 30
+                ? '12/15/2021'
+                : `01/${String(Math.max(1, 28 - index)).padStart(2, '0')}/2026`;
+          const patchTitle =
+            index === 0
+              ? 'Update #17 - Small update'
+              : index === 5
+                ? 'Ziggurat 2 update for 1 February 2023'
+                : index === 30
+                  ? '15.12.2021'
+                  : `Ziggurat 2 update ${index}`;
+          return {
+            appId: 1159560,
+            buildId,
+            link: `https://steamdb.info/patchnotes/${buildId}/`,
+            patchDate,
+            patchTitle,
+            publishedAt: new Date(
+              Date.UTC(2026, 0, Math.max(1, 28 - index)),
+            ).toISOString(),
+            title: patchTitle,
+            trackedItemId: item.id,
+          };
+        }),
+      );
+      database.upsertInstallRecord({
+        installedAt: '12/15/2021',
+        installedBuildId: '7873732',
+        installedSourceKind: 'steamrip',
+        installedSourceUrl:
+          'https://steamrip.com/ziggurat-2-free-download-1r/',
+        installedVersion: '15.12.2021',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-24T12:00:00.000Z',
+      });
+      for (const sourceKind of ['steamrip', 'elamigos'] as const) {
+        database.upsertSourceMatch({
+          confidence: 1,
+          createdAt: '2026-04-24T12:00:00.000Z',
+          isPrimary: sourceKind === 'steamrip',
+          lastCheckedAt: '2026-04-24T12:00:00.000Z',
+          lastError: null,
+          method: 'fuzzy_title',
+          normalizedTitle: 'ziggurat 2',
+          score: 1,
+          sourceKind,
+          sourceTitle:
+            sourceKind === 'steamrip'
+              ? 'Ziggurat 2'
+              : 'Ziggurat 2 Deluxe Edition',
+          sourceUrl:
+            sourceKind === 'steamrip'
+              ? 'https://steamrip.com/ziggurat-2-free-download-1r/'
+              : 'https://elamigos.site/data/Ziggurat_2_MULTi10_-_ElAmigos.html',
+          status: 'probable',
+          trackedItemId: item.id,
+          updatedAt: '2026-04-24T12:00:00.000Z',
+          usable: true,
+        });
+      }
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-24T12:00:00.000Z',
+        fingerprint: 'steamrip-ziggurat-2',
+        observedBuildId: '7873732',
+        observedPatchDate: '12/15/2021',
+        observedPatchLink: null,
+        observedPatchTitle: '15.12.2021',
+        observedVersion: '15.12.2021',
+        patchSelectionSource: null,
+        sourceKind: 'steamrip',
+        sourceUrl: 'https://steamrip.com/ziggurat-2-free-download-1r/',
+        trackedItemId: item.id,
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-24T12:00:00.000Z',
+        fingerprint: 'elamigos-ziggurat-2',
+        observedBuildId: '10454348',
+        observedPatchDate: '02/01/2023',
+        observedPatchLink: null,
+        observedPatchTitle: 'Ziggurat 2 update for 1 February 2023',
+        observedVersion: 'Updated till 02/01/2023',
+        patchSelectionSource: null,
+        sourceKind: 'elamigos',
+        sourceUrl:
+          'https://elamigos.site/data/Ziggurat_2_MULTi10_-_ElAmigos.html',
+        trackedItemId: item.id,
+      });
+      await mkdir(join(tempRoot, 'Library', 'Ziggurat 2'), {
+        recursive: true,
+      });
+
+      const [view] = await createService(database).listTrackedItems();
+      const elamigos = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'elamigos',
+      );
+      const steamrip = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'steamrip',
+      );
+
+      expect(view?.status).toBe('installed');
+      expect(view?.versionsBehindLatest).toBe(30);
+      expect(view?.trackingStatus).toBe('update_available');
+      expect(elamigos).toMatchObject({
+        isUpdateSource: true,
+        matchedPatch: {
+          buildId: '10454348',
+        },
+        updateStatus: 'source_behind_upstream',
+        versionsBehindLatest: 5,
+      });
+      expect(steamrip).toMatchObject({
+        isUpdateSource: false,
+        matchedPatch: {
+          buildId: '7873732',
+        },
+        updateStatus: 'source_behind_upstream',
+        versionsBehindLatest: 30,
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('queues a matched draft from a non-current source using cached mirrors', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -1961,7 +2239,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
     }
   });
 
-  it('defaults SteamRIP downloads to the direct HTTP provider when JDownloader is disabled', async () => {
+  it('defaults SteamRIP downloads to manual mode when JDownloader is disabled', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
       database.setSetting('library.rootPath', join(tempRoot, 'Library'));
@@ -1997,15 +2275,12 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       });
 
       expect(queueLinks).not.toHaveBeenCalled();
-      expect(startDirectHttpDownload).toHaveBeenCalledWith(
-        expect.objectContaining({
-          sourceKind: 'steamrip',
-          url: 'https://gofile.io/d/full',
-        }),
-      );
+      expect(startDirectHttpDownload).not.toHaveBeenCalled();
       expect(queued.currentDownload).toMatchObject({
-        provider: 'direct_http',
+        provider: 'manual',
         selectedMirrorUrl: 'https://gofile.io/d/full',
+        stage: 'queued',
+        statusMessage: 'Manual download required',
       });
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
@@ -2924,6 +3199,295 @@ describe('VaultTrackService SteamDB patch workflow', () => {
     }
   });
 
+  it('queues the ElAmigos full package when no update package exists', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const elamigosSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fullDownloadUrls: [
+          { kind: 'full', label: 'FULL', url: 'https://filecrypt.cc/full' },
+        ],
+        latestSourceRelease: {
+          isPatch: false,
+          label: 'Patch 1.9.8',
+          patchDate: '03/30/2026',
+          version: '1.9.8',
+        },
+        patchDownloadUrls: [],
+        sourceKind: 'elamigos',
+        sourceUrl:
+          'https://elamigos.site/data/Against_the_Storm_MULTi14_-_ElAmigos.html',
+      };
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9003,
+        packageName: 'Against the Storm_22900000',
+      }));
+      const service = createService(database, queueLinks);
+      const item = database.upsertTrackedItem({
+        normalizedTitle: elamigosSource.normalizedTitle,
+        sourceKind: 'elamigos',
+        sourceUrl: elamigosSource.sourceUrl,
+        title: 'Against the Storm',
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-23T12:00:00.000Z',
+        fingerprint: elamigosSource.fingerprint,
+        observedBuildId: '22900000',
+        observedPatchDate: '03/30/2026',
+        observedPatchLink: null,
+        observedPatchTitle: 'Patch 1.9.8',
+        observedVersion: '1.9.8',
+        patchSelectionSource: selectedPatch.selectionSource ?? 'rss',
+        sourceKind: 'elamigos',
+        sourceUrl: elamigosSource.sourceUrl,
+        trackedItemId: item.id,
+      });
+      database.setRawParsedSourcePayload(item.id, elamigosSource);
+      database.syncDownloadMirrors(item.id, 'elamigos', [
+        { kind: 'full', label: 'FULL', url: 'https://filecrypt.cc/full' },
+      ]);
+      database.upsertInstallRecord({
+        installedAt: '03/04/2025',
+        installedBuildId: '1758027',
+        installedSourceKind: 'elamigos',
+        installedSourceUrl: elamigosSource.sourceUrl,
+        installedVersion: '1.7.6',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-23T12:00:00.000Z',
+      });
+
+      await service.queueUpdateFromSource({
+        sourceKind: 'elamigos',
+        trackedItemId: item.id,
+      });
+
+      expect(queueLinks).toHaveBeenCalledWith(
+        expect.objectContaining({
+          selectedDownloads: {
+            fullUrl: 'https://filecrypt.cc/full',
+            patchUrl: null,
+            sourceKind: 'elamigos',
+          },
+        }),
+      );
+      expect(database.getDownloadJob(item.id)).toMatchObject({
+        packageName: 'Against the Storm_22900000',
+        selectedMirrorUrl: 'https://filecrypt.cc/full',
+        selectedPatchMirrorUrl: null,
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('queues full-only ElAmigos updates in manual mode when ElAmigos JDownloader is disabled', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      database.setSetting(
+        'download.jdownloader.sources',
+        JSON.stringify({ elamigos: false, steamrip: true }),
+      );
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const elamigosSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fullDownloadUrls: [
+          {
+            kind: 'full',
+            label: 'FULL',
+            url: 'https://cdn.example.invalid/against-the-storm.part1.rar',
+          },
+        ],
+        latestSourceRelease: {
+          isPatch: false,
+          label: 'Patch 1.9.8',
+          patchDate: '03/30/2026',
+          version: '1.9.8',
+        },
+        patchDownloadUrls: [],
+        sourceKind: 'elamigos',
+        sourceUrl:
+          'https://elamigos.site/data/Against_the_Storm_MULTi14_-_ElAmigos.html',
+      };
+      const queueLinks = vi.fn();
+      const startDirectHttpDownload = createEmbeddedBrowserRunner();
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        undefined,
+        undefined,
+        fetch,
+        undefined,
+        undefined,
+        undefined,
+        startDirectHttpDownload,
+      );
+      const item = database.upsertTrackedItem({
+        normalizedTitle: elamigosSource.normalizedTitle,
+        sourceKind: 'elamigos',
+        sourceUrl: elamigosSource.sourceUrl,
+        title: 'Against the Storm',
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-23T12:00:00.000Z',
+        fingerprint: elamigosSource.fingerprint,
+        observedBuildId: '22900000',
+        observedPatchDate: '03/30/2026',
+        observedPatchLink: null,
+        observedPatchTitle: 'Patch 1.9.8',
+        observedVersion: '1.9.8',
+        patchSelectionSource: selectedPatch.selectionSource ?? 'rss',
+        sourceKind: 'elamigos',
+        sourceUrl: elamigosSource.sourceUrl,
+        trackedItemId: item.id,
+      });
+      database.setRawParsedSourcePayload(item.id, elamigosSource);
+      database.syncDownloadMirrors(item.id, 'elamigos', [
+        {
+          kind: 'full',
+          label: 'FULL',
+          url: 'https://cdn.example.invalid/against-the-storm.part1.rar',
+        },
+      ]);
+      database.upsertInstallRecord({
+        installedAt: '03/04/2025',
+        installedBuildId: '1758027',
+        installedSourceKind: 'elamigos',
+        installedSourceUrl: elamigosSource.sourceUrl,
+        installedVersion: '1.7.6',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-23T12:00:00.000Z',
+      });
+
+      await service.queueUpdateFromSource({
+        sourceKind: 'elamigos',
+        trackedItemId: item.id,
+      });
+
+      expect(queueLinks).not.toHaveBeenCalled();
+      expect(startDirectHttpDownload).not.toHaveBeenCalled();
+      expect(database.getDownloadJob(item.id)).toMatchObject({
+        provider: 'manual',
+        selectedMirrorUrl: 'https://cdn.example.invalid/against-the-storm.part1.rar',
+        selectedPatchMirrorUrl: null,
+        stage: 'queued',
+        statusMessage: 'Manual download required',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('allows ElAmigos FileCrypt container mirrors in manual mode', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      database.setSetting(
+        'download.jdownloader.sources',
+        JSON.stringify({ elamigos: false, steamrip: true }),
+      );
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const elamigosSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fullDownloadUrls: [
+          {
+            kind: 'full',
+            label: 'FULL',
+            url: 'https://www.filecrypt.cc/Container/759E348C1F.html',
+          },
+        ],
+        latestSourceRelease: {
+          isPatch: false,
+          label: 'Patch 1.9.8',
+          patchDate: '03/30/2026',
+          version: '1.9.8',
+        },
+        patchDownloadUrls: [],
+        sourceKind: 'elamigos',
+        sourceUrl:
+          'https://elamigos.site/data/Against_the_Storm_MULTi14_-_ElAmigos.html',
+      };
+      const queueLinks = vi.fn();
+      const startDirectHttpDownload = createEmbeddedBrowserRunner();
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        undefined,
+        undefined,
+        fetch,
+        undefined,
+        undefined,
+        undefined,
+        startDirectHttpDownload,
+      );
+      const item = database.upsertTrackedItem({
+        normalizedTitle: elamigosSource.normalizedTitle,
+        sourceKind: 'elamigos',
+        sourceUrl: elamigosSource.sourceUrl,
+        title: 'Against the Storm',
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-23T12:00:00.000Z',
+        fingerprint: elamigosSource.fingerprint,
+        observedBuildId: '22900000',
+        observedPatchDate: '03/30/2026',
+        observedPatchLink: null,
+        observedPatchTitle: 'Patch 1.9.8',
+        observedVersion: '1.9.8',
+        patchSelectionSource: selectedPatch.selectionSource ?? 'rss',
+        sourceKind: 'elamigos',
+        sourceUrl: elamigosSource.sourceUrl,
+        trackedItemId: item.id,
+      });
+      database.setRawParsedSourcePayload(item.id, elamigosSource);
+      database.syncDownloadMirrors(item.id, 'elamigos', [
+        {
+          kind: 'full',
+          label: 'FULL',
+          url: 'https://www.filecrypt.cc/Container/759E348C1F.html',
+        },
+      ]);
+      database.upsertInstallRecord({
+        installedAt: '03/04/2025',
+        installedBuildId: '1758027',
+        installedSourceKind: 'elamigos',
+        installedSourceUrl: elamigosSource.sourceUrl,
+        installedVersion: '1.7.6',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-23T12:00:00.000Z',
+      });
+
+      await service.queueUpdateFromSource({
+        sourceKind: 'elamigos',
+        trackedItemId: item.id,
+      });
+
+      expect(queueLinks).not.toHaveBeenCalled();
+      expect(startDirectHttpDownload).not.toHaveBeenCalled();
+      expect(database.getDownloadJob(item.id)).toMatchObject({
+        provider: 'manual',
+        selectedMirrorUrl: 'https://www.filecrypt.cc/Container/759E348C1F.html',
+        stage: 'queued',
+        statusMessage: 'Manual download required',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('queues ElAmigos full plus update when the installed source is not ElAmigos', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -3489,6 +4053,102 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         manuallyFailedAt: expect.any(String),
         url: ankergamesProxyUrl,
       });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('cancels ElAmigos downloads by removing JDownloader packages and staged files without failing the mirror', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootLibraryPath = join(tempRoot, 'Library');
+      database.setSetting('library.rootPath', rootLibraryPath);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const elamigosSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fullDownloadUrls: [
+          { kind: 'full', label: 'FULL', url: 'https://gofile.io/d/full' },
+        ],
+        latestSourceRelease: {
+          isPatch: false,
+          label: 'Patch 1.9.8',
+          patchDate: '03/30/2026',
+          version: '1.9.8',
+        },
+        normalizedTitle: 'against the storm',
+        patchDownloadUrls: [],
+        sourceKind: 'elamigos',
+        title: 'Against the Storm',
+      };
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9001,
+        packageName: 'Against the Storm_22900000',
+        parts: [
+          {
+            mirrorUrl: 'https://gofile.io/d/full',
+            packageId: 9001,
+            packageName: 'Against the Storm_22900000',
+            role: 'full' as const,
+          },
+        ],
+      }));
+      const removePackage = vi.fn(async () => undefined);
+      const dismountIsoUnderPath = vi.fn(async () => ['mounted.iso']);
+      const service = createService(
+        database,
+        queueLinks,
+        removePackage,
+        undefined,
+        dismountIsoUnderPath,
+      );
+
+      const queued = await service.addTrackedItem({
+        parsedSource: elamigosSource,
+        queueDownload: true,
+        selectedDownloads: { fullUrl: 'https://gofile.io/d/full' },
+        selectedSteamPatch: {
+          ...selectedPatch,
+          buildId: '22900000',
+          patchDate: '03/30/2026',
+        },
+        steamMatch: {
+          ...steamMatch,
+          normalizedTitle: 'against the storm',
+          title: 'Against the Storm',
+        },
+      });
+      const stagePath = queued.currentDownload!.stagePath;
+      const installedPath = join(rootLibraryPath, 'Against the Storm');
+      await mkdir(stagePath, { recursive: true });
+      await mkdir(installedPath, { recursive: true });
+      await writeFile(join(stagePath, 'setup.iso'), 'iso');
+      await writeFile(join(installedPath, 'AgainstTheStorm.exe'), 'exe');
+
+      const cancelled = await service.cancelDownload(queued.item.id);
+
+      expect(removePackage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          packageId: 9001,
+          packageIds: [9001],
+          packageName: 'Against the Storm_22900000',
+          packageNames: ['Against the Storm_22900000'],
+          stagePath,
+        }),
+      );
+      expect(dismountIsoUnderPath).toHaveBeenCalledWith({ rootPath: stagePath });
+      expect(existsSync(stagePath)).toBe(false);
+      expect(existsSync(join(installedPath, 'AgainstTheStorm.exe'))).toBe(true);
+      expect(database.getDownloadJob(queued.item.id)).toBeNull();
+      expect(
+        database.listDownloadMirrors(queued.item.id, 'elamigos')[0],
+      ).toMatchObject({
+        manuallyFailedAt: null,
+        url: 'https://gofile.io/d/full',
+      });
+      expect(cancelled.currentDownload).toBeNull();
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
@@ -4283,6 +4943,157 @@ describe('VaultTrackService SteamDB patch workflow', () => {
     }
   });
 
+  it('completes manual SteamRIP updates by moving the extracted folder into the library root', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootLibraryPath = join(tempRoot, 'Library');
+      database.setSetting('library.rootPath', rootLibraryPath);
+      database.setSetting('download.jdownloader.enabled', 'false');
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response(rss([selectedPatch]), { status: 200 })),
+      );
+      const queueLinks = vi.fn();
+      const startDirectHttpDownload = createEmbeddedBrowserRunner();
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        undefined,
+        undefined,
+        fetch,
+        undefined,
+        undefined,
+        undefined,
+        startDirectHttpDownload,
+        false,
+      );
+      const queued = await service.addTrackedItem({
+        parsedSource,
+        queueDownload: true,
+        selectedDownloads: { fullUrl: 'https://gofile.io/d/full' },
+        selectedSteamPatch: selectedPatch,
+        steamMatch,
+      });
+      const job = queued.currentDownload!;
+      const extractPath = join(dirname(job.stagePath), basename(job.finalPath), 'contents');
+      const manualFolder = join(extractPath, basename(job.finalPath));
+      await mkdir(manualFolder, { recursive: true });
+      await writeFile(join(manualFolder, 'Game.exe'), 'exe');
+
+      const completed = await service.completeStagedInstall(queued.item.id);
+
+      expect(queueLinks).not.toHaveBeenCalled();
+      expect(startDirectHttpDownload).not.toHaveBeenCalled();
+      expect(existsSync(join(rootLibraryPath, basename(job.finalPath), 'Game.exe'))).toBe(
+        true,
+      );
+      expect(existsSync(dirname(job.stagePath))).toBe(true);
+      expect(existsSync(join(dirname(job.stagePath), basename(job.finalPath)))).toBe(
+        false,
+      );
+      expect(completed.currentDownload).toMatchObject({
+        provider: 'manual',
+        stage: 'complete',
+      });
+      expect(completed.installRecord).toMatchObject({
+        installedSourceKind: 'steamrip',
+        installPath: join(rootLibraryPath, basename(job.finalPath)),
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('requires the installed library folder before completing manual ElAmigos updates', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootLibraryPath = join(tempRoot, 'Library');
+      database.setSetting('library.rootPath', rootLibraryPath);
+      database.setSetting(
+        'download.jdownloader.sources',
+        JSON.stringify({ elamigos: false, steamrip: true }),
+      );
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const elamigosSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fullDownloadUrls: [
+          { kind: 'full', label: 'FULL', url: 'https://filecrypt.cc/full' },
+        ],
+        latestSourceRelease: {
+          isPatch: false,
+          label: 'Patch 1.9.8',
+          patchDate: '03/30/2026',
+          version: '1.9.8',
+        },
+        normalizedTitle: 'against the storm',
+        patchDownloadUrls: [],
+        sourceKind: 'elamigos',
+        sourceUrl:
+          'https://elamigos.site/data/Against_the_Storm_MULTi14_-_ElAmigos.html',
+        title: 'Against the Storm',
+      };
+      const queueLinks = vi.fn();
+      const startDirectHttpDownload = createEmbeddedBrowserRunner();
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        undefined,
+        undefined,
+        fetch,
+        undefined,
+        undefined,
+        undefined,
+        startDirectHttpDownload,
+      );
+      const queued = await service.addTrackedItem({
+        parsedSource: elamigosSource,
+        queueDownload: true,
+        selectedDownloads: { fullUrl: 'https://filecrypt.cc/full' },
+        selectedSteamPatch: {
+          ...selectedPatch,
+          buildId: '22900000',
+          patchDate: '03/30/2026',
+        },
+        steamMatch: {
+          ...steamMatch,
+          normalizedTitle: 'against the storm',
+          title: 'Against the Storm',
+        },
+      });
+      const stagePath = queued.currentDownload!.stagePath;
+      await mkdir(stagePath, { recursive: true });
+      await writeFile(join(stagePath, 'setup.iso'), 'iso');
+
+      await expect(service.completeStagedInstall(queued.item.id)).rejects.toThrow(
+        'No completed ElAmigos install',
+      );
+
+      const installedPath = join(rootLibraryPath, 'Against the Storm');
+      await mkdir(installedPath, { recursive: true });
+      await writeFile(join(installedPath, 'AgainstTheStorm.exe'), 'exe');
+      const completed = await service.completeStagedInstall(queued.item.id);
+
+      expect(queueLinks).not.toHaveBeenCalled();
+      expect(startDirectHttpDownload).not.toHaveBeenCalled();
+      expect(existsSync(stagePath)).toBe(false);
+      expect(completed.currentDownload).toMatchObject({
+        provider: 'manual',
+        stage: 'complete',
+      });
+      expect(completed.installRecord).toMatchObject({
+        installedSourceKind: 'elamigos',
+        installPath: installedPath,
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('shows ElAmigos downloads as staged when staged files exist after package cleanup', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -4370,6 +5181,109 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       expect(staged.currentDownload).toMatchObject({
         stage: 'staged',
         statusMessage: 'Staged files found',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('keeps SteamRIP downloads extracting until the game folder appears', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const zigguratSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fullDownloadUrls: [
+          {
+            kind: 'full',
+            label: 'GOFILE',
+            url: 'https://gofile.io/d/ziggurat',
+          },
+        ],
+        latestSourceRelease: {
+          isPatch: false,
+          label: 'v15.12.2021',
+          patchDate: '12/15/2021',
+          version: '15.12.2021',
+        },
+        normalizedTitle: 'ziggurat 2',
+        patchDownloadUrls: [],
+        sourceKind: 'steamrip',
+        sourceUrl: 'https://steamrip.com/ziggurat-2-free-download-1r/',
+        title: 'Ziggurat 2',
+      };
+      const zigguratMatch: ConfirmedSteamMatch = {
+        ...steamMatch,
+        appId: 1159560,
+        normalizedTitle: 'ziggurat 2',
+        title: 'Ziggurat 2',
+      };
+      const zigguratPatch: SteamPatchCandidate = {
+        ...selectedPatch,
+        appId: zigguratMatch.appId,
+        buildId: '7873732',
+        patchDate: '12/15/2021',
+        patchTitle: 'Ziggurat 2 update for 15 December 2021',
+        publishedAt: '2021-12-15T12:00:00.000Z',
+        title: 'Ziggurat 2 update for 15 December 2021',
+        version: '15.12.2021',
+      };
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9001,
+        packageName: 'Ziggurat 2_7873732',
+        parts: [
+          {
+            mirrorUrl: 'https://gofile.io/d/ziggurat',
+            packageId: 9001,
+            packageName: 'Ziggurat 2_7873732',
+            role: 'full' as const,
+          },
+        ],
+      }));
+      const removePackage = vi.fn(async () => undefined);
+      const getPackageProgress = vi.fn(async () => ({
+        bytesLoaded: 100,
+        bytesTotal: 100,
+        etaSeconds: 0,
+        packageId: 9001,
+        speed: null,
+        stage: 'complete' as const,
+        statusMessage: null,
+      }));
+      const service = createService(
+        database,
+        queueLinks,
+        removePackage,
+        getPackageProgress,
+      );
+      const queued = await service.addTrackedItem({
+        parsedSource: zigguratSource,
+        queueDownload: true,
+        selectedDownloads: { fullUrl: 'https://gofile.io/d/ziggurat' },
+        selectedSteamPatch: zigguratPatch,
+        steamMatch: zigguratMatch,
+      });
+
+      await service.pollDownloadJobs();
+
+      expect(removePackage).not.toHaveBeenCalled();
+      expect(database.getDownloadJob(queued.item.id)).toMatchObject({
+        bytesLoaded: 100,
+        bytesTotal: 100,
+        etaSeconds: null,
+        parts: [
+          expect.objectContaining({
+            etaSeconds: null,
+            stage: 'extracting',
+            statusMessage: 'Waiting for JDownloader extraction to finish',
+          }),
+        ],
+        stage: 'extracting',
+        statusMessage: 'Waiting for JDownloader extraction to finish',
       });
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
@@ -4920,6 +5834,193 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         stage: 'downloading',
         statusMessage: '1 of 2 complete',
         totalParts: 2,
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('keeps ElAmigos downloads extracting until staged installer files appear', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const elamigosSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fullDownloadUrls: [
+          {
+            kind: 'full',
+            label: 'FULL',
+            url: 'https://gofile.io/d/full',
+          },
+        ],
+        latestSourceRelease: {
+          isPatch: false,
+          label: 'Patch 1.5.4.H2',
+          patchDate: '04/13/2026',
+          version: '1.5.4.H2',
+        },
+        normalizedTitle: 'frostpunk 2',
+        patchDownloadUrls: [],
+        sourceKind: 'elamigos',
+        title: 'Frostpunk 2 Deluxe Edition',
+      };
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9001,
+        packageName: 'Frostpunk 2_22852168_full',
+        parts: [
+          {
+            mirrorUrl: 'https://gofile.io/d/full',
+            packageId: 9001,
+            packageName: 'Frostpunk 2_22852168_full',
+            role: 'full' as const,
+          },
+        ],
+      }));
+      const getPackageProgress = vi.fn(async () => ({
+        bytesLoaded: 100,
+        bytesTotal: 100,
+        etaSeconds: 0,
+        packageId: 9001,
+        speed: null,
+        stage: 'staged' as const,
+        statusMessage: null,
+      }));
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        getPackageProgress,
+      );
+      const view = await service.addTrackedItem({
+        parsedSource: elamigosSource,
+        queueDownload: true,
+        selectedDownloads: {
+          fullUrl: 'https://gofile.io/d/full',
+        },
+        selectedSteamPatch: {
+          ...selectedPatch,
+          buildId: '22852168',
+          patchDate: '04/13/2026',
+        },
+        steamMatch: {
+          ...steamMatch,
+          normalizedTitle: 'frostpunk 2',
+          title: 'Frostpunk 2',
+        },
+      });
+
+      await service.pollDownloadJobs();
+
+      expect(database.getDownloadJob(view.item.id)).toMatchObject({
+        bytesLoaded: 100,
+        bytesTotal: 100,
+        completedParts: 0,
+        parts: [
+          expect.objectContaining({
+            stage: 'extracting',
+            statusMessage: 'Waiting for JDownloader extraction to finish',
+          }),
+        ],
+        stage: 'extracting',
+        statusMessage: 'Waiting for JDownloader extraction to finish',
+        totalParts: 1,
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('recognizes full-only ElAmigos staged files in the job staging folder', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const elamigosSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fullDownloadUrls: [
+          {
+            kind: 'full',
+            label: 'FULL',
+            url: 'https://gofile.io/d/full',
+          },
+        ],
+        latestSourceRelease: {
+          isPatch: false,
+          label: 'Patch 1.9.8',
+          patchDate: '03/30/2026',
+          version: '1.9.8',
+        },
+        normalizedTitle: 'against the storm',
+        patchDownloadUrls: [],
+        sourceKind: 'elamigos',
+        title: 'Against the Storm',
+      };
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9001,
+        packageName: 'Against the Storm_22900000',
+        parts: [
+          {
+            mirrorUrl: 'https://gofile.io/d/full',
+            packageId: 9001,
+            packageName: 'Against the Storm_22900000',
+            role: 'full' as const,
+          },
+        ],
+      }));
+      const getPackageProgress = vi.fn(async () => ({
+        bytesLoaded: 100,
+        bytesTotal: 100,
+        etaSeconds: 0,
+        packageId: 9001,
+        speed: null,
+        stage: 'staged' as const,
+        statusMessage: null,
+      }));
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        getPackageProgress,
+      );
+      const view = await service.addTrackedItem({
+        parsedSource: elamigosSource,
+        queueDownload: true,
+        selectedDownloads: {
+          fullUrl: 'https://gofile.io/d/full',
+        },
+        selectedSteamPatch: {
+          ...selectedPatch,
+          buildId: '22900000',
+          patchDate: '03/30/2026',
+        },
+        steamMatch: {
+          ...steamMatch,
+          normalizedTitle: 'against the storm',
+          title: 'Against the Storm',
+        },
+      });
+      const stagePath = view.currentDownload?.stagePath;
+      expect(stagePath).toEqual(expect.any(String));
+      await writeFile(join(stagePath!, 'AgainstTheStorm.iso'), 'iso');
+
+      await service.pollDownloadJobs();
+
+      expect(database.getDownloadJob(view.item.id)).toMatchObject({
+        completedParts: 1,
+        parts: [
+          expect.objectContaining({
+            stage: 'staged',
+          }),
+        ],
+        stage: 'staged',
+        totalParts: 1,
       });
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);

@@ -216,6 +216,14 @@ export class NativeBridgeServer {
             ),
             type: request.type,
           };
+        case 'cancelDownload':
+          return {
+            ok: true,
+            payload: await this.service.cancelDownload(
+              request.payload.trackedItemId,
+            ),
+            type: request.type,
+          };
         case 'completeStagedInstall':
           return {
             ok: true,

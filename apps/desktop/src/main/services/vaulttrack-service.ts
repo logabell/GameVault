@@ -52,6 +52,7 @@ import {
   deriveTrackedItemTrackingStatus,
   findSteamPatchByDateAndVersion,
   findUniqueSteamPatchByTitleVersion,
+  extractSteamPatchTitleVersion,
   getSteamPatchIdentityKey,
   inferSourceComparisonRows,
   normalizeSourceComparisonVersion,
@@ -82,6 +83,7 @@ import {
   resolveSteamLibraryCoverUrl,
   resolveSteamMatch as resolveSteamSearch,
 } from '@vaulttrack/steam-core';
+import { rm } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 
 import { VaultTrackDatabase } from './database.js';
@@ -119,6 +121,8 @@ const IMPORT_STEAM_MATCH_CONCURRENCY = 3;
 const STEAMDB_BUILD_LOOKUP_TTL_MS = 60 * 60 * 1000;
 const SOURCE_CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
 const STEAMRIP_UPLOAD_PATCH_WINDOW_DAYS = 2;
+const WAITING_FOR_JDOWNLOADER_EXTRACTION_STATUS =
+  'Waiting for JDownloader extraction to finish';
 const SOURCE_MATCH_PROBABLE_SCORE = 0.92;
 const SOURCE_MATCH_CANDIDATE_SCORE = 0.84;
 const SUPPORTED_SOURCE_KINDS: SupportedSourceKind[] = [
@@ -296,8 +300,9 @@ function sourceVersionIdentity(
     return `build:${snapshot.observedBuildId}`;
   }
 
-  if (snapshot.observedVersion) {
-    return `version:${snapshot.observedVersion.toLowerCase()}`;
+  const sourceVersion = sourceComparableVersion(snapshot);
+  if (sourceVersion) {
+    return `version:${sourceVersion}`;
   }
 
   if (snapshot.observedPatchDate) {
@@ -305,6 +310,25 @@ function sourceVersionIdentity(
   }
 
   return null;
+}
+
+function comparableVersionText(value: string | null | undefined): string | null {
+  return (
+    extractSteamPatchTitleVersion(value) ??
+    normalizeSourceComparisonVersion(value)
+  );
+}
+
+function sourceComparableVersion(
+  snapshot?: SourceSnapshot | null,
+): string | null {
+  if (!snapshot) {
+    return null;
+  }
+  return (
+    comparableVersionText(snapshot.observedVersion) ??
+    comparableVersionText(snapshot.observedPatchTitle)
+  );
 }
 
 function numericSteamBuildId(value: string | null | undefined): string | null {
@@ -540,6 +564,18 @@ function isDirectHttpProvider(
   return provider === 'direct_http';
 }
 
+function isManualProvider(
+  provider: DownloadJobRecord['provider'] | null | undefined,
+): provider is 'manual' {
+  return provider === 'manual';
+}
+
+function isJDownloaderProvider(
+  provider: DownloadJobRecord['provider'] | null | undefined,
+): provider is 'jdownloader' | null | undefined {
+  return !isDirectHttpProvider(provider) && !isManualProvider(provider);
+}
+
 function getDirectHttpPartStagePath(params: {
   job: DownloadJobRecord;
   part: DownloadJobPartRecord;
@@ -631,6 +667,7 @@ function downloadJobHasPackageId(job: DownloadJobRecord): boolean {
 function isUnconfirmedQueuedDownload(job: DownloadJobRecord): boolean {
   return (
     !isDirectHttpProvider(job.provider) &&
+    !isManualProvider(job.provider) &&
     job.stage === 'queued' &&
     !downloadJobHasPackageId(job)
   );
@@ -734,6 +771,85 @@ function getElamigosFullStagePaths(job: DownloadJobRecord): string[] {
   }
 
   return Array.from(candidates);
+}
+
+function getElamigosPartStagePathCandidates(
+  job: DownloadJobRecord,
+  part: DownloadJobPartRecord,
+): string[] {
+  const candidates = new Set<string>();
+  const stageName = basename(job.stagePath);
+  const packageName = part.packageName || job.packageName;
+
+  if (packageName) {
+    candidates.add(join(job.stagePath, packageName));
+  }
+
+  if (part.role === 'full') {
+    for (const rootPath of getElamigosFullStagePaths(job)) {
+      candidates.add(rootPath);
+    }
+  } else {
+    if (stageName) {
+      candidates.add(join(job.stagePath, `${stageName}_update`));
+    }
+    candidates.add(resolve(`${job.stagePath}_update`));
+  }
+
+  if (
+    packageName &&
+    !packageName.endsWith('_full') &&
+    !packageName.endsWith('_update')
+  ) {
+    candidates.add(job.stagePath);
+  }
+
+  return Array.from(candidates);
+}
+
+async function elamigosPartHasStagedFiles(params: {
+  job: DownloadJobRecord;
+  part: DownloadJobPartRecord;
+}): Promise<boolean> {
+  for (const candidatePath of getElamigosPartStagePathCandidates(
+    params.job,
+    params.part,
+  )) {
+    await normalizeDuplicateNestedFolder({
+      nestedFolderName: params.part.packageName,
+      rootPath: candidatePath,
+    }).catch(() => false);
+    if (await directoryHasEntries(candidatePath)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function elamigosJobHasStagedFiles(
+  job: DownloadJobRecord,
+): Promise<boolean> {
+  const parts =
+    job.parts && job.parts.length > 0
+      ? job.parts
+      : buildDownloadJobParts({
+          jobId: job.id,
+          now: job.createdAt,
+          packageName: job.packageName,
+          selectedDownloads: {
+            fullUrl: job.selectedMirrorUrl ?? '',
+            patchUrl: job.selectedPatchMirrorUrl ?? null,
+          },
+          sourceKind: 'elamigos',
+          trackedItemId: job.trackedItemId,
+        });
+
+  for (const part of parts) {
+    if (await elamigosPartHasStagedFiles({ job, part })) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function getElamigosPartContentPaths(job: DownloadJobRecord): string[] {
@@ -995,7 +1111,7 @@ export class VaultTrackService {
     trackedItemId: string,
     warningMessage: string,
   ): Promise<void> {
-    if (isDirectHttpProvider(job.provider)) {
+    if (!isJDownloaderProvider(job.provider)) {
       return;
     }
 
@@ -1021,7 +1137,13 @@ export class VaultTrackService {
   }
 
   private getDownloadJobProvider(job: DownloadJobRecord): DownloadProvider {
-    return isDirectHttpProvider(job.provider) ? 'direct_http' : 'jdownloader';
+    if (isDirectHttpProvider(job.provider)) {
+      return 'direct_http';
+    }
+    if (isManualProvider(job.provider)) {
+      return 'manual';
+    }
+    return 'jdownloader';
   }
 
   private async resolveDownloadProvider(params: {
@@ -1034,12 +1156,12 @@ export class VaultTrackService {
     }
 
     if (!params.settings.jDownloaderEnabled) {
-      return 'direct_http';
+      return 'manual';
     }
 
     const preferences = getJDownloaderSourcePreferences(params.settings);
     if (!preferences[params.sourceKind]) {
-      return 'direct_http';
+      return 'manual';
     }
 
     try {
@@ -1050,18 +1172,18 @@ export class VaultTrackService {
 
       this.appendEvent(
         'info',
-        'Falling back to curl because JDownloader is not ready',
+        'Falling back to manual download because JDownloader is not ready',
         {
           jDownloaderStatus: health.color,
           sourceKind: params.sourceKind,
           trackedItemId: params.trackedItemId,
         },
       );
-      return 'direct_http';
+      return 'manual';
     } catch (error) {
       this.appendEvent(
         'warn',
-        'Falling back to curl because JDownloader status could not be checked',
+        'Falling back to manual download because JDownloader status could not be checked',
         {
           error:
             error instanceof Error
@@ -1071,7 +1193,7 @@ export class VaultTrackService {
           trackedItemId: params.trackedItemId,
         },
       );
-      return 'direct_http';
+      return 'manual';
     }
   }
 
@@ -1659,12 +1781,12 @@ export class VaultTrackService {
         archiveRootPath: targetPath,
         destinationPath: targetPath,
       });
-      if (
-        extractedArchives.length === 0 &&
-        !(await directoryHasEntries(targetPath))
-      ) {
+      if (extractedArchives.length === 0) {
+        await rm(targetPath, { force: true, recursive: true }).catch(
+          () => undefined,
+        );
         throw new Error(
-          'ElAmigos curl download completed, but no staged files were found.',
+          'ElAmigos curl download did not produce an extractable archive. The selected mirror likely returned an HTML page or unsupported container.',
         );
       }
       parts = parts.map((candidate) =>
@@ -1674,10 +1796,7 @@ export class VaultTrackService {
               errorMessage: null,
               etaSeconds: 0,
               stage: 'staged' as const,
-              statusMessage:
-                extractedArchives.length > 0
-                  ? 'Extracted staged archive'
-                  : 'Staged files found',
+              statusMessage: 'Extracted staged archive',
               updatedAt: new Date().toISOString(),
             }
           : candidate,
@@ -3138,6 +3257,24 @@ export class VaultTrackService {
     const installedSourceKind =
       this.database.getInstallRecord(params.trackedItemId)
         ?.installedSourceKind ?? null;
+    const hasPatchDownloads = params.parsedSource.patchDownloadUrls.length > 0;
+
+    if (!hasPatchDownloads) {
+      const selectedFullUrl = params.selectedDownloads.fullUrl?.trim() ?? '';
+      if (!selectedFullUrl) {
+        throw new Error(
+          'Select an ElAmigos full mirror before queueing this update.',
+        );
+      }
+
+      return {
+        ...params.selectedDownloads,
+        fullUrl: selectedFullUrl,
+        patchUrl: null,
+        sourceKind: 'elamigos',
+      };
+    }
+
     const selectedPatchUrl = params.selectedDownloads.patchUrl?.trim() ?? '';
     if (!selectedPatchUrl) {
       throw new Error(
@@ -3736,10 +3873,27 @@ export class VaultTrackService {
       return 'newer_than_installed';
     }
 
+    const installedComparableVersion = comparableVersionText(
+      installRecord?.installedVersion,
+    );
+    const sourceComparableVersionValue = sourceComparableVersion(snapshot);
+    if (
+      installRecord &&
+      !snapshot.observedBuildId &&
+      installedComparableVersion &&
+      sourceComparableVersionValue
+    ) {
+      return installedComparableVersion === sourceComparableVersionValue
+        ? 'same_as_installed'
+        : match.method === 'recent_updates'
+          ? 'possible_update'
+          : 'newer_than_installed';
+    }
+
     const installIdentity = installRecord?.installedBuildId
       ? `build:${installRecord.installedBuildId}`
-      : installRecord?.installedVersion
-        ? `version:${installRecord.installedVersion.toLowerCase()}`
+      : installedComparableVersion
+        ? `version:${installedComparableVersion}`
         : null;
     const sourceIdentity = sourceVersionIdentity(snapshot);
     if (installIdentity && sourceIdentity) {
@@ -4763,6 +4917,43 @@ export class VaultTrackService {
         resolveQueueLock();
         return;
       }
+      if (provider === 'manual') {
+        const updatedAt = new Date().toISOString();
+        const manualParts = placeholderParts.map((part) => ({
+          ...part,
+          errorMessage: null,
+          stage: 'queued' as const,
+          statusMessage: 'Manual download required',
+          updatedAt,
+        }));
+        const job: DownloadJobRecord = {
+          ...placeholderJob,
+          bytesLoaded: null,
+          bytesTotal: null,
+          completedParts: 0,
+          errorMessage: null,
+          etaSeconds: null,
+          packageId: null,
+          parts: manualParts,
+          provider,
+          speed: null,
+          stage: 'queued',
+          statusMessage: 'Manual download required',
+          totalParts: manualParts.length,
+          updatedAt,
+        };
+        this.database.upsertDownloadJob(job);
+        this.appendEvent(
+          'info',
+          `Prepared manual download for ${trackedView.item.title}`,
+          {
+            packageName,
+            trackedItemId,
+          },
+        );
+        resolveQueueLock();
+        return;
+      }
       const queued = await this.myJDownloader.queueLinks({
         extractDirectory: paths.extractPath,
         packageName,
@@ -5712,6 +5903,72 @@ export class VaultTrackService {
     return this.buildTrackedItemView(trackedItemId);
   }
 
+  async cancelDownload(trackedItemId: string): Promise<TrackedItemView> {
+    const job = this.database.getDownloadJob(trackedItemId);
+    if (!job) {
+      throw new Error('No download job is available to cancel.');
+    }
+    if (job.stage === 'complete') {
+      throw new Error('Completed installs cannot be cancelled.');
+    }
+
+    await this.cancelDirectHttpDownload(
+      trackedItemId,
+      'Download cancelled',
+    ).catch(() => undefined);
+    await this.removeJDownloaderPackagesForJob(
+      job,
+      trackedItemId,
+      'Unable to remove JDownloader package while cancelling download',
+    );
+
+    const settings = this.database.getSettings();
+    if (!settings.rootLibraryPath) {
+      throw new Error(
+        'Root library path is not configured, so staged files cannot be deleted safely.',
+      );
+    }
+
+    const sourceKind =
+      job.sourceKind === 'ankergames' ||
+      job.sourceKind === 'elamigos' ||
+      job.sourceKind === 'steamrip'
+        ? job.sourceKind
+        : null;
+    const ejectedIsoPaths: string[] = [];
+    if (sourceKind === 'elamigos') {
+      for (const rootPath of getElamigosPartContentPaths(job)) {
+        if (!(await pathExists(rootPath))) {
+          continue;
+        }
+        ejectedIsoPaths.push(
+          ...(await this.dismountIsoUnderPath({ rootPath })),
+        );
+      }
+    }
+
+    const extractionPath =
+      sourceKind === 'ankergames' || sourceKind === 'steamrip'
+        ? getPortableArchiveExtractPath({
+            finalPath: job.finalPath,
+            sourceKind,
+            stagePath: job.stagePath,
+          })
+        : job.stagePath;
+    const deletedPaths = await removeKnownStagingPaths({
+      extractionPath,
+      rootLibraryPath: settings.rootLibraryPath,
+      stagePath: job.stagePath,
+    });
+    this.database.deleteDownloadJob(job.id);
+    this.appendEvent('info', 'Cancelled download and deleted staged files', {
+      deletedPaths,
+      ejectedIsoPaths,
+      trackedItemId,
+    });
+    return this.buildTrackedItemView(trackedItemId);
+  }
+
   async pollDownloadJobs(): Promise<void> {
     for (const item of this.database.listTrackedItems()) {
       const job = this.database.getDownloadJob(item.id);
@@ -5741,6 +5998,9 @@ export class VaultTrackService {
             );
             this.database.upsertDownloadJob(recoveredJob);
           }
+          continue;
+        }
+        if (isManualProvider(job.provider)) {
           continue;
         }
 
@@ -5780,31 +6040,23 @@ export class VaultTrackService {
             sourceKind: jobSourceKind,
             stagePath: job.stagePath,
           });
-          const partStagePath = join(job.stagePath, part.packageName);
-          const normalizedNestedFolder =
-            jobSourceKind === 'elamigos'
-              ? await normalizeDuplicateNestedFolder({
-                  nestedFolderName: part.packageName,
-                  rootPath: partStagePath,
-                })
-              : false;
-          if (normalizedNestedFolder) {
-            this.appendEvent(
-              'info',
-              'Normalized nested ElAmigos extraction folder',
-              {
-                packageName: part.packageName,
-                rootPath: partStagePath,
-                trackedItemId: item.id,
-              },
-            );
-          }
+          const elamigosPartHasFiles =
+            jobSourceKind === 'elamigos' &&
+            (await elamigosPartHasStagedFiles({ job, part }));
+          const progressStatusText = `${progress.statusMessage ?? ''} ${
+            progress.errorMessage ?? ''
+          }`;
+          const progressHasExtractionError =
+            isExtractionErrorMessage(progressStatusText);
           const stagedPartHasFiles =
             jobSourceKind === 'elamigos' &&
-            isExtractionErrorMessage(
-              `${progress.statusMessage ?? ''} ${progress.errorMessage ?? ''}`,
-            ) &&
-            (await directoryHasEntries(partStagePath));
+            progressHasExtractionError &&
+            elamigosPartHasFiles;
+          const elamigosWaitingForExtraction =
+            jobSourceKind === 'elamigos' &&
+            progress.stage === 'staged' &&
+            !elamigosPartHasFiles &&
+            !progressHasExtractionError;
           updatedParts.push({
             ...part,
             bytesLoaded: progress.bytesLoaded,
@@ -5813,14 +6065,40 @@ export class VaultTrackService {
             etaSeconds: progress.etaSeconds,
             packageId: progress.packageId,
             speed: progress.speed,
-            stage: stagedPartHasFiles ? 'staged' : progress.stage,
+            stage: stagedPartHasFiles
+              ? 'staged'
+              : elamigosWaitingForExtraction
+                ? 'extracting'
+                : progress.stage,
             statusMessage: stagedPartHasFiles
               ? 'JDownloader reported Extraction error; staged files are present'
+              : elamigosWaitingForExtraction
+                ? WAITING_FOR_JDOWNLOADER_EXTRACTION_STATUS
               : (progress.statusMessage ?? null),
             updatedAt: new Date().toISOString(),
           });
         }
-        const summary = summarizeDownloadParts(updatedParts, jobSourceKind);
+        const hasActiveElamigosDownload =
+          jobSourceKind === 'elamigos' &&
+          updatedParts.some(
+            (part) => part.stage === 'queued' || part.stage === 'downloading',
+          );
+        const effectiveUpdatedParts = hasActiveElamigosDownload
+          ? updatedParts.map((part) =>
+              part.stage === 'extracting' &&
+              part.statusMessage === WAITING_FOR_JDOWNLOADER_EXTRACTION_STATUS
+                ? {
+                    ...part,
+                    stage: 'staged' as const,
+                    statusMessage: null,
+                  }
+                : part,
+            )
+          : updatedParts;
+        const summary = summarizeDownloadParts(
+          effectiveUpdatedParts,
+          jobSourceKind,
+        );
         let nextJob: DownloadJobRecord = {
           ...job,
           bytesLoaded: summary.bytesLoaded,
@@ -5830,7 +6108,7 @@ export class VaultTrackService {
           etaSeconds: summary.etaSeconds,
           packageId: summary.packageId,
           packageName: summary.packageName || job.packageName,
-          parts: updatedParts,
+          parts: effectiveUpdatedParts,
           speed: summary.speed,
           stage: summary.stage,
           statusMessage: summary.statusMessage,
@@ -5870,7 +6148,22 @@ export class VaultTrackService {
                 });
               }
             }
-            if (portableExtractionError && !hasExtractedGameFolder) {
+            if (!portableExtractionError && !hasExtractedGameFolder) {
+              nextJob.stage = 'extracting';
+              nextJob.statusMessage =
+                WAITING_FOR_JDOWNLOADER_EXTRACTION_STATUS;
+              nextJob.etaSeconds = null;
+              nextJob.parts = effectiveUpdatedParts.map((part) =>
+                part.stage === 'complete'
+                  ? {
+                      ...part,
+                      etaSeconds: null,
+                      stage: 'extracting' as const,
+                      statusMessage: WAITING_FOR_JDOWNLOADER_EXTRACTION_STATUS,
+                    }
+                  : part,
+              );
+            } else if (portableExtractionError && !hasExtractedGameFolder) {
               const message =
                 jobSourceKind === 'ankergames'
                   ? 'JDownloader reported Extraction error and ZIP recovery did not extract game files. Retry will restart extraction from the staged archive.'
@@ -5878,7 +6171,7 @@ export class VaultTrackService {
               nextJob.errorMessage = message;
               nextJob.stage = 'failed';
               nextJob.statusMessage = message;
-              nextJob.parts = updatedParts.map((part) => ({
+              nextJob.parts = effectiveUpdatedParts.map((part) => ({
                 ...part,
                 errorMessage: message,
                 stage: 'failed',
@@ -5896,7 +6189,7 @@ export class VaultTrackService {
                     : nextJob.statusMessage,
                 updatedParts:
                   portableExtractionError || recoveredFromStagedZip
-                    ? updatedParts.map((part) => ({
+                    ? effectiveUpdatedParts.map((part) => ({
                         ...part,
                         errorMessage: null,
                         stage: 'extracting' as const,
@@ -5905,7 +6198,7 @@ export class VaultTrackService {
                             ? 'Finalizing staged archive'
                             : part.statusMessage,
                       }))
-                    : updatedParts,
+                    : effectiveUpdatedParts,
               });
             }
           }
@@ -6643,6 +6936,7 @@ export class VaultTrackService {
 
   async updateSourcePatch(params: {
     selectedSteamPatch: SteamPatchCandidate;
+    sourceKind?: SupportedSourceKind;
     steamPatchEntries?: SteamPatchCandidate[] | null;
     trackedItemId: string;
   }): Promise<TrackedItemView> {
@@ -6662,7 +6956,9 @@ export class VaultTrackService {
       );
     }
 
-    const sourceSnapshot = this.getItemSourceSnapshot(item);
+    const sourceSnapshot = params.sourceKind
+      ? this.database.getSourceSnapshot(params.trackedItemId, params.sourceKind)
+      : this.getItemSourceSnapshot(item);
     if (!sourceSnapshot) {
       throw new Error('No source snapshot is available for this item.');
     }
@@ -6693,7 +6989,7 @@ export class VaultTrackService {
         sourceSnapshot.observedVersion,
       patchSelectionSource: selectionSource,
     });
-    if (item.sourceKind === 'manual') {
+    if (!params.sourceKind && item.sourceKind === 'manual') {
       const installRecord = this.database.getInstallRecord(
         params.trackedItemId,
       );
@@ -6715,6 +7011,7 @@ export class VaultTrackService {
 
     this.appendEvent('info', 'Updated source patch selection', {
       buildId: params.selectedSteamPatch.buildId ?? null,
+      sourceKind: params.sourceKind ?? sourceSnapshot.sourceKind,
       trackedItemId: params.trackedItemId,
     });
     return this.buildTrackedItemView(params.trackedItemId);
@@ -6795,7 +7092,7 @@ export class VaultTrackService {
               settings.rootLibraryPath,
               sanitizePathSegment(steamMatch?.title ?? item.title),
             ),
-          )
+        )
         : null;
 
     if (currentJob) {
@@ -6803,6 +7100,73 @@ export class VaultTrackService {
         currentJob,
         trackedItemId,
         'Unable to remove JDownloader package while completing staged install',
+      );
+    }
+
+    if (
+      currentJob &&
+      isManualProvider(currentJob.provider) &&
+      sourceSnapshot.sourceKind === 'steamrip'
+    ) {
+      const extractPath = getPortableArchiveExtractPath({
+        finalPath: currentJob.finalPath,
+        sourceKind: 'steamrip',
+        stagePath: currentJob.stagePath,
+      });
+      const canonicalTitle = this.getPortableArchiveCanonicalTitle(
+        item,
+        currentJob,
+      );
+      if (
+        !(await hasPortableArchiveContentFolder({
+          canonicalTitle,
+          extractPath,
+          sourceKind: 'steamrip',
+        }))
+      ) {
+        throw new Error(
+          `No manual SteamRIP game folder was found. Extract the downloaded game folder to ${join(
+            extractPath,
+            basename(currentJob.finalPath),
+          )} and try again.`,
+        );
+      }
+
+      const completedJob = await this.finalizePortableArchiveJob({
+        item,
+        job: currentJob,
+        sourceKind: 'steamrip',
+        statusMessage: 'Manual install completed',
+        updatedParts: this.getDownloadJobParts(currentJob, 'steamrip'),
+      });
+      this.database.upsertDownloadJob(completedJob);
+      this.appendEvent('info', 'Completed manual SteamRIP install', {
+        trackedItemId,
+      });
+      return this.buildTrackedItemView(trackedItemId);
+    }
+
+    if (
+      currentJob &&
+      isManualProvider(currentJob.provider) &&
+      sourceSnapshot.sourceKind === 'elamigos' &&
+      (!installedFinalPath || !(await directoryHasEntries(installedFinalPath)))
+    ) {
+      throw new Error(
+        `No completed ElAmigos install was found at ${
+          installedFinalPath ?? 'the expected library folder'
+        }. Finish the manual installer there and try again.`,
+      );
+    }
+
+    if (
+      currentJob &&
+      !isManualProvider(currentJob.provider) &&
+      sourceSnapshot.sourceKind === 'elamigos' &&
+      !(await elamigosJobHasStagedFiles(currentJob))
+    ) {
+      throw new Error(
+        'No staged ElAmigos installer files were found. Wait for JDownloader extraction to finish and try again.',
       );
     }
 

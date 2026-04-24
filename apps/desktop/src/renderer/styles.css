@@ -220,11 +220,13 @@ select option {
   height: 38px;
   display: inline-grid;
   place-items: center;
+  padding: 0;
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--panel-soft);
   color: var(--muted);
   font-weight: 800;
+  line-height: 1;
 }
 
 .theme-switch {
@@ -530,11 +532,12 @@ code {
 .game-card__actions {
   align-self: start;
   display: flex;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   gap: 6px;
   align-items: center;
   margin-top: 2px;
   padding-right: 38px;
+  padding-bottom: 36px;
 }
 
 .game-row {
@@ -544,7 +547,8 @@ code {
   position: relative;
   display: grid;
   grid-template-columns: var(--game-row-cover-width) minmax(0, 1fr);
-  height: var(--game-row-height);
+  min-height: var(--game-row-height);
+  height: auto;
   align-items: stretch;
   overflow: visible;
 }
@@ -552,8 +556,8 @@ code {
 .game-row__media {
   align-self: stretch;
   width: var(--game-row-cover-width);
-  height: var(--game-row-height);
-  min-height: 0;
+  min-height: var(--game-row-height);
+  height: auto;
   display: grid;
   place-items: center;
   overflow: hidden;
@@ -568,11 +572,12 @@ code {
 
 .game-row__body {
   grid-template-columns: minmax(220px, 0.32fr) minmax(0, 1fr);
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto;
+  align-content: start;
   column-gap: 18px;
   gap: 8px;
   padding: 14px 74px 14px 14px;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .game-row__body > :not(.detail-grid) {
@@ -914,6 +919,13 @@ code {
   gap: 7px;
 }
 
+.progress-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
 .progress-track {
   height: 8px;
   overflow: hidden;
@@ -943,6 +955,31 @@ code {
   border: 1px solid var(--border);
   border-radius: 999px;
   background: var(--panel-soft);
+}
+
+.cancel-download-button {
+  flex: 0 0 auto;
+  color: var(--danger);
+}
+
+.cancel-download-button.is-progress {
+  width: 28px;
+  height: 28px;
+  border-color: color-mix(in srgb, var(--danger) 36%, var(--border));
+  background: color-mix(in srgb, var(--danger) 10%, var(--panel-soft));
+}
+
+.cancel-download-button svg {
+  width: 13px;
+  height: 13px;
+  display: block;
+}
+
+.cancel-download-button:hover,
+.cancel-download-button:focus-visible {
+  border-color: color-mix(in srgb, var(--danger) 62%, var(--border));
+  background: color-mix(in srgb, var(--danger) 18%, var(--panel-soft));
+  color: color-mix(in srgb, var(--danger) 80%, white);
 }
 
 .empty-state {
@@ -1965,6 +2002,10 @@ code {
   backdrop-filter: blur(10px);
 }
 
+.modal-backdrop--stacked {
+  z-index: 90;
+}
+
 .modal-panel {
   width: min(620px, 100%);
   display: grid;
@@ -1973,12 +2014,83 @@ code {
   background: var(--overlay);
 }
 
+.update-flow-error {
+  margin: 0;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--danger) 32%, var(--border));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--danger) 10%, var(--panel-soft));
+  color: color-mix(in srgb, var(--danger) 62%, var(--ink));
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .retry-modal.is-single-choice {
   width: min(520px, 100%);
 }
 
 .patch-modal {
   width: min(720px, 100%);
+}
+
+.manual-update-modal {
+  width: min(760px, 100%);
+}
+
+.manual-link-list,
+.manual-update-notes {
+  display: grid;
+  gap: 10px;
+}
+
+.manual-link-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--panel-soft);
+}
+
+.manual-link-row div {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.manual-link-row span {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.manual-link-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.manual-update-notes {
+  padding: 11px;
+  border: 1px solid color-mix(in srgb, var(--warning) 24%, var(--border));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--warning) 8%, var(--panel-soft));
+}
+
+.manual-update-notes ol {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--muted-strong);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.manual-copy-path {
+  justify-self: start;
 }
 
 .imported-source-modal {
@@ -2089,6 +2201,28 @@ code {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.likely-match-chip {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  min-height: 20px;
+  padding: 0 7px;
+  border: 1px solid color-mix(in srgb, var(--success) 36%, var(--border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--success) 14%, var(--panel-soft));
+  color: color-mix(in srgb, var(--success) 82%, var(--ink));
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.likely-match-chip svg {
+  width: 11px;
+  height: 11px;
 }
 
 .patch-option small,

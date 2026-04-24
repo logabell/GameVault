@@ -5,6 +5,8 @@ const api = {
     ipcRenderer.invoke('vault:authenticateMyJDownloader', payload),
   applySteamMatch: (payload: unknown) =>
     ipcRenderer.invoke('vault:applySteamMatch', payload),
+  cancelDownload: (trackedItemId: string) =>
+    ipcRenderer.invoke('vault:cancelDownload', trackedItemId),
   completeStagedInstall: (trackedItemId: string) =>
     ipcRenderer.invoke('vault:completeStagedInstall', trackedItemId),
   disconnectMyJDownloader: () =>

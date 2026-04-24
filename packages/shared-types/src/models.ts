@@ -258,7 +258,7 @@ export type DownloadStage =
   | 'failed'
   | 'complete';
 
-export type DownloadProvider = 'direct_http' | 'jdownloader';
+export type DownloadProvider = 'direct_http' | 'jdownloader' | 'manual';
 
 export interface DownloadJobPartRecord {
   id: string;

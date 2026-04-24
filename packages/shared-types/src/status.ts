@@ -80,7 +80,8 @@ function hasMatchedSourceUpdate(
         source.isUpdateSource &&
         (source.updateStatus === 'newer_than_installed' ||
           source.updateStatus === 'matches_upstream' ||
-          source.updateStatus === 'possible_update'),
+          source.updateStatus === 'possible_update' ||
+          source.updateStatus === 'source_behind_upstream'),
     ),
   );
 }

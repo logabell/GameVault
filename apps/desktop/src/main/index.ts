@@ -601,6 +601,9 @@ async function bootstrap() {
   ipcMain.handle('vault:markDownloadFailed', (_event, trackedItemId: string) =>
     service.markDownloadFailed(trackedItemId),
   );
+  ipcMain.handle('vault:cancelDownload', (_event, trackedItemId: string) =>
+    service.cancelDownload(trackedItemId),
+  );
   ipcMain.handle(
     'vault:clearDownloadMirrorFailed',
     (_event, payload: { trackedItemId: string; url: string }) =>

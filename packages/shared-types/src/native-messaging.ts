@@ -109,12 +109,17 @@ export type NativeMessageRequest =
       type: 'updateSourcePatch';
       payload: {
         selectedSteamPatch: SteamPatchCandidate;
+        sourceKind?: SupportedSourceKind;
         steamPatchEntries?: SteamPatchCandidate[] | null;
         trackedItemId: string;
       };
     }
   | {
       type: 'markDownloadFailed';
+      payload: { trackedItemId: string };
+    }
+  | {
+      type: 'cancelDownload';
       payload: { trackedItemId: string };
     }
   | {
@@ -277,6 +282,11 @@ export type NativeMessageResponse =
   | {
       ok: true;
       type: 'markDownloadFailed';
+      payload: TrackedItemView;
+    }
+  | {
+      ok: true;
+      type: 'cancelDownload';
       payload: TrackedItemView;
     }
   | {

@@ -1812,6 +1812,8 @@ export class VaultTrackDatabase {
             row.provider === 'embedded_browser' ||
             row.provider === 'direct_http'
               ? 'direct_http'
+              : row.provider === 'manual'
+                ? 'manual'
               : 'jdownloader',
           sourceKind: row.source_kind,
           selectedPatchMirrorUrl: row.selected_patch_mirror_url,
@@ -1978,6 +1980,11 @@ export class VaultTrackDatabase {
     for (const part of job.parts ?? []) {
       this.upsertDownloadJobPart(part);
     }
+  }
+
+  deleteDownloadJob(jobId: string): void {
+    this.exec(`DELETE FROM download_job_parts WHERE job_id = ?`, [jobId]);
+    this.exec(`DELETE FROM download_jobs WHERE id = ?`, [jobId]);
   }
 
   deleteTrackedItemCascade(trackedItemId: string): void {

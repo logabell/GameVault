@@ -86,6 +86,9 @@ export function getDeleteTrackedItemPrompt(item: TrackedItemView): string {
   if (item.currentDownload?.provider === 'direct_http') {
     return `Delete ${item.item.title} from VaultTrack, stop its curl download, and delete staged/install files?`;
   }
+  if (item.currentDownload?.provider === 'manual') {
+    return `Delete ${item.item.title} from VaultTrack and delete manual staging/install files?`;
+  }
 
   return `Delete ${item.item.title} from VaultTrack, remove it from JDownloader, and delete staged/install files?`;
 }
@@ -93,6 +96,9 @@ export function getDeleteTrackedItemPrompt(item: TrackedItemView): string {
 export function getMarkDownloadFailedPrompt(item: TrackedItemView): string {
   if (item.currentDownload?.provider === 'direct_http') {
     return `Mark ${item.item.title} as failed and stop its curl download?`;
+  }
+  if (item.currentDownload?.provider === 'manual') {
+    return `Cancel the manual download for ${item.item.title} and delete staged files?`;
   }
 
   return `Mark ${item.item.title} as failed and remove its JDownloader package(s)?`;
