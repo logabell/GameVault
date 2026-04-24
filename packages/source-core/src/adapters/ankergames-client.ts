@@ -808,7 +808,7 @@ export async function resolveAnkerGamesBrowserDownloadUrl(
   }
   if (!isAnkerGamesGeneratedDownloadUrl(stableDownloadUrl)) {
     throw new Error(
-      `AnkerGames browser download must start from a generated endpoint, proxy URL, or direct DataNodes URL. ${buildAnkerGamesCandidateSummary(
+      `AnkerGames curl download must start from a generated endpoint, proxy URL, or direct DataNodes URL. ${buildAnkerGamesCandidateSummary(
         {
           stableDownloadUrl,
         },
@@ -832,8 +832,23 @@ export async function resolveAnkerGamesBrowserDownloadUrl(
       context: params,
       signedPageUrl,
     });
-    return firstAnkerGamesLaunchUrl(candidates) ?? signedPageUrl;
-  } catch {
-    return signedPageUrl;
+    const launchUrl = firstAnkerGamesLaunchUrl(candidates);
+    if (launchUrl) {
+      return launchUrl;
+    }
+    throw new Error(
+      `AnkerGames signed page did not include a curl-ready dlproxy or DataNodes URL. ${buildAnkerGamesCandidateSummary(
+        {
+          directUrls: candidates.directUrls,
+          proxyUrls: candidates.proxyUrls,
+          signedPageUrl,
+          stableDownloadUrl,
+        },
+      )}`,
+    );
+  } catch (error) {
+    throw error instanceof Error
+      ? error
+      : new Error('AnkerGames signed page did not include a curl-ready URL.');
   }
 }

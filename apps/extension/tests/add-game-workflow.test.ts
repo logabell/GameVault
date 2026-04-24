@@ -470,7 +470,7 @@ describe('extension add-game workflow helpers', () => {
       }),
     ).toBeNull();
     expect(getDownloadQueueSuccessMessage('ankergames')).toBe(
-      'Download is starting in the desktop browser.',
+      'Download is starting in the desktop app with curl.',
     );
   });
 

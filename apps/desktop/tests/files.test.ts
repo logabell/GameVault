@@ -295,7 +295,7 @@ describe('finalizeSteamRipExtraction', () => {
     }
   });
 
-  it('refuses to overwrite an existing non-empty install folder', async () => {
+  it('replaces an existing non-empty install folder after staged extraction is valid', async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), 'vaulttrack-existing-'));
     const rootLibraryPath = join(tempRoot, 'High Seas');
     const stageRootPath = join(rootLibraryPath, '_STAGING');
@@ -309,18 +309,20 @@ describe('finalizeSteamRipExtraction', () => {
       await mkdir(finalPath, { recursive: true });
       await writeFile(join(finalPath, 'existing.txt'), 'keep');
 
+      await finalizePortableArchiveExtraction({
+        canonicalTitle: 'Shape of Dreams',
+        extractPath,
+        finalPath,
+        sourceKind: 'ankergames',
+        stageRootPath,
+      });
       await expect(
-        finalizePortableArchiveExtraction({
-          canonicalTitle: 'Shape of Dreams',
-          extractPath,
-          finalPath,
-          sourceKind: 'ankergames',
-          stageRootPath,
-        }),
-      ).rejects.toThrow('Refusing to overwrite existing install');
-      await expect(
-        readFile(join(finalPath, 'existing.txt'), 'utf8'),
-      ).resolves.toBe('keep');
+        readFile(join(finalPath, 'ShapeOfDreams.exe'), 'utf8'),
+      ).resolves.toBe('game');
+      await expect(pathExists(join(finalPath, 'existing.txt'))).resolves.toBe(
+        false,
+      );
+      await expect(pathExists(extractPath)).resolves.toBe(false);
     } finally {
       await rm(tempRoot, { force: true, recursive: true });
     }

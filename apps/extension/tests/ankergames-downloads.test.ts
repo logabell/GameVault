@@ -7,7 +7,7 @@ import {
   mergeAnkergamesBrowserDownloadsIntoParsedSource,
 } from '../src/background/ankergames-parse.js';
 
-describe('Ankergames browser-ready mirror harvesting', () => {
+describe('Ankergames direct-ready mirror harvesting', () => {
   it('resolves the dlproxy URL during background scrape without replacing the stable mirror URL', async () => {
     const stableUrl = 'https://ankergames.net/generate-download-url/2726';
     const browserDownloadUrl =
@@ -76,7 +76,7 @@ describe('Ankergames browser-ready mirror harvesting', () => {
     ]);
   });
 
-  it('merges harvested browser-ready Ankergames mirrors without changing the stable source URL', () => {
+  it('merges harvested direct-ready Ankergames mirrors without changing the stable source URL', () => {
     const stableUrl = 'https://ankergames.net/generate-download-url/2726';
     const browserDownloadUrl =
       'https://tunnel1.dlproxy.uk/download/proxy-token?sig=proxy-signature';
@@ -125,7 +125,7 @@ describe('Ankergames browser-ready mirror harvesting', () => {
     ]);
   });
 
-  it('keeps the stable Ankergames mirror when background scrape cannot resolve a browser-ready URL', async () => {
+  it('keeps the stable Ankergames mirror when background scrape cannot resolve a direct-ready URL', async () => {
     const stableUrl = 'https://ankergames.net/generate-download-url/2726';
     const parsedSource: ParsedSourcePayload = {
       coverUrl: null,

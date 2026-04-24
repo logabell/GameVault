@@ -4704,7 +4704,7 @@ function App() {
                   </strong>
                   <p className="muted-text">
                     {connectionHealth?.myJDownloader.message ??
-                      'Connect MyJDownloader for SteamRIP and ElAmigos automation. Ankergames uses the desktop browser.'}
+                      'Connect MyJDownloader for SteamRIP and ElAmigos automation. Ankergames uses desktop curl.'}
                   </p>
                 </div>
               </div>

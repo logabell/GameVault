@@ -123,6 +123,8 @@ CREATE TABLE IF NOT EXISTS install_records (
   installed_build_id TEXT,
   installed_at TEXT,
   install_path TEXT,
+  installed_source_kind TEXT,
+  installed_source_url TEXT,
   updated_at TEXT NOT NULL
 );
 
@@ -138,6 +140,7 @@ CREATE TABLE IF NOT EXISTS source_watches (
 CREATE TABLE IF NOT EXISTS download_jobs (
   id TEXT PRIMARY KEY,
   tracked_item_id TEXT NOT NULL,
+  source_kind TEXT,
   package_name TEXT NOT NULL,
   stage_path TEXT NOT NULL,
   final_path TEXT NOT NULL,
@@ -310,6 +313,9 @@ function applyMigrations(db: SqlJsDatabase): void {
     `ALTER TABLE steam_patch_entries ADD COLUMN selection_source TEXT`,
     `ALTER TABLE steam_feed_checks ADD COLUMN feed_url TEXT`,
     `ALTER TABLE install_records ADD COLUMN install_path TEXT`,
+    `ALTER TABLE install_records ADD COLUMN installed_source_kind TEXT`,
+    `ALTER TABLE install_records ADD COLUMN installed_source_url TEXT`,
+    `ALTER TABLE download_jobs ADD COLUMN source_kind TEXT`,
   ];
 
   for (const statement of statements) {
@@ -331,6 +337,24 @@ function applyMigrations(db: SqlJsDatabase): void {
   migrateDownloadJobParts(db);
   repairTransientSourceMatchState(db);
   repairSourceSnapshotsFromRawPayload(db);
+  repairDownloadJobProviderAndSourceKind(db);
+}
+
+function repairDownloadJobProviderAndSourceKind(db: SqlJsDatabase): void {
+  db.exec(`
+    UPDATE download_jobs
+       SET provider = 'direct_http'
+     WHERE provider = 'embedded_browser';
+
+    UPDATE download_jobs
+       SET source_kind = (
+             SELECT source_kind
+               FROM tracked_items
+              WHERE tracked_items.id = download_jobs.tracked_item_id
+           )
+     WHERE source_kind IS NULL
+        OR source_kind = '';
+  `);
 }
 
 function repairTransientSourceMatchState(db: SqlJsDatabase): void {
@@ -1557,6 +1581,8 @@ export class VaultTrackDatabase {
       installed_build_id: string | null;
       installed_at: string | null;
       install_path: string | null;
+      installed_source_kind: SourceKind | null;
+      installed_source_url: string | null;
       updated_at: string;
     }>(`SELECT * FROM install_records WHERE tracked_item_id = ?`, [
       trackedItemId,
@@ -1566,6 +1592,8 @@ export class VaultTrackDatabase {
           installedAt: row.installed_at,
           installedBuildId: row.installed_build_id,
           installPath: row.install_path,
+          installedSourceKind: row.installed_source_kind,
+          installedSourceUrl: row.installed_source_url,
           installedVersion: row.installed_version,
           trackedItemId: row.tracked_item_id,
           updatedAt: row.updated_at,
@@ -1576,13 +1604,16 @@ export class VaultTrackDatabase {
   upsertInstallRecord(record: InstallRecord): void {
     this.exec(
       `INSERT INTO install_records (
-         tracked_item_id, installed_version, installed_build_id, installed_at, install_path, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?)
+         tracked_item_id, installed_version, installed_build_id, installed_at, install_path,
+         installed_source_kind, installed_source_url, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(tracked_item_id) DO UPDATE SET
          installed_version = excluded.installed_version,
          installed_build_id = excluded.installed_build_id,
          installed_at = excluded.installed_at,
          install_path = excluded.install_path,
+         installed_source_kind = excluded.installed_source_kind,
+         installed_source_url = excluded.installed_source_url,
          updated_at = excluded.updated_at`,
       [
         record.trackedItemId,
@@ -1590,6 +1621,8 @@ export class VaultTrackDatabase {
         record.installedBuildId ?? null,
         record.installedAt ?? null,
         record.installPath ?? null,
+        record.installedSourceKind ?? null,
+        record.installedSourceUrl ?? null,
         record.updatedAt,
       ],
     );
@@ -1602,11 +1635,15 @@ export class VaultTrackDatabase {
       installed_build_id: string | null;
       installed_at: string | null;
       install_path: string | null;
+      installed_source_kind: SourceKind | null;
+      installed_source_url: string | null;
       updated_at: string;
     }>(`SELECT * FROM install_records`).map((row) => ({
       installPath: row.install_path,
       installedAt: row.installed_at,
       installedBuildId: row.installed_build_id,
+      installedSourceKind: row.installed_source_kind,
+      installedSourceUrl: row.installed_source_url,
       installedVersion: row.installed_version,
       trackedItemId: row.tracked_item_id,
       updatedAt: row.updated_at,
@@ -1701,6 +1738,7 @@ export class VaultTrackDatabase {
     const row = this.queryOne<{
       id: string;
       tracked_item_id: string;
+      source_kind: SupportedSourceKind | null;
       package_name: string;
       stage_path: string;
       final_path: string;
@@ -1737,9 +1775,11 @@ export class VaultTrackDatabase {
           packageId: row.package_id,
           packageName: row.package_name,
           provider:
-            row.provider === 'embedded_browser'
-              ? 'embedded_browser'
+            row.provider === 'embedded_browser' ||
+            row.provider === 'direct_http'
+              ? 'direct_http'
               : 'jdownloader',
+          sourceKind: row.source_kind,
           selectedPatchMirrorUrl: row.selected_patch_mirror_url,
           selectedMirrorUrl: row.selected_mirror_url,
           speed: row.speed,
@@ -1840,12 +1880,13 @@ export class VaultTrackDatabase {
   upsertDownloadJob(job: DownloadJobRecord): void {
     this.exec(
       `INSERT INTO download_jobs (
-         id, tracked_item_id, package_name, stage_path, final_path, stage, provider, package_id, selected_mirror_url,
+         id, tracked_item_id, source_kind, package_name, stage_path, final_path, stage, provider, package_id, selected_mirror_url,
           selected_patch_mirror_url, bytes_loaded, bytes_total, speed, eta_seconds, status_message,
           completed_parts, total_parts, created_at, updated_at, error_message
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
           tracked_item_id = excluded.tracked_item_id,
+          source_kind = excluded.source_kind,
           package_name = excluded.package_name,
           stage_path = excluded.stage_path,
           final_path = excluded.final_path,
@@ -1866,6 +1907,7 @@ export class VaultTrackDatabase {
       [
         job.id,
         job.trackedItemId,
+        job.sourceKind ?? null,
         job.packageName,
         job.stagePath,
         job.finalPath,

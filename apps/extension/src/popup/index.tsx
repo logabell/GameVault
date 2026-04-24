@@ -4810,7 +4810,7 @@ function App() {
                     </strong>
                     <p className="muted-text">
                       {health?.myJDownloader.message ??
-                        'Sign in to MyJDownloader for SteamRIP and ElAmigos automation. Ankergames uses the desktop browser.'}
+                        'Sign in to MyJDownloader for SteamRIP and ElAmigos automation. Ankergames uses desktop curl.'}
                     </p>
                   </div>
                 </div>

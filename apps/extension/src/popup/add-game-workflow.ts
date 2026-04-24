@@ -145,7 +145,7 @@ export function getDownloadQueueSuccessMessage(
   sourceKind: SupportedSourceKind | null | undefined,
 ): string {
   return sourceKind === 'ankergames'
-    ? 'Download is starting in the desktop browser.'
+    ? 'Download is starting in the desktop app with curl.'
     : 'Queued in MyJDownloader.';
 }
 
@@ -153,7 +153,7 @@ export function getDownloadQueueTimeoutMessage(
   sourceKind: SupportedSourceKind | null | undefined,
 ): string {
   return sourceKind === 'ankergames'
-    ? 'Download startup timed out. Check the VaultTrack desktop app, then try again if the browser download did not begin.'
+    ? 'Download startup timed out. Check the VaultTrack desktop app, then try again if the curl download did not begin.'
     : 'Download queueing timed out. Check MyJDownloader, then try again if the package was not added.';
 }
 

@@ -10,15 +10,12 @@ import type {
   SteamPatchCandidate,
   SupportedSourceKind,
 } from '@vaulttrack/shared-types';
-import type {
-  AnkerGamesSignedDownloadPageRenderer,
-  SourceFetch,
-} from '@vaulttrack/source-core';
+import type { SourceFetch } from '@vaulttrack/source-core';
 import type { MyJDownloaderService } from '../src/main/services/myjdownloader.js';
 import { VaultTrackDatabase } from '../src/main/services/database.js';
 import {
   VaultTrackService,
-  type AnkerGamesEmbeddedBrowserDownloadRunner,
+  type DirectHttpDownloadRunner,
 } from '../src/main/services/vaulttrack-service.js';
 import type { extractSingleStagedZipArchive } from '../src/main/services/files.js';
 
@@ -342,9 +339,9 @@ const ankergamesSource: ParsedSourcePayload = {
 
 const ankergamesProxyUrl =
   'https://tunnel1.dlproxy.uk/download/proxy-token?sig=proxy-signature';
-const ankergamesBrowserReadySource: ParsedSourcePayload = {
+const ankergamesDirectReadySource: ParsedSourcePayload = {
   ...ankergamesSource,
-  fingerprint: 'ankergames-browser-ready',
+  fingerprint: 'ankergames-direct-ready',
   fullDownloadUrls: [
     {
       ...ankergamesSource.fullDownloadUrls[0],
@@ -561,12 +558,12 @@ function createService(
     rootPath: string;
   }) => Promise<string[]> = vi.fn(async () => []),
   sourceFetch: SourceFetch = fetch,
-  renderAnkerGamesSignedDownloadPage?: AnkerGamesSignedDownloadPageRenderer,
+  _legacyRenderAnkerGamesSignedDownloadPage?: unknown,
   restartExtraction: unknown = vi.fn(async () => false),
   extractStagedZipArchive: typeof extractSingleStagedZipArchive = vi.fn(
     async () => null,
   ),
-  startAnkerGamesEmbeddedDownload: AnkerGamesEmbeddedBrowserDownloadRunner = vi.fn(
+  startDirectHttpDownload: DirectHttpDownloadRunner = vi.fn(
     () => ({
       cancel: vi.fn(),
       completion: new Promise<{ fileName: string; savePath: string }>(
@@ -601,8 +598,7 @@ function createService(
     async () => null,
     dismountIsoUnderPath,
     sourceFetch,
-    renderAnkerGamesSignedDownloadPage,
-    startAnkerGamesEmbeddedDownload,
+    startDirectHttpDownload,
     extractStagedZipArchive,
   );
 }
@@ -611,7 +607,7 @@ function createEmbeddedBrowserRunner(params: {
   cancel?: ReturnType<typeof vi.fn>;
   completion?: Promise<{ fileName: string; savePath: string }>;
 } = {}) {
-  return vi.fn<AnkerGamesEmbeddedBrowserDownloadRunner>(() => ({
+  return vi.fn<DirectHttpDownloadRunner>(() => ({
     cancel: params.cancel ?? vi.fn(),
     completion:
       params.completion ?? new Promise<{ fileName: string; savePath: string }>(() => undefined),
@@ -1647,7 +1643,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
     }
   });
 
-  it('queues a matched draft from a non-current AnkerGames source with the embedded browser provider', async () => {
+  it('queues a matched draft from a non-current AnkerGames source with the direct HTTP provider', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
       database.setSetting('library.rootPath', join(tempRoot, 'Library'));
@@ -1686,7 +1682,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       });
       const ankerSourceUrl = 'https://ankergames.net/game/mouse-p-i-for-hire';
       const ankerMirrorUrl =
-        'https://ankergames.net/generate-download-url/2726';
+        'https://tunnel1.dlproxy.uk/download/mouse-pi?sig=proxy-signature';
       database.upsertSourceSnapshot({
         checkedAt: '2026-04-22T12:00:00.000Z',
         fingerprint: 'ankergames-mouse-pi',
@@ -1737,12 +1733,12 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         expect.objectContaining({
           packageName: 'MOUSE P.I. For Hire_22852168',
           sourceUrl: ankerSourceUrl,
-          stableDownloadUrl: ankerMirrorUrl,
+          url: ankerMirrorUrl,
         }),
       );
       expect(queueLinks).not.toHaveBeenCalled();
       expect(queued.currentDownload).toMatchObject({
-        provider: 'embedded_browser',
+        provider: 'direct_http',
         selectedMirrorUrl: ankerMirrorUrl,
         stage: 'queued',
       });
@@ -2518,7 +2514,201 @@ describe('VaultTrackService SteamDB patch workflow', () => {
     }
   });
 
-  it('falls back to the stored Ankergames mirror when queue-time browser resolution fails', async () => {
+  it('queues only the ElAmigos update package when the installed source is ElAmigos', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const elamigosSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fullDownloadUrls: [
+          { kind: 'full', label: 'FULL', url: 'https://filecrypt.cc/full' },
+        ],
+        latestSourceRelease: {
+          isPatch: true,
+          label: 'update 1.0.1 - 1.0.5',
+          patchDate: '04/21/2026',
+          version: '1.0.5',
+        },
+        patchDownloadUrls: [
+          {
+            kind: 'patch',
+            label: 'UPDATE',
+            url: 'https://filecrypt.cc/update',
+          },
+        ],
+        sourceKind: 'elamigos',
+        sourceUrl:
+          'https://elamigos.site/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html',
+      };
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9002,
+        packageName: 'MOUSE P.I. For Hire_22852168_update',
+      }));
+      const service = createService(database, queueLinks);
+      const item = database.upsertTrackedItem({
+        normalizedTitle: elamigosSource.normalizedTitle,
+        sourceKind: 'elamigos',
+        sourceUrl: elamigosSource.sourceUrl,
+        title: elamigosSource.title,
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-23T12:00:00.000Z',
+        fingerprint: elamigosSource.fingerprint,
+        observedBuildId: selectedPatch.buildId ?? null,
+        observedPatchDate: selectedPatch.patchDate,
+        observedPatchLink: selectedPatch.link,
+        observedPatchTitle: selectedPatch.patchTitle,
+        observedVersion: '1.0.5',
+        patchSelectionSource: selectedPatch.selectionSource ?? 'rss',
+        sourceKind: 'elamigos',
+        sourceUrl: elamigosSource.sourceUrl,
+        trackedItemId: item.id,
+      });
+      database.setRawParsedSourcePayload(item.id, elamigosSource);
+      database.syncDownloadMirrors(item.id, 'elamigos', [
+        { kind: 'full', label: 'FULL', url: 'https://filecrypt.cc/full' },
+        {
+          kind: 'patch',
+          label: 'UPDATE',
+          url: 'https://filecrypt.cc/update',
+        },
+      ]);
+      database.upsertInstallRecord({
+        installedAt: '04/19/2026',
+        installedBuildId: '22800000',
+        installedSourceKind: 'elamigos',
+        installedSourceUrl: elamigosSource.sourceUrl,
+        installedVersion: '1.0.1',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-23T12:00:00.000Z',
+      });
+
+      await service.queueUpdateFromSource({
+        sourceKind: 'elamigos',
+        trackedItemId: item.id,
+      });
+
+      expect(queueLinks).toHaveBeenCalledWith(
+        expect.objectContaining({
+          selectedDownloads: {
+            fullUrl: '',
+            patchUrl: 'https://filecrypt.cc/update',
+            sourceKind: 'elamigos',
+          },
+        }),
+      );
+      expect(database.getDownloadJob(item.id)).toMatchObject({
+        packageName: 'MOUSE P.I. For Hire_22852168_update',
+        selectedMirrorUrl: '',
+        selectedPatchMirrorUrl: 'https://filecrypt.cc/update',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('queues ElAmigos full plus update when the installed source is not ElAmigos', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const elamigosSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fullDownloadUrls: [
+          { kind: 'full', label: 'FULL', url: 'https://filecrypt.cc/full' },
+        ],
+        latestSourceRelease: {
+          isPatch: true,
+          label: 'update 1.0.1 - 1.0.5',
+          patchDate: '04/21/2026',
+          version: '1.0.5',
+        },
+        patchDownloadUrls: [
+          {
+            kind: 'patch',
+            label: 'UPDATE',
+            url: 'https://filecrypt.cc/update',
+          },
+        ],
+        sourceKind: 'elamigos',
+        sourceUrl:
+          'https://elamigos.site/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html',
+      };
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9001,
+        packageName: 'MOUSE P.I. For Hire_22852168_full',
+      }));
+      const service = createService(database, queueLinks);
+      const item = database.upsertTrackedItem({
+        normalizedTitle: elamigosSource.normalizedTitle,
+        sourceKind: 'steamrip',
+        sourceUrl: parsedSource.sourceUrl,
+        title: elamigosSource.title,
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-23T12:00:00.000Z',
+        fingerprint: elamigosSource.fingerprint,
+        observedBuildId: selectedPatch.buildId ?? null,
+        observedPatchDate: selectedPatch.patchDate,
+        observedPatchLink: selectedPatch.link,
+        observedPatchTitle: selectedPatch.patchTitle,
+        observedVersion: '1.0.5',
+        patchSelectionSource: selectedPatch.selectionSource ?? 'rss',
+        sourceKind: 'elamigos',
+        sourceUrl: elamigosSource.sourceUrl,
+        trackedItemId: item.id,
+      });
+      database.setRawParsedSourcePayload(item.id, elamigosSource);
+      database.syncDownloadMirrors(item.id, 'elamigos', [
+        { kind: 'full', label: 'FULL', url: 'https://filecrypt.cc/full' },
+        {
+          kind: 'patch',
+          label: 'UPDATE',
+          url: 'https://filecrypt.cc/update',
+        },
+      ]);
+      database.upsertInstallRecord({
+        installedAt: '04/19/2026',
+        installedBuildId: '22800000',
+        installedSourceKind: 'steamrip',
+        installedSourceUrl: parsedSource.sourceUrl,
+        installedVersion: '1.0.1',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-23T12:00:00.000Z',
+      });
+
+      await service.queueUpdateFromSource({
+        sourceKind: 'elamigos',
+        trackedItemId: item.id,
+      });
+
+      expect(queueLinks).toHaveBeenCalledWith(
+        expect.objectContaining({
+          selectedDownloads: {
+            fullUrl: 'https://filecrypt.cc/full',
+            patchUrl: 'https://filecrypt.cc/update',
+            sourceKind: 'elamigos',
+          },
+        }),
+      );
+      expect(database.getDownloadJob(item.id)).toMatchObject({
+        packageName: 'MOUSE P.I. For Hire_22852168_full',
+        selectedMirrorUrl: 'https://filecrypt.cc/full',
+        selectedPatchMirrorUrl: 'https://filecrypt.cc/update',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('fails Ankergames queueing when curl-ready resolution fails', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
       const rootLibraryPath = join(tempRoot, 'Library');
@@ -2548,24 +2738,26 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         startEmbeddedBrowserDownload,
       );
 
-      const view = await service.addTrackedItem({
-        parsedSource: ankergamesSource,
-        queueDownload: true,
-        selectedDownloads: {
-          fullUrl: 'https://ankergames.net/generate-download-url/2557',
-        },
-        selectedSteamPatch: {
-          ...selectedPatch,
-          appId: 2444750,
-          buildId: '22630308',
-        },
-        steamMatch: {
-          ...steamMatch,
-          appId: 2444750,
-          normalizedTitle: 'shape of dreams',
-          title: 'Shape of Dreams',
-        },
-      });
+      await expect(
+        service.addTrackedItem({
+          parsedSource: ankergamesSource,
+          queueDownload: true,
+          selectedDownloads: {
+            fullUrl: 'https://ankergames.net/generate-download-url/2557',
+          },
+          selectedSteamPatch: {
+            ...selectedPatch,
+            appId: 2444750,
+            buildId: '22630308',
+          },
+          steamMatch: {
+            ...steamMatch,
+            appId: 2444750,
+            normalizedTitle: 'shape of dreams',
+            title: 'Shape of Dreams',
+          },
+        }),
+      ).rejects.toThrow('Unable to resolve AnkerGames dlproxy link before queueing');
 
       expect(sourceFetch).toHaveBeenCalledWith(
         'https://ankergames.net/csrf-token',
@@ -2573,49 +2765,14 @@ describe('VaultTrackService SteamDB patch workflow', () => {
           credentials: 'include',
         }),
       );
-      expect(startEmbeddedBrowserDownload).toHaveBeenCalledWith(
-        expect.objectContaining({
-          packageName: 'Shape of Dreams_22630308',
-          sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
-          stableDownloadUrl: 'https://ankergames.net/generate-download-url/2557',
-        }),
-      );
-      const [downloadParams] = startEmbeddedBrowserDownload.mock.calls[0] ?? [];
-      downloadParams?.onProgress({
-        bytesLoaded: 64,
-        bytesTotal: 128,
-        etaSeconds: 5,
-        speed: 32,
-        stage: 'downloading',
-        statusMessage: 'Downloading in hidden browser',
-      });
+      expect(startEmbeddedBrowserDownload).not.toHaveBeenCalled();
       expect(queueLinks).not.toHaveBeenCalled();
-      expect(view.currentDownload).toMatchObject({
-        finalPath: join(rootLibraryPath, 'Shape of Dreams'),
-        provider: 'embedded_browser',
-        selectedMirrorUrl: 'https://ankergames.net/generate-download-url/2557',
-        stage: 'queued',
-      });
-      expect(database.getDownloadJob(view.item.id)).toMatchObject({
-        bytesLoaded: 64,
-        bytesTotal: 128,
-        provider: 'embedded_browser',
-        speed: 32,
-        stage: 'downloading',
-        statusMessage: 'Downloading in hidden browser',
-      });
-      expect(database.listDownloadMirrors(view.item.id, 'ankergames')).toEqual([
-        expect.objectContaining({
-          kind: 'full',
-          url: 'https://ankergames.net/generate-download-url/2557',
-        }),
-      ]);
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
   });
 
-  it('resolves Ankergames generated mirrors to dlproxy before starting the embedded browser download', async () => {
+  it('resolves Ankergames generated mirrors to dlproxy before starting the curl download', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
       const rootLibraryPath = join(tempRoot, 'Library');
@@ -2683,11 +2840,11 @@ describe('VaultTrackService SteamDB patch workflow', () => {
 
       expect(startEmbeddedBrowserDownload).toHaveBeenCalledWith(
         expect.objectContaining({
-          stableDownloadUrl: ankergamesProxyUrl,
+          url: ankergamesProxyUrl,
         }),
       );
       expect(view.currentDownload).toMatchObject({
-        provider: 'embedded_browser',
+        provider: 'direct_http',
         selectedMirrorUrl: ankergamesProxyUrl,
         stage: 'queued',
       });
@@ -2704,7 +2861,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
     }
   });
 
-  it('stores browser-ready Ankergames mirrors from parsed source when creating a matched draft', async () => {
+  it('stores direct-ready Ankergames mirrors from parsed source when creating a matched draft', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
       vi.stubGlobal(
@@ -2714,7 +2871,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       const service = createService(database);
 
       const draft = await service.createMatchedDraft({
-        parsedSource: ankergamesBrowserReadySource,
+        parsedSource: ankergamesDirectReadySource,
         steamMatch: {
           ...steamMatch,
           appId: 2444750,
@@ -2744,7 +2901,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
     }
   });
 
-  it('prefers parsed-source browser-ready Ankergames mirrors when queueing downloads', async () => {
+  it('prefers parsed-source direct-ready Ankergames mirrors when queueing downloads', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
       database.setSetting('library.rootPath', join(tempRoot, 'Library'));
@@ -2753,7 +2910,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         vi.fn(async () => new Response('', { status: 503 })),
       );
       const sourceFetch = vi.fn(async () => {
-        throw new Error('Browser-ready Ankergames mirrors should skip queue-time resolution.');
+        throw new Error('Direct-ready Ankergames mirrors should skip queue-time resolution.');
       });
       const startEmbeddedBrowserDownload = createEmbeddedBrowserRunner();
       const service = createService(
@@ -2770,7 +2927,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       );
 
       const view = await service.addTrackedItem({
-        parsedSource: ankergamesBrowserReadySource,
+        parsedSource: ankergamesDirectReadySource,
         queueDownload: true,
         selectedDownloads: {
           fullUrl: 'https://ankergames.net/generate-download-url/2557',
@@ -2791,11 +2948,11 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       expect(sourceFetch).not.toHaveBeenCalled();
       expect(startEmbeddedBrowserDownload).toHaveBeenCalledWith(
         expect.objectContaining({
-          stableDownloadUrl: ankergamesProxyUrl,
+          url: ankergamesProxyUrl,
         }),
       );
       expect(view.currentDownload).toMatchObject({
-        provider: 'embedded_browser',
+        provider: 'direct_http',
         selectedMirrorUrl: ankergamesProxyUrl,
       });
       expect(database.listDownloadMirrors(view.item.id, 'ankergames')).toEqual([
@@ -2810,7 +2967,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
     }
   });
 
-  it('rewrites Ankergames refreshed mirrors to the browser-ready dlproxy URL without leaving the generated mirror behind', async () => {
+  it('rewrites Ankergames refreshed mirrors to the direct-ready dlproxy URL without leaving the generated mirror behind', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
       vi.stubGlobal(
@@ -2950,7 +3107,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
     }
   });
 
-  it('marks embedded-browser Ankergames downloads failed and cancels the active browser session', async () => {
+  it('marks Ankergames curl downloads failed and cancels the active session', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
       database.setSetting('library.rootPath', join(tempRoot, 'Library'));
@@ -2976,7 +3133,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       );
 
       const queued = await service.addTrackedItem({
-        parsedSource: ankergamesSource,
+        parsedSource: ankergamesDirectReadySource,
         queueDownload: true,
         selectedDownloads: {
           fullUrl: 'https://ankergames.net/generate-download-url/2557',
@@ -2999,21 +3156,21 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       expect(cancel).toHaveBeenCalledWith('Marked failed manually');
       expect(failed.currentDownload).toMatchObject({
         errorMessage: 'Marked failed manually',
-        provider: 'embedded_browser',
+        provider: 'direct_http',
         stage: 'failed',
       });
       expect(
         database.listDownloadMirrors(queued.item.id, 'ankergames')[0],
       ).toMatchObject({
         manuallyFailedAt: expect.any(String),
-        url: 'https://ankergames.net/generate-download-url/2557',
+        url: ankergamesProxyUrl,
       });
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
   });
 
-  it('retries Ankergames embedded browser downloads with the original selected mirror URL', async () => {
+  it('retries Ankergames curl downloads with the resolved selected mirror URL', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
       database.setSetting('library.rootPath', join(tempRoot, 'Library'));
@@ -3040,7 +3197,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       );
 
       const queued = await service.addTrackedItem({
-        parsedSource: ankergamesSource,
+        parsedSource: ankergamesDirectReadySource,
         queueDownload: true,
         selectedDownloads: {
           fullUrl: 'https://ankergames.net/generate-download-url/2557',
@@ -3064,13 +3221,13 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       expect(startEmbeddedBrowserDownload).toHaveBeenCalledTimes(2);
       expect(startEmbeddedBrowserDownload).toHaveBeenLastCalledWith(
         expect.objectContaining({
-          stableDownloadUrl: 'https://ankergames.net/generate-download-url/2557',
+          url: ankergamesProxyUrl,
         }),
       );
       expect(queueLinks).not.toHaveBeenCalled();
       expect(database.getDownloadJob(queued.item.id)).toMatchObject({
-        provider: 'embedded_browser',
-        selectedMirrorUrl: 'https://ankergames.net/generate-download-url/2557',
+        provider: 'direct_http',
+        selectedMirrorUrl: ankergamesProxyUrl,
         stage: 'queued',
       });
     } finally {
@@ -3514,6 +3671,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
           selectedDownloads: {
             fullUrl: 'https://pixeldrain.com/u/full',
             patchUrl: null,
+            sourceKind: 'steamrip',
           },
         }),
       );
@@ -3599,6 +3757,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
           selectedDownloads: {
             fullUrl: 'https://pixeldrain.com/u/full',
             patchUrl: null,
+            sourceKind: 'elamigos',
           },
         }),
       );
@@ -3988,6 +4147,8 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       );
       const gameFolderPath = join(releasePath, 'Actual Extracted Game Folder');
       const finalPath = join(tempRoot, 'Library', 'Ziggurat 2');
+      await mkdir(finalPath, { recursive: true });
+      await writeFile(join(finalPath, 'OldBuild.exe'), 'old');
       await writeFile(join(stagePath!, 'download.rar'), 'archive');
       await mkdir(join(releasePath, '_CommonRedist'), { recursive: true });
       await mkdir(gameFolderPath, { recursive: true });
@@ -4005,6 +4166,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         }),
       );
       expect(existsSync(join(finalPath, 'Ziggurat2.exe'))).toBe(true);
+      expect(existsSync(join(finalPath, 'OldBuild.exe'))).toBe(false);
       expect(existsSync(join(finalPath, '_CommonRedist'))).toBe(false);
       expect(existsSync(stagePath!)).toBe(false);
       expect(existsSync(extractWorkspacePath)).toBe(false);
@@ -4030,7 +4192,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
     }
   });
 
-  it('completes Ankergames embedded browser downloads after the staged ZIP finishes saving', async () => {
+  it('completes Ankergames curl downloads after the staged ZIP finishes saving', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
       database.setSetting('library.rootPath', join(tempRoot, 'Library'));
@@ -4071,7 +4233,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       );
 
       const queued = await service.addTrackedItem({
-        parsedSource: ankergamesSource,
+        parsedSource: ankergamesDirectReadySource,
         queueDownload: true,
         selectedDownloads: {
           fullUrl: 'https://ankergames.net/generate-download-url/2557',
@@ -4114,16 +4276,16 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         installedVersion: 'V 1.2.1.7',
       });
       expect(database.getDownloadJob(queued.item.id)).toMatchObject({
-        provider: 'embedded_browser',
+        provider: 'direct_http',
         stage: 'complete',
-        statusMessage: 'Downloaded and installed from hidden browser',
+        statusMessage: 'Downloaded and installed with curl',
       });
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
   });
 
-  it('recovers Ankergames embedded browser downloads from extracted files during polling', async () => {
+  it('recovers Ankergames curl downloads from extracted files during polling', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
       database.setSetting('library.rootPath', join(tempRoot, 'Library'));
@@ -4144,7 +4306,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         createEmbeddedBrowserRunner(),
       );
       const queued = await initialService.addTrackedItem({
-        parsedSource: ankergamesSource,
+        parsedSource: ankergamesDirectReadySource,
         queueDownload: true,
         selectedDownloads: {
           fullUrl: 'https://ankergames.net/generate-download-url/2557',
@@ -4178,7 +4340,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       expect(existsSync(join(finalPath, 'Run me!.bat'))).toBe(false);
       expect(existsSync(stagePath!)).toBe(false);
       expect(database.getDownloadJob(queued.item.id)).toMatchObject({
-        provider: 'embedded_browser',
+        provider: 'direct_http',
         stage: 'complete',
         statusMessage: 'Recovered extracted game files',
       });
@@ -4187,7 +4349,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
     }
   });
 
-  it('recovers Ankergames embedded browser downloads from the staged ZIP fallback on restart', async () => {
+  it('recovers Ankergames curl downloads from the staged ZIP fallback on restart', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
       database.setSetting('library.rootPath', join(tempRoot, 'Library'));
@@ -4208,7 +4370,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         createEmbeddedBrowserRunner(),
       );
       const queued = await initialService.addTrackedItem({
-        parsedSource: ankergamesSource,
+        parsedSource: ankergamesDirectReadySource,
         queueDownload: true,
         selectedDownloads: {
           fullUrl: 'https://ankergames.net/generate-download-url/2557',
@@ -4264,7 +4426,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       expect(existsSync(join(finalPath, 'ShapeOfDreams.exe'))).toBe(true);
       expect(existsSync(stagePath!)).toBe(false);
       expect(database.getDownloadJob(queued.item.id)).toMatchObject({
-        provider: 'embedded_browser',
+        provider: 'direct_http',
         stage: 'complete',
         statusMessage: 'Recovered from staged ZIP',
       });
@@ -4273,7 +4435,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
     }
   });
 
-  it('marks unrecoverable Ankergames embedded browser downloads failed on restart', async () => {
+  it('marks unrecoverable Ankergames curl downloads failed on restart', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
       database.setSetting('library.rootPath', join(tempRoot, 'Library'));
@@ -4294,7 +4456,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         createEmbeddedBrowserRunner(),
       );
       const queued = await initialService.addTrackedItem({
-        parsedSource: ankergamesSource,
+        parsedSource: ankergamesDirectReadySource,
         queueDownload: true,
         selectedDownloads: {
           fullUrl: 'https://ankergames.net/generate-download-url/2557',
@@ -4317,11 +4479,11 @@ describe('VaultTrackService SteamDB patch workflow', () => {
 
       expect(database.getDownloadJob(queued.item.id)).toMatchObject({
         errorMessage:
-          'AnkerGames browser download did not finish cleanly. Retry the download to continue.',
-        provider: 'embedded_browser',
+          'AnkerGames curl download did not finish cleanly. Retry the download to continue.',
+        provider: 'direct_http',
         stage: 'failed',
         statusMessage:
-          'AnkerGames browser download did not finish cleanly. Retry the download to continue.',
+          'AnkerGames curl download did not finish cleanly. Retry the download to continue.',
       });
       expect(database.getInstallRecord(queued.item.id)).toBeNull();
     } finally {

@@ -331,7 +331,11 @@ function getQueueRequestPaths(params: {
   requestCount: number;
   sourceKind: ParsedSourcePayload['sourceKind'];
 }): LinkQueueRequestPaths {
-  if (params.sourceKind !== 'elamigos' || params.requestCount <= 1) {
+  const shouldUseSplitElamigosPath =
+    params.sourceKind === 'elamigos' &&
+    (params.requestCount > 1 ||
+      isSplitElamigosPackageName(params.request.packageName));
+  if (!shouldUseSplitElamigosPath) {
     return {
       extractDirectory: params.baseExtractDirectory,
       targetDirectory: params.baseTargetDirectory,
@@ -1689,7 +1693,9 @@ export class MyJDownloaderService {
         packageName: request.packageName,
         role: request.role,
         splitPackageLinks:
-          params.sourceKind === 'elamigos' && requests.length > 1,
+          params.sourceKind === 'elamigos' &&
+          (requests.length > 1 ||
+            isSplitElamigosPackageName(request.packageName)),
         stagePath: requestPaths.targetDirectory,
       });
 
@@ -1698,7 +1704,8 @@ export class MyJDownloaderService {
           ...device,
           linkOnly:
             params.sourceKind === 'elamigos' &&
-            requests.length > 1 &&
+            (requests.length > 1 ||
+              isSplitElamigosPackageName(request.packageName)) &&
             crawledReferences.linkIds.length > 0,
           packageName: request.packageName,
           references: crawledReferences,

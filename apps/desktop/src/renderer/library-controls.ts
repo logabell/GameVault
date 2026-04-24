@@ -102,7 +102,7 @@ export function getLibraryAutomationWarning(params: {
   if (connectionHealth.myJDownloader.color !== 'green') {
     return {
       label: 'MyJDownloader limited',
-      message: `${connectionHealth.myJDownloader.message} SteamRIP and ElAmigos downloads still need MyJDownloader, but Ankergames browser downloads can still start.`,
+      message: `${connectionHealth.myJDownloader.message} SteamRIP and ElAmigos downloads still need MyJDownloader, but Ankergames curl downloads can still start.`,
     };
   }
 
@@ -110,16 +110,16 @@ export function getLibraryAutomationWarning(params: {
 }
 
 export function getDeleteTrackedItemPrompt(item: TrackedItemView): string {
-  if (item.currentDownload?.provider === 'embedded_browser') {
-    return `Delete ${item.item.title} from VaultTrack, stop its browser download, and delete staged/install files?`;
+  if (item.currentDownload?.provider === 'direct_http') {
+    return `Delete ${item.item.title} from VaultTrack, stop its curl download, and delete staged/install files?`;
   }
 
   return `Delete ${item.item.title} from VaultTrack, remove it from JDownloader, and delete staged/install files?`;
 }
 
 export function getMarkDownloadFailedPrompt(item: TrackedItemView): string {
-  if (item.currentDownload?.provider === 'embedded_browser') {
-    return `Mark ${item.item.title} as failed and stop its browser download?`;
+  if (item.currentDownload?.provider === 'direct_http') {
+    return `Mark ${item.item.title} as failed and stop its curl download?`;
   }
 
   return `Mark ${item.item.title} as failed and remove its JDownloader package(s)?`;

@@ -107,6 +107,8 @@ export interface InstallRecord {
   installedBuildId?: string | null;
   installedAt?: string | null;
   installPath?: string | null;
+  installedSourceKind?: SourceKind | null;
+  installedSourceUrl?: string | null;
   updatedAt: string;
 }
 
@@ -256,7 +258,7 @@ export type DownloadStage =
   | 'failed'
   | 'complete';
 
-export type DownloadProvider = 'embedded_browser' | 'jdownloader';
+export type DownloadProvider = 'direct_http' | 'jdownloader';
 
 export interface DownloadJobPartRecord {
   id: string;
@@ -280,6 +282,7 @@ export interface DownloadJobPartRecord {
 export interface DownloadJobRecord {
   id: string;
   trackedItemId: string;
+  sourceKind?: SupportedSourceKind | null;
   packageName: string;
   stagePath: string;
   finalPath: string;

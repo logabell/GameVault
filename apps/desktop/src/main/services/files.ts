@@ -569,9 +569,6 @@ export async function finalizePortableArchiveExtraction(params: {
 
   await ensureDirectory(dirname(finalPath));
   if (await pathExists(finalPath)) {
-    if (await directoryHasEntries(finalPath)) {
-      throw new Error(`Refusing to overwrite existing install: ${finalPath}`);
-    }
     await rm(finalPath, { force: true, recursive: true });
   }
   await stageMove({ finalPath, stagePath: contentFolderPath });

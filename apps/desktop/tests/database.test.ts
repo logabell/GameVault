@@ -446,7 +446,7 @@ describe('VaultTrackDatabase cleanup metadata', () => {
             updatedAt: '2026-04-23T18:00:00.000Z',
           },
         ] satisfies DownloadJobPartRecord[],
-        provider: 'embedded_browser',
+        provider: 'direct_http',
         selectedMirrorUrl: 'https://tunnel1.dlproxy.uk/download/example',
         selectedPatchMirrorUrl: null,
         speed: null,
@@ -465,7 +465,7 @@ describe('VaultTrackDatabase cleanup metadata', () => {
         errorMessage: null,
         parts: [baseJob.parts![0]!],
         stage: 'queued',
-        statusMessage: 'Starting hidden browser download',
+        statusMessage: 'Starting curl download',
         totalParts: 1,
         updatedAt: '2026-04-23T19:05:00.000Z',
       });

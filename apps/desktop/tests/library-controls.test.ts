@@ -303,7 +303,7 @@ describe('library controls', () => {
     ).toMatchObject({
       label: 'MyJDownloader limited',
       message:
-        'Connect MyJDownloader. SteamRIP and ElAmigos downloads still need MyJDownloader, but Ankergames browser downloads can still start.',
+        'Connect MyJDownloader. SteamRIP and ElAmigos downloads still need MyJDownloader, but Ankergames curl downloads can still start.',
     });
   });
 
@@ -314,7 +314,7 @@ describe('library controls', () => {
         finalPath: 'D:/Games/Shape of Dreams',
         id: 'job-1',
         packageName: 'Shape of Dreams_22630308',
-        provider: 'embedded_browser',
+        provider: 'direct_http',
         stage: TrackedItemStatus.Downloading,
         stagePath: 'D:/Games/_STAGING/Shape of Dreams_22630308',
         trackedItemId: 'shape-of-dreams',
@@ -324,10 +324,10 @@ describe('library controls', () => {
     });
 
     expect(getMarkDownloadFailedPrompt(item)).toBe(
-      'Mark Shape of Dreams as failed and stop its browser download?',
+      'Mark Shape of Dreams as failed and stop its curl download?',
     );
     expect(getDeleteTrackedItemPrompt(item)).toBe(
-      'Delete Shape of Dreams from VaultTrack, stop its browser download, and delete staged/install files?',
+      'Delete Shape of Dreams from VaultTrack, stop its curl download, and delete staged/install files?',
     );
   });
 });

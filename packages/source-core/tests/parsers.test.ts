@@ -794,7 +794,7 @@ describe('source parsers', () => {
     );
   });
 
-  it('resolves Ankergames generated download pages to browser-ready dlproxy links', async () => {
+  it('resolves Ankergames generated download pages to direct-ready dlproxy links', async () => {
     const proxyUrl =
       'https://tunnel1.dlproxy.uk/download/proxy-token?sig=proxy-signature';
     const fetchMock = vi.fn(async (input: string, init?: RequestInit) => {
@@ -829,6 +829,40 @@ describe('source parsers', () => {
         stableDownloadUrl: 'https://ankergames.net/generate-download-url/2557',
       }),
     ).resolves.toBe(proxyUrl);
+  });
+
+  it('rejects direct-ready Ankergames resolution when no dlproxy or DataNodes link is exposed', async () => {
+    const fetchMock = vi.fn(async (input: string, init?: RequestInit) => {
+      if (input === 'https://ankergames.net/csrf-token') {
+        return new Response(JSON.stringify({ token: 'csrf-token' }), {
+          status: 200,
+        });
+      }
+
+      if (input === 'https://ankergames.net/generate-download-url/2557') {
+        expect(init?.method).toBe('POST');
+        return new Response(
+          JSON.stringify({
+            download_url: 'https://ankergames.net/download/signed',
+            success: true,
+          }),
+          { status: 200 },
+        );
+      }
+
+      expect(input).toBe('https://ankergames.net/download/signed');
+      return new Response('<html><body>Countdown</body></html>', {
+        status: 200,
+      });
+    });
+
+    await expect(
+      resolveAnkerGamesBrowserDownloadUrl({
+        fetch: fetchMock,
+        sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+        stableDownloadUrl: 'https://ankergames.net/generate-download-url/2557',
+      }),
+    ).rejects.toThrow('curl-ready dlproxy or DataNodes URL');
   });
 
   it('rejects Ankergames dlproxy stable URLs instead of resolving them', async () => {

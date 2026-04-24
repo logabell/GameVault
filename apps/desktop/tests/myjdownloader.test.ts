@@ -717,6 +717,86 @@ describe('MyJDownloaderService queueLinks', () => {
     ).toEqual([]);
   });
 
+  it('filters a patch-only ElAmigos shared container to update-like files', async () => {
+    const client = new FakeMyJDownloaderClient();
+    client.crawledLinksByJob.set(9001, [
+      {
+        name: 'Replaced-elamigos.rar',
+        packageUUID: 200,
+        url: 'https://cdn.example.invalid/Replaced-elamigos.rar',
+        uuid: 100,
+      },
+      {
+        name: 'Replaced-Update1.0.1097-elamigos.rar',
+        packageUUID: 200,
+        url: 'https://cdn.example.invalid/Replaced-Update1.0.1097-elamigos.rar',
+        uuid: 101,
+      },
+    ]);
+    client.downloadPackages = [
+      {
+        finished: false,
+        name: 'REPLACED_2283087_update',
+        running: false,
+        saveTo:
+          'C:\\Games\\_STAGING\\REPLACED_2283087\\REPLACED_2283087_update',
+        uuid: 302,
+      },
+    ];
+    client.downloadLinks = [
+      {
+        name: 'Replaced-Update1.0.1097-elamigos.rar',
+        packageUUID: 302,
+        uuid: 502,
+      },
+    ];
+    const service = createService(client);
+
+    const result = await service.queueLinks({
+      extractDirectory: 'C:\\Games\\_STAGING\\REPLACED_2283087',
+      packageName: 'REPLACED_2283087',
+      parsedSource: {
+        ...parsedSource,
+        latestSourceRelease: {
+          isPatch: true,
+          label: 'update 1.0.1097',
+          patchDate: '04/20/2026',
+          version: '1.0.1097',
+        },
+        sourceKind: 'elamigos',
+        title: 'REPLACED',
+      },
+      selectedDownloads: {
+        fullUrl: '',
+        patchUrl: 'https://gofile.io/d/shared',
+      },
+      sourceKind: 'elamigos',
+      targetDirectory: 'C:\\Games\\_STAGING\\REPLACED_2283087',
+    });
+
+    expect(client.findAll('/linkgrabberv2/addLinks')).toHaveLength(1);
+    expect(client.find('/linkgrabberv2/addLinks').params).toMatchObject({
+      destinationFolder:
+        'C:\\Games\\_STAGING\\REPLACED_2283087\\REPLACED_2283087_update',
+      links: 'https://gofile.io/d/shared',
+      packageName: 'REPLACED_2283087_update',
+    });
+    expect(client.find('/linkgrabberv2/movetoNewPackage').params).toEqual([
+      [101],
+      [],
+      'REPLACED_2283087_update',
+      'C:\\Games\\_STAGING\\REPLACED_2283087\\REPLACED_2283087_update',
+    ]);
+    expect(result.parts).toEqual([
+      {
+        mirrorUrl: 'https://gofile.io/d/shared',
+        packageId: 302,
+        packageName: 'REPLACED_2283087_update',
+        role: 'patch',
+      },
+    ]);
+  });
+
   it('renames and moves the crawled LinkGrabber package into the download list', async () => {
     const client = new FakeMyJDownloaderClient();
     const service = createService(client);
