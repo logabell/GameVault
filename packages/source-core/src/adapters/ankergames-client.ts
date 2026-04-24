@@ -71,6 +71,14 @@ function getString(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
+function getVersionStatusString(value: unknown): string | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(value);
+  }
+
+  return getString(value);
+}
+
 function safeDecodeURIComponent(value: string): string | null {
   try {
     return decodeURIComponent(value);
@@ -253,8 +261,8 @@ export async function hydrateAnkerGamesVersionStatus(params: {
   const snapshot = asRecord(JSON.parse(snapshotText));
   const data = asRecord(snapshot?.data);
   const versionData = unwrapLivewireValue(data?.versionData);
-  const version = getString(versionData?.current_version);
-  const buildId = getString(versionData?.current_build);
+  const version = getVersionStatusString(versionData?.current_version);
+  const buildId = getVersionStatusString(versionData?.current_build);
   if (!version || !buildId) {
     throw new Error(
       'AnkerGames version response did not include current version and build.',

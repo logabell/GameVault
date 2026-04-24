@@ -572,6 +572,38 @@ describe('source parsers', () => {
     expect(parsed.latestSourceRelease.buildId).toBe('22813976');
   });
 
+  it('parses Ankergames current build from Livewire snapshot state in the page', () => {
+    const versionSnapshot = JSON.stringify({
+      data: {
+        versionData: [
+          {
+            current_build: 22836223,
+            current_version: 'V 1.58.1.4s',
+            latest_build: 22836223,
+          },
+          { s: 'arr' },
+        ],
+      },
+      memo: {
+        name: 'version-status',
+        path: 'game/euro-truck-simulator-2',
+      },
+    }).replaceAll('"', '&quot;');
+    const parsed = parseSupportedPage(
+      'https://ankergames.net/game/euro-truck-simulator-2',
+      ankerGamesHtml()
+        .replaceAll('Shape of Dreams', 'Euro Truck Simulator 2')
+        .replace('<span class="animate-glow">V 1.2.1.7</span>', '')
+        .replace(
+          /<div\s+wire:snapshot=[\s\S]*?<\/div>/,
+          `<div wire:snapshot="${versionSnapshot}"></div>`,
+        ),
+    );
+
+    expect(parsed.latestSourceRelease.version).toBe('V 1.58.1.4s');
+    expect(parsed.latestSourceRelease.buildId).toBe('22836223');
+  });
+
   it('hydrates Ankergames current version and build from the Livewire status component', async () => {
     const fetchMock = vi.fn(async (input: string, init?: RequestInit) => {
       if (input === 'https://ankergames.net/csrf-token') {
@@ -633,6 +665,48 @@ describe('source parsers', () => {
     });
     expect(parsed.latestSourceRelease.version).toBe('V 1.2.1.7');
     expect(parsed.latestSourceRelease.buildId).toBe('22630308');
+  });
+
+  it('hydrates Ankergames current build when Livewire returns a numeric build id', async () => {
+    const fetchMock = vi.fn(async (input: string) => {
+      if (input === 'https://ankergames.net/csrf-token') {
+        return new Response(JSON.stringify({ token: 'csrf-token' }), {
+          status: 200,
+        });
+      }
+
+      return new Response(
+        JSON.stringify({
+          components: [
+            {
+              snapshot: JSON.stringify({
+                data: {
+                  versionData: [
+                    {
+                      current_build: 22583570,
+                      current_version: 'V 1.407',
+                      latest_build: 22583570,
+                    },
+                    { s: 'arr' },
+                  ],
+                },
+              }),
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    });
+
+    const parsed = await parseSupportedPageForKindWithNetwork(
+      'ankergames',
+      'https://ankergames.net/game/graveyard-keeper',
+      ankerGamesHtml().replaceAll('Shape of Dreams', 'Graveyard Keeper'),
+      fetchMock,
+    );
+
+    expect(parsed.latestSourceRelease.version).toBe('V 1.407');
+    expect(parsed.latestSourceRelease.buildId).toBe('22583570');
   });
 
   it('extracts direct Ankergames DataNodes links from signed page markup', () => {

@@ -1,3 +1,4 @@
+import { derivePatchLag } from '@vaulttrack/shared-types';
 import type {
   ConnectionHealthSummary,
   DownloadMirrorRecord,
@@ -5,6 +6,7 @@ import type {
   ParsedSourcePayload,
   SelectedDownloads,
   SteamCandidate,
+  SteamPatchEntry,
   SteamPatchCandidate,
   SupportedSourceKind,
   TrackedItemView,
@@ -258,6 +260,41 @@ export function findSharedPatchMirrorUrl(
   );
 }
 
+export function getAutoSourceMirrorSelection(params: {
+  currentFullUrl: string | null;
+  currentPatchUrl: string | null;
+  fullMirrors: Array<{ url: string }>;
+  patchMirrors: Array<{ url: string }>;
+  sharedPatchMirrors: boolean;
+}): {
+  selectedFullUrl: string | null;
+  selectedPatchUrl: string | null;
+} {
+  const selectedFullUrl =
+    params.currentFullUrl &&
+    params.fullMirrors.some((mirror) => mirror.url === params.currentFullUrl)
+      ? params.currentFullUrl
+      : params.fullMirrors.length === 1
+        ? (params.fullMirrors[0]?.url ?? null)
+        : null;
+  const selectedPatchUrl =
+    params.sharedPatchMirrors || params.patchMirrors.length === 0
+      ? null
+      : params.currentPatchUrl &&
+          params.patchMirrors.some(
+            (mirror) => mirror.url === params.currentPatchUrl,
+          )
+        ? params.currentPatchUrl
+        : params.patchMirrors.length === 1
+          ? (params.patchMirrors[0]?.url ?? null)
+          : null;
+
+  return {
+    selectedFullUrl,
+    selectedPatchUrl,
+  };
+}
+
 export function buildCreateMatchedDraftMessage(
   input: CreateMatchedDraftMessageInput,
 ): CreateMatchedDraftMessage {
@@ -317,6 +354,158 @@ export function getSourceMatchPatchKey(
     return getSteamPatchKey(source.matchedPatch);
   }
   return getPatchKeyForSnapshot(source.snapshot, patches);
+}
+
+function numericSourceBuildId(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  return trimmed && /^\d+$/.test(trimmed) ? trimmed : null;
+}
+
+function normalizeSourceVersion(
+  value: string | null | undefined,
+): string | null {
+  const normalized = value
+    ?.trim()
+    .toLowerCase()
+    .replace(/^version\s*:?\s*/i, '')
+    .replace(/^v\s*(?=\d)/i, '')
+    .replace(/\s+/g, ' ');
+  return normalized || null;
+}
+
+function sourceVersion(source: MatchedSourceView): string | null {
+  return normalizeSourceVersion(
+    source.snapshot?.observedVersion ?? source.matchedPatch?.version,
+  );
+}
+
+function sourceBuildId(source: MatchedSourceView): string | null {
+  return (
+    numericSourceBuildId(source.snapshot?.observedBuildId) ??
+    numericSourceBuildId(source.matchedPatch?.buildId)
+  );
+}
+
+function patchEntryFromCandidate(
+  trackedItemId: string,
+  patch: SteamPatchCandidate | SteamPatchEntry,
+): SteamPatchEntry {
+  return 'trackedItemId' in patch
+    ? patch
+    : {
+        ...patch,
+        trackedItemId,
+      };
+}
+
+function findPatchEntryByBuildId(
+  patches: SteamPatchEntry[],
+  buildId: string,
+): SteamPatchEntry | null {
+  return patches.find((patch) => patch.buildId === buildId) ?? null;
+}
+
+export function inferSourceComparisonRows(
+  item: TrackedItemView | null | undefined,
+  patches: SteamPatchCandidate[],
+): MatchedSourceView[] {
+  if (!item) return [];
+
+  const patchEntries = patches.map((patch) =>
+    patchEntryFromCandidate(item.item.id, patch),
+  );
+  return item.sourceMatches.map((source) => {
+    if (source.match.sourceKind !== 'steamrip' || !source.snapshot) {
+      return source;
+    }
+
+    const existingBuildId = sourceBuildId(source);
+    if (existingBuildId && source.snapshot.observedBuildId) {
+      return source;
+    }
+
+    const steamRipVersion = sourceVersion(source);
+    const matchingVersionPeers = steamRipVersion
+      ? item.sourceMatches.filter(
+          (peer) =>
+            (peer.match.sourceKind === 'ankergames' ||
+              peer.match.sourceKind === 'elamigos') &&
+            sourceVersion(peer) === steamRipVersion &&
+            sourceBuildId(peer),
+        )
+      : [];
+    const matchingAnkerGamesSources = matchingVersionPeers.filter(
+      (peer) => peer.match.sourceKind === 'ankergames',
+    );
+    const inferredBuildIds = new Set(
+      matchingVersionPeers
+        .map((peer) => sourceBuildId(peer))
+        .filter((buildId): buildId is string => Boolean(buildId)),
+    );
+    const ankerGamesBuildIds = new Set(
+      matchingAnkerGamesSources
+        .map((peer) => sourceBuildId(peer))
+        .filter((buildId): buildId is string => Boolean(buildId)),
+    );
+    const inferredBuildId =
+      existingBuildId ??
+      (inferredBuildIds.size === 1 && ankerGamesBuildIds.size === 1
+        ? Array.from(inferredBuildIds)[0]!
+        : null);
+    if (!inferredBuildId) {
+      return source;
+    }
+
+    const matchingPeer = matchingAnkerGamesSources.find(
+      (peer) => sourceBuildId(peer) === inferredBuildId,
+    );
+    const matchedPatch =
+      source.matchedPatch ??
+      (matchingPeer?.matchedPatch?.buildId === inferredBuildId
+        ? matchingPeer.matchedPatch
+        : null) ??
+      findPatchEntryByBuildId(patchEntries, inferredBuildId);
+    const patchLag = matchedPatch
+      ? derivePatchLag({
+          feedEntries: patchEntries,
+          selectedPatch: matchedPatch,
+        })
+      : null;
+    const versionsBehindLatest =
+      patchLag?.versionsBehindLatest ??
+      matchingPeer?.versionsBehindLatest ??
+      source.versionsBehindLatest ??
+      null;
+
+    return {
+      ...source,
+      isUpdateSource:
+        source.isUpdateSource ||
+        Boolean(matchingPeer?.isUpdateSource) ||
+        (versionsBehindLatest === 0 && source.match.usable),
+      matchedPatch: matchedPatch ?? source.matchedPatch,
+      snapshot: {
+        ...source.snapshot,
+        observedBuildId: inferredBuildId,
+        observedPatchDate:
+          matchedPatch?.patchDate ?? source.snapshot.observedPatchDate,
+        observedPatchLink: matchedPatch?.link ?? source.snapshot.observedPatchLink,
+        observedPatchTitle:
+          matchedPatch?.patchTitle ?? source.snapshot.observedPatchTitle,
+      },
+      updateStatus:
+        typeof versionsBehindLatest === 'number'
+          ? versionsBehindLatest === 0
+            ? 'matches_upstream'
+            : 'source_behind_upstream'
+          : (matchingPeer?.updateStatus ?? source.updateStatus),
+      versionsBehindLatest,
+      versionsBehindLatestIsLowerBound:
+        patchLag?.versionsBehindLatestIsLowerBound ??
+        matchingPeer?.versionsBehindLatestIsLowerBound ??
+        source.versionsBehindLatestIsLowerBound,
+    };
+  });
 }
 
 export function getLikelyPatchForSelectedSource(

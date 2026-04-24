@@ -26,6 +26,11 @@ describe('supported detail pages', () => {
         'https://www.elamigos.site/data/Ziggurat_2_MULTi11_-_ElAmigos.html',
       ),
     ).toBe(true);
+    expect(
+      isSupportedDetailPage(
+        'https://elamigos.site/data/Ziggurat_2_MULTi11_-_ElAmigos.html?from=vaulttrack#mirrors',
+      ),
+    ).toBe(true);
 
     for (const url of [
       'https://steamrip.com/mouse-p-i-for-hire-free-download',

@@ -1,16 +1,43 @@
-const EL_AMIGOS_RE = /^https:\/\/(?:www\.)?elamigos\.site\/data\/.+\.html$/i;
-const ANKERGAMES_RE = /^https:\/\/(?:www\.)?ankergames\.net\/game\/[a-z0-9][a-z0-9-]*\/?$/i;
 const STEAMRIP_DETAIL_SLUG_RE =
   /^[a-z0-9][a-z0-9-]*-free-download(?:-[a-z0-9][a-z0-9-]*)?$/i;
+
+function normalizedHostname(url: URL): string {
+  return url.hostname.replace(/^www\./i, '').toLowerCase();
+}
+
+function isAnkerGamesDetailPage(url: string): boolean {
+  try {
+    const parsedUrl = new URL(url);
+    return (
+      parsedUrl.protocol === 'https:' &&
+      normalizedHostname(parsedUrl) === 'ankergames.net' &&
+      /^\/game\/[a-z0-9][a-z0-9-]*\/?$/i.test(parsedUrl.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isElAmigosDetailPage(url: string): boolean {
+  try {
+    const parsedUrl = new URL(url);
+    return (
+      parsedUrl.protocol === 'https:' &&
+      normalizedHostname(parsedUrl) === 'elamigos.site' &&
+      /^\/data\/.+\.html$/i.test(parsedUrl.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
 
 function isSteamRipDetailPage(url: string): boolean {
   try {
     const parsedUrl = new URL(url);
-    const hostname = parsedUrl.hostname.replace(/^www\./i, '').toLowerCase();
     const pathSegments = parsedUrl.pathname.split('/').filter(Boolean);
     return (
       parsedUrl.protocol === 'https:' &&
-      hostname === 'steamrip.com' &&
+      normalizedHostname(parsedUrl) === 'steamrip.com' &&
       pathSegments.length === 1 &&
       STEAMRIP_DETAIL_SLUG_RE.test(pathSegments[0] ?? '')
     );
@@ -20,7 +47,11 @@ function isSteamRipDetailPage(url: string): boolean {
 }
 
 export function isSupportedDetailPage(url: string): boolean {
-  return ANKERGAMES_RE.test(url) || EL_AMIGOS_RE.test(url) || isSteamRipDetailPage(url);
+  return (
+    isAnkerGamesDetailPage(url) ||
+    isElAmigosDetailPage(url) ||
+    isSteamRipDetailPage(url)
+  );
 }
 
 export function copiedUrlMatchesPage(copiedText: string, pageUrl: string): boolean {

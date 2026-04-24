@@ -1,5 +1,9 @@
 import { copiedUrlMatchesPage, isSupportedDetailPage } from '../support.js';
 
+const ANKERGAMES_CURRENT_BUILD_RE =
+  /\bCurrent\s+Build\b\D*(?<build>\d{5,})\b/i;
+const ANKERGAMES_VERSION_STATUS_TIMEOUT_MS = 3000;
+
 function readHtml() {
   return document.documentElement.outerHTML;
 }
@@ -18,6 +22,60 @@ function readFingerprint() {
   return hashText(readHtml());
 }
 
+function isAnkerGamesDetailPage() {
+  try {
+    const parsedUrl = new URL(location.href);
+    return (
+      parsedUrl.protocol === 'https:' &&
+      parsedUrl.hostname.replace(/^www\./i, '').toLowerCase() ===
+        'ankergames.net' &&
+      /^\/game\/[a-z0-9][a-z0-9-]*\/?$/i.test(parsedUrl.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function hasAnkerGamesCurrentBuild() {
+  return ANKERGAMES_CURRENT_BUILD_RE.test(
+    document.body?.textContent ?? '',
+  );
+}
+
+function waitForAnkerGamesCurrentBuild(): Promise<void> {
+  if (!isAnkerGamesDetailPage() || hasAnkerGamesCurrentBuild()) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    const finish = () => {
+      window.clearTimeout(timer);
+      observer.disconnect();
+      resolve();
+    };
+    const observer = new MutationObserver(() => {
+      if (hasAnkerGamesCurrentBuild()) {
+        finish();
+      }
+    });
+    const timer = window.setTimeout(
+      finish,
+      ANKERGAMES_VERSION_STATUS_TIMEOUT_MS,
+    );
+
+    observer.observe(document.documentElement, {
+      characterData: true,
+      childList: true,
+      subtree: true,
+    });
+  });
+}
+
+async function readHtmlForSourceCapture() {
+  await waitForAnkerGamesCurrentBuild();
+  return readHtml();
+}
+
 declare global {
   var __vaultTrackContentBound__: boolean | undefined;
 }
@@ -25,10 +83,12 @@ declare global {
 if (!globalThis.__vaultTrackContentBound__ && isSupportedDetailPage(location.href)) {
   globalThis.__vaultTrackContentBound__ = true;
 
-  void chrome.runtime.sendMessage({
-    fingerprint: readFingerprint(),
-    type: 'vaulttrack:page-ready',
-    url: location.href,
+  void readHtmlForSourceCapture().then((html) => {
+    void chrome.runtime.sendMessage({
+      fingerprint: hashText(html),
+      type: 'vaulttrack:page-ready',
+      url: location.href,
+    });
   });
 
   document.addEventListener('copy', (event) => {
@@ -46,17 +106,24 @@ if (!globalThis.__vaultTrackContentBound__ && isSupportedDetailPage(location.hre
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === 'vaulttrack:get-page-probe') {
-    sendResponse({
-      fingerprint: readFingerprint(),
-      url: location.href,
+    void readHtmlForSourceCapture().then((html) => {
+      sendResponse({
+        fingerprint: hashText(html),
+        url: location.href,
+      });
     });
+    return true;
   }
 
   if (message.type === 'vaulttrack:get-html') {
-    sendResponse({
-      html: readHtml(),
-      url: location.href,
+    void readHtmlForSourceCapture().then((html) => {
+      sendResponse({
+        fingerprint: hashText(html),
+        html,
+        url: location.href,
+      });
     });
+    return true;
   }
 
   return undefined;

@@ -35,7 +35,10 @@ function cleanAnkerGamesTitle(rawTitle: string): string {
   );
 }
 
-function findVisibleVersion($: ReturnType<typeof load>): string | null {
+function findVisibleVersion(
+  $: ReturnType<typeof load>,
+  html: string,
+): string | null {
   const directBadge =
     $('span, div')
       .toArray()
@@ -49,11 +52,20 @@ function findVisibleVersion($: ReturnType<typeof load>): string | null {
   return (
     bodyText
       .match(/Version\s+updated\s+to\s+(?<version>[vV]\s*[0-9][0-9a-z._-]*)/i)
-      ?.groups?.version?.trim() ?? null
+      ?.groups?.version?.trim() ??
+    html
+      .match(
+        /(?:current_version|currentVersion)(?:&quot;|["'])?\s*:\s*(?:&quot;|["'])(?<version>[vV]\s*[0-9][0-9a-z._-]*)/i,
+      )
+      ?.groups?.version?.trim() ??
+    null
   );
 }
 
-function findVisibleCurrentBuild($: ReturnType<typeof load>): string | null {
+function findVisibleCurrentBuild(
+  $: ReturnType<typeof load>,
+  html: string,
+): string | null {
   const readBuildAfterLabel = (text: string): string | null =>
     compactText(text).match(/\bCurrent\s+Build\b\D*(?<build>\d{5,})\b/i)
       ?.groups?.build ?? null;
@@ -89,7 +101,13 @@ function findVisibleCurrentBuild($: ReturnType<typeof load>): string | null {
   }
 
   const bodyText = compactText($('body').text());
-  return readBuildAfterLabel(bodyText);
+  return (
+    readBuildAfterLabel(bodyText) ??
+    html.match(
+      /(?:current_build|currentBuild)(?:&quot;|["'])?\s*:\s*(?:&quot;|["'])?(?<build>\d{5,})/i,
+    )?.groups?.build ??
+    null
+  );
 }
 
 function normalizeHref(href: string, baseUrl: string): string | null {
@@ -191,8 +209,8 @@ export const ankerGamesAdapter: SourceAdapter = {
       $('meta[itemprop="image"]').attr('content') ??
       $('img').first().attr('src') ??
       null;
-    const version = findVisibleVersion($) ?? 'unknown';
-    const buildId = findVisibleCurrentBuild($);
+    const version = findVisibleVersion($, html) ?? 'unknown';
+    const buildId = findVisibleCurrentBuild($, html);
     const fullDownloadUrls = collectDownloadUrls($, url);
 
     if (!title || fullDownloadUrls.length === 0) {

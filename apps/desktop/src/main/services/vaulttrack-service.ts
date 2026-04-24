@@ -313,7 +313,7 @@ function normalizeSourceVersion(
     ?.trim()
     .toLowerCase()
     .replace(/^version\s*:?\s*/i, '')
-    .replace(/^v(?=\d)/i, '')
+    .replace(/^v\s*(?=\d)/i, '')
     .replace(/\s+/g, ' ');
   return normalized || null;
 }
@@ -1829,9 +1829,95 @@ export class VaultTrackService {
     return this.findUniquePatchNearUploadDate(params.patchEntries, uploadDate);
   }
 
+  private inferSteamRipBuildIdFromAnkerGamesVersion(
+    trackedItemId: string,
+    patchEntries: SteamPatchEntry[],
+  ): void {
+    const steamRipSnapshot = this.database.getSourceSnapshot(
+      trackedItemId,
+      'steamrip',
+    );
+    if (
+      !steamRipSnapshot ||
+      numericSteamBuildId(steamRipSnapshot.observedBuildId)
+    ) {
+      return;
+    }
+    const parsedSteamRip = this.database.getRawParsedSourcePayload(
+      trackedItemId,
+      'steamrip',
+    );
+    const steamRipVersion = normalizeSourceVersion(
+      parsedSteamRip?.latestSourceRelease.version ??
+        steamRipSnapshot.observedVersion,
+    );
+    if (!steamRipVersion) {
+      return;
+    }
+
+    let ankerGamesBuildId: string | null = null;
+    const peerBuildIds = new Set<string>();
+    for (const sourceKind of ['ankergames', 'elamigos'] as const) {
+      const snapshot = this.database.getSourceSnapshot(
+        trackedItemId,
+        sourceKind,
+      );
+      if (!snapshot) {
+        continue;
+      }
+      const parsedSource = this.database.getRawParsedSourcePayload(
+        trackedItemId,
+        sourceKind,
+      );
+      const version = normalizeSourceVersion(
+        parsedSource?.latestSourceRelease.version ?? snapshot.observedVersion,
+      );
+      if (version !== steamRipVersion) {
+        continue;
+      }
+      const directPatch = this.findDirectPatchForSourceSnapshot(
+        snapshot,
+        patchEntries,
+        parsedSource,
+      );
+      const buildId =
+        numericSteamBuildId(parsedSource?.latestSourceRelease.buildId) ??
+        numericSteamBuildId(snapshot.observedBuildId) ??
+        numericSteamBuildId(directPatch?.buildId);
+      if (buildId) {
+        peerBuildIds.add(buildId);
+      }
+      if (sourceKind === 'ankergames') {
+        ankerGamesBuildId = buildId;
+      }
+    }
+
+    if (
+      !ankerGamesBuildId ||
+      peerBuildIds.size !== 1 ||
+      !peerBuildIds.has(ankerGamesBuildId)
+    ) {
+      return;
+    }
+
+    this.database.upsertSourceSnapshot({
+      ...steamRipSnapshot,
+      fingerprint: parsedSteamRip?.fingerprint ?? steamRipSnapshot.fingerprint,
+      observedBuildId: ankerGamesBuildId,
+      observedVersion:
+        parsedSteamRip?.latestSourceRelease.version ??
+        steamRipSnapshot.observedVersion,
+      sourceUrl: parsedSteamRip?.sourceUrl ?? steamRipSnapshot.sourceUrl,
+    });
+  }
+
   private reconcileSourcePatchAlignments(trackedItemId: string): void {
     const patchEntries = this.sortPatchEntries(
       this.database.listPatchEntries(trackedItemId),
+    );
+    this.inferSteamRipBuildIdFromAnkerGamesVersion(
+      trackedItemId,
+      patchEntries,
     );
     if (patchEntries.length === 0) {
       return;
@@ -2013,11 +2099,9 @@ export class VaultTrackService {
     const patchEntries = this.sortPatchEntries(
       this.database.listPatchEntries(trackedItemId),
     );
-    if (patchEntries.length > 0) {
-      this.reconcileSourcePatchAlignments(trackedItemId);
-      sourceSnapshot = this.getItemSourceSnapshot(item);
-      sourceSnapshots = this.database.listSourceSnapshots(trackedItemId);
-    }
+    this.reconcileSourcePatchAlignments(trackedItemId);
+    sourceSnapshot = this.getItemSourceSnapshot(item);
+    sourceSnapshots = this.database.listSourceSnapshots(trackedItemId);
     const latestPatch = patchEntries[0] ?? null;
     const matchedSourceViews = sourceMatches.map((match) => {
       const snapshot =

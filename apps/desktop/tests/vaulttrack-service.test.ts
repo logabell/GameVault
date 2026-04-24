@@ -5331,6 +5331,144 @@ describe('VaultTrackService SteamDB patch workflow', () => {
     }
   });
 
+  it('infers a missing SteamRIP build from a matching AnkerGames version', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'repo',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:repo',
+        title: 'Repo',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 2344520,
+        coverUrl: null,
+        matchedAt: '2026-04-22T12:00:00.000Z',
+        normalizedTitle: 'repo',
+        title: 'Repo',
+      });
+      const payloads: ParsedSourcePayload[] = [
+        {
+          coverUrl: null,
+          fingerprint: 'ankergames-repo',
+          fullDownloadUrls: [],
+          latestSourceRelease: {
+            buildId: '20514355',
+            isPatch: false,
+            label: 'Version V 7.0.0.1243375',
+            patchDate: null,
+            version: 'V 7.0.0.1243375',
+          },
+          normalizedTitle: 'repo',
+          patchDownloadUrls: [],
+          sourceKind: 'ankergames',
+          sourceUrl: 'https://ankergames.net/game/repo',
+          title: 'Repo',
+        },
+        {
+          coverUrl: null,
+          fingerprint: 'steamrip-repo',
+          fullDownloadUrls: [],
+          latestSourceRelease: {
+            buildId: null,
+            isPatch: false,
+            label: 'Version 7.0.0.1243375',
+            patchDate: null,
+            version: '7.0.0.1243375',
+          },
+          normalizedTitle: 'repo',
+          patchDownloadUrls: [],
+          sourceKind: 'steamrip',
+          sourceUrl: 'https://steamrip.com/repo-free-download/',
+          title: 'Repo',
+        },
+      ];
+
+      for (const payload of payloads) {
+        database.upsertSourceMatch({
+          confidence: 1,
+          createdAt: '2026-04-22T12:00:00.000Z',
+          isPrimary: false,
+          lastCheckedAt: '2026-04-22T12:00:00.000Z',
+          lastError: null,
+          method: 'fuzzy_title',
+          normalizedTitle: payload.normalizedTitle,
+          score: 1,
+          sourceKind: payload.sourceKind,
+          sourceTitle: payload.title,
+          sourceUrl: payload.sourceUrl,
+          status: 'probable',
+          trackedItemId: item.id,
+          updatedAt: '2026-04-22T12:00:00.000Z',
+          usable: true,
+        });
+        database.upsertSourceSnapshot({
+          checkedAt: '2026-04-22T12:00:00.000Z',
+          fingerprint: payload.fingerprint,
+          observedBuildId: payload.latestSourceRelease.buildId ?? null,
+          observedPatchDate: payload.latestSourceRelease.patchDate ?? null,
+          observedPatchLink: null,
+          observedPatchTitle: null,
+          observedVersion: payload.latestSourceRelease.version,
+          patchSelectionSource: null,
+          sourceKind: payload.sourceKind,
+          sourceUrl: payload.sourceUrl,
+          trackedItemId: item.id,
+        });
+        database.setRawParsedSourcePayload(item.id, payload);
+      }
+
+      const [initialView] = await createService(database).listTrackedItems();
+      const initialSteamRip = initialView?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'steamrip',
+      );
+
+      expect(initialSteamRip).toMatchObject({
+        matchedPatch: null,
+        snapshot: {
+          observedBuildId: '20514355',
+          observedVersion: '7.0.0.1243375',
+        },
+        versionsBehindLatest: null,
+      });
+
+      database.upsertPatchEntries([
+        {
+          appId: 2344520,
+          buildId: '20514355',
+          link: 'https://steamdb.info/patchnotes/20514355/',
+          patchDate: '10/23/2025',
+          patchTitle: 'Repo update for 23 October 2025',
+          publishedAt: '2025-10-23T12:00:00.000Z',
+          title: 'Repo update for 23 October 2025',
+          trackedItemId: item.id,
+        },
+      ]);
+
+      const [view] = await createService(database).listTrackedItems();
+      const steamrip = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'steamrip',
+      );
+
+      expect(steamrip).toMatchObject({
+        matchedPatch: {
+          buildId: '20514355',
+        },
+        snapshot: {
+          observedBuildId: '20514355',
+          observedVersion: '7.0.0.1243375',
+        },
+        updateStatus: 'matches_upstream',
+        versionsBehindLatest: 0,
+      });
+      expect(
+        database.getSourceSnapshot(item.id, 'steamrip')?.observedBuildId,
+      ).toBe('20514355');
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('infers SteamRIP patch alignment from updated-games timing and higher version', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {

@@ -184,6 +184,9 @@ function fallbackConnectionHealth(message: string): ConnectionHealthSummary {
 function canonicalizeSupportedUrl(url: string): string {
   const parsedUrl = new URL(url);
   parsedUrl.hash = '';
+  if (isSupportedDetailPage(url)) {
+    parsedUrl.search = '';
+  }
   return parsedUrl.toString();
 }
 
@@ -204,6 +207,13 @@ function isParsedCacheFresh(
   }
 
   if (fingerprint && cacheEntry.fingerprint !== fingerprint) {
+    return false;
+  }
+
+  if (
+    cacheEntry.parsedSource.sourceKind === 'ankergames' &&
+    !cacheEntry.parsedSource.latestSourceRelease.buildId
+  ) {
     return false;
   }
 
@@ -600,12 +610,14 @@ async function requestPageProbe(tabId: number): Promise<PageProbe> {
 async function requestPageHtml(
   tabId: number,
 ): Promise<{
+  fingerprint?: string;
   html: string;
   url: string;
 }> {
   return chrome.tabs.sendMessage(tabId, {
     type: 'vaulttrack:get-html',
   }) as Promise<{
+    fingerprint?: string;
     html: string;
     url: string;
   }>;
@@ -720,7 +732,7 @@ async function parseAndCachePageFromTab(params: {
 }): Promise<ParsedSourcePayload> {
   const result = await requestPageHtml(params.tabId);
   return parseAndCachePage({
-    fingerprint: params.fingerprint,
+    fingerprint: result.fingerprint ?? params.fingerprint,
     html: result.html,
     url: result.url,
   });
@@ -1828,6 +1840,7 @@ async function clearBadge(tabId: number): Promise<void> {
 async function warmSupportedTab(params: {
   fingerprint: string;
   isActive: boolean;
+  skipOpen?: boolean;
   tabId: number;
   url: string;
 }): Promise<ParsedSourcePayload> {
@@ -1844,7 +1857,7 @@ async function warmSupportedTab(params: {
     await setActiveDraft(params.tabId, params.url);
   }
   await setReadyBadge(params.tabId);
-  if (params.isActive) {
+  if (params.isActive && !params.skipOpen) {
     const reopened = await maybeReopenPopupAfterNavigation({
       tabId: params.tabId,
       url: params.url,
@@ -1876,24 +1889,24 @@ async function handleSupportedTab(
     await ensureContentScript(tabId, url);
     const pageProbe = await requestPageProbe(tabId);
     const cached = await readParsedCache(pageProbe.url);
+    const reopened = isActive
+      ? await maybeReopenPopupAfterNavigation({
+          tabId,
+          url: pageProbe.url,
+        })
+      : false;
 
     if (isParsedCacheFresh(cached, pageProbe.fingerprint)) {
       if (isActive) {
         await setActiveDraft(tabId, pageProbe.url);
       }
       await setReadyBadge(tabId);
-      if (isActive) {
-        const reopened = await maybeReopenPopupAfterNavigation({
+      if (isActive && !reopened) {
+        await maybeAutoOpenDetectedPage({
+          fingerprint: pageProbe.fingerprint,
           tabId,
           url: pageProbe.url,
         });
-        if (!reopened) {
-          await maybeAutoOpenDetectedPage({
-            fingerprint: pageProbe.fingerprint,
-            tabId,
-            url: pageProbe.url,
-          });
-        }
       }
       return;
     }
@@ -1902,6 +1915,7 @@ async function handleSupportedTab(
     void warmSupportedTab({
       fingerprint: pageProbe.fingerprint,
       isActive,
+      skipOpen: reopened,
       tabId,
       url: pageProbe.url,
     }).catch(() => clearBadge(tabId));
@@ -1938,19 +1952,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
       if (tabId && url && fingerprint) {
         const cached = await readParsedCache(url);
+        const reopened = sender.tab?.active
+          ? await maybeReopenPopupAfterNavigation({
+              tabId,
+              url,
+            })
+          : false;
         if (isParsedCacheFresh(cached, fingerprint)) {
           if (sender.tab?.active) {
             await setActiveDraft(tabId, url);
           }
           await setReadyBadge(tabId);
-          if (sender.tab?.active) {
-            const reopened = await maybeReopenPopupAfterNavigation({
-              tabId,
-              url,
-            });
-            if (!reopened) {
-              await maybeAutoOpenDetectedPage({ fingerprint, tabId, url });
-            }
+          if (sender.tab?.active && !reopened) {
+            await maybeAutoOpenDetectedPage({ fingerprint, tabId, url });
           }
           sendResponse({ ok: true, payload: cached.parsedSource });
           return;
@@ -1960,6 +1974,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const parsedSource = await warmSupportedTab({
           fingerprint,
           isActive: Boolean(sender.tab?.active),
+          skipOpen: reopened,
           tabId,
           url,
         });

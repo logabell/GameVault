@@ -48,6 +48,7 @@ import {
   getDownloadAutomationWarning,
   getDownloadQueueSuccessMessage,
   getDownloadQueueTimeoutMessage,
+  getAutoSourceMirrorSelection,
   findSharedPatchMirrorUrl,
   getHeroPresenceState,
   getLikelyPatchForSelectedSource,
@@ -57,6 +58,7 @@ import {
   getSourceMatchPatchKey,
   haveSharedMirrorUrls,
   hasActionableSourceUpdate,
+  inferSourceComparisonRows,
   isSourceReadyForAutomation,
   normalizeComparableUrl,
   trackedItemMatchesSourceUrls,
@@ -187,6 +189,18 @@ interface StoredPopupState {
   step: FlowStep;
   version: typeof EXTENSION_POPUP_STATE_VERSION;
 }
+
+type StoredPopupStateOverrides = Partial<
+  Pick<
+    StoredPopupState,
+    | 'activeTab'
+    | 'selectedFullMirrorUrl'
+    | 'selectedPatchMirrorUrl'
+    | 'selectedSourceKind'
+    | 'selectedSteamPatchKey'
+    | 'step'
+  >
+>;
 
 interface WorkflowSnapshot {
   finishQueued: boolean;
@@ -1122,7 +1136,7 @@ function App() {
     [libraryItems, libraryUpdateItemId],
   );
   const isLibraryUpdateFlow = Boolean(libraryUpdateItem);
-  const activeDraftItem = useMemo(
+  const baseActiveDraftItem = useMemo(
     () =>
       libraryUpdateItem ??
       (matchedDraftItemId
@@ -1130,7 +1144,20 @@ function App() {
         : null) ?? currentPageTrackedItem,
     [currentPageTrackedItem, libraryItems, libraryUpdateItem, matchedDraftItemId],
   );
-  const sourceRows = activeDraftItem?.sourceMatches ?? [];
+  const sourceRows = useMemo(
+    () => inferSourceComparisonRows(baseActiveDraftItem, steamPatches),
+    [baseActiveDraftItem, steamPatches],
+  );
+  const activeDraftItem = useMemo(
+    () =>
+      baseActiveDraftItem
+        ? {
+            ...baseActiveDraftItem,
+            sourceMatches: sourceRows,
+          }
+        : null,
+    [baseActiveDraftItem, sourceRows],
+  );
   const selectedSourceView =
     sourceRows.find(
       (source) => source.match.sourceKind === selectedSourceKind,
@@ -1138,18 +1165,30 @@ function App() {
     sourceRows.find((source) => source.match.isPrimary) ??
     sourceRows[0] ??
     null;
-  const selectedSourceFullMirrors =
-    selectedSourceView?.downloadMirrors.filter(
-      (mirror) => mirror.kind === 'full',
-    ) ?? [];
-  const selectedSourcePatchMirrors =
-    selectedSourceView?.downloadMirrors.filter(
-      (mirror) => mirror.kind === 'patch',
-    ) ?? [];
+  const selectedSourceFullMirrors = useMemo(
+    () =>
+      selectedSourceView?.downloadMirrors.filter(
+        (mirror) => mirror.kind === 'full',
+      ) ?? [],
+    [selectedSourceView],
+  );
+  const selectedSourcePatchMirrors = useMemo(
+    () =>
+      selectedSourceView?.downloadMirrors.filter(
+        (mirror) => mirror.kind === 'patch',
+      ) ?? [],
+    [selectedSourceView],
+  );
   const sharedSourcePatchMirrors = haveSharedMirrorUrls(
     selectedSourceFullMirrors,
     selectedSourcePatchMirrors,
   );
+  const selectedSourceFullMirrorKey = selectedSourceFullMirrors
+    .map((mirror) => mirror.url)
+    .join('\n');
+  const selectedSourcePatchMirrorKey = selectedSourcePatchMirrors
+    .map((mirror) => mirror.url)
+    .join('\n');
   const requiresSourcePatchMirror =
     selectedSourcePatchMirrors.length > 0 && !sharedSourcePatchMirrors;
   const likelySteamPatch = useMemo(
@@ -1272,7 +1311,10 @@ function App() {
   }
 
   const writePopupStateForSourceUrl = useCallback(
-    (stateSourceUrl: string | null | undefined): void => {
+    (
+      stateSourceUrl: string | null | undefined,
+      overrides: StoredPopupStateOverrides = {},
+    ): void => {
       const storageKey = getPopupStateStorageKey(stateSourceUrl);
       if (!storageKey || !stateSourceUrl) {
         return;
@@ -1295,6 +1337,7 @@ function App() {
         step,
         version: EXTENSION_POPUP_STATE_VERSION,
       };
+      Object.assign(snapshot, overrides);
 
       try {
         window.localStorage.setItem(storageKey, JSON.stringify(snapshot));
@@ -2015,6 +2058,31 @@ function App() {
   }, [selectedAppId, selectedSourceView, steamPatches]);
 
   useEffect(() => {
+    const selection = getAutoSourceMirrorSelection({
+      currentFullUrl: selectedFullMirrorUrl,
+      currentPatchUrl: selectedPatchMirrorUrl,
+      fullMirrors: selectedSourceFullMirrors,
+      patchMirrors: selectedSourcePatchMirrors,
+      sharedPatchMirrors: sharedSourcePatchMirrors,
+    });
+
+    if (selection.selectedFullUrl !== selectedFullMirrorUrl) {
+      setSelectedFullMirrorUrl(selection.selectedFullUrl);
+    }
+    if (selection.selectedPatchUrl !== selectedPatchMirrorUrl) {
+      setSelectedPatchMirrorUrl(selection.selectedPatchUrl);
+    }
+  }, [
+    selectedFullMirrorUrl,
+    selectedPatchMirrorUrl,
+    selectedSourceFullMirrorKey,
+    selectedSourceFullMirrors,
+    selectedSourcePatchMirrorKey,
+    selectedSourcePatchMirrors,
+    sharedSourcePatchMirrors,
+  ]);
+
+  useEffect(() => {
     const trackedItemId = activeDraftItem?.item.id ?? null;
     if (
       step !== 'patch' ||
@@ -2337,7 +2405,11 @@ function App() {
       libraryRedirectTimerRef.current = null;
     }
 
-    const preferredSource = getPreferredUpdateSource(item);
+    const comparisonItem = {
+      ...item,
+      sourceMatches: inferSourceComparisonRows(item, steamPatchesRef.current),
+    };
+    const preferredSource = getPreferredUpdateSource(comparisonItem);
     const selection = getSourceDownloadSelection(preferredSource);
     const steamCandidate = createLibraryUpdateSteamCandidate(item);
 
@@ -2369,11 +2441,24 @@ function App() {
       return;
     }
 
+    const selection = getSourceDownloadSelection(source);
+    const sourcePatchKey = getSourceMatchPatchKey(source, steamPatches);
+    const targetState: StoredPopupStateOverrides = {
+      activeTab: 'game',
+      selectedFullMirrorUrl: selection.selectedFullUrl,
+      selectedPatchMirrorUrl: selection.selectedPatchUrl,
+      selectedSourceKind: source.match.sourceKind,
+      selectedSteamPatchKey: sourcePatchKey,
+      step: 'game',
+    };
     const currentSourceUrl = draftShell?.sourceUrl ?? sourceUrl;
     if (!isLibraryUpdateFlow) {
       writePopupStateForSourceUrl(currentSourceUrl);
-      writePopupStateForSourceUrl(source.match.sourceUrl);
+      writePopupStateForSourceUrl(source.match.sourceUrl, targetState);
     }
+    setActiveTab('game');
+    setStep('game');
+    selectSourceForDownload(source);
     setMessage(null);
     try {
       const response = await chrome.runtime.sendMessage({
@@ -4103,7 +4188,8 @@ function App() {
                                   <span>
                                     Build:{' '}
                                     {formatSourceSignalValue(
-                                      source.snapshot?.observedBuildId,
+                                      source.snapshot?.observedBuildId ??
+                                        source.matchedPatch?.buildId,
                                     )}
                                   </span>
                                 </button>

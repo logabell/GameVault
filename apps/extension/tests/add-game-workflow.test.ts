@@ -15,6 +15,7 @@ import { TrackedItemTrackingStatus } from '@vaulttrack/shared-types';
 
 import {
   buildCreateMatchedDraftMessage,
+  getAutoSourceMirrorSelection,
   getPreferredUpdateSource,
   getDownloadAutomationWarning,
   getDownloadQueueSuccessMessage,
@@ -23,6 +24,7 @@ import {
   getSourceComparisonLabel,
   getSourceDownloadSelection,
   hasActionableSourceUpdate,
+  inferSourceComparisonRows,
   isSourceReadyForAutomation,
   trackedItemMatchesSourceUrls,
 } from '../src/popup/add-game-workflow.js';
@@ -240,6 +242,55 @@ describe('extension add-game workflow helpers', () => {
     );
   });
 
+  it('auto-selects the only available mirror for the active source', () => {
+    const fullMirror = mirror(
+      'ankergames',
+      'full',
+      'https://ankergames.example.test/full',
+      'Full',
+    );
+    const patchMirror = mirror(
+      'ankergames',
+      'patch',
+      'https://ankergames.example.test/update',
+      'Update',
+    );
+
+    expect(
+      getAutoSourceMirrorSelection({
+        currentFullUrl: null,
+        currentPatchUrl: null,
+        fullMirrors: [fullMirror],
+        patchMirrors: [patchMirror],
+        sharedPatchMirrors: false,
+      }),
+    ).toEqual({
+      selectedFullUrl: fullMirror.url,
+      selectedPatchUrl: patchMirror.url,
+    });
+
+    expect(
+      getAutoSourceMirrorSelection({
+        currentFullUrl: null,
+        currentPatchUrl: null,
+        fullMirrors: [
+          fullMirror,
+          mirror(
+            'ankergames',
+            'full',
+            'https://ankergames.example.test/full-2',
+            'Full 2',
+          ),
+        ],
+        patchMirrors: [],
+        sharedPatchMirrors: false,
+      }),
+    ).toEqual({
+      selectedFullUrl: null,
+      selectedPatchUrl: null,
+    });
+  });
+
   it('marks only actionable source updates for the library update button', () => {
     expect(
       hasActionableSourceUpdate(
@@ -374,6 +425,122 @@ describe('extension add-game workflow helpers', () => {
     expect(
       getLikelyPatchForSelectedSource(parsedSource, steamrip, [latestPatch]),
     ).toBeNull();
+  });
+
+  it('infers a missing SteamRIP build from a matching AnkerGames version', () => {
+    const latestPatch = patch('20514355', 'Repo update for 23 October 2025');
+    const ankergames = sourceView(
+      'ankergames',
+      {
+        observedBuildId: latestPatch.buildId,
+        observedVersion: 'V 7.0.0.1243375',
+      },
+      [
+        mirror(
+          'ankergames',
+          'full',
+          'https://ankergames.example.test/full',
+          'Full',
+        ),
+      ],
+    );
+    const steamrip = {
+      ...sourceView(
+        'steamrip',
+        {
+          observedBuildId: null,
+          observedVersion: '7.0.0.1243375',
+        },
+        [
+          mirror(
+            'steamrip',
+            'full',
+            'https://steamrip.example.test/full',
+            'Full',
+          ),
+        ],
+      ),
+      matchedPatch: null,
+      updateStatus: 'unknown' as const,
+      versionsBehindLatest: null,
+    };
+
+    const rows = inferSourceComparisonRows(
+      trackedItem({
+        sourceMatches: [ankergames, steamrip],
+      }),
+      [latestPatch],
+    );
+    const inferredSteamRip = rows.find(
+      (source) => source.match.sourceKind === 'steamrip',
+    );
+
+    expect(inferredSteamRip).toMatchObject({
+      isUpdateSource: true,
+      matchedPatch: {
+        buildId: latestPatch.buildId,
+      },
+      snapshot: {
+        observedBuildId: latestPatch.buildId,
+        observedVersion: '7.0.0.1243375',
+      },
+      updateStatus: 'matches_upstream',
+      versionsBehindLatest: 0,
+    });
+    expect(
+      getSourceComparisonLabel(inferredSteamRip!, trackedItem()),
+    ).toBe('Latest');
+  });
+
+  it('does not infer a SteamRIP build when same-version peers conflict', () => {
+    const ankergames = sourceView(
+      'ankergames',
+      {
+        observedBuildId: '111',
+        observedVersion: 'V 1.0',
+      },
+      [],
+    );
+    const elamigos = sourceView(
+      'elamigos',
+      {
+        observedBuildId: '222',
+        observedVersion: '1.0',
+      },
+      [],
+    );
+    const steamrip = {
+      ...sourceView(
+        'steamrip',
+        {
+          observedBuildId: null,
+          observedVersion: '1.0',
+        },
+        [],
+      ),
+      matchedPatch: null,
+      updateStatus: 'unknown' as const,
+      versionsBehindLatest: null,
+    };
+
+    const rows = inferSourceComparisonRows(
+      trackedItem({
+        sourceMatches: [ankergames, elamigos, steamrip],
+      }),
+      [],
+    );
+    const inferredSteamRip = rows.find(
+      (source) => source.match.sourceKind === 'steamrip',
+    );
+
+    expect(inferredSteamRip).toMatchObject({
+      matchedPatch: null,
+      snapshot: {
+        observedBuildId: null,
+      },
+      updateStatus: 'unknown',
+      versionsBehindLatest: null,
+    });
   });
 
   it('labels Steam-matched draft-only items as discovered in the hero', () => {
