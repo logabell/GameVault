@@ -1,6 +1,6 @@
 import { GameVaultService } from './gamevault-service.js';
 
-export function getLatestExpectedDailyPollAt(
+function getLatestExpectedDailyPollAt(
   now: Date,
   pollHourLocal: number,
 ): Date {

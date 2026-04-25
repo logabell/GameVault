@@ -7,26 +7,26 @@ import type {
 } from '@gamevault/shared-types';
 import { isAnkerGamesDirectDownloadUrl } from '@gamevault/source-core';
 
-export interface MyJDownloaderCredentials {
+interface MyJDownloaderCredentials {
   deviceId: string;
   email: string;
   password: string;
 }
 
-export interface QueuedPackageResult {
+interface QueuedPackageResult {
   packageId: number | null;
   packageName: string;
   parts: QueuedPackagePartResult[];
 }
 
-export interface QueuedPackagePartResult {
+interface QueuedPackagePartResult {
   mirrorUrl: string;
   packageId: number | null;
   packageName: string;
   role: 'full' | 'patch';
 }
 
-export interface DownloadProgressSnapshot {
+interface DownloadProgressSnapshot {
   bytesLoaded: number | null;
   bytesTotal: number | null;
   errorMessage?: string | null;

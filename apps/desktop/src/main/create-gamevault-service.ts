@@ -10,7 +10,7 @@ import {
 import type { GameVaultDatabase } from './services/database.js';
 import type { dismountIsoImagesUnderPath } from './services/files.js';
 
-export interface CreateGameVaultServiceParams {
+interface CreateGameVaultServiceParams {
   database: GameVaultDatabase;
   dismountIsoUnderPath?: typeof dismountIsoImagesUnderPath;
   myJDownloader: MyJDownloaderService;

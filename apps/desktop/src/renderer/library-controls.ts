@@ -8,14 +8,9 @@ export {
   canDeleteTrackedItemFiles,
   filterLibraryItem,
   getDefaultLibrarySortDirection,
-  getLibraryStatusFilterCount,
-  getLibraryStatusSortRank,
   getScopedLibraryStatusFilterCounts,
   getTrackingStatus,
   hasActionableSourceUpdate,
-  isInstalledUpToDateLibraryItem,
-  isPatchBehindLatest,
-  isSourceBehindUpstream,
   LIBRARY_STATUS_FILTER_OPTIONS,
   matchesLibrarySearch,
   matchesLibraryStatusFilter,
@@ -29,7 +24,7 @@ export type {
   LibraryStatusFilter,
 } from '@gamevault/shared-types';
 
-export function sourceRequiresMyJDownloader(
+function sourceRequiresMyJDownloader(
   _sourceKind: SupportedSourceKind | null | undefined,
 ): boolean {
   return false;

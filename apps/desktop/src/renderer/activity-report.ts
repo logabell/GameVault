@@ -22,7 +22,7 @@ function sanitizeString(value: string): string {
   );
 }
 
-export function sanitizeActivityReportValue(
+function sanitizeActivityReportValue(
   value: unknown,
   keyHint = '',
 ): unknown {
@@ -50,7 +50,7 @@ export function sanitizeActivityReportValue(
   return value;
 }
 
-export function getActivityIssueRank(issue: ActivityIssue): number {
+function getActivityIssueRank(issue: ActivityIssue): number {
   if (issue.severity === 'error') return 0;
   if (issue.severity === 'warning') return 1;
   return 2;

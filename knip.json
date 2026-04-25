@@ -1,0 +1,37 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "workspaces": {
+    "apps/desktop": {
+      "entry": [
+        "scripts/register-native-host.mjs",
+        "scripts/unregister-native-host.mjs",
+        "src/main/index.ts",
+        "src/main/preload.ts",
+        "src/native-host/index.ts",
+        "src/renderer/index.tsx"
+      ],
+      "project": ["scripts/**/*.mjs", "src/**/*.{ts,tsx}", "tests/**/*.ts"]
+    },
+    "apps/extension": {
+      "entry": [
+        "src/background/index.ts",
+        "src/content/index.ts",
+        "src/content/steamdb.ts",
+        "src/popup/index.tsx"
+      ],
+      "project": ["scripts/**/*.mjs", "src/**/*.{ts,tsx}", "tests/**/*.ts"]
+    },
+    "packages/shared-types": {
+      "entry": ["src/index.ts"],
+      "project": ["src/**/*.ts", "tests/**/*.ts"]
+    },
+    "packages/source-core": {
+      "entry": ["src/index.ts"],
+      "project": ["src/**/*.ts", "tests/**/*.ts"]
+    },
+    "packages/steam-core": {
+      "entry": ["src/index.ts"],
+      "project": ["src/**/*.ts", "tests/**/*.ts"]
+    }
+  }
+}

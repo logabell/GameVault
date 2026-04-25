@@ -46,4 +46,13 @@ export default tseslint.config(
       ],
     },
   },
+  {
+    files: [
+      'apps/desktop/src/renderer/index.tsx',
+      'apps/extension/src/popup/index.tsx',
+    ],
+    rules: {
+      'react-refresh/only-export-components': 'off',
+    },
+  },
 );

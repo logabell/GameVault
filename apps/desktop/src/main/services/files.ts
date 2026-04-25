@@ -23,7 +23,7 @@ function normalizeTitle(input: string): string {
     .replace(/\s+/g, ' ');
 }
 
-export interface ImportFolderCandidate {
+interface ImportFolderCandidate {
   folderName: string;
   normalizedTitle: string;
   rootPath: string;
@@ -195,7 +195,7 @@ export async function ensureDirectory(target: string): Promise<void> {
   await mkdir(target, { recursive: true });
 }
 
-export async function stageMove(params: {
+async function stageMove(params: {
   finalPath: string;
   stagePath: string;
 }): Promise<void> {

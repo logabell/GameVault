@@ -8,7 +8,7 @@ import type {
 } from '@gamevault/shared-types';
 import { getPatchHistoryKey } from '@gamevault/shared-types';
 
-export type UpdateMirrorOption = Pick<
+type UpdateMirrorOption = Pick<
   DownloadMirrorRecord,
   'kind' | 'label' | 'manuallyFailedAt' | 'selectedAt' | 'url'
 >;
@@ -32,7 +32,7 @@ export interface SteamPatchSuggestion {
   score: number;
 }
 
-export function normalizeComparableUrl(
+function normalizeComparableUrl(
   value: string | null | undefined,
 ): string | null {
   if (!value) return null;

@@ -14,7 +14,7 @@ interface DirectoryEntry {
   name: string;
 }
 
-export interface BrowserExtensionDetectionOptions {
+interface BrowserExtensionDetectionOptions {
   env?: NodeJS.ProcessEnv;
   extensionPath?: string | null;
   firefoxExtensionId?: string;

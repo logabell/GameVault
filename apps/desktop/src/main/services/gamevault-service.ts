@@ -118,7 +118,7 @@ import {
 } from './files.js';
 import { MyJDownloaderService } from './myjdownloader.js';
 
-export type RendererSettingsView = SettingsView;
+type RendererSettingsView = SettingsView;
 
 const IS_TEST_ENV =
   process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST);
@@ -650,12 +650,12 @@ export interface DirectHttpDownloadProgressSnapshot {
   statusMessage?: string | null;
 }
 
-export interface DirectHttpDownloadResult {
+interface DirectHttpDownloadResult {
   fileName: string;
   savePath: string;
 }
 
-export interface DirectHttpDownloadHandle {
+interface DirectHttpDownloadHandle {
   cancel: (reason?: string) => Promise<void> | void;
   completion: Promise<DirectHttpDownloadResult>;
 }
@@ -673,15 +673,15 @@ export type DirectHttpDownloadRunner = (
   params: StartDirectHttpDownloadParams,
 ) => DirectHttpDownloadHandle;
 
-export interface DownloadProgressChangeEvent {
+interface DownloadProgressChangeEvent {
   trackedItemIds: string[];
 }
 
-export type DownloadProgressChangeListener = (
+type DownloadProgressChangeListener = (
   event: DownloadProgressChangeEvent,
 ) => void;
 
-export interface PollDownloadJobsOptions {
+interface PollDownloadJobsOptions {
   activity?: boolean;
   lightweight?: boolean;
   skipIfRunning?: boolean;

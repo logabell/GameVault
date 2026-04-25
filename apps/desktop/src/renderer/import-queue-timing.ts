@@ -7,14 +7,14 @@ export type ImportBuildLookupPauseReason =
   | 'rate_limited'
   | 'success';
 
-export interface ImportBuildLookupTiming {
+interface ImportBuildLookupTiming {
   pauseReason: ImportBuildLookupPauseReason;
   queueCooldownMs: number;
   rowRetryDelayMs: number | null;
   shouldRetry: boolean;
 }
 
-export interface ImportBuildLookupQueueRow {
+interface ImportBuildLookupQueueRow {
   needsUserAttention?: boolean | null;
   nextRetryAt: string | null;
   patchHistoryStatus: string;

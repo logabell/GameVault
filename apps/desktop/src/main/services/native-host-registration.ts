@@ -11,7 +11,7 @@ import { FIREFOX_EXTENSION_ID } from '@gamevault/shared-types';
 
 export const GAMEVAULT_NATIVE_HOST_NAME = 'com.gamevault.desktop';
 
-export interface NativeHostRegistrationOptions extends RegisterExtensionNativeHostPayload {
+interface NativeHostRegistrationOptions extends RegisterExtensionNativeHostPayload {
   localAppData?: string;
   nativeHostBundlePath: string;
   now?: () => Date;

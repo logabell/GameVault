@@ -10,7 +10,7 @@ import { buildFingerprint, compactText, normalizeTitle } from '../utils.js';
 const DOWNLOAD_ACTION_RE = /generateDownloadUrl\((?<id>\d+)\)/i;
 const VERSION_TOKEN_RE = /^[vV]\s*[0-9][0-9a-z._-]*(?:\s*[+][^<]+)?$/i;
 
-export function isAnkerGamesDetailPage(url: string): boolean {
+function isAnkerGamesDetailPage(url: string): boolean {
   try {
     const parsedUrl = new URL(url);
     const hostname = parsedUrl.hostname.replace(/^www\./i, '').toLowerCase();

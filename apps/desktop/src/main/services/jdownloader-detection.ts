@@ -9,7 +9,7 @@ interface CommandResult {
   stdout: string;
 }
 
-export interface JDownloaderDetectionOptions {
+interface JDownloaderDetectionOptions {
   env?: NodeJS.ProcessEnv;
   now?: () => Date;
   runCommand?: (command: string, args: string[]) => Promise<CommandResult>;

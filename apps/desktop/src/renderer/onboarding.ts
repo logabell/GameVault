@@ -13,7 +13,7 @@ export type DesktopOnboardingStep =
   | 'myjdownloader'
   | 'extension';
 
-export type EmptyLibraryState = 'items' | 'no-results' | 'start';
+type EmptyLibraryState = 'items' | 'no-results' | 'start';
 
 export function shouldShowFirstLaunchOnboarding(
   settings: Pick<SettingsView, 'onboarding'>,

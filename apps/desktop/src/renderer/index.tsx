@@ -2477,20 +2477,20 @@ function App() {
     }
   }
 
-  function syncSettingsDrafts(loadedSettings: SettingsView): void {
+  const syncSettingsDrafts = useCallback((loadedSettings: SettingsView): void => {
     setSettingsDraft(createSettingsDraftFromSettings(loadedSettings));
     setLibraryRootsDraft(normalizeSettingsLibraryRoots(loadedSettings));
     setRenameOnImportDraft(loadedSettings.renameGameFoldersOnImport ?? true);
-  }
+  }, []);
 
-  function syncAuthDraft(loadedSettings: SettingsView): void {
+  const syncAuthDraft = useCallback((loadedSettings: SettingsView): void => {
     setAuthDraft((current) => ({
       ...current,
       email: loadedSettings.myJDownloaderEmail ?? '',
       selectedDeviceId:
         loadedSettings.myJDownloaderDeviceId ?? current.selectedDeviceId,
     }));
-  }
+  }, []);
 
   function cancelSettingsDraftChanges(): void {
     syncSettingsDrafts(settings);
@@ -2521,13 +2521,13 @@ function App() {
     setSettingsSaveStatus('idle');
   }
 
-  async function refreshSettings() {
+  const refreshSettings = useCallback(async (): Promise<void> => {
     const nextSettings = await window.gameVaultApi.getSettings();
     setSettings(nextSettings);
     syncSettingsDrafts(nextSettings);
     syncAuthDraft(nextSettings);
     setExtensionIdDraft(savedChromiumExtensionId(nextSettings.onboarding));
-  }
+  }, [syncAuthDraft, syncSettingsDrafts]);
 
   async function saveTheme(themeMode: ThemeMode) {
     setThemeBusy(true);
@@ -3728,7 +3728,7 @@ function App() {
         }
       },
     );
-  }, []);
+  }, [syncSettingsDrafts]);
 
   useEffect(() => {
     return window.gameVaultApi.onDownloadProgress((payload) => {
@@ -3816,7 +3816,7 @@ function App() {
       refreshExtensionSetupInfo(),
       refreshSettings(),
     ]).catch(() => undefined);
-  }, [section]);
+  }, [refreshSettings, section]);
 
   function actionErrorMessage(error: unknown, fallback = 'Action failed.') {
     return error instanceof Error ? error.message : fallback;

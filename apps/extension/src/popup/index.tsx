@@ -1382,24 +1382,27 @@ function App() {
         currentPageLifecycleStatus ?? '',
       ));
 
-  function syncTrackedStatus(nextTrackedStatus: TrackedItemView | null) {
-    setSelectedFullMirrorUrl(
-      (current) =>
-        current ??
-        nextTrackedStatus?.downloadMirrors.find(
-          (mirror) => mirror.kind === 'full' && mirror.selectedAt,
-        )?.url ??
-        null,
-    );
-    setSelectedPatchMirrorUrl(
-      (current) =>
-        current ??
-        nextTrackedStatus?.downloadMirrors.find(
-          (mirror) => mirror.kind === 'patch' && mirror.selectedAt,
-        )?.url ??
-        null,
-    );
-  }
+  const syncTrackedStatus = useCallback(
+    (nextTrackedStatus: TrackedItemView | null): void => {
+      setSelectedFullMirrorUrl(
+        (current) =>
+          current ??
+          nextTrackedStatus?.downloadMirrors.find(
+            (mirror) => mirror.kind === 'full' && mirror.selectedAt,
+          )?.url ??
+          null,
+      );
+      setSelectedPatchMirrorUrl(
+        (current) =>
+          current ??
+          nextTrackedStatus?.downloadMirrors.find(
+            (mirror) => mirror.kind === 'patch' && mirror.selectedAt,
+          )?.url ??
+          null,
+      );
+    },
+    [],
+  );
 
   function applyUpdatedTrackedItem(updated: TrackedItemView) {
     setLibraryItems((current) => {
@@ -1803,7 +1806,7 @@ function App() {
     }
   }
 
-  async function refreshSettings() {
+  const refreshSettings = useCallback(async (): Promise<void> => {
     const response = await chrome.runtime.sendMessage({
       type: 'gamevault:get-settings',
     });
@@ -1813,9 +1816,9 @@ function App() {
       setEmail(nextSettings.myJDownloaderEmail ?? '');
       setRootLibraryPathDraft(nextSettings.rootLibraryPath ?? '');
     }
-  }
+  }, []);
 
-  async function refreshDraftStatus() {
+  const refreshDraftStatus = useCallback(async (): Promise<void> => {
     setStatusLoading(true);
     try {
       const response = await sendRuntimeMessageWithTimeout<{
@@ -1856,7 +1859,7 @@ function App() {
     } finally {
       setStatusLoading(false);
     }
-  }
+  }, [mode, sourceUrl, syncTrackedStatus, tabId]);
 
   async function refreshConnectionHealth() {
     setConnectionPending(true);
@@ -1976,6 +1979,105 @@ function App() {
       setSettingsBusy(false);
     }
   }
+
+  const loadSteamCandidates = useCallback(
+    async (
+      queryTitle: string,
+      options: { preserveSelection?: boolean; syncSearchField: boolean },
+    ): Promise<void> => {
+      const requestId = (steamSearchRequestIdRef.current += 1);
+      const requestedQuery = queryTitle.trim();
+      const response = await chrome.runtime.sendMessage({
+        mode,
+        queryTitle: requestedQuery,
+        sourceUrl,
+        tabId: tabId ? Number(tabId) : null,
+        type: 'gamevault:resolve-steam-match',
+      });
+      if (requestId !== steamSearchRequestIdRef.current) {
+        return;
+      }
+
+      if (!response.ok) {
+        setMessage(response.message ?? 'Unable to load Steam candidates.');
+        return;
+      }
+
+      const payload = normalizeSteamMatchPayload(response.payload);
+      setSteamCandidates(payload.candidates);
+      setSelectedAppId((currentAppId) =>
+        options.preserveSelection &&
+        currentAppId &&
+        payload.candidates.some(
+          (candidate) => candidate.appId === currentAppId,
+        )
+          ? currentAppId
+          : (payload.candidates[0]?.appId ?? null),
+      );
+      steamPatchesRef.current = [];
+      steamDbBackfillRequestIdRef.current += 1;
+      setSteamPatches([]);
+      setSelectedSteamPatchKey(null);
+      setSteamPatchFeedUrl(null);
+      setSteamDbBackfillStatus('idle');
+      if (options.syncSearchField) {
+        setSteamSearchQuery(payload.queryTitle || requestedQuery);
+      }
+      if (response.errorMessage) {
+        setMessage(response.errorMessage);
+      }
+    },
+    [mode, sourceUrl, tabId],
+  );
+
+  const hydrateSteamDbConfirmation = useCallback(
+    (pending: SteamDbPendingConfirmation): void => {
+      const normalizedSelected = normalizeSteamPatchCandidate(
+        pending.selectedPatch,
+        pending.context.appId,
+      );
+      if (!normalizedSelected) {
+        return;
+      }
+      const normalizedPatches = [
+        normalizedSelected,
+        ...pending.patches
+          .map((entry) =>
+            normalizeSteamPatchCandidate(entry, pending.context.appId),
+          )
+          .filter((entry): entry is SteamPatchCandidate => entry != null),
+      ];
+
+      setSelectedAppId(pending.context.appId);
+      setSteamCandidates((current) =>
+        pending.context.selectedSteamCandidate &&
+        !current.some(
+          (candidate) =>
+            candidate.appId === pending.context.selectedSteamCandidate?.appId,
+        )
+          ? [pending.context.selectedSteamCandidate, ...current]
+          : current,
+      );
+      setSelectedFullMirrorUrl(pending.context.selectedDownloads.fullUrl);
+      setSelectedPatchMirrorUrl(
+        pending.context.selectedDownloads.patchUrl ?? null,
+      );
+      setSteamPatches((current) => {
+        const merged = mergeSteamPatchLists(current, normalizedPatches);
+        steamPatchesRef.current = merged;
+        return merged;
+      });
+      setSelectedSteamPatchKey(getSteamPatchKey(normalizedSelected));
+      setPatchFallbackMode(null);
+      setSteamDbConfirmation({
+        ...pending,
+        patches: normalizedPatches,
+        selectedPatch: normalizedSelected,
+      });
+      setStep('patch');
+    },
+    [],
+  );
 
   useEffect(() => {
     if (settingsSaveStatus !== 'saved') return undefined;
@@ -2166,12 +2268,18 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [mode, sourceUrl, tabId]);
+  }, [
+    hydrateSteamDbConfirmation,
+    mode,
+    sourceUrl,
+    syncTrackedStatus,
+    tabId,
+  ]);
 
   useEffect(() => {
     if (shellLoading) return;
     void refreshDraftStatus();
-  }, [shellLoading, mode, sourceUrl, tabId]);
+  }, [refreshDraftStatus, shellLoading]);
 
   useEffect(() => {
     if (
@@ -2197,6 +2305,7 @@ function App() {
     draftShell?.sourceUrl,
     parsedSource,
     shellLoading,
+    loadSteamCandidates,
     sourceUrl,
     steamCandidates.length,
     step,
@@ -2206,7 +2315,7 @@ function App() {
     if (!shouldPollDraftStatus) return undefined;
     const timer = window.setInterval(() => void refreshDraftStatus(), 1400);
     return () => window.clearInterval(timer);
-  }, [shouldPollDraftStatus, mode, sourceUrl, tabId]);
+  }, [refreshDraftStatus, shouldPollDraftStatus]);
 
   useEffect(() => {
     if (activeTab === 'library') {
@@ -2358,7 +2467,14 @@ function App() {
       preserveSelection: true,
       syncSearchField: false,
     }).finally(() => setCandidateLoading(false));
-  }, [busy, candidateLoading, steamCandidates, steamSearchQuery, step]);
+  }, [
+    busy,
+    candidateLoading,
+    loadSteamCandidates,
+    steamCandidates,
+    steamSearchQuery,
+    step,
+  ]);
 
   async function connectMyJDownloader() {
     if (!email || !password) {
@@ -2433,51 +2549,6 @@ function App() {
       }
     } finally {
       setBusy(false);
-    }
-  }
-
-  async function loadSteamCandidates(
-    queryTitle: string,
-    options: { preserveSelection?: boolean; syncSearchField: boolean },
-  ) {
-    const requestId = (steamSearchRequestIdRef.current += 1);
-    const requestedQuery = queryTitle.trim();
-    const response = await chrome.runtime.sendMessage({
-      mode,
-      queryTitle: requestedQuery,
-      sourceUrl,
-      tabId: tabId ? Number(tabId) : null,
-      type: 'gamevault:resolve-steam-match',
-    });
-    if (requestId !== steamSearchRequestIdRef.current) {
-      return;
-    }
-
-    if (!response.ok) {
-      setMessage(response.message ?? 'Unable to load Steam candidates.');
-      return;
-    }
-
-    const payload = normalizeSteamMatchPayload(response.payload);
-    setSteamCandidates(payload.candidates);
-    setSelectedAppId((currentAppId) =>
-      options.preserveSelection &&
-      currentAppId &&
-      payload.candidates.some((candidate) => candidate.appId === currentAppId)
-        ? currentAppId
-        : (payload.candidates[0]?.appId ?? null),
-    );
-    steamPatchesRef.current = [];
-    steamDbBackfillRequestIdRef.current += 1;
-    setSteamPatches([]);
-    setSelectedSteamPatchKey(null);
-    setSteamPatchFeedUrl(null);
-    setSteamDbBackfillStatus('idle');
-    if (options.syncSearchField) {
-      setSteamSearchQuery(payload.queryTitle || requestedQuery);
-    }
-    if (response.errorMessage) {
-      setMessage(response.errorMessage);
     }
   }
 
@@ -2872,54 +2943,6 @@ function App() {
     next: SteamPatchCandidate[],
   ): SteamPatchCandidate[] {
     return mergeSteamPatchLists(current, next);
-  }
-
-  function hydrateSteamDbConfirmation(
-    pending: SteamDbPendingConfirmation,
-  ): void {
-    const normalizedSelected = normalizeSteamPatchCandidate(
-      pending.selectedPatch,
-      pending.context.appId,
-    );
-    if (!normalizedSelected) {
-      return;
-    }
-    const normalizedPatches = [
-      normalizedSelected,
-      ...pending.patches
-        .map((entry) =>
-          normalizeSteamPatchCandidate(entry, pending.context.appId),
-        )
-        .filter((entry): entry is SteamPatchCandidate => entry != null),
-    ];
-
-    setSelectedAppId(pending.context.appId);
-    setSteamCandidates((current) =>
-      pending.context.selectedSteamCandidate &&
-      !current.some(
-        (candidate) =>
-          candidate.appId === pending.context.selectedSteamCandidate?.appId,
-      )
-        ? [pending.context.selectedSteamCandidate, ...current]
-        : current,
-    );
-    setSelectedFullMirrorUrl(pending.context.selectedDownloads.fullUrl);
-    setSelectedPatchMirrorUrl(
-      pending.context.selectedDownloads.patchUrl ?? null,
-    );
-    setSteamPatches((current) => {
-      const merged = mergeSteamPatches(current, normalizedPatches);
-      steamPatchesRef.current = merged;
-      return merged;
-    });
-    setSelectedSteamPatchKey(getSteamPatchKey(normalizedSelected));
-    setPatchFallbackMode(null);
-    setSteamDbConfirmation({
-      ...pending,
-      patches: normalizedPatches,
-      selectedPatch: normalizedSelected,
-    });
-    setStep('patch');
   }
 
   async function openSteamDbPatchPage() {

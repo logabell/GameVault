@@ -15,6 +15,7 @@
     "clean": "node ./scripts/clean.mjs",
     "dev:desktop": "npm run dev --workspace @gamevault/desktop",
     "dev:extension": "npm run dev --workspace @gamevault/extension",
+    "check:unused": "knip --no-progress",
     "lint": "eslint .",
     "test": "vitest run",
     "typecheck": "tsc -b"
@@ -31,8 +32,7 @@
     "eslint-plugin-react-hooks": "^5.2.0",
     "eslint-plugin-react-refresh": "^0.4.19",
     "globals": "^16.0.0",
-    "prettier": "^3.5.3",
-    "tsx": "^4.19.3",
+    "knip": "^6.6.3",
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.30.1",
     "vitest": "^3.1.2"

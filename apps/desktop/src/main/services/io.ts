@@ -1,5 +1,5 @@
 import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 export async function ensureDir(targetFilePath: string): Promise<void> {
@@ -12,14 +12,6 @@ export async function readFileIfExists(targetFilePath: string): Promise<Uint8Arr
   } catch {
     return null;
   }
-}
-
-export async function writeBinaryFile(
-  targetFilePath: string,
-  payload: Uint8Array,
-): Promise<void> {
-  await ensureDir(targetFilePath);
-  await writeFile(targetFilePath, payload);
 }
 
 export function writeBinaryFileSync(

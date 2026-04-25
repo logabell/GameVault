@@ -1,9 +1,9 @@
-export interface SteamDbChallengeDetectionInput {
+interface SteamDbChallengeDetectionInput {
   pageText: string;
   title: string;
 }
 
-export interface SteamDbChallengeDetection {
+interface SteamDbChallengeDetection {
   message: string;
 }
 

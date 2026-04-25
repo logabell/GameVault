@@ -6,7 +6,7 @@ import {
   type SourceFetch,
 } from '@gamevault/source-core';
 
-export interface AnkergamesBrowserDownloadCapture {
+interface AnkergamesBrowserDownloadCapture {
   browserDownloadUrl: string;
   url: string;
 }
@@ -25,7 +25,7 @@ function normalizeComparableUrl(value: string | null | undefined): string | null
   }
 }
 
-export function isAnkergamesBrowserDownloadUrl(
+function isAnkergamesBrowserDownloadUrl(
   value: string | null | undefined,
 ): value is string {
   return Boolean(

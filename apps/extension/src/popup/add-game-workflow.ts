@@ -21,7 +21,7 @@ import {
   type SteamPatchSuggestion,
 } from './patch-matching.js';
 
-export interface CreateMatchedDraftMessageInput {
+interface CreateMatchedDraftMessageInput {
   mode: 'active' | 'clipboard';
   selectedAppId: number | null;
   selectedSteamCandidate: SteamCandidate;
@@ -29,7 +29,7 @@ export interface CreateMatchedDraftMessageInput {
   tabId?: number | null;
 }
 
-export interface CreateMatchedDraftMessage {
+interface CreateMatchedDraftMessage {
   mode: 'active' | 'clipboard';
   selectedAppId: number | null;
   selectedSteamCandidate: SteamCandidate;
@@ -38,7 +38,7 @@ export interface CreateMatchedDraftMessage {
   type: 'gamevault:create-matched-draft';
 }
 
-export interface SourceDownloadSelection {
+interface SourceDownloadSelection {
   canSelect: boolean;
   fullMirrors: DownloadMirrorRecord[];
   patchMirrors: DownloadMirrorRecord[];
@@ -50,12 +50,12 @@ export interface SourceDownloadSelection {
   sourceKind: SupportedSourceKind | null;
 }
 
-export interface HeroPresenceState {
+interface HeroPresenceState {
   presenceLabel: 'Discovered' | 'In Library' | null;
   statusLabel: string | null;
 }
 
-export function sourceRequiresMyJDownloader(
+function sourceRequiresMyJDownloader(
   _sourceKind: SupportedSourceKind | null | undefined,
 ): boolean {
   return false;
