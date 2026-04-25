@@ -25,7 +25,11 @@ function allowedTagsForVersion(version) {
 
 const rootPackage = await readJson('package.json');
 const releaseVersion = rootPackage.version;
-const releaseTag = process.argv[2] ?? process.env.GITHUB_REF_NAME ?? null;
+const releaseTag =
+  process.argv[2] ??
+  (process.env.GITHUB_REF_TYPE === 'tag'
+    ? process.env.GITHUB_REF_NAME
+    : null);
 const errors = [];
 
 for (const packagePath of workspacePackagePaths) {
