@@ -28,7 +28,12 @@ describe('supported detail pages', () => {
     ).toBe(true);
     expect(
       isSupportedDetailPage(
-        'https://elamigos.site/data/Ziggurat_2_MULTi11_-_ElAmigos.html?from=vaulttrack#mirrors',
+        'https://elamigos.site/data/Ziggurat_2_MULTi11_-_ElAmigos.html?from=gamevault#mirrors',
+      ),
+    ).toBe(true);
+    expect(
+      isSupportedDetailPage(
+        'https://elamigos.site/data/Jay_and_Silent_Bob_Chronic_Blunt_Punch_MULTi6_-_ElAmigos.html',
       ),
     ).toBe(true);
 
@@ -48,6 +53,14 @@ describe('supported detail pages', () => {
         'https://steamrip.com/category/example-game-free-download/',
       ),
     ).toBe(false);
+
+    for (const homepageUrl of [
+      'https://elamigos.site/',
+      'https://ankergames.net/',
+      'https://steamrip.com/',
+    ]) {
+      expect(isSupportedDetailPage(homepageUrl)).toBe(false);
+    }
   });
 
   it('only triggers clipboard add when the copied url matches the current page', () => {

@@ -1,4 +1,4 @@
-import type { SteamDbBuildLookupFailureKind } from '@vaulttrack/shared-types';
+import type { SteamDbBuildLookupFailureKind } from '@gamevault/shared-types';
 
 export const IMPORT_BUILD_LOOKUP_MAX_ATTEMPTS = 2;
 

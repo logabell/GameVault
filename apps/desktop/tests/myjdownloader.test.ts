@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import type { ParsedSourcePayload } from '@vaulttrack/shared-types';
+import type { ParsedSourcePayload } from '@gamevault/shared-types';
 import {
   MyJDownloaderService,
   type MyJDownloaderClient,
@@ -296,6 +296,34 @@ describe('MyJDownloaderService authentication', () => {
       label: 'Authentication failed',
       message: expect.stringMatching(/rejected the email or password/),
     });
+  });
+
+  it('returns reconnect health when stored credentials cannot be loaded', async () => {
+    const client = new FakeMyJDownloaderClient();
+    const service = new MyJDownloaderService(async () => {
+      throw new Error('Saved credentials are unreadable');
+    }, client);
+
+    await expect(
+      service.getHealth({ forceRefresh: true }),
+    ).resolves.toMatchObject({
+      color: 'red',
+      devices: [],
+      label: 'Reconnect MyJDownloader',
+      selectedDeviceId: null,
+    });
+    expect(client.listDeviceCalls).toEqual([]);
+  });
+
+  it('bypasses cached health when force refresh is requested', async () => {
+    const client = new FakeMyJDownloaderClient();
+    const service = createService(client);
+
+    await service.getHealth({ forceRefresh: true });
+    await service.getHealth();
+    await service.getHealth({ forceRefresh: true });
+
+    expect(client.listDeviceCalls).toHaveLength(2);
   });
 });
 
@@ -1113,6 +1141,79 @@ describe('MyJDownloaderService getPackageProgress', () => {
       bytesTotal: size,
       stage: 'queued',
     });
+  });
+
+  it('skips archive inspection during lightweight active download polling', async () => {
+    const client = new FakeMyJDownloaderClient();
+    client.downloadPackages = [
+      {
+        bytesLoaded: 256,
+        bytesTotal: 1024,
+        eta: 30,
+        finished: false,
+        name: 'Frostpunk 2_1.5.4.H2',
+        running: true,
+        saveTo: 'C:\\Games\\_STAGING\\Frostpunk 2_1.5.4.H2',
+        speed: 64,
+        status: 'Downloading',
+        uuid: 300,
+      },
+    ];
+    const service = createService(client);
+
+    await expect(
+      service.getPackageProgress({
+        extractDirectory: 'C:\\Games\\_STAGING\\Frostpunk 2\\contents',
+        packageId: 300,
+        packageName: 'Frostpunk 2_1.5.4.H2',
+        skipArchiveInspection: true,
+        sourceKind: 'elamigos',
+        stagePath: 'C:\\Games\\_STAGING\\Frostpunk 2_1.5.4.H2',
+      }),
+    ).resolves.toMatchObject({
+      bytesLoaded: 256,
+      bytesTotal: 1024,
+      etaSeconds: 30,
+      speed: 64,
+      stage: 'downloading',
+    });
+
+    expect(client.findAll('/extraction/getArchiveInfo')).toHaveLength(0);
+    expect(client.findAll('/extraction/setArchiveSettings')).toHaveLength(0);
+  });
+
+  it('keeps archive inspection for lightweight completed package polling', async () => {
+    const client = new FakeMyJDownloaderClient();
+    client.downloadPackages = [
+      {
+        bytesLoaded: 1024,
+        bytesTotal: 1024,
+        eta: 0,
+        finished: true,
+        name: 'Frostpunk 2_1.5.4.H2',
+        running: false,
+        saveTo: 'C:\\Games\\_STAGING\\Frostpunk 2_1.5.4.H2',
+        uuid: 300,
+      },
+    ];
+    const service = createService(client);
+
+    await expect(
+      service.getPackageProgress({
+        extractDirectory: 'C:\\Games\\_STAGING\\Frostpunk 2\\contents',
+        packageId: 300,
+        packageName: 'Frostpunk 2_1.5.4.H2',
+        skipArchiveInspection: true,
+        sourceKind: 'elamigos',
+        stagePath: 'C:\\Games\\_STAGING\\Frostpunk 2_1.5.4.H2',
+      }),
+    ).resolves.toMatchObject({
+      bytesLoaded: 1024,
+      bytesTotal: 1024,
+      stage: 'staged',
+    });
+
+    expect(client.findAll('/extraction/getArchiveInfo')).toHaveLength(1);
   });
 
   it('keeps completed bytes for a finished staged package', async () => {

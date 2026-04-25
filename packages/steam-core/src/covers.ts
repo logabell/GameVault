@@ -74,7 +74,7 @@ async function resolveCoverFromStoreBrowse(
 ): Promise<string | null> {
   const response = await fetchImpl(buildGetItemsUrl(appId), {
     headers: {
-      'User-Agent': 'VaultTrack/0.1 (+https://example.invalid/vaulttrack)',
+      'User-Agent': 'GameVault/0.1 (+https://example.invalid/gamevault)',
     },
   });
   if (!response.ok) {

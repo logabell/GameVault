@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { mergeSteamPatchLists } from '../src/popup/patch-list.js';
 
-import type { SteamPatchCandidate } from '@vaulttrack/shared-types';
+import type { SteamPatchCandidate } from '@gamevault/shared-types';
 
 function patch(
   buildId: string,

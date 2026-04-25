@@ -15,15 +15,15 @@ import type {
   SupportedSourceKind,
   ThemeMode,
   TrackedItemView,
-} from '@vaulttrack/shared-types';
-import { parseSupportedPageWithNetwork } from '@vaulttrack/source-core';
+} from '@gamevault/shared-types';
+import { parseSupportedPageWithNetwork } from '@gamevault/source-core';
 
 import { isSupportedDetailPage } from '../support.js';
 import { enrichParsedSourceWithAnkergamesBrowserDownloads } from './ankergames-parse.js';
 import {
   buildSteamDbPatchnotesUrl,
   parseSteamDbAppIdFromUrl,
-} from '@vaulttrack/steam-core';
+} from '@gamevault/steam-core';
 
 const CACHE_TTL_MS = 15 * 60 * 1000;
 const BRIDGE_URL = 'http://127.0.0.1:47615/native-message';
@@ -33,7 +33,7 @@ const ADD_TRACKED_ITEM_TIMEOUT_MS = 90000;
 const MYJD_AUTH_TIMEOUT_MS = 75000;
 const STEAM_PATCH_RESOLVE_TIMEOUT_MS = 45000;
 const PREPARE_DRAFT_HEALTH_TIMEOUT_MS = 1500;
-const NATIVE_HOST_NAME = 'com.vaulttrack.desktop';
+const NATIVE_HOST_NAME = 'com.gamevault.desktop';
 const AUTO_OPEN_PREFIX = 'autoOpen';
 const ACTIVE_DRAFT_KEY = 'activeDraft';
 const CLIPBOARD_DRAFT_KEY = 'clipboardDraft';
@@ -239,7 +239,7 @@ async function sendNativeMessage(
 ): Promise<NativeMessageResponse> {
   return new Promise<NativeMessageResponse>((resolve, reject) => {
     const timer = setTimeout(() => {
-      reject(new Error('VaultTrack desktop bridge timed out.'));
+      reject(new Error('GameVault desktop bridge timed out.'));
     }, NATIVE_MESSAGE_TIMEOUT_MS);
 
     (
@@ -308,7 +308,7 @@ async function postBridgeRequest(
     });
 
     if (!response.ok) {
-      throw new Error(`VaultTrack desktop bridge returned ${response.status}.`);
+      throw new Error(`GameVault desktop bridge returned ${response.status}.`);
     }
 
     return (await response.json()) as NativeMessageResponse;
@@ -561,9 +561,13 @@ async function openActionPopupForTab(
     }
     if (chrome.action.openPopup) {
       const tab = await chrome.tabs.get(tabId);
-      await chrome.action.openPopup({
-        windowId: tab.windowId,
-      });
+      try {
+        await chrome.action.openPopup({
+          windowId: tab.windowId,
+        });
+      } catch {
+        await chrome.action.openPopup();
+      }
     }
   } catch {
     // Popup opening is best-effort and can be blocked by the browser.
@@ -603,7 +607,7 @@ async function maybeReopenPopupAfterNavigation(params: {
 
 async function requestPageProbe(tabId: number): Promise<PageProbe> {
   return chrome.tabs.sendMessage(tabId, {
-    type: 'vaulttrack:get-page-probe',
+    type: 'gamevault:get-page-probe',
   }) as Promise<PageProbe>;
 }
 
@@ -615,7 +619,7 @@ async function requestPageHtml(
   url: string;
 }> {
   return chrome.tabs.sendMessage(tabId, {
-    type: 'vaulttrack:get-html',
+    type: 'gamevault:get-html',
   }) as Promise<{
     fingerprint?: string;
     html: string;
@@ -813,7 +817,7 @@ async function maybeAutoOpenDetectedPage(params: {
   );
   await chrome.action.setTitle({
     tabId: params.tabId,
-    title: 'VaultTrack is ready on this page',
+    title: 'GameVault is ready on this page',
   });
 
   await openActionPopupForTab(params.tabId, {
@@ -854,7 +858,7 @@ function beginDesktopBootstrap(): Promise<ConnectionHealthSummary | null> {
       fallbackConnectionHealth(
         error instanceof Error
           ? error.message
-          : 'VaultTrack desktop bridge is unavailable.',
+          : 'GameVault desktop bridge is unavailable.',
       ),
     )
     .finally(() => {
@@ -893,7 +897,7 @@ async function getSettings(): Promise<SettingsView> {
   if (!response.ok || response.type !== 'getSettings') {
     throw new Error(
       response.ok
-        ? 'Unable to load VaultTrack settings.'
+        ? 'Unable to load GameVault settings.'
         : response.error.message,
     );
   }
@@ -913,7 +917,7 @@ async function saveSettings(payload: {
   if (!response.ok || response.type !== 'saveSettings') {
     throw new Error(
       response.ok
-        ? 'Unable to save VaultTrack settings.'
+        ? 'Unable to save GameVault settings.'
         : response.error.message,
     );
   }
@@ -930,7 +934,7 @@ async function pickDirectory(): Promise<string | null> {
   if (!response.ok || response.type !== 'pickDirectory') {
     throw new Error(
       response.ok
-        ? 'Unable to open the VaultTrack folder picker.'
+        ? 'Unable to open the GameVault folder picker.'
         : response.error.message,
     );
   }
@@ -945,7 +949,7 @@ async function getConnectionHealthForPrepareDraft(): Promise<ConnectionHealthSum
       new Promise<ConnectionHealthSummary>((resolve) => {
         setTimeout(() => {
           resolve(
-            fallbackConnectionHealth('VaultTrack desktop bridge timed out.'),
+            fallbackConnectionHealth('GameVault desktop bridge timed out.'),
           );
         }, PREPARE_DRAFT_HEALTH_TIMEOUT_MS);
       }),
@@ -954,7 +958,7 @@ async function getConnectionHealthForPrepareDraft(): Promise<ConnectionHealthSum
     return fallbackConnectionHealth(
       error instanceof Error
         ? error.message
-        : 'VaultTrack desktop bridge is unavailable.',
+        : 'GameVault desktop bridge is unavailable.',
     );
   }
 }
@@ -1456,16 +1460,9 @@ async function resolveDraftTarget(params: {
   } else if (params.sourceUrl) {
     url = params.sourceUrl;
   } else {
-    const activeDraft =
-      await getSessionValue<StoredDraftPointer>(ACTIVE_DRAFT_KEY);
-    if (activeDraft) {
-      tabId = activeDraft.tabId;
-      url = activeDraft.url;
-    } else {
-      const tab = await getActiveTab();
-      tabId = tab?.id;
-      url = tab?.url;
-    }
+    const tab = await getActiveTab();
+    tabId = tab?.id;
+    url = tab?.url;
   }
 
   if (!url || !isSupportedDetailPage(url)) {
@@ -1507,7 +1504,13 @@ async function getDraftShell(params: {
 }): Promise<DraftShellContext> {
   const target = await resolveDraftTarget(params);
   if (!target.url) {
-    throw new Error('Open a supported ElAmigos or SteamRIP detail page first.');
+    return {
+      mode: target.mode,
+      parsedSource: null,
+      parsePending: false,
+      sourceUrl: null,
+      trackedStatus: null,
+    };
   }
 
   const cachedParsedPage = await readParsedCache(target.url);
@@ -1536,7 +1539,18 @@ async function getDraftStatus(params: {
 }): Promise<DraftStatusContext> {
   const target = await resolveDraftTarget(params);
   if (!target.url) {
-    throw new Error('Open a supported ElAmigos or SteamRIP detail page first.');
+    const connectionHealth = await getConnectionHealthForPrepareDraft();
+    return {
+      connectionHealth,
+      connectionPending:
+        connectionHealth.desktop.color === 'yellow' &&
+        desktopBootstrapPromise != null,
+      parsedSource: null,
+      parsePending: false,
+      sourceUrl: null,
+      trackedStatus: null,
+      trackedStatusPending: false,
+    };
   }
 
   let cachedParsedPage = await readParsedCache(target.url);
@@ -1826,7 +1840,7 @@ async function setLoadingBadge(tabId: number): Promise<void> {
   });
   await chrome.action.setTitle({
     tabId,
-    title: 'VaultTrack is reading this page',
+    title: 'GameVault is reading this page',
   });
 }
 
@@ -1939,7 +1953,7 @@ async function primeCurrentTab(): Promise<void> {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   void (async () => {
-    if (message.type === 'vaulttrack:page-ready') {
+    if (message.type === 'gamevault:page-ready') {
       const tabId = sender.tab?.id;
       const url =
         typeof message.url === 'string'
@@ -1989,7 +2003,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:clipboard-copy') {
+    if (message.type === 'gamevault:clipboard-copy') {
       const tabId = sender.tab?.id;
       const url =
         typeof message.url === 'string'
@@ -2013,7 +2027,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:get-draft-shell') {
+    if (message.type === 'gamevault:get-draft-shell') {
       const draft = await getDraftShell({
         mode: (message.mode as 'active' | 'clipboard') ?? 'active',
         sourceUrl:
@@ -2027,7 +2041,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:get-draft-status') {
+    if (message.type === 'gamevault:get-draft-status') {
       const draftStatus = await getDraftStatus({
         mode: (message.mode as 'active' | 'clipboard') ?? 'active',
         sourceUrl:
@@ -2041,7 +2055,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:open-source-detail-page') {
+    if (message.type === 'gamevault:open-source-detail-page') {
       const targetUrl =
         typeof message.url === 'string' ? (message.url as string) : null;
       if (!targetUrl || !isSupportedDetailPage(targetUrl)) {
@@ -2079,12 +2093,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:get-connection-health') {
+    if (message.type === 'gamevault:get-connection-health') {
       sendResponse({ ok: true, payload: await getConnectionHealth() });
       return;
     }
 
-    if (message.type === 'vaulttrack:get-settings') {
+    if (message.type === 'gamevault:get-settings') {
       try {
         sendResponse({ ok: true, payload: await getSettings() });
       } catch (error) {
@@ -2097,7 +2111,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:save-settings') {
+    if (message.type === 'gamevault:save-settings') {
       try {
         const settingsPayload: {
           rootLibraryPath?: string | null;
@@ -2126,7 +2140,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:pick-directory') {
+    if (message.type === 'gamevault:pick-directory') {
       try {
         sendResponse({
           ok: true,
@@ -2142,7 +2156,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:authenticate-myjd') {
+    if (message.type === 'gamevault:authenticate-myjd') {
       try {
         const response = await sendDesktopRequest(
           {
@@ -2172,7 +2186,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:select-myjd-device') {
+    if (message.type === 'gamevault:select-myjd-device') {
       try {
         const response = await sendDesktopRequest(
           {
@@ -2197,7 +2211,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:disconnect-myjd') {
+    if (message.type === 'gamevault:disconnect-myjd') {
       try {
         const response = await sendDesktopRequest({
           payload: {},
@@ -2218,7 +2232,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:resolve-steam-match') {
+    if (message.type === 'gamevault:resolve-steam-match') {
       const shell = await getDraftShell({
         mode: (message.mode as 'active' | 'clipboard') ?? 'active',
         sourceUrl:
@@ -2230,7 +2244,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       });
       if (!shell.parsedSource) {
         sendResponse({
-          errorMessage: 'VaultTrack is still parsing this page.',
+          errorMessage: 'GameVault is still parsing this page.',
           ok: true,
           payload: [],
         });
@@ -2259,7 +2273,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:resolve-steam-patches') {
+    if (message.type === 'gamevault:resolve-steam-patches') {
       const appId = typeof message.appId === 'number' ? message.appId : null;
       if (!appId) {
         sendResponse({
@@ -2279,7 +2293,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:list-steam-patch-entries') {
+    if (message.type === 'gamevault:list-steam-patch-entries') {
       const trackedItemId =
         typeof message.trackedItemId === 'string' ? message.trackedItemId : '';
       sendResponse({
@@ -2291,7 +2305,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:start-steamdb-build-backfill') {
+    if (message.type === 'gamevault:start-steamdb-build-backfill') {
       const appId = typeof message.appId === 'number' ? message.appId : null;
       if (!appId) {
         sendResponse({
@@ -2310,7 +2324,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:get-steamdb-build-backfill') {
+    if (message.type === 'gamevault:get-steamdb-build-backfill') {
       const appId = typeof message.appId === 'number' ? message.appId : null;
       if (!appId) {
         sendResponse({ ok: true, payload: null });
@@ -2324,7 +2338,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:open-steamdb-patch-page') {
+    if (message.type === 'gamevault:open-steamdb-patch-page') {
       const appId = typeof message.appId === 'number' ? message.appId : null;
       const fullUrl =
         typeof message.selectedDownloads?.fullUrl === 'string'
@@ -2389,7 +2403,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:get-steamdb-selection-context') {
+    if (message.type === 'gamevault:get-steamdb-selection-context') {
       const appId = typeof message.appId === 'number' ? message.appId : null;
       const tabId = sender.tab?.id;
       let context = appId
@@ -2416,7 +2430,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:steamdb-patch-selected') {
+    if (message.type === 'gamevault:steamdb-patch-selected') {
       const appId = typeof message.appId === 'number' ? message.appId : null;
       const context = appId
         ? await getSessionValue<SteamDbSelectionContext>(
@@ -2431,7 +2445,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       ) {
         sendResponse({
           message:
-            'VaultTrack no longer has a pending SteamDB selection for this page.',
+            'GameVault no longer has a pending SteamDB selection for this page.',
           ok: false,
         });
         return;
@@ -2486,7 +2500,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:steamdb-builds-backfilled') {
+    if (message.type === 'gamevault:steamdb-builds-backfilled') {
       const appId = typeof message.appId === 'number' ? message.appId : null;
       const context = appId
         ? await getSessionValue<SteamDbSelectionContext>(
@@ -2538,7 +2552,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:steamdb-builds-challenge-required') {
+    if (message.type === 'gamevault:steamdb-builds-challenge-required') {
       const appId = typeof message.appId === 'number' ? message.appId : null;
       const context = appId
         ? await getSessionValue<SteamDbSelectionContext>(
@@ -2595,7 +2609,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:steamdb-builds-backfill-failed') {
+    if (message.type === 'gamevault:steamdb-builds-backfill-failed') {
       const appId = typeof message.appId === 'number' ? message.appId : null;
       const context = appId
         ? await getSessionValue<SteamDbSelectionContext>(
@@ -2648,7 +2662,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:get-steamdb-pending-confirmation') {
+    if (message.type === 'gamevault:get-steamdb-pending-confirmation') {
       const pending = await getSessionValue<PendingSteamDbConfirmation>(
         STEAMDB_PENDING_CONFIRMATION_KEY,
       );
@@ -2661,7 +2675,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:clear-steamdb-pending-confirmation') {
+    if (message.type === 'gamevault:clear-steamdb-pending-confirmation') {
       const pending = await getSessionValue<PendingSteamDbConfirmation>(
         STEAMDB_PENDING_CONFIRMATION_KEY,
       );
@@ -2675,7 +2689,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:create-matched-draft') {
+    if (message.type === 'gamevault:create-matched-draft') {
       const result = await createMatchedDraft({
         mode: (message.mode as 'active' | 'clipboard') ?? 'active',
         selectedAppId:
@@ -2698,7 +2712,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:discover-source-matches') {
+    if (message.type === 'gamevault:discover-source-matches') {
       const trackedItemId = String(message.trackedItemId ?? '');
       if (!trackedItemId) {
         sendResponse({
@@ -2716,7 +2730,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:refresh-matched-source') {
+    if (message.type === 'gamevault:refresh-matched-source') {
       const trackedItemId = String(message.trackedItemId ?? '');
       const sourceKind =
         message.sourceKind === 'ankergames' ||
@@ -2735,7 +2749,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:sync-tracked-steam-patches') {
+    if (message.type === 'gamevault:sync-tracked-steam-patches') {
       const trackedItemId = String(message.trackedItemId ?? '');
       const appId = typeof message.appId === 'number' ? message.appId : null;
       if (!trackedItemId || !appId) {
@@ -2757,7 +2771,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:queue-draft-download') {
+    if (message.type === 'gamevault:queue-draft-download') {
       const sourceKind =
         message.sourceKind === 'ankergames' ||
         message.sourceKind === 'elamigos' ||
@@ -2797,7 +2811,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:complete-draft') {
+    if (message.type === 'gamevault:complete-draft') {
       const result = await completeDraft({
         mode: (message.mode as 'active' | 'clipboard') ?? 'active',
         selectedAppId:
@@ -2835,7 +2849,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:list-library') {
+    if (message.type === 'gamevault:list-library') {
       try {
         const response = await sendDesktopRequest({
           payload: {},
@@ -2849,14 +2863,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           message:
             error instanceof Error
               ? error.message
-              : 'Unable to load Vault library.',
+              : 'Unable to load GameVault library.',
           ok: false,
         });
       }
       return;
     }
 
-    if (message.type === 'vaulttrack:remove-tracked-item') {
+    if (message.type === 'gamevault:remove-tracked-item') {
       try {
         const response = await sendDesktopRequest({
           payload: {
@@ -2883,7 +2897,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:mark-download-failed') {
+    if (message.type === 'gamevault:mark-download-failed') {
       try {
         const response = await sendDesktopRequest({
           payload: {
@@ -2906,7 +2920,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:complete-staged-install') {
+    if (message.type === 'gamevault:complete-staged-install') {
       try {
         const response = await sendDesktopRequest({
           payload: {
@@ -2929,7 +2943,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:update-source-patch') {
+    if (message.type === 'gamevault:confirm-manual-download-ready') {
+      try {
+        const response = await sendDesktopRequest({
+          payload: {
+            trackedItemId: String(message.trackedItemId ?? ''),
+          },
+          type: 'confirmManualDownloadReady',
+        });
+        sendResponse(
+          response.ok ? { ok: true, payload: response.payload } : response,
+        );
+      } catch (error) {
+        sendResponse({
+          message:
+            error instanceof Error
+              ? error.message
+              : 'Unable to confirm download readiness.',
+          ok: false,
+        });
+      }
+      return;
+    }
+
+    if (message.type === 'gamevault:update-source-patch') {
       try {
         const selectedSteamPatch =
           typeof message.selectedSteamPatch === 'object' &&
@@ -2969,7 +3006,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:retry-download') {
+    if (message.type === 'gamevault:retry-download') {
       try {
         const response = await sendDesktopRequest({
           payload: {
@@ -3003,7 +3040,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:clear-download-mirror-failed') {
+    if (message.type === 'gamevault:clear-download-mirror-failed') {
       try {
         const response = await sendDesktopRequest({
           payload: {
@@ -3027,7 +3064,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (message.type === 'vaulttrack:open-desktop') {
+    if (message.type === 'gamevault:open-desktop') {
       const result = await sendDesktopRequest({
         payload: {},
         type: 'openDesktop',

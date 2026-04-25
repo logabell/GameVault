@@ -4,15 +4,15 @@ import type {
   NativeMessageRequest,
   NativeMessageResponse,
   SourceKind,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 
-import { VaultTrackService } from './vaulttrack-service.js';
+import { GameVaultService } from './gamevault-service.js';
 
 export class NativeBridgeServer {
   private server: Server | null = null;
 
   constructor(
-    private readonly service: VaultTrackService,
+    private readonly service: GameVaultService,
     private readonly port = 47615,
   ) {}
 
@@ -34,6 +34,13 @@ export class NativeBridgeServer {
           const message = JSON.parse(
             Buffer.concat(chunks).toString('utf8'),
           ) as NativeMessageRequest;
+          if (
+            message &&
+            typeof message === 'object' &&
+            typeof (message as { type?: unknown }).type === 'string'
+          ) {
+            this.service.recordExtensionActivity();
+          }
           const payload = await this.handleMessage(message);
           response.setHeader('Content-Type', 'application/json');
           response.end(JSON.stringify(payload));
@@ -224,6 +231,14 @@ export class NativeBridgeServer {
             ),
             type: request.type,
           };
+        case 'confirmManualDownloadReady':
+          return {
+            ok: true,
+            payload: await this.service.confirmManualDownloadReady(
+              request.payload.trackedItemId,
+            ),
+            type: request.type,
+          };
         case 'completeStagedInstall':
           return {
             ok: true,
@@ -266,7 +281,7 @@ export class NativeBridgeServer {
         case 'getConnectionHealth':
           return {
             ok: true,
-            payload: await this.service.getConnectionHealth(),
+            payload: await this.service.getConnectionHealth(request.payload),
             type: request.type,
           };
         case 'authenticateMyJDownloader':

@@ -1,5 +1,5 @@
 import { XMLParser } from 'fast-xml-parser';
-import type { SteamPatchCandidate, SteamPatchEntry } from '@vaulttrack/shared-types';
+import type { SteamPatchCandidate, SteamPatchEntry } from '@gamevault/shared-types';
 
 const STEAMDB_PATCH_FEED_BASE_URL = 'https://steamdb.info/api/PatchnotesRSS/';
 

@@ -1,11 +1,11 @@
 {
-  "name": "@vaulttrack/desktop",
+  "name": "@gamevault/desktop",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "main": "./dist/main/index.cjs",
   "scripts": {
-    "build": "npm run build --workspace @vaulttrack/shared-types && npm run build --workspace @vaulttrack/source-core && npm run build --workspace @vaulttrack/steam-core && node ./scripts/build.mjs",
+    "build": "npm run build --workspace @gamevault/shared-types && npm run build --workspace @gamevault/source-core && npm run build --workspace @gamevault/steam-core && node ./scripts/build.mjs",
     "dev": "npm run build && electron .",
     "test": "vitest run"
   },
@@ -13,9 +13,9 @@
     "@fortawesome/fontawesome-svg-core": "^7.2.0",
     "@fortawesome/free-solid-svg-icons": "^7.2.0",
     "@fortawesome/react-fontawesome": "^3.3.1",
-    "@vaulttrack/shared-types": "0.1.0",
-    "@vaulttrack/source-core": "0.1.0",
-    "@vaulttrack/steam-core": "0.1.0",
+    "@gamevault/shared-types": "0.1.0",
+    "@gamevault/source-core": "0.1.0",
+    "@gamevault/steam-core": "0.1.0",
     "7zip-bin-full": "^26.0.1",
     "electron": "^41.2.1",
     "jdownloader-connect": "^1.0.8",

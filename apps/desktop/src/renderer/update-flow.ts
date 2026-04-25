@@ -5,8 +5,8 @@ import type {
   SourceKind,
   SteamPatchCandidate,
   SupportedSourceKind,
-} from '@vaulttrack/shared-types';
-import { getPatchHistoryKey } from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
+import { getPatchHistoryKey } from '@gamevault/shared-types';
 
 export type UpdateMirrorOption = Pick<
   DownloadMirrorRecord,

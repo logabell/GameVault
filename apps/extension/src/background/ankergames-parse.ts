@@ -1,10 +1,10 @@
-import type { ParsedSourcePayload } from '@vaulttrack/shared-types';
+import type { ParsedSourcePayload } from '@gamevault/shared-types';
 import {
   isAnkerGamesDirectDownloadUrl,
   isAnkerGamesProxyDownloadUrl,
   resolveAnkerGamesBrowserDownloadUrl,
   type SourceFetch,
-} from '@vaulttrack/source-core';
+} from '@gamevault/source-core';
 
 export interface AnkergamesBrowserDownloadCapture {
   browserDownloadUrl: string;

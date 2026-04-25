@@ -2,7 +2,7 @@ import type {
   SourceCatalogEntry,
   SourceMatchMethod,
   SupportedSourceKind,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 import { load } from 'cheerio';
 import type { AnyNode } from 'domhandler';
 

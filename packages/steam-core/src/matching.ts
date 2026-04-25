@@ -1,7 +1,7 @@
 import type {
   ConfirmedSteamMatch,
   SteamCandidate,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 
 type RankableSteamCandidate = Omit<
   SteamCandidate,

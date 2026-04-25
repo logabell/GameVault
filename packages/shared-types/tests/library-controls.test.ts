@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { SteamPatchEntry, TrackedItemView } from '../src/index.js';
 import {
+  canDeleteTrackedItemFiles,
   getScopedLibraryStatusFilterCounts,
   matchesLibrarySearch,
   matchesLibraryStatusFilter,
@@ -162,5 +163,58 @@ describe('shared library controls', () => {
       sourceBehind: 1,
       updates: 0,
     });
+  });
+
+  it('only offers file deletion for local lifecycle states', () => {
+    expect(
+      canDeleteTrackedItemFiles(
+        makeItem('Discovered', {
+          fileState: { finalPathExists: false },
+          status: TrackedItemStatus.Discovered,
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      canDeleteTrackedItemFiles(
+        makeItem('New', {
+          fileState: { finalPathExists: false },
+          status: TrackedItemStatus.New,
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      canDeleteTrackedItemFiles(
+        makeItem('Folder Missing', {
+          fileState: {
+            finalPath: 'D:/Games/Folder Missing',
+            finalPathExists: false,
+          },
+          status: TrackedItemStatus.FolderMissing,
+        }),
+      ),
+    ).toBe(false);
+    expect(canDeleteTrackedItemFiles(makeItem('Installed'))).toBe(true);
+    expect(
+      canDeleteTrackedItemFiles(
+        makeItem('Downloading', {
+          currentDownload: {
+            createdAt: '2026-04-01T00:00:00.000Z',
+            finalPath: 'D:/Games/Downloading',
+            id: 'job-1',
+            packageName: 'Downloading',
+            stage: 'downloading',
+            stagePath: 'D:/Games/_STAGING/Downloading',
+            trackedItemId: 'downloading',
+            updatedAt: '2026-04-01T00:00:00.000Z',
+          },
+          fileState: {
+            finalPath: 'D:/Games/Downloading',
+            finalPathExists: false,
+            stagePath: 'D:/Games/_STAGING/Downloading',
+          },
+          status: TrackedItemStatus.Downloading,
+        }),
+      ),
+    ).toBe(true);
   });
 });

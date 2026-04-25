@@ -1,6 +1,6 @@
-import type { InstallRecord, SourceSnapshot, SourceWatch, SteamPatchEntry } from '@vaulttrack/shared-types';
+import type { InstallRecord, SourceSnapshot, SourceWatch, SteamPatchEntry } from '@gamevault/shared-types';
 
-import { TrackedItemTrackingStatus } from '@vaulttrack/shared-types';
+import { TrackedItemTrackingStatus } from '@gamevault/shared-types';
 
 export function createWatchWindow(
   trackedItemId: string,

@@ -61,6 +61,87 @@ export interface ConnectionHealthSummary {
   selectedDeviceId?: string | null;
 }
 
+export interface DesktopHealthSummary {
+  extension: HealthIndicator;
+  jDownloader: HealthIndicator;
+  lastExtensionActivityAt?: string | null;
+  overall: HealthIndicator;
+}
+
+export const FIREFOX_EXTENSION_ID = 'gamevault@vaulttrack.local';
+
+export type BrowserTarget = 'chrome' | 'edge' | 'firefox';
+
+export interface BrowserExtensionInstall {
+  browser: BrowserTarget;
+  enabled: boolean;
+  extensionId: string;
+  installPath?: string | null;
+  manifestName?: string | null;
+  preferencesPath: string;
+  profileName: string;
+  state?: number | null;
+}
+
+export interface BrowserExtensionInstallStatus {
+  checkedAt: string;
+  detected: boolean;
+  enabled: boolean;
+  installations: BrowserExtensionInstall[];
+  message: string;
+}
+
+export interface JDownloaderInstallStatus {
+  checkedAt: string;
+  detected: boolean;
+  installPath?: string | null;
+  installed: boolean;
+  message: string;
+  running: boolean;
+  source?: 'known-path' | 'process' | 'where' | null;
+}
+
+export interface NativeHostRegistrationMetadata {
+  browsers: BrowserTarget[];
+  extensionId: string;
+  manifestPath: string;
+  manifestPaths?: Partial<Record<BrowserTarget, string>>;
+  registeredAt: string;
+}
+
+export interface NativeHostRegistrationResult extends NativeHostRegistrationMetadata {
+  launcherPath: string;
+}
+
+export interface ExtensionSetupInfo {
+  browsers: BrowserTarget[];
+  extensionPath: string;
+  extensionPathExists: boolean;
+  firefoxExtensionId?: string;
+  nativeHostName: string;
+}
+
+export interface RegisterExtensionNativeHostPayload {
+  browsers: BrowserTarget[];
+  extensionId: string;
+}
+
+export interface OnboardingState {
+  completedAt?: string | null;
+  extensionConfirmedAt?: string | null;
+  extensionRegistration?: NativeHostRegistrationMetadata | null;
+  extensionRegistrations?: Partial<
+    Record<BrowserTarget, NativeHostRegistrationMetadata>
+  > | null;
+  extensionSkippedAt?: string | null;
+  jDownloaderConfirmedAt?: string | null;
+  jDownloaderSkippedAt?: string | null;
+  myJDownloaderConfirmedAt?: string | null;
+  myJDownloaderSkippedAt?: string | null;
+  skippedAt?: string | null;
+  updatedAt?: string | null;
+}
+
 export interface ParsedSourcePayload {
   sourceKind: SupportedSourceKind;
   sourceUrl: string;
@@ -315,7 +396,7 @@ export interface DownloadMirrorRecord {
   lastSeenAt: string;
 }
 
-export type ThemeMode = 'system' | 'light' | 'dark';
+export type ThemeMode = 'light' | 'dark';
 
 export interface LibraryRootRecord {
   id: string;
@@ -345,6 +426,8 @@ export interface SettingsRecord {
   jDownloaderSourcePreferences?: JDownloaderSourcePreferences;
   myJDownloaderEmail?: string | null;
   myJDownloaderDeviceId?: string | null;
+  onboarding?: OnboardingState | null;
+  lastExtensionActivityAt?: string | null;
   pollDailyHourLocal?: number;
   sourceWatchDurationDays?: number;
   sourceWatchIntervalHours?: number;
@@ -361,6 +444,88 @@ export interface EventLogRecord {
   message: string;
   context?: Record<string, unknown>;
   createdAt: string;
+}
+
+export type ActivitySeverity = 'info' | 'warning' | 'error';
+
+export type ActivityIssueKind =
+  | 'download_failed'
+  | 'download_stale'
+  | 'recent_errors'
+  | 'scheduler_stale'
+  | 'source_error'
+  | 'source_watch_expired'
+  | 'source_watch_overdue'
+  | 'steamdb_error'
+  | 'steamdb_rate_limited'
+  | 'steamdb_stale';
+
+export type ActivityActionPayload =
+  | {
+      issueId: string;
+      issueKey: string;
+      trackedItemId?: string | null;
+      type: 'dismissActivityIssue';
+    }
+  | { type: 'pollDownloadJobs' }
+  | { type: 'processSourceWatches' }
+  | {
+      type: 'refreshMatchedSource';
+      trackedItemId: string;
+      sourceKind: SupportedSourceKind;
+    }
+  | { type: 'refreshSteamFeeds' }
+  | { type: 'refreshTrackedItem'; trackedItemId: string };
+
+export interface ActivityIssueAction {
+  label: string;
+  payload?: ActivityActionPayload;
+  target?: 'settings';
+  disabledReason?: string | null;
+}
+
+export interface ActivityIssue {
+  id: string;
+  action?: ActivityIssueAction | null;
+  createdAt?: string | null;
+  detail: string;
+  dismissalKey?: string;
+  gameTitle?: string | null;
+  kind: ActivityIssueKind;
+  severity: ActivitySeverity;
+  sourceKind?: SupportedSourceKind | null;
+  title: string;
+  trackedItemId?: string | null;
+}
+
+export type ActivitySummaryStatus = 'ok' | 'running' | 'warning' | 'error';
+
+export interface ActivitySummaryCard {
+  id:
+    | 'automationErrors'
+    | 'sourceMaintenance'
+    | 'startupCatchUp'
+    | 'steamDbMaintenance';
+  detail: string;
+  label: string;
+  status: ActivitySummaryStatus;
+  value: string;
+}
+
+export interface ActivityTask {
+  id: string;
+  detail?: string | null;
+  startedAt: string;
+  status: 'running';
+  title: string;
+}
+
+export interface ActivityView {
+  activeTasks: ActivityTask[];
+  generatedAt: string;
+  issues: ActivityIssue[];
+  logs: EventLogRecord[];
+  summary: ActivitySummaryCard[];
 }
 
 export interface TrackedItemRecord {

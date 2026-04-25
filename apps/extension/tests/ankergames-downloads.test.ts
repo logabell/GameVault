@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import type { ParsedSourcePayload } from '@vaulttrack/shared-types';
+import type { ParsedSourcePayload } from '@gamevault/shared-types';
 
 import {
   enrichParsedSourceWithAnkergamesBrowserDownloads,

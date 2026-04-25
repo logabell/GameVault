@@ -5,7 +5,7 @@ import {
   parseSteamDbAppIdFromUrl,
   parseSteamDbBuildRowsFromDocument,
   parseSteamDbBuildRowText,
-} from '@vaulttrack/steam-core';
+} from '@gamevault/steam-core';
 
 describe('SteamDB build table helpers', () => {
   it('builds and recognizes SteamDB patchnotes URLs', () => {

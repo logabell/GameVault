@@ -2,9 +2,10 @@ import type {
   ConnectionHealthSummary,
   SupportedSourceKind,
   TrackedItemView,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 
 export {
+  canDeleteTrackedItemFiles,
   filterLibraryItem,
   getDefaultLibrarySortDirection,
   getLibraryStatusFilterCount,
@@ -20,13 +21,13 @@ export {
   matchesLibraryStatusFilter,
   needsPatchMetadataAttention,
   sortLibraryItems,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 export type {
   LibraryFilter,
   LibrarySortDirection,
   LibrarySortMode,
   LibraryStatusFilter,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 
 export function sourceRequiresMyJDownloader(
   _sourceKind: SupportedSourceKind | null | undefined,
@@ -84,13 +85,13 @@ export function getLibraryAutomationWarning(params: {
 
 export function getDeleteTrackedItemPrompt(item: TrackedItemView): string {
   if (item.currentDownload?.provider === 'direct_http') {
-    return `Delete ${item.item.title} from VaultTrack, stop its curl download, and delete staged/install files?`;
+    return `Delete ${item.item.title} from GameVault, stop its curl download, and delete staged/install files?`;
   }
   if (item.currentDownload?.provider === 'manual') {
-    return `Delete ${item.item.title} from VaultTrack and delete manual staging/install files?`;
+    return `Delete ${item.item.title} from GameVault and delete manual staging/install files?`;
   }
 
-  return `Delete ${item.item.title} from VaultTrack, remove it from JDownloader, and delete staged/install files?`;
+  return `Delete ${item.item.title} from GameVault, remove it from JDownloader, and delete staged/install files?`;
 }
 
 export function getMarkDownloadFailedPrompt(item: TrackedItemView): string {

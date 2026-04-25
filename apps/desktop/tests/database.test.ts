@@ -4,14 +4,14 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { VaultTrackDatabase } from '../src/main/services/database.js';
+import { GameVaultDatabase } from '../src/main/services/database.js';
 import type {
   DownloadJobRecord,
   DownloadJobPartRecord,
   ParsedSourcePayload,
   SourceMatch,
   SteamPatchCandidate,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 
 function resolveSqlWasmPath(): string {
   const candidates = [
@@ -26,9 +26,9 @@ function resolveSqlWasmPath(): string {
 }
 
 async function openTestDatabase() {
-  const tempRoot = await mkdtemp(join(tmpdir(), 'vaulttrack-db-'));
-  const database = await VaultTrackDatabase.open(
-    join(tempRoot, 'vaulttrack.sqlite'),
+  const tempRoot = await mkdtemp(join(tmpdir(), 'gamevault-db-'));
+  const database = await GameVaultDatabase.open(
+    join(tempRoot, 'gamevault.sqlite'),
     resolveSqlWasmPath(),
   );
   return { database, tempRoot };
@@ -39,7 +39,7 @@ async function removeTempRootAfterPendingSave(tempRoot: string): Promise<void> {
   await rm(tempRoot, { force: true, recursive: true });
 }
 
-describe('VaultTrackDatabase cleanup metadata', () => {
+describe('GameVaultDatabase cleanup metadata', () => {
   it('caches SteamDB build-table history until expiry', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -297,8 +297,8 @@ describe('VaultTrackDatabase cleanup metadata', () => {
         usable: false,
       });
 
-      const reopened = await VaultTrackDatabase.open(
-        join(tempRoot, 'vaulttrack.sqlite'),
+      const reopened = await GameVaultDatabase.open(
+        join(tempRoot, 'gamevault.sqlite'),
         resolveSqlWasmPath(),
       );
 
@@ -373,8 +373,8 @@ describe('VaultTrackDatabase cleanup metadata', () => {
       };
       database.setRawParsedSourcePayload(item.id, payload);
 
-      const reopened = await VaultTrackDatabase.open(
-        join(tempRoot, 'vaulttrack.sqlite'),
+      const reopened = await GameVaultDatabase.open(
+        join(tempRoot, 'gamevault.sqlite'),
         resolveSqlWasmPath(),
       );
 

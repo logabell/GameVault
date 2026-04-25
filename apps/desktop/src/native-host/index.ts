@@ -5,7 +5,7 @@ import { createRequire } from 'node:module';
 import type {
   NativeMessageRequest,
   NativeMessageResponse,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 
 const BRIDGE_URL = 'http://127.0.0.1:47615/native-message';
 const BRIDGE_POST_TIMEOUT_MS = 75000;
@@ -70,13 +70,13 @@ async function postBridge(
     });
     if (!bridgeResponse.ok) {
       throw new Error(
-        `VaultTrack desktop bridge returned ${bridgeResponse.status}.`,
+        `GameVault desktop bridge returned ${bridgeResponse.status}.`,
       );
     }
     return (await bridgeResponse.json()) as NativeMessageResponse;
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') {
-      throw new Error('VaultTrack desktop bridge timed out.');
+      throw new Error('GameVault desktop bridge timed out.');
     }
     throw error;
   } finally {
@@ -118,7 +118,7 @@ async function ensureBridge(
 
   throw lastError instanceof Error
     ? lastError
-    : new Error('VaultTrack desktop bridge is unavailable');
+    : new Error('GameVault desktop bridge is unavailable');
 }
 
 async function main() {
@@ -137,7 +137,7 @@ async function main() {
         message:
           error instanceof Error
             ? error.message
-            : 'VaultTrack desktop bridge is unavailable',
+            : 'GameVault desktop bridge is unavailable',
       },
       ok: false,
       type: request.type,

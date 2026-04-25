@@ -494,7 +494,7 @@ describe('derivePatchLag', () => {
         selectedPatch: {
           appId: 123,
           buildId: null,
-          link: 'vaulttrack:older-than-available:123',
+          link: 'gamevault:older-than-available:123',
           patchDate: '',
           patchTitle: 'Older than available / not listed',
           publishedAt: '',
@@ -583,7 +583,7 @@ describe('derivePatchMetadataStatus', () => {
         selectedPatch: {
           appId: 123,
           buildId: null,
-          link: 'vaulttrack:older-than-available:123',
+          link: 'gamevault:older-than-available:123',
           patchDate: '',
           patchTitle: 'Older than available / not listed',
           publishedAt: '',

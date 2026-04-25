@@ -1,14 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { createVaultTrackService } from '../src/main/create-vaulttrack-service.js';
+import { createGameVaultService } from '../src/main/create-gamevault-service.js';
 import { extractSingleStagedZipArchive } from '../src/main/services/files.js';
 
-describe('createVaultTrackService', () => {
+describe('createGameVaultService', () => {
   it('keeps the staged ZIP extractor separate from steamFetch', () => {
     const steamFetch = vi.fn<typeof fetch>();
     const sourceFetch = vi.fn();
 
-    const service = createVaultTrackService({
+    const service = createGameVaultService({
       database: {} as never,
       myJDownloader: {} as never,
       notify: () => undefined,

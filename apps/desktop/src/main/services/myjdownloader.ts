@@ -4,8 +4,8 @@ import type {
   MyJDownloaderDeviceSummary,
   ParsedSourcePayload,
   SelectedDownloads,
-} from '@vaulttrack/shared-types';
-import { isAnkerGamesDirectDownloadUrl } from '@vaulttrack/source-core';
+} from '@gamevault/shared-types';
+import { isAnkerGamesDirectDownloadUrl } from '@gamevault/source-core';
 
 export interface MyJDownloaderCredentials {
   deviceId: string;
@@ -159,7 +159,7 @@ interface ArchiveSettingsResult {
 }
 
 const MYJD_API_ENDPOINT = 'https://api.jdownloader.org';
-const MYJD_APP_KEY = 'VaultTrack';
+const MYJD_APP_KEY = 'GameVault';
 const MYJD_API_VERSION = 1;
 const MYJD_TIMEOUT_MS = 30000;
 const HEALTH_CACHE_TTL_MS = 15 * 1000;
@@ -211,6 +211,27 @@ function normalizeMyJDownloaderError(error: unknown): Error {
     );
   }
   return error instanceof Error ? error : new Error(message);
+}
+
+function buildNotConnectedHealth(): MyJDownloaderHealthSnapshot {
+  return {
+    color: 'red',
+    devices: [],
+    label: 'Not connected',
+    message: 'Sign in to MyJDownloader to enable download automation.',
+    selectedDeviceId: null,
+  };
+}
+
+function buildReconnectHealth(): MyJDownloaderHealthSnapshot {
+  return {
+    color: 'red',
+    devices: [],
+    label: 'Reconnect MyJDownloader',
+    message:
+      'Saved MyJDownloader credentials could not be read. Reconnect your account in Settings.',
+    selectedDeviceId: null,
+  };
 }
 
 function normalizeDevice(
@@ -467,6 +488,10 @@ function statusPriority(value: string): number {
 function isExtractionErrorStatus(value: string | null | undefined): boolean {
   const lower = (value ?? '').toLowerCase();
   return lower.includes('extraction') && lower.includes('error');
+}
+
+function isExtractionStatus(value: string | null | undefined): boolean {
+  return (value ?? '').toLowerCase().includes('extract');
 }
 
 function buildStatusMessage(
@@ -884,15 +909,14 @@ export class MyJDownloaderService {
   }
 
   private async buildHealthSnapshot(): Promise<MyJDownloaderHealthSnapshot> {
-    const credentials = await this.getCredentials();
+    let credentials: MyJDownloaderCredentials | null;
+    try {
+      credentials = await this.getCredentials();
+    } catch {
+      return buildReconnectHealth();
+    }
     if (!credentials?.email || !credentials?.password) {
-      return {
-        color: 'red',
-        devices: [],
-        label: 'Not connected',
-        message: 'Sign in to MyJDownloader to enable download automation.',
-        selectedDeviceId: null,
-      };
+      return buildNotConnectedHealth();
     }
 
     try {
@@ -917,7 +941,7 @@ export class MyJDownloaderService {
           color: 'yellow',
           devices: snapshot.devices,
           label: 'Choose device',
-          message: 'Select which JDownloader device VaultTrack should control.',
+          message: 'Select which JDownloader device GameVault should control.',
           selectedDeviceId: null,
         };
       }
@@ -987,23 +1011,23 @@ export class MyJDownloaderService {
       return cachedSnapshot.value;
     }
 
-    const credentials = await this.getCredentials();
+    let credentials: MyJDownloaderCredentials | null;
+    try {
+      credentials = await this.getCredentials();
+    } catch {
+      void this.refreshHealthSnapshot();
+      return buildReconnectHealth();
+    }
     void this.refreshHealthSnapshot();
     if (!credentials?.email || !credentials?.password) {
-      return {
-        color: 'red',
-        devices: [],
-        label: 'Not connected',
-        message: 'Sign in to MyJDownloader to enable download automation.',
-        selectedDeviceId: null,
-      };
+      return buildNotConnectedHealth();
     }
 
     return {
       color: 'yellow',
       devices: [],
       label: 'Checking connection',
-      message: 'VaultTrack is refreshing the latest MyJDownloader status.',
+      message: 'GameVault is refreshing the latest MyJDownloader status.',
       selectedDeviceId: credentials.deviceId || null,
     };
   }
@@ -1780,6 +1804,7 @@ export class MyJDownloaderService {
     extractDirectory: string;
     packageId: number | null;
     packageName: string;
+    skipArchiveInspection?: boolean;
     sourceKind: ParsedSourcePayload['sourceKind'];
     stagePath: string;
   }): Promise<DownloadProgressSnapshot> {
@@ -1831,22 +1856,32 @@ export class MyJDownloaderService {
       );
 
     const statusMessage = buildStatusMessage(packageInfo, links);
-    const archiveSettings = await this.ensureArchiveSettings({
-      deviceId: device.deviceId,
-      email: device.email,
-      extractPath: effectiveExtractDirectory,
-      packageFinished:
-        params.sourceKind !== 'elamigos' &&
-        packageInfo?.finished === true &&
-        !isExtractionErrorStatus(statusMessage),
-      packageId: resolvedPackageId,
-      password: device.password,
-    }).catch(
-      (): ArchiveSettingsResult => ({
-        archives: [],
-        extractionStarted: false,
-      }),
-    );
+    const shouldInspectArchives =
+      params.skipArchiveInspection !== true ||
+      packageInfo?.finished === true ||
+      isExtractionStatus(statusMessage) ||
+      isExtractionStatus(packageInfo?.activeTask);
+    const archiveSettings = shouldInspectArchives
+      ? await this.ensureArchiveSettings({
+          deviceId: device.deviceId,
+          email: device.email,
+          extractPath: effectiveExtractDirectory,
+          packageFinished:
+            params.sourceKind !== 'elamigos' &&
+            packageInfo?.finished === true &&
+            !isExtractionErrorStatus(statusMessage),
+          packageId: resolvedPackageId,
+          password: device.password,
+        }).catch(
+          (): ArchiveSettingsResult => ({
+            archives: [],
+            extractionStarted: false,
+          }),
+        )
+      : {
+          archives: [],
+          extractionStarted: false,
+        };
     const archives = archiveSettings.archives;
     const hasActiveExtraction =
       archiveSettings.extractionStarted ||

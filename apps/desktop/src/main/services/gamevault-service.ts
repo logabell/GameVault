@@ -1,21 +1,32 @@
 import type {
   AddTrackedItemRequestPayload,
+  ActivityActionPayload,
+  ActivityIssue,
+  ActivitySeverity,
+  ActivitySummaryCard,
+  ActivityTask,
+  ActivityView,
   CacheSteamDbBuildLookupPayload,
   CompleteSteamDbBuildLookupPayload,
   ConnectionHealthSummary,
   ConfirmedSteamMatch,
+  DesktopHealthSummary,
   DownloadDescriptor,
   DownloadProvider,
   CreateMatchedDraftPayload,
   DownloadJobPartRecord,
   DownloadJobRecord,
   EventLogRecord,
+  ExtensionSetupInfo,
+  HealthColor,
+  HealthIndicator,
   IgnoreImportFolderPayload,
   IgnoredImportFolderRecord,
   InstallRecord,
   ImportCandidate,
   ImportScanPayload,
   LibraryRootRecord,
+  OnboardingState,
   ParsedSourcePayload,
   QueueDraftDownloadPayload,
   RefreshResult,
@@ -43,7 +54,7 @@ import type {
   TrackedItemRecord,
   TrackedItemView,
   UpdateSteamDbBuildLookupPayload,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 import {
   TrackedItemTrackingStatus,
   derivePatchMetadataStatus,
@@ -56,7 +67,7 @@ import {
   getSteamPatchIdentityKey,
   inferSourceComparisonRows,
   normalizeSourceComparisonVersion,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 import {
   isAnkerGamesDirectDownloadUrl,
   isAnkerGamesGeneratedDownloadUrl,
@@ -72,7 +83,7 @@ import {
   rankSourceTitleMatch,
   type SourceFetch,
   type SourceTitleMatchRank,
-} from '@vaulttrack/source-core';
+} from '@gamevault/source-core';
 import {
   buildSteamDbPatchFeedUrl,
   compareSourceToUpstream,
@@ -82,11 +93,11 @@ import {
   parseSteamDbPatchCandidates,
   resolveSteamLibraryCoverUrl,
   resolveSteamMatch as resolveSteamSearch,
-} from '@vaulttrack/steam-core';
+} from '@gamevault/steam-core';
 import { rm } from 'node:fs/promises';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 
-import { VaultTrackDatabase } from './database.js';
+import { GameVaultDatabase } from './database.js';
 import {
   directoryHasEntries,
   dismountIsoImagesUnderPath,
@@ -130,6 +141,13 @@ const SUPPORTED_SOURCE_KINDS: SupportedSourceKind[] = [
   'elamigos',
   'steamrip',
 ];
+const ACTIVITY_LOG_LIMIT = 150;
+const ACTIVITY_RECENT_ERROR_WINDOW_MS = 24 * 60 * 60 * 1000;
+const ACTIVITY_STALE_DOWNLOAD_MS = 2 * 60 * 60 * 1000;
+const ACTIVITY_STALE_GRACE_MS = 5 * 60 * 1000;
+const STEAMDB_BACKOFF_EVENT_INTERVAL_MS = 30 * 60 * 1000;
+const EXTENSION_ACTIVITY_RECENT_MS = 30 * 60 * 1000;
+const EXTENSION_ACTIVITY_SETTING_KEY = 'extension.lastNativeMessageAt';
 
 const SOURCE_CATALOG_URLS: Record<SupportedSourceKind, string[]> = {
   ankergames: [
@@ -289,6 +307,20 @@ function clampNumber(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, Math.round(value)));
 }
 
+function normalizeThemeMode(
+  themeMode: ThemeMode | null | undefined,
+): Extract<ThemeMode, 'dark' | 'light'> {
+  return themeMode === 'light' ? 'light' : 'dark';
+}
+
+function compactOnboardingState(
+  state: Partial<OnboardingState>,
+): OnboardingState {
+  return Object.fromEntries(
+    Object.entries(state).filter(([, value]) => value !== undefined),
+  ) as OnboardingState;
+}
+
 function sourceVersionIdentity(
   snapshot?: SourceSnapshot | null,
 ): string | null {
@@ -312,7 +344,9 @@ function sourceVersionIdentity(
   return null;
 }
 
-function comparableVersionText(value: string | null | undefined): string | null {
+function comparableVersionText(
+  value: string | null | undefined,
+): string | null {
   return (
     extractSteamPatchTitleVersion(value) ??
     normalizeSourceComparisonVersion(value)
@@ -411,6 +445,102 @@ function latestIsoTimestamp(
     }
   }
   return latest;
+}
+
+function timestampMs(value: string | null | undefined): number | null {
+  if (!value) {
+    return null;
+  }
+  const timestamp = new Date(value).getTime();
+  return Number.isNaN(timestamp) ? null : timestamp;
+}
+
+function latestExpectedDailyPollAt(now: Date, pollHourLocal: number): Date {
+  const expected = new Date(now);
+  expected.setHours(pollHourLocal, 0, 0, 0);
+  if (expected.getTime() > now.getTime()) {
+    expected.setDate(expected.getDate() - 1);
+  }
+  return expected;
+}
+
+function isBeforeWithGrace(
+  value: string | null | undefined,
+  expected: Date,
+): boolean {
+  const timestamp = timestampMs(value);
+  return (
+    timestamp == null ||
+    timestamp + ACTIVITY_STALE_GRACE_MS < expected.getTime()
+  );
+}
+
+function formatDurationMs(value: number): string {
+  const minutes = Math.max(0, Math.round(value / 60_000));
+  if (minutes < 60) {
+    return `${minutes} min`;
+  }
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) {
+    return `${hours} hr`;
+  }
+  return `${Math.round(hours / 24)} days`;
+}
+
+function activityIssueRank(issue: ActivityIssue): number {
+  if (issue.severity === 'error') return 0;
+  if (issue.severity === 'warning') return 1;
+  return 2;
+}
+
+function sortActivityIssues(issues: ActivityIssue[]): ActivityIssue[] {
+  return [...issues].sort((left, right) => {
+    const rankDelta = activityIssueRank(left) - activityIssueRank(right);
+    if (rankDelta !== 0) {
+      return rankDelta;
+    }
+
+    return (
+      (timestampMs(right.createdAt) ?? 0) - (timestampMs(left.createdAt) ?? 0)
+    );
+  });
+}
+
+function getActivityIssueDismissalKey(
+  issue: Pick<ActivityIssue, 'createdAt' | 'detail' | 'id'>,
+): string {
+  return JSON.stringify([issue.id, issue.createdAt ?? null, issue.detail]);
+}
+
+function countActivityIssues(
+  issues: ActivityIssue[],
+  kinds: ActivityIssue['kind'][],
+): number {
+  const kindSet = new Set(kinds);
+  return issues.filter((issue) => kindSet.has(issue.kind)).length;
+}
+
+function worstActivitySeverityForKinds(
+  issues: ActivityIssue[],
+  kinds: ActivityIssue['kind'][],
+): ActivitySeverity | null {
+  const kindSet = new Set(kinds);
+  const matchingIssues = issues.filter((issue) => kindSet.has(issue.kind));
+  if (matchingIssues.some((issue) => issue.severity === 'error')) {
+    return 'error';
+  }
+  if (matchingIssues.some((issue) => issue.severity === 'warning')) {
+    return 'warning';
+  }
+  return null;
+}
+
+function activityStatusFromSeverity(
+  severity: ActivitySeverity | null,
+): ActivitySummaryCard['status'] {
+  if (severity === 'error') return 'error';
+  if (severity === 'warning') return 'warning';
+  return 'ok';
 }
 
 function normalizeLibraryRootsForSave(
@@ -543,8 +673,22 @@ export type DirectHttpDownloadRunner = (
   params: StartDirectHttpDownloadParams,
 ) => DirectHttpDownloadHandle;
 
+export interface DownloadProgressChangeEvent {
+  trackedItemIds: string[];
+}
+
+export type DownloadProgressChangeListener = (
+  event: DownloadProgressChangeEvent,
+) => void;
+
+export interface PollDownloadJobsOptions {
+  activity?: boolean;
+  lightweight?: boolean;
+  skipIfRunning?: boolean;
+}
+
 function getJDownloaderSourcePreferences(
-  settings: SettingsView | ReturnType<VaultTrackDatabase['getSettings']>,
+  settings: SettingsView | ReturnType<GameVaultDatabase['getSettings']>,
 ): NonNullable<SettingsView['jDownloaderSourcePreferences']> {
   return {
     elamigos: settings.jDownloaderSourcePreferences?.elamigos !== false,
@@ -641,6 +785,49 @@ function buildDownloadJobParts(params: {
   }));
 }
 
+function getElamigosJobParts(job: DownloadJobRecord): DownloadJobPartRecord[] {
+  return job.parts && job.parts.length > 0
+    ? job.parts
+    : buildDownloadJobParts({
+        jobId: job.id,
+        now: job.createdAt,
+        packageName: job.packageName,
+        selectedDownloads: {
+          fullUrl: job.selectedMirrorUrl ?? '',
+          patchUrl: job.selectedPatchMirrorUrl ?? null,
+        },
+        sourceKind: 'elamigos',
+        trackedItemId: job.trackedItemId,
+      });
+}
+
+function elamigosJobIncludesFullInstaller(job: DownloadJobRecord): boolean {
+  const parts = getElamigosJobParts(job);
+  if (parts.length > 0) {
+    return parts.some(
+      (part) => part.role === 'full' && Boolean(part.mirrorUrl?.trim()),
+    );
+  }
+
+  return Boolean(job.selectedMirrorUrl?.trim());
+}
+
+async function elamigosJobHasAllRequiredStagedFiles(
+  job: DownloadJobRecord,
+): Promise<boolean> {
+  const parts = getElamigosJobParts(job);
+  if (parts.length === 0) {
+    return false;
+  }
+
+  for (const part of parts) {
+    if (!(await elamigosPartHasStagedFiles({ job, part }))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function getPrimaryQueuePackageName(params: {
   packageName: string;
   selectedDownloads: SelectedDownloads;
@@ -700,6 +887,14 @@ function mirrorUrlMatches(
   right: string,
 ): boolean {
   return (left ?? '').trim() === right;
+}
+
+function pathIsInsideOrEqual(parentPath: string, targetPath: string): boolean {
+  const relativePath = relative(resolve(parentPath), resolve(targetPath));
+  return (
+    relativePath === '' ||
+    (!relativePath.startsWith('..') && !isAbsolute(relativePath))
+  );
 }
 
 function getAnkerGamesBrowserDownloadUrl(
@@ -829,22 +1024,7 @@ async function elamigosPartHasStagedFiles(params: {
 async function elamigosJobHasStagedFiles(
   job: DownloadJobRecord,
 ): Promise<boolean> {
-  const parts =
-    job.parts && job.parts.length > 0
-      ? job.parts
-      : buildDownloadJobParts({
-          jobId: job.id,
-          now: job.createdAt,
-          packageName: job.packageName,
-          selectedDownloads: {
-            fullUrl: job.selectedMirrorUrl ?? '',
-            patchUrl: job.selectedPatchMirrorUrl ?? null,
-          },
-          sourceKind: 'elamigos',
-          trackedItemId: job.trackedItemId,
-        });
-
-  for (const part of parts) {
+  for (const part of getElamigosJobParts(job)) {
     if (await elamigosPartHasStagedFiles({ job, part })) {
       return true;
     }
@@ -983,8 +1163,110 @@ async function fetchWithTimeout(
   }
 }
 
-export class VaultTrackService {
+function parseTimestampMillis(value: string | null | undefined): number | null {
+  if (!value) {
+    return null;
+  }
+  const timestamp = new Date(value).getTime();
+  return Number.isNaN(timestamp) ? null : timestamp;
+}
+
+function getWorstHealthColor(colors: HealthColor[]): HealthColor {
+  if (colors.includes('red')) {
+    return 'red';
+  }
+  if (colors.includes('yellow')) {
+    return 'yellow';
+  }
+  return 'green';
+}
+
+function buildOverallHealth(color: HealthColor): HealthIndicator {
+  if (color === 'green') {
+    return {
+      color,
+      label: 'Healthy',
+      message: 'JDownloader and extension health checks are ready.',
+    };
+  }
+  if (color === 'yellow') {
+    return {
+      color,
+      label: 'Needs review',
+      message: 'One or more health checks need attention.',
+    };
+  }
+  return {
+    color,
+    label: 'Needs attention',
+    message: 'One or more health checks are not ready.',
+  };
+}
+
+function buildExtensionHealth(params: {
+  extensionSetupInfo: ExtensionSetupInfo;
+  lastExtensionActivityAt?: string | null;
+  nowMs: number;
+  registered: boolean;
+}): HealthIndicator {
+  if (!params.extensionSetupInfo.extensionPathExists) {
+    return {
+      color: 'red',
+      label: 'Extension build missing',
+      message: 'Build the browser extension before using extension actions.',
+    };
+  }
+
+  if (!params.registered) {
+    return {
+      color: 'red',
+      label: 'Extension not registered',
+      message: 'Register the extension native host from setup.',
+    };
+  }
+
+  const activityMs = parseTimestampMillis(params.lastExtensionActivityAt);
+  if (!activityMs) {
+    return {
+      color: 'yellow',
+      label: 'Awaiting extension activity',
+      message:
+        'Extension setup is saved, but no browser activity has reached GameVault yet.',
+    };
+  }
+
+  if (params.nowMs - activityMs > EXTENSION_ACTIVITY_RECENT_MS) {
+    return {
+      color: 'yellow',
+      label: 'Extension inactive',
+      message:
+        'Extension setup is saved, but no recent browser activity has reached GameVault.',
+    };
+  }
+
+  return {
+    color: 'green',
+    label: 'Extension connected',
+    message: 'Recent extension activity reached the desktop bridge.',
+  };
+}
+
+function hasRegisteredBrowserExtension(
+  onboarding: OnboardingState | null | undefined,
+): boolean {
+  if (onboarding?.extensionRegistration?.extensionId) {
+    return true;
+  }
+  return Object.values(onboarding?.extensionRegistrations ?? {}).some(
+    (registration) => Boolean(registration?.extensionId),
+  );
+}
+
+export class GameVaultService {
   private readonly downloadQueueLocks = new Map<string, Promise<void>>();
+  private readonly downloadProgressChangeListeners =
+    new Set<DownloadProgressChangeListener>();
+  private readonly pendingDownloadProgressItemIds = new Set<string>();
   private readonly activeDirectHttpDownloads = new Map<
     string,
     DirectHttpDownloadHandle
@@ -998,11 +1280,16 @@ export class VaultTrackService {
     { capturedAt: number; entries: SourceCatalogEntry[] }
   >();
   private readonly requestPacingStates = new Map<string, RequestPacingState>();
+  private readonly activeActivityTasks = new Map<string, ActivityTask>();
+  private downloadProgressFlushTimer: NodeJS.Timeout | null = null;
+  private downloadProgressBatchDepth = 0;
+  private downloadJobPollPromise: Promise<void> | null = null;
+  private lastSteamDbBackoffEventAt = 0;
   private steamFeedPollPromise: Promise<void> | null = null;
   private steamLibraryCoverBackfillPromise: Promise<number> | null = null;
 
   constructor(
-    private readonly database: VaultTrackDatabase,
+    private readonly database: GameVaultDatabase,
     private readonly myJDownloader: MyJDownloaderService,
     private readonly secrets: SecureValueProvider,
     private readonly notify: (
@@ -1019,6 +1306,80 @@ export class VaultTrackService {
     private readonly steamFetch: typeof fetch = (input, init) =>
       fetch(input, init),
   ) {}
+
+  onDownloadProgressChange(
+    listener: DownloadProgressChangeListener,
+  ): () => void {
+    this.downloadProgressChangeListeners.add(listener);
+    return () => {
+      this.downloadProgressChangeListeners.delete(listener);
+    };
+  }
+
+  private queueDownloadProgressChange(trackedItemId: string): void {
+    if (this.downloadProgressChangeListeners.size === 0) {
+      return;
+    }
+    this.pendingDownloadProgressItemIds.add(trackedItemId);
+    if (
+      this.downloadProgressBatchDepth > 0 ||
+      this.downloadProgressFlushTimer
+    ) {
+      return;
+    }
+    this.downloadProgressFlushTimer = setTimeout(() => {
+      this.downloadProgressFlushTimer = null;
+      this.flushDownloadProgressChanges();
+    }, 0);
+  }
+
+  private flushDownloadProgressChanges(): void {
+    if (
+      this.downloadProgressBatchDepth > 0 ||
+      this.pendingDownloadProgressItemIds.size === 0
+    ) {
+      return;
+    }
+    const trackedItemIds = Array.from(this.pendingDownloadProgressItemIds);
+    this.pendingDownloadProgressItemIds.clear();
+    for (const listener of this.downloadProgressChangeListeners) {
+      listener({ trackedItemIds });
+    }
+  }
+
+  private async withDownloadProgressBatch<T>(
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    this.downloadProgressBatchDepth += 1;
+    try {
+      return await operation();
+    } finally {
+      this.downloadProgressBatchDepth -= 1;
+      if (this.downloadProgressBatchDepth === 0) {
+        this.flushDownloadProgressChanges();
+      }
+    }
+  }
+
+  private upsertDownloadJob(job: DownloadJobRecord): void {
+    this.database.upsertDownloadJob(job);
+    this.queueDownloadProgressChange(job.trackedItemId);
+  }
+
+  private listActiveDownloadJobs(): DownloadJobRecord[] {
+    return this.database
+      .listDownloadJobs()
+      .filter(
+        (job) =>
+          job.stage !== 'failed' &&
+          job.stage !== 'complete' &&
+          !isManualProvider(job.provider),
+      );
+  }
+
+  hasActiveDownloadJobs(): boolean {
+    return this.listActiveDownloadJobs().length > 0;
+  }
 
   private async pacedFetch(
     input: string,
@@ -1096,6 +1457,48 @@ export class VaultTrackService {
     this.notify(level, message);
   }
 
+  recordActivityEvent(
+    level: EventLogRecord['level'],
+    message: string,
+    context?: Record<string, unknown>,
+  ): void {
+    this.appendEvent(level, message, context);
+  }
+
+  beginActivityTask(params: {
+    detail?: string | null;
+    id: string;
+    title: string;
+  }): () => void {
+    const task: ActivityTask = {
+      detail: params.detail ?? null,
+      id: params.id,
+      startedAt: new Date().toISOString(),
+      status: 'running',
+      title: params.title,
+    };
+    this.activeActivityTasks.set(params.id, task);
+    return () => {
+      if (
+        this.activeActivityTasks.get(params.id)?.startedAt === task.startedAt
+      ) {
+        this.activeActivityTasks.delete(params.id);
+      }
+    };
+  }
+
+  private async withActivityTask<T>(
+    params: { detail?: string | null; id: string; title: string },
+    run: () => Promise<T>,
+  ): Promise<T> {
+    const endTask = this.beginActivityTask(params);
+    try {
+      return await run();
+    } finally {
+      endTask();
+    }
+  }
+
   private async withCanonicalSteamCover(
     match: ConfirmedSteamMatch,
   ): Promise<ConfirmedSteamMatch> {
@@ -1147,7 +1550,7 @@ export class VaultTrackService {
   }
 
   private async resolveDownloadProvider(params: {
-    settings: ReturnType<VaultTrackDatabase['getSettings']>;
+    settings: ReturnType<GameVaultDatabase['getSettings']>;
     sourceKind: ParsedSourcePayload['sourceKind'];
     trackedItemId: string;
   }): Promise<DownloadProvider> {
@@ -1255,7 +1658,7 @@ export class VaultTrackService {
         : part,
     );
     const summary = summarizeDownloadParts(nextParts, params.sourceKind);
-    this.database.upsertDownloadJob({
+    this.upsertDownloadJob({
       ...job,
       bytesLoaded: summary.bytesLoaded,
       bytesTotal: summary.bytesTotal,
@@ -1292,7 +1695,7 @@ export class VaultTrackService {
       }
     }
 
-    this.database.upsertDownloadJob({
+    this.upsertDownloadJob({
       ...params.job,
       completedParts: params.job.completedParts ?? 0,
       errorMessage: params.message,
@@ -1471,7 +1874,7 @@ export class VaultTrackService {
       totalParts: summary.totalParts,
       updatedAt: new Date().toISOString(),
     };
-    this.database.upsertDownloadJob(nextJob);
+    this.upsertDownloadJob(nextJob);
     return nextJob;
   }
 
@@ -1521,6 +1924,12 @@ export class VaultTrackService {
           trackedItemId: item.id,
         });
         return this.database.getDownloadJob(item.id) ?? recoveredJob;
+      }
+      if (recoveredJob.stage === 'staged') {
+        await this.deleteExistingElamigosFullReplacementInstallFolder({
+          item,
+          job: recoveredJob,
+        });
       }
       return recoveredJob;
     }
@@ -1738,7 +2147,7 @@ export class VaultTrackService {
           statusMessage: 'Downloaded and installed with curl',
           updatedParts: parts,
         });
-        this.database.upsertDownloadJob(completedJob);
+        this.upsertDownloadJob(completedJob);
         return;
       }
 
@@ -1808,6 +2217,22 @@ export class VaultTrackService {
       });
     }
 
+    if (params.parsedSource.sourceKind === 'elamigos') {
+      const item = this.database.findTrackedItemById(params.trackedItemId);
+      const currentJob = this.database.getDownloadJob(params.trackedItemId);
+      if (!item || !currentJob || currentJob.id !== params.job.id) {
+        return;
+      }
+      if (currentJob.stage === 'staged') {
+        await this.deleteExistingElamigosFullReplacementInstallFolder({
+          item,
+          job: currentJob,
+        });
+        this.upsertDownloadJob(currentJob);
+      }
+      return;
+    }
+
     if (params.parsedSource.sourceKind === 'steamrip') {
       const item = this.database.findTrackedItemById(params.trackedItemId);
       const currentJob = this.database.getDownloadJob(params.trackedItemId);
@@ -1821,7 +2246,7 @@ export class VaultTrackService {
         statusMessage: 'Downloaded and installed with curl',
         updatedParts: this.getDownloadJobParts(currentJob, 'steamrip'),
       });
-      this.database.upsertDownloadJob(completedJob);
+      this.upsertDownloadJob(completedJob);
     }
   }
 
@@ -2217,10 +2642,7 @@ export class VaultTrackService {
     }
 
     if (snapshot.sourceKind === 'ankergames' && signals.buildId) {
-      return findUniqueSteamPatchByTitleVersion(
-        patchEntries,
-        signals.version,
-      );
+      return findUniqueSteamPatchByTitleVersion(patchEntries, signals.version);
     }
 
     return null;
@@ -2285,7 +2707,10 @@ export class VaultTrackService {
           const peerPatches =
             resolvedPeersByVersion.get(normalizedVersion) ??
             new Map<string, SteamPatchEntry>();
-          peerPatches.set(getSteamPatchIdentityKey(existingPatch), existingPatch);
+          peerPatches.set(
+            getSteamPatchIdentityKey(existingPatch),
+            existingPatch,
+          );
           resolvedPeersByVersion.set(normalizedVersion, peerPatches);
         }
         continue;
@@ -2646,6 +3071,22 @@ export class VaultTrackService {
     return Promise.all(
       this.database
         .listTrackedItems()
+        .map((item) => this.buildTrackedItemView(item.id)),
+    );
+  }
+
+  async listTrackedItemsByIds(
+    trackedItemIds: string[],
+  ): Promise<TrackedItemView[]> {
+    if (trackedItemIds.length === 0) {
+      return [];
+    }
+    await this.ensureSteamLibraryCoversBackfilled();
+    const requestedIds = new Set(trackedItemIds);
+    return Promise.all(
+      this.database
+        .listTrackedItems()
+        .filter((item) => requestedIds.has(item.id))
         .map((item) => this.buildTrackedItemView(item.id)),
     );
   }
@@ -3947,7 +4388,7 @@ export class VaultTrackService {
       desktop: {
         color: 'green',
         label: 'Desktop ready',
-        message: 'VaultTrack desktop bridge is available.',
+        message: 'GameVault desktop bridge is available.',
       },
       devices: myJDownloader.devices,
       myJDownloader: {
@@ -3956,6 +4397,31 @@ export class VaultTrackService {
         message: myJDownloader.message,
       },
       selectedDeviceId: myJDownloader.selectedDeviceId,
+    };
+  }
+
+  private buildDesktopHealthSummary(params: {
+    connectionHealth: ConnectionHealthSummary;
+    extensionSetupInfo: ExtensionSetupInfo;
+    nowMs: number;
+  }): DesktopHealthSummary {
+    const settings = this.database.getSettings();
+    const extension = buildExtensionHealth({
+      extensionSetupInfo: params.extensionSetupInfo,
+      lastExtensionActivityAt: settings.lastExtensionActivityAt,
+      nowMs: params.nowMs,
+      registered: hasRegisteredBrowserExtension(settings.onboarding),
+    });
+    const color = getWorstHealthColor([
+      params.connectionHealth.myJDownloader.color,
+      extension.color,
+    ]);
+
+    return {
+      extension,
+      jDownloader: params.connectionHealth.myJDownloader,
+      lastExtensionActivityAt: settings.lastExtensionActivityAt ?? null,
+      overall: buildOverallHealth(color),
     };
   }
 
@@ -3969,7 +4435,7 @@ export class VaultTrackService {
         headers: {
           Accept:
             'application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8',
-          'User-Agent': 'VaultTrack/0.1 (+https://example.invalid/vaulttrack)',
+          'User-Agent': 'GameVault/0.1 (+https://example.invalid/gamevault)',
         },
       },
       STEAMDB_RSS_TIMEOUT_MS,
@@ -4875,7 +5341,7 @@ export class VaultTrackService {
         trackedItemId,
         updatedAt: now,
       };
-      this.database.upsertDownloadJob(placeholderJob);
+      this.upsertDownloadJob(placeholderJob);
 
       await ensureDirectory(paths.stageRootPath);
       await ensureDirectory(paths.stagePath);
@@ -4900,7 +5366,7 @@ export class VaultTrackService {
           statusMessage: 'Preparing curl download',
           updatedAt: new Date().toISOString(),
         };
-        this.database.upsertDownloadJob(job);
+        this.upsertDownloadJob(job);
         await this.startDirectHttpDownloadForJob({
           job,
           parsedSource,
@@ -4942,7 +5408,7 @@ export class VaultTrackService {
           totalParts: manualParts.length,
           updatedAt,
         };
-        this.database.upsertDownloadJob(job);
+        this.upsertDownloadJob(job);
         this.appendEvent(
           'info',
           `Prepared manual download for ${trackedView.item.title}`,
@@ -5028,7 +5494,7 @@ export class VaultTrackService {
         totalParts: queuedSummary.totalParts,
         updatedAt: new Date().toISOString(),
       };
-      this.database.upsertDownloadJob(job);
+      this.upsertDownloadJob(job);
       this.appendEvent(
         'info',
         `Queued download for ${trackedView.item.title}`,
@@ -5045,7 +5511,7 @@ export class VaultTrackService {
           error instanceof Error
             ? error.message
             : 'Unknown download queue error';
-        this.database.upsertDownloadJob({
+        this.upsertDownloadJob({
           ...placeholderJob,
           errorMessage,
           parts: (placeholderJob.parts ?? []).map((part) => ({
@@ -5449,7 +5915,7 @@ export class VaultTrackService {
       if (restarted) {
         const now = new Date().toISOString();
         const message = 'Restarted JDownloader extraction';
-        this.database.upsertDownloadJob({
+        this.upsertDownloadJob({
           ...existingJob,
           completedParts: 0,
           errorMessage: null,
@@ -5671,6 +6137,87 @@ export class VaultTrackService {
     return this.database.getDownloadJob(item.id)?.finalPath ?? null;
   }
 
+  private getExpectedElamigosInstallPath(
+    item: TrackedItemRecord,
+    rootLibraryPath: string,
+  ): string {
+    const installPath = this.database
+      .getInstallRecord(item.id)
+      ?.installPath?.trim();
+    if (installPath) {
+      return resolve(installPath);
+    }
+
+    const steamMatch = this.database.getSteamMatch(item.id);
+    return resolve(
+      join(
+        rootLibraryPath,
+        sanitizePathSegment(steamMatch?.title ?? item.title),
+      ),
+    );
+  }
+
+  private async deleteExistingElamigosFullReplacementInstallFolder(params: {
+    item: TrackedItemRecord;
+    job: DownloadJobRecord;
+  }): Promise<string[]> {
+    if (!elamigosJobIncludesFullInstaller(params.job)) {
+      return [];
+    }
+    if (!(await elamigosJobHasAllRequiredStagedFiles(params.job))) {
+      throw new Error(
+        'ElAmigos full installer files are not fully staged yet.',
+      );
+    }
+
+    const settings = this.database.getSettings();
+    const rootLibraryPath = settings.rootLibraryPath?.trim();
+    if (!rootLibraryPath) {
+      throw new Error(
+        'Root library path is not configured, so the existing ElAmigos install folder cannot be deleted safely.',
+      );
+    }
+
+    const installPath = this.getExpectedElamigosInstallPath(
+      params.item,
+      rootLibraryPath,
+    );
+    const resolvedRootLibraryPath = resolve(rootLibraryPath);
+    if (
+      installPath === resolvedRootLibraryPath ||
+      !pathIsInsideOrEqual(resolvedRootLibraryPath, installPath)
+    ) {
+      throw new Error(
+        'Refusing to delete the ElAmigos replacement install folder because it is not a game folder inside the root library.',
+      );
+    }
+    const stagingRootPath = resolve(join(rootLibraryPath, '_STAGING'));
+    if (pathIsInsideOrEqual(stagingRootPath, installPath)) {
+      throw new Error(
+        'Refusing to delete the ElAmigos replacement install folder because it points at staging.',
+      );
+    }
+
+    if (!(await pathExists(installPath))) {
+      return [];
+    }
+
+    const deletedPaths = await removeKnownLibraryPaths({
+      finalPath: installPath,
+      rootLibraryPath,
+    });
+    this.appendEvent(
+      'info',
+      'Deleted existing ElAmigos install folder for full replacement',
+      {
+        deletedPaths,
+        installPath,
+        trackedItemId: params.item.id,
+      },
+    );
+    return deletedPaths;
+  }
+
   private upsertInstallRecordFromSnapshot(
     trackedItemId: string,
     sourceSnapshot: SourceSnapshot,
@@ -5708,7 +6255,7 @@ export class VaultTrackService {
     const totalParts =
       parts.length > 0 ? parts.length : (params.job.totalParts ?? null);
 
-    this.database.upsertDownloadJob({
+    this.upsertDownloadJob({
       ...params.job,
       completedParts: totalParts,
       errorMessage: null,
@@ -5969,259 +6516,315 @@ export class VaultTrackService {
     return this.buildTrackedItemView(trackedItemId);
   }
 
-  async pollDownloadJobs(): Promise<void> {
-    for (const item of this.database.listTrackedItems()) {
-      const job = this.database.getDownloadJob(item.id);
-      const jobSourceKind =
-        job?.sourceKind ??
-        (item.sourceKind === 'ankergames' ||
-        item.sourceKind === 'elamigos' ||
-        item.sourceKind === 'steamrip'
-          ? item.sourceKind
-          : null);
-      if (
-        !job ||
-        !jobSourceKind ||
-        job.stage === 'failed' ||
-        job.stage === 'complete'
-      ) {
-        continue;
+  async pollDownloadJobs(options: PollDownloadJobsOptions = {}): Promise<void> {
+    if (this.downloadJobPollPromise) {
+      if (options.skipIfRunning) {
+        return;
       }
+      return this.downloadJobPollPromise;
+    }
 
-      try {
-        if (isDirectHttpProvider(job.provider)) {
-          if (!this.activeDirectHttpDownloads.has(item.id)) {
-            const recoveredJob = await this.recoverDirectHttpDownloadJob(
-              item,
-              job,
-              jobSourceKind,
-            );
-            this.database.upsertDownloadJob(recoveredJob);
-          }
-          continue;
-        }
-        if (isManualProvider(job.provider)) {
-          continue;
-        }
+    this.downloadJobPollPromise = this.pollDownloadJobsInternal(options).finally(
+      () => {
+        this.downloadJobPollPromise = null;
+      },
+    );
+    return this.downloadJobPollPromise;
+  }
 
-        const extractDirectory =
-          jobSourceKind === 'ankergames' || jobSourceKind === 'steamrip'
-            ? getPortableArchiveExtractPath({
-                finalPath: job.finalPath,
-                sourceKind: jobSourceKind,
-                stagePath: job.stagePath,
-              })
-            : job.stagePath;
-        const jobParts =
-          job.parts && job.parts.length > 0
-            ? job.parts
-            : buildDownloadJobParts({
-                jobId: job.id,
-                now: job.createdAt,
-                packageName: job.packageName,
-                selectedDownloads: {
-                  fullUrl: job.selectedMirrorUrl ?? '',
-                  patchUrl: job.selectedPatchMirrorUrl ?? null,
-                },
-                sourceKind: jobSourceKind,
-                trackedItemId: item.id,
-              });
-        const updatedParts: DownloadJobPartRecord[] = [];
-        for (const part of jobParts) {
-          if (part.stage === 'failed') {
-            updatedParts.push(part);
+  private async pollDownloadJobsInternal(
+    options: PollDownloadJobsOptions,
+  ): Promise<void> {
+    const activeJobs = this.listActiveDownloadJobs();
+    if (activeJobs.length === 0) {
+      return;
+    }
+
+    const pollJobs = async () => {
+      await this.withDownloadProgressBatch(async () => {
+        for (const item of this.database.listTrackedItems()) {
+          const job = this.database.getDownloadJob(item.id);
+          const jobSourceKind =
+            job?.sourceKind ??
+            (item.sourceKind === 'ankergames' ||
+            item.sourceKind === 'elamigos' ||
+            item.sourceKind === 'steamrip'
+              ? item.sourceKind
+              : null);
+          if (
+            !job ||
+            !jobSourceKind ||
+            job.stage === 'failed' ||
+            job.stage === 'complete'
+          ) {
             continue;
           }
 
-          const progress = await this.myJDownloader.getPackageProgress({
-            extractDirectory,
-            packageId: part.packageId ?? null,
-            packageName: part.packageName,
-            sourceKind: jobSourceKind,
-            stagePath: job.stagePath,
-          });
-          const elamigosPartHasFiles =
-            jobSourceKind === 'elamigos' &&
-            (await elamigosPartHasStagedFiles({ job, part }));
-          const progressStatusText = `${progress.statusMessage ?? ''} ${
-            progress.errorMessage ?? ''
-          }`;
-          const progressHasExtractionError =
-            isExtractionErrorMessage(progressStatusText);
-          const stagedPartHasFiles =
-            jobSourceKind === 'elamigos' &&
-            progressHasExtractionError &&
-            elamigosPartHasFiles;
-          const elamigosWaitingForExtraction =
-            jobSourceKind === 'elamigos' &&
-            progress.stage === 'staged' &&
-            !elamigosPartHasFiles &&
-            !progressHasExtractionError;
-          updatedParts.push({
-            ...part,
-            bytesLoaded: progress.bytesLoaded,
-            bytesTotal: progress.bytesTotal,
-            errorMessage: progress.errorMessage ?? null,
-            etaSeconds: progress.etaSeconds,
-            packageId: progress.packageId,
-            speed: progress.speed,
-            stage: stagedPartHasFiles
-              ? 'staged'
-              : elamigosWaitingForExtraction
-                ? 'extracting'
-                : progress.stage,
-            statusMessage: stagedPartHasFiles
-              ? 'JDownloader reported Extraction error; staged files are present'
-              : elamigosWaitingForExtraction
-                ? WAITING_FOR_JDOWNLOADER_EXTRACTION_STATUS
-              : (progress.statusMessage ?? null),
-            updatedAt: new Date().toISOString(),
-          });
-        }
-        const hasActiveElamigosDownload =
-          jobSourceKind === 'elamigos' &&
-          updatedParts.some(
-            (part) => part.stage === 'queued' || part.stage === 'downloading',
-          );
-        const effectiveUpdatedParts = hasActiveElamigosDownload
-          ? updatedParts.map((part) =>
-              part.stage === 'extracting' &&
-              part.statusMessage === WAITING_FOR_JDOWNLOADER_EXTRACTION_STATUS
-                ? {
-                    ...part,
-                    stage: 'staged' as const,
-                    statusMessage: null,
-                  }
-                : part,
-            )
-          : updatedParts;
-        const summary = summarizeDownloadParts(
-          effectiveUpdatedParts,
-          jobSourceKind,
-        );
-        let nextJob: DownloadJobRecord = {
-          ...job,
-          bytesLoaded: summary.bytesLoaded,
-          bytesTotal: summary.bytesTotal,
-          completedParts: summary.completedParts,
-          errorMessage: summary.errorMessage,
-          etaSeconds: summary.etaSeconds,
-          packageId: summary.packageId,
-          packageName: summary.packageName || job.packageName,
-          parts: effectiveUpdatedParts,
-          speed: summary.speed,
-          stage: summary.stage,
-          statusMessage: summary.statusMessage,
-          totalParts: summary.totalParts,
-          updatedAt: new Date().toISOString(),
-        };
-        const portableExtractionError =
-          isPortableArchiveSourceKind(jobSourceKind) &&
-          isExtractionErrorMessage(nextJob.statusMessage);
-        if (nextJob.stage === 'complete' || portableExtractionError) {
-          nextJob.etaSeconds = 0;
-          if (jobSourceKind === 'ankergames' || jobSourceKind === 'steamrip') {
-            const canonicalTitle = this.getPortableArchiveCanonicalTitle(
-              item,
-              job,
-            );
-            let hasExtractedGameFolder = await hasPortableArchiveContentFolder({
-              canonicalTitle,
-              extractPath: extractDirectory,
-              sourceKind: jobSourceKind,
-            });
-            let recoveredFromStagedZip = false;
-            if (
-              portableExtractionError &&
-              !hasExtractedGameFolder &&
-              jobSourceKind === 'ankergames'
-            ) {
-              recoveredFromStagedZip =
-                (await this.extractStagedZipArchive({
-                  extractPath: extractDirectory,
-                }).catch(() => null)) != null;
-              if (recoveredFromStagedZip) {
-                hasExtractedGameFolder = await hasPortableArchiveContentFolder({
-                  canonicalTitle,
-                  extractPath: extractDirectory,
-                  sourceKind: jobSourceKind,
-                });
+          try {
+            if (isDirectHttpProvider(job.provider)) {
+              if (!this.activeDirectHttpDownloads.has(item.id)) {
+                const recoveredJob = await this.recoverDirectHttpDownloadJob(
+                  item,
+                  job,
+                  jobSourceKind,
+                );
+                this.upsertDownloadJob(recoveredJob);
               }
+              continue;
             }
-            if (!portableExtractionError && !hasExtractedGameFolder) {
-              nextJob.stage = 'extracting';
-              nextJob.statusMessage =
-                WAITING_FOR_JDOWNLOADER_EXTRACTION_STATUS;
-              nextJob.etaSeconds = null;
-              nextJob.parts = effectiveUpdatedParts.map((part) =>
-                part.stage === 'complete'
-                  ? {
-                      ...part,
-                      etaSeconds: null,
-                      stage: 'extracting' as const,
-                      statusMessage: WAITING_FOR_JDOWNLOADER_EXTRACTION_STATUS,
-                    }
-                  : part,
-              );
-            } else if (portableExtractionError && !hasExtractedGameFolder) {
-              const message =
-                jobSourceKind === 'ankergames'
-                  ? 'JDownloader reported Extraction error and ZIP recovery did not extract game files. Retry will restart extraction from the staged archive.'
-                  : 'JDownloader reported Extraction error before extracting game files. Retry will restart extraction from the staged archive.';
-              nextJob.errorMessage = message;
-              nextJob.stage = 'failed';
-              nextJob.statusMessage = message;
-              nextJob.parts = effectiveUpdatedParts.map((part) => ({
-                ...part,
-                errorMessage: message,
-                stage: 'failed',
-                statusMessage: message,
-              }));
-            } else {
-              nextJob = await this.finalizePortableArchiveJob({
-                item,
-                job,
+            if (isManualProvider(job.provider)) {
+              continue;
+            }
+
+            const extractDirectory =
+              jobSourceKind === 'ankergames' || jobSourceKind === 'steamrip'
+                ? getPortableArchiveExtractPath({
+                    finalPath: job.finalPath,
+                    sourceKind: jobSourceKind,
+                    stagePath: job.stagePath,
+                  })
+                : job.stagePath;
+            const jobParts =
+              job.parts && job.parts.length > 0
+                ? job.parts
+                : buildDownloadJobParts({
+                    jobId: job.id,
+                    now: job.createdAt,
+                    packageName: job.packageName,
+                    selectedDownloads: {
+                      fullUrl: job.selectedMirrorUrl ?? '',
+                      patchUrl: job.selectedPatchMirrorUrl ?? null,
+                    },
+                    sourceKind: jobSourceKind,
+                    trackedItemId: item.id,
+                  });
+            const updatedParts: DownloadJobPartRecord[] = [];
+            for (const part of jobParts) {
+              if (part.stage === 'failed') {
+                updatedParts.push(part);
+                continue;
+              }
+
+              const progress = await this.myJDownloader.getPackageProgress({
+                extractDirectory,
+                packageId: part.packageId ?? null,
+                packageName: part.packageName,
+                skipArchiveInspection: options.lightweight === true,
                 sourceKind: jobSourceKind,
-                statusMessage: recoveredFromStagedZip
-                  ? 'JDownloader reported Extraction error; recovered from staged ZIP'
-                  : portableExtractionError
-                    ? 'JDownloader reported Extraction error; staged files are present'
-                    : nextJob.statusMessage,
-                updatedParts:
-                  portableExtractionError || recoveredFromStagedZip
-                    ? effectiveUpdatedParts.map((part) => ({
-                        ...part,
-                        errorMessage: null,
-                        stage: 'extracting' as const,
-                        statusMessage:
-                          recoveredFromStagedZip || portableExtractionError
-                            ? 'Finalizing staged archive'
-                            : part.statusMessage,
-                      }))
-                    : effectiveUpdatedParts,
+                stagePath: job.stagePath,
+              });
+              const elamigosPartHasFiles =
+                jobSourceKind === 'elamigos' &&
+                (await elamigosPartHasStagedFiles({ job, part }));
+              const progressStatusText = `${progress.statusMessage ?? ''} ${
+                progress.errorMessage ?? ''
+              }`;
+              const progressHasExtractionError =
+                isExtractionErrorMessage(progressStatusText);
+              const stagedPartHasFiles =
+                jobSourceKind === 'elamigos' &&
+                progressHasExtractionError &&
+                elamigosPartHasFiles;
+              const elamigosWaitingForExtraction =
+                jobSourceKind === 'elamigos' &&
+                progress.stage === 'staged' &&
+                !elamigosPartHasFiles &&
+                !progressHasExtractionError;
+              updatedParts.push({
+                ...part,
+                bytesLoaded: progress.bytesLoaded,
+                bytesTotal: progress.bytesTotal,
+                errorMessage: progress.errorMessage ?? null,
+                etaSeconds: progress.etaSeconds,
+                packageId: progress.packageId,
+                speed: progress.speed,
+                stage: stagedPartHasFiles
+                  ? 'staged'
+                  : elamigosWaitingForExtraction
+                    ? 'extracting'
+                    : progress.stage,
+                statusMessage: stagedPartHasFiles
+                  ? 'JDownloader reported Extraction error; staged files are present'
+                  : elamigosWaitingForExtraction
+                    ? WAITING_FOR_JDOWNLOADER_EXTRACTION_STATUS
+                    : (progress.statusMessage ?? null),
+                updatedAt: new Date().toISOString(),
               });
             }
+            const hasActiveElamigosDownload =
+              jobSourceKind === 'elamigos' &&
+              updatedParts.some(
+                (part) =>
+                  part.stage === 'queued' || part.stage === 'downloading',
+              );
+            const effectiveUpdatedParts = hasActiveElamigosDownload
+              ? updatedParts.map((part) =>
+                  part.stage === 'extracting' &&
+                  part.statusMessage ===
+                    WAITING_FOR_JDOWNLOADER_EXTRACTION_STATUS
+                    ? {
+                        ...part,
+                        stage: 'staged' as const,
+                        statusMessage: null,
+                      }
+                    : part,
+                )
+              : updatedParts;
+            const summary = summarizeDownloadParts(
+              effectiveUpdatedParts,
+              jobSourceKind,
+            );
+            let nextJob: DownloadJobRecord = {
+              ...job,
+              bytesLoaded: summary.bytesLoaded,
+              bytesTotal: summary.bytesTotal,
+              completedParts: summary.completedParts,
+              errorMessage: summary.errorMessage,
+              etaSeconds: summary.etaSeconds,
+              packageId: summary.packageId,
+              packageName: summary.packageName || job.packageName,
+              parts: effectiveUpdatedParts,
+              speed: summary.speed,
+              stage: summary.stage,
+              statusMessage: summary.statusMessage,
+              totalParts: summary.totalParts,
+              updatedAt: new Date().toISOString(),
+            };
+            const portableExtractionError =
+              isPortableArchiveSourceKind(jobSourceKind) &&
+              isExtractionErrorMessage(nextJob.statusMessage);
+            if (nextJob.stage === 'complete' || portableExtractionError) {
+              nextJob.etaSeconds = 0;
+              if (
+                jobSourceKind === 'ankergames' ||
+                jobSourceKind === 'steamrip'
+              ) {
+                const canonicalTitle = this.getPortableArchiveCanonicalTitle(
+                  item,
+                  job,
+                );
+                let hasExtractedGameFolder =
+                  await hasPortableArchiveContentFolder({
+                    canonicalTitle,
+                    extractPath: extractDirectory,
+                    sourceKind: jobSourceKind,
+                  });
+                let recoveredFromStagedZip = false;
+                if (
+                  portableExtractionError &&
+                  !hasExtractedGameFolder &&
+                  jobSourceKind === 'ankergames'
+                ) {
+                  recoveredFromStagedZip =
+                    (await this.extractStagedZipArchive({
+                      extractPath: extractDirectory,
+                    }).catch(() => null)) != null;
+                  if (recoveredFromStagedZip) {
+                    hasExtractedGameFolder =
+                      await hasPortableArchiveContentFolder({
+                        canonicalTitle,
+                        extractPath: extractDirectory,
+                        sourceKind: jobSourceKind,
+                      });
+                  }
+                }
+                if (!portableExtractionError && !hasExtractedGameFolder) {
+                  nextJob.stage = 'extracting';
+                  nextJob.statusMessage =
+                    WAITING_FOR_JDOWNLOADER_EXTRACTION_STATUS;
+                  nextJob.etaSeconds = null;
+                  nextJob.parts = effectiveUpdatedParts.map((part) =>
+                    part.stage === 'complete'
+                      ? {
+                          ...part,
+                          etaSeconds: null,
+                          stage: 'extracting' as const,
+                          statusMessage:
+                            WAITING_FOR_JDOWNLOADER_EXTRACTION_STATUS,
+                        }
+                      : part,
+                  );
+                } else if (portableExtractionError && !hasExtractedGameFolder) {
+                  const message =
+                    jobSourceKind === 'ankergames'
+                      ? 'JDownloader reported Extraction error and ZIP recovery did not extract game files. Retry will restart extraction from the staged archive.'
+                      : 'JDownloader reported Extraction error before extracting game files. Retry will restart extraction from the staged archive.';
+                  nextJob.errorMessage = message;
+                  nextJob.stage = 'failed';
+                  nextJob.statusMessage = message;
+                  nextJob.parts = effectiveUpdatedParts.map((part) => ({
+                    ...part,
+                    errorMessage: message,
+                    stage: 'failed',
+                    statusMessage: message,
+                  }));
+                } else {
+                  nextJob = await this.finalizePortableArchiveJob({
+                    item,
+                    job,
+                    sourceKind: jobSourceKind,
+                    statusMessage: recoveredFromStagedZip
+                      ? 'JDownloader reported Extraction error; recovered from staged ZIP'
+                      : portableExtractionError
+                        ? 'JDownloader reported Extraction error; staged files are present'
+                        : nextJob.statusMessage,
+                    updatedParts:
+                      portableExtractionError || recoveredFromStagedZip
+                        ? effectiveUpdatedParts.map((part) => ({
+                            ...part,
+                            errorMessage: null,
+                            stage: 'extracting' as const,
+                            statusMessage:
+                              recoveredFromStagedZip || portableExtractionError
+                                ? 'Finalizing staged archive'
+                                : part.statusMessage,
+                          }))
+                        : effectiveUpdatedParts,
+                  });
+                }
+              }
+            }
+            if (jobSourceKind === 'elamigos' && nextJob.stage === 'staged') {
+              await this.deleteExistingElamigosFullReplacementInstallFolder({
+                item,
+                job: nextJob,
+              });
+            }
+            this.upsertDownloadJob(nextJob);
+          } catch (error) {
+            this.upsertDownloadJob({
+              ...job,
+              bytesLoaded: job.bytesLoaded ?? null,
+              bytesTotal: job.bytesTotal ?? null,
+              etaSeconds: job.etaSeconds ?? null,
+              errorMessage:
+                error instanceof Error
+                  ? error.message
+                  : 'Unknown download polling error',
+              selectedPatchMirrorUrl: job.selectedPatchMirrorUrl ?? null,
+              selectedMirrorUrl: job.selectedMirrorUrl ?? null,
+              speed: job.speed ?? null,
+              stage: 'failed',
+              updatedAt: new Date().toISOString(),
+            });
           }
         }
-        this.database.upsertDownloadJob(nextJob);
-      } catch (error) {
-        this.database.upsertDownloadJob({
-          ...job,
-          bytesLoaded: job.bytesLoaded ?? null,
-          bytesTotal: job.bytesTotal ?? null,
-          etaSeconds: job.etaSeconds ?? null,
-          errorMessage:
-            error instanceof Error
-              ? error.message
-              : 'Unknown download polling error',
-          selectedPatchMirrorUrl: job.selectedPatchMirrorUrl ?? null,
-          selectedMirrorUrl: job.selectedMirrorUrl ?? null,
-          speed: job.speed ?? null,
-          stage: 'failed',
-          updatedAt: new Date().toISOString(),
-        });
-      }
+      });
+    };
+
+    if (options.activity === false) {
+      await pollJobs();
+      return;
     }
+
+    await this.withActivityTask(
+      {
+        detail: `Checking ${activeJobs.length} active download job${activeJobs.length === 1 ? '' : 's'}.`,
+        id: 'download-jobs',
+        title: 'Checking download jobs',
+      },
+      pollJobs,
+    );
   }
 
   private steamDbRssBackoffRemainingMs(): number {
@@ -6237,10 +6840,29 @@ export class VaultTrackService {
 
     const backoffMs = this.steamDbRssBackoffRemainingMs();
     if (backoffMs > 0) {
+      const now = Date.now();
+      if (
+        now - this.lastSteamDbBackoffEventAt >
+        STEAMDB_BACKOFF_EVENT_INTERVAL_MS
+      ) {
+        this.lastSteamDbBackoffEventAt = now;
+        this.appendEvent(
+          'warn',
+          'SteamDB feed checks are waiting for rate-limit backoff.',
+          { retryAfterMs: backoffMs },
+        );
+      }
       return;
     }
 
-    this.steamFeedPollPromise = this.pollSteamFeedsInternal().finally(() => {
+    this.steamFeedPollPromise = this.withActivityTask(
+      {
+        detail: 'Refreshing SteamDB patch history RSS feeds.',
+        id: 'steamdb-feeds',
+        title: 'Checking SteamDB feeds',
+      },
+      () => this.pollSteamFeedsInternal(),
+    ).finally(() => {
       this.steamFeedPollPromise = null;
     });
     return this.steamFeedPollPromise;
@@ -6248,11 +6870,15 @@ export class VaultTrackService {
 
   private async pollSteamFeedsInternal(): Promise<void> {
     const matches = this.database.listSteamMatches();
+    let checked = 0;
+    let failed = 0;
     let stoppedByRateLimit = false;
     for (const match of matches) {
       try {
         await this.syncSteamPatchFeed(match.trackedItemId, match);
+        checked += 1;
       } catch (error) {
+        failed += 1;
         const message =
           error instanceof Error ? error.message : 'Unknown SteamDB RSS error';
         this.appendEvent(
@@ -6281,6 +6907,14 @@ export class VaultTrackService {
         'scheduler.lastDailyPollAt',
         new Date().toISOString(),
       );
+    }
+    if (matches.length > 0) {
+      this.appendEvent('info', 'SteamDB feed check completed', {
+        checked,
+        failed,
+        skipped: matches.length - checked - failed,
+        stoppedByRateLimit,
+      });
     }
   }
 
@@ -6320,82 +6954,122 @@ export class VaultTrackService {
 
   async processDueWatches(now = new Date()): Promise<void> {
     const dueWatches = this.database.listDueWatches(now.toISOString());
-    const settings = this.database.getSettings();
-    const intervalHours = clampNumber(
-      settings.sourceWatchIntervalHours ?? 8,
-      1,
-      72,
-    );
-    for (const watch of dueWatches) {
-      if (new Date(watch.endsAt).getTime() <= now.getTime()) {
-        this.database.expireWatch(watch.trackedItemId, now.toISOString());
-        continue;
-      }
-
-      await this.discoverSourceMatches(watch.trackedItemId).catch((error) => {
-        this.appendEvent('warn', 'Source match discovery failed during watch', {
-          error:
-            error instanceof Error ? error.message : 'Unknown discovery error',
-          trackedItemId: watch.trackedItemId,
-        });
-      });
-      const matches = this.database
-        .listSourceMatches(watch.trackedItemId)
-        .filter((match) => match.usable && match.sourceUrl);
-      if (matches.length === 0) {
-        const item = this.database.findTrackedItemById(watch.trackedItemId);
-        if (
-          item?.sourceKind &&
-          item.sourceKind !== 'manual' &&
-          item.sourceUrl
-        ) {
-          await this.refreshTrackedItem(watch.trackedItemId).catch((error) => {
-            this.appendEvent(
-              'warn',
-              'Primary source refresh failed during watch',
-              {
-                error:
-                  error instanceof Error
-                    ? error.message
-                    : 'Unknown source refresh error',
-                trackedItemId: watch.trackedItemId,
-              },
-            );
-          });
-        }
-      } else {
-        for (const match of matches) {
-          await this.refreshMatchedSource(
-            watch.trackedItemId,
-            match.sourceKind,
-            {
-              bypassBackoff: false,
-              forceCatalog: false,
-            },
-          ).catch((error) => {
-            this.appendEvent('warn', 'Matched source refresh failed', {
-              error:
-                error instanceof Error
-                  ? error.message
-                  : 'Unknown source refresh error',
-              sourceKind: match.sourceKind,
-              trackedItemId: watch.trackedItemId,
-            });
-          });
-        }
-      }
-      this.database.upsertWatch({
-        ...watch,
-        lastCheckedAt: now.toISOString(),
-        nextCheckAt: new Date(
-          now.getTime() + intervalHours * 60 * 60 * 1000,
-        ).toISOString(),
-      });
+    if (dueWatches.length === 0) {
+      return;
     }
+
+    await this.withActivityTask(
+      {
+        detail: `Checking ${dueWatches.length} source watch${dueWatches.length === 1 ? '' : 'es'}.`,
+        id: 'source-watches',
+        title: 'Checking watched sources',
+      },
+      async () => {
+        const settings = this.database.getSettings();
+        const intervalHours = clampNumber(
+          settings.sourceWatchIntervalHours ?? 8,
+          1,
+          72,
+        );
+        let expired = 0;
+        for (const watch of dueWatches) {
+          if (new Date(watch.endsAt).getTime() <= now.getTime()) {
+            this.database.expireWatch(watch.trackedItemId, now.toISOString());
+            expired += 1;
+            continue;
+          }
+
+          await this.discoverSourceMatches(watch.trackedItemId).catch(
+            (error) => {
+              this.appendEvent(
+                'warn',
+                'Source match discovery failed during watch',
+                {
+                  error:
+                    error instanceof Error
+                      ? error.message
+                      : 'Unknown discovery error',
+                  trackedItemId: watch.trackedItemId,
+                },
+              );
+            },
+          );
+          const matches = this.database
+            .listSourceMatches(watch.trackedItemId)
+            .filter((match) => match.usable && match.sourceUrl);
+          if (matches.length === 0) {
+            const item = this.database.findTrackedItemById(watch.trackedItemId);
+            if (
+              item?.sourceKind &&
+              item.sourceKind !== 'manual' &&
+              item.sourceUrl
+            ) {
+              await this.refreshTrackedItem(watch.trackedItemId).catch(
+                (error) => {
+                  this.appendEvent(
+                    'warn',
+                    'Primary source refresh failed during watch',
+                    {
+                      error:
+                        error instanceof Error
+                          ? error.message
+                          : 'Unknown source refresh error',
+                      trackedItemId: watch.trackedItemId,
+                    },
+                  );
+                },
+              );
+            }
+          } else {
+            for (const match of matches) {
+              await this.refreshMatchedSource(
+                watch.trackedItemId,
+                match.sourceKind,
+                {
+                  bypassBackoff: false,
+                  forceCatalog: false,
+                },
+              ).catch((error) => {
+                this.appendEvent('warn', 'Matched source refresh failed', {
+                  error:
+                    error instanceof Error
+                      ? error.message
+                      : 'Unknown source refresh error',
+                  sourceKind: match.sourceKind,
+                  trackedItemId: watch.trackedItemId,
+                });
+              });
+            }
+          }
+          this.database.upsertWatch({
+            ...watch,
+            lastCheckedAt: now.toISOString(),
+            nextCheckAt: new Date(
+              now.getTime() + intervalHours * 60 * 60 * 1000,
+            ).toISOString(),
+          });
+        }
+        this.appendEvent('info', 'Source watch processing completed', {
+          checked: dueWatches.length - expired,
+          expired,
+        });
+      },
+    );
   }
 
   getSettings(): RendererSettingsView {
-    const settings = this.database.getSettings();
+    let settings = this.database.getSettings();
+    if (!settings.onboarding && this.database.listTrackedItems().length > 0) {
+      const now = new Date().toISOString();
+      this.database.setSetting(
+        'onboarding.state',
+        JSON.stringify({
+          completedAt: now,
+          updatedAt: now,
+        } satisfies OnboardingState),
+      );
+      settings = this.database.getSettings();
+    }
     return {
       ignoredImportFolders: settings.ignoredImportFolders ?? [],
       jDownloaderEnabled: settings.jDownloaderEnabled ?? false,
@@ -6407,12 +7081,13 @@ export class VaultTrackService {
       myJDownloaderDeviceId: settings.myJDownloaderDeviceId,
       myJDownloaderEmail: settings.myJDownloaderEmail,
       myJDownloaderPasswordConfigured: Boolean(settings.encryptedPassword),
+      onboarding: settings.onboarding ?? null,
       pollDailyHourLocal: settings.pollDailyHourLocal,
       renameGameFoldersOnImport: settings.renameGameFoldersOnImport ?? true,
       rootLibraryPath: settings.rootLibraryPath,
       sourceWatchDurationDays: settings.sourceWatchDurationDays ?? 5,
       sourceWatchIntervalHours: settings.sourceWatchIntervalHours ?? 8,
-      themeMode: settings.themeMode ?? 'system',
+      themeMode: normalizeThemeMode(settings.themeMode),
     };
   }
 
@@ -6495,7 +7170,7 @@ export class VaultTrackService {
     if (input.themeMode !== undefined) {
       this.database.setSetting(
         'appearance.themeMode',
-        input.themeMode ?? 'system',
+        normalizeThemeMode(input.themeMode),
       );
     }
     if (input.jDownloaderEnabled !== undefined) {
@@ -6518,10 +7193,57 @@ export class VaultTrackService {
     return this.getSettings();
   }
 
-  async getConnectionHealth(): Promise<ConnectionHealthSummary> {
+  saveOnboardingState(input: Partial<OnboardingState>): RendererSettingsView {
+    const current = this.database.getSettings().onboarding ?? {};
+    const extensionRegistrations =
+      input.extensionRegistrations === undefined
+        ? current.extensionRegistrations
+        : input.extensionRegistrations === null
+          ? null
+          : {
+              ...(current.extensionRegistrations ?? {}),
+              ...input.extensionRegistrations,
+            };
+    const next = compactOnboardingState({
+      ...current,
+      ...input,
+      extensionRegistrations,
+      updatedAt: new Date().toISOString(),
+    });
+    this.database.setSetting('onboarding.state', JSON.stringify(next));
+    this.appendEvent('info', 'Updated onboarding setup state');
+    return this.getSettings();
+  }
+
+  async getConnectionHealth(options?: {
+    forceRefresh?: boolean;
+  }): Promise<ConnectionHealthSummary> {
     return this.buildConnectionHealthSummary(
-      await this.myJDownloader.getHealth(),
+      await this.myJDownloader.getHealth({
+        forceRefresh: options?.forceRefresh ?? false,
+      }),
     );
+  }
+
+  async getDesktopHealth(
+    extensionSetupInfo: ExtensionSetupInfo,
+    options?: {
+      forceRefresh?: boolean;
+      now?: Date;
+    },
+  ): Promise<DesktopHealthSummary> {
+    const connectionHealth = await this.getConnectionHealth({
+      forceRefresh: options?.forceRefresh ?? false,
+    });
+    return this.buildDesktopHealthSummary({
+      connectionHealth,
+      extensionSetupInfo,
+      nowMs: (options?.now ?? new Date()).getTime(),
+    });
+  }
+
+  recordExtensionActivity(now = new Date()): void {
+    this.database.setSetting(EXTENSION_ACTIVITY_SETTING_KEY, now.toISOString());
   }
 
   async authenticateMyJDownloader(
@@ -6579,11 +7301,29 @@ export class VaultTrackService {
       return null;
     }
 
-    return {
-      deviceId: settings.myJDownloaderDeviceId ?? '',
-      email: settings.myJDownloaderEmail.trim().toLowerCase(),
-      password: this.secrets.decrypt(settings.encryptedPassword),
-    };
+    try {
+      return {
+        deviceId: settings.myJDownloaderDeviceId ?? '',
+        email: settings.myJDownloaderEmail.trim().toLowerCase(),
+        password: this.secrets.decrypt(settings.encryptedPassword),
+      };
+    } catch (error) {
+      this.database.setSetting('myjd.password', null);
+      this.database.setSetting('myjd.deviceId', null);
+      this.appendEvent(
+        'warn',
+        'Cleared unreadable MyJDownloader credentials after app rename',
+        {
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Unknown credential decrypt error',
+        },
+      );
+      throw new Error(
+        'Saved MyJDownloader credentials could not be read. Reconnect your account in Settings.',
+      );
+    }
   }
 
   private getTrackedInstallPathKeys(): Set<string> {
@@ -7066,6 +7806,87 @@ export class VaultTrackService {
     return this.buildTrackedItemView(params.trackedItemId);
   }
 
+  async confirmManualDownloadReady(
+    trackedItemId: string,
+  ): Promise<TrackedItemView> {
+    const item = this.database.findTrackedItemById(trackedItemId);
+    if (!item) {
+      throw new Error(`Tracked item ${trackedItemId} not found`);
+    }
+
+    const currentJob = this.database.getDownloadJob(trackedItemId);
+    if (!currentJob) {
+      throw new Error('No staged download is available for this item.');
+    }
+    if (!isManualProvider(currentJob.provider)) {
+      throw new Error(
+        'Download readiness can only be confirmed for manual downloads.',
+      );
+    }
+
+    const jobSourceKind =
+      currentJob.sourceKind ??
+      (item.sourceKind && item.sourceKind !== 'manual'
+        ? item.sourceKind
+        : null);
+    if (jobSourceKind !== 'elamigos') {
+      throw new Error(
+        'Manual download readiness is only required for ElAmigos installers.',
+      );
+    }
+    if (!elamigosJobIncludesFullInstaller(currentJob)) {
+      throw new Error(
+        'This ElAmigos download is update-only and can be installed in place.',
+      );
+    }
+    if (currentJob.stage === 'failed' || currentJob.stage === 'complete') {
+      throw new Error(
+        'This ElAmigos download cannot be confirmed in its current state.',
+      );
+    }
+    if (!(await elamigosJobHasAllRequiredStagedFiles(currentJob))) {
+      throw new Error(
+        'ElAmigos full installer files are not fully staged yet.',
+      );
+    }
+
+    const deletedPaths =
+      await this.deleteExistingElamigosFullReplacementInstallFolder({
+        item,
+        job: currentJob,
+      });
+    const now = new Date().toISOString();
+    const parts = getElamigosJobParts(currentJob).map((part) => ({
+      ...part,
+      errorMessage: null,
+      etaSeconds: 0,
+      stage: 'staged' as const,
+      statusMessage: null,
+      updatedAt: now,
+    }));
+    const summary = summarizeDownloadParts(parts, 'elamigos');
+    this.upsertDownloadJob({
+      ...currentJob,
+      bytesLoaded: summary.bytesLoaded,
+      bytesTotal: summary.bytesTotal,
+      completedParts: summary.completedParts,
+      errorMessage: null,
+      etaSeconds: 0,
+      parts,
+      speed: summary.speed,
+      stage: 'staged',
+      statusMessage: 'ElAmigos installer files ready',
+      totalParts: summary.totalParts,
+      updatedAt: now,
+    });
+    this.appendEvent('info', 'Confirmed manual ElAmigos download readiness', {
+      deletedPaths,
+      trackedItemId,
+    });
+
+    return this.buildTrackedItemView(trackedItemId);
+  }
+
   async completeStagedInstall(trackedItemId: string): Promise<TrackedItemView> {
     const item = this.database.findTrackedItemById(trackedItemId);
     if (!item) {
@@ -7084,16 +7905,15 @@ export class VaultTrackService {
       throw new Error('No staged source snapshot is available for this item.');
     }
     const settings = this.database.getSettings();
-    const steamMatch = this.database.getSteamMatch(trackedItemId);
     const installedFinalPath =
       sourceSnapshot.sourceKind === 'elamigos' && settings.rootLibraryPath
-        ? resolve(
-            join(
-              settings.rootLibraryPath,
-              sanitizePathSegment(steamMatch?.title ?? item.title),
-            ),
-        )
+        ? this.getExpectedElamigosInstallPath(item, settings.rootLibraryPath)
         : null;
+    const manualElamigosFullReplacement =
+      currentJob &&
+      isManualProvider(currentJob.provider) &&
+      sourceSnapshot.sourceKind === 'elamigos' &&
+      elamigosJobIncludesFullInstaller(currentJob);
 
     if (currentJob) {
       await this.removeJDownloaderPackagesForJob(
@@ -7139,11 +7959,17 @@ export class VaultTrackService {
         statusMessage: 'Manual install completed',
         updatedParts: this.getDownloadJobParts(currentJob, 'steamrip'),
       });
-      this.database.upsertDownloadJob(completedJob);
+      this.upsertDownloadJob(completedJob);
       this.appendEvent('info', 'Completed manual SteamRIP install', {
         trackedItemId,
       });
       return this.buildTrackedItemView(trackedItemId);
+    }
+
+    if (manualElamigosFullReplacement && currentJob.stage !== 'staged') {
+      throw new Error(
+        'Confirm the ElAmigos download is ready before running the full installer.',
+      );
     }
 
     if (
@@ -7216,7 +8042,7 @@ export class VaultTrackService {
     this.clearFailedStateForSelectedMirrors(trackedItemId);
 
     if (currentJob) {
-      this.database.upsertDownloadJob({
+      this.upsertDownloadJob({
         ...currentJob,
         errorMessage: null,
         etaSeconds: 0,
@@ -7310,6 +8136,436 @@ export class VaultTrackService {
 
   getLogs(): EventLogRecord[] {
     return this.database.listEvents();
+  }
+
+  getActivity(): ActivityView {
+    const generatedAt = new Date();
+    const generatedAtIso = generatedAt.toISOString();
+    const settings = this.database.getSettings();
+    const pollHour = clampNumber(settings.pollDailyHourLocal ?? 9, 0, 23);
+    const expectedPollAt = latestExpectedDailyPollAt(generatedAt, pollHour);
+    const logs = this.database.listEvents(ACTIVITY_LOG_LIMIT);
+    const recentLogs = logs.filter((log) => {
+      const createdAt = timestampMs(log.createdAt);
+      return (
+        log.level !== 'info' &&
+        createdAt != null &&
+        generatedAt.getTime() - createdAt <= ACTIVITY_RECENT_ERROR_WINDOW_MS
+      );
+    });
+    const items = this.database.listTrackedItems();
+    const itemsById = new Map(items.map((item) => [item.id, item]));
+    const steamMatches = this.database.listSteamMatches();
+    const backoffMs = this.steamDbRssBackoffRemainingMs();
+    const issues: ActivityIssue[] = [];
+    const steamFeedCheckTimes: Array<string | null | undefined> = [];
+    const sourceCheckTimes: Array<string | null | undefined> = [];
+
+    const steamRefreshAction =
+      backoffMs > 0
+        ? {
+            disabledReason: `SteamDB asked the app to retry in ${formatDurationMs(
+              backoffMs,
+            )}.`,
+            label: 'Refresh SteamDB',
+            payload: { type: 'refreshSteamFeeds' as const },
+          }
+        : {
+            label: 'Refresh SteamDB',
+            payload: { type: 'refreshSteamFeeds' as const },
+          };
+
+    if (
+      steamMatches.length > 0 &&
+      isBeforeWithGrace(settings.lastDailyPollAt, expectedPollAt)
+    ) {
+      issues.push({
+        action: steamRefreshAction,
+        createdAt: settings.lastDailyPollAt ?? null,
+        detail: `The last completed daily SteamDB maintenance is older than the expected ${expectedPollAt.toLocaleString()} poll.`,
+        id: 'scheduler:steamdb-stale',
+        kind: 'scheduler_stale',
+        severity: 'warning',
+        title: 'Daily SteamDB maintenance is behind',
+      });
+    }
+
+    if (backoffMs > 0) {
+      issues.push({
+        action: steamRefreshAction,
+        createdAt: generatedAtIso,
+        detail: `SteamDB rate limited the last feed request. The next check can run in ${formatDurationMs(
+          backoffMs,
+        )}.`,
+        id: 'steamdb:rate-limited',
+        kind: 'steamdb_rate_limited',
+        severity: 'warning',
+        title: 'SteamDB checks are paused',
+      });
+    }
+
+    for (const match of steamMatches) {
+      const item = itemsById.get(match.trackedItemId);
+      const feedCheck = this.database.getSteamFeedCheck(match.trackedItemId);
+      steamFeedCheckTimes.push(feedCheck?.lastCheckedAt);
+      if (feedCheck?.lastError) {
+        issues.push({
+          action: steamRefreshAction,
+          createdAt: feedCheck.lastCheckedAt ?? feedCheck.updatedAt,
+          detail: feedCheck.lastError,
+          gameTitle: item?.title ?? match.title,
+          id: `steamdb:error:${match.trackedItemId}`,
+          kind: 'steamdb_error',
+          severity: /429|rate/i.test(feedCheck.lastError) ? 'warning' : 'error',
+          title: `SteamDB feed failed for ${item?.title ?? match.title}`,
+          trackedItemId: match.trackedItemId,
+        });
+        continue;
+      }
+
+      if (isBeforeWithGrace(feedCheck?.lastCheckedAt, expectedPollAt)) {
+        issues.push({
+          action: steamRefreshAction,
+          createdAt: feedCheck?.lastCheckedAt ?? null,
+          detail: feedCheck?.lastCheckedAt
+            ? `Last checked at ${new Date(feedCheck.lastCheckedAt).toLocaleString()}; expected after ${expectedPollAt.toLocaleString()}.`
+            : 'This game has a Steam match but no recorded SteamDB feed check yet.',
+          gameTitle: item?.title ?? match.title,
+          id: `steamdb:stale:${match.trackedItemId}`,
+          kind: 'steamdb_stale',
+          severity: 'warning',
+          title: `SteamDB feed is stale for ${item?.title ?? match.title}`,
+          trackedItemId: match.trackedItemId,
+        });
+      }
+    }
+
+    for (const item of items) {
+      const watch = this.database.getWatch(item.id);
+      if (watch) {
+        if (watch.expiredAt) {
+          issues.push({
+            action: {
+              label: 'Refresh game',
+              payload: { trackedItemId: item.id, type: 'refreshTrackedItem' },
+            },
+            createdAt: watch.expiredAt,
+            detail:
+              'The source watch window expired before this game caught up to upstream patch history.',
+            gameTitle: item.title,
+            id: `source-watch:expired:${item.id}`,
+            kind: 'source_watch_expired',
+            severity: 'warning',
+            title: `Source watch expired for ${item.title}`,
+            trackedItemId: item.id,
+          });
+        } else if (
+          (timestampMs(watch.nextCheckAt) ?? 0) <= generatedAt.getTime()
+        ) {
+          issues.push({
+            action: {
+              label: 'Run source checks',
+              payload: { type: 'processSourceWatches' },
+            },
+            createdAt: watch.nextCheckAt,
+            detail: `Next source check was due at ${new Date(
+              watch.nextCheckAt,
+            ).toLocaleString()}.`,
+            gameTitle: item.title,
+            id: `source-watch:due:${item.id}`,
+            kind: 'source_watch_overdue',
+            severity: 'warning',
+            title: `Source watch is overdue for ${item.title}`,
+            trackedItemId: item.id,
+          });
+        }
+        sourceCheckTimes.push(watch.lastCheckedAt, watch.nextCheckAt);
+      }
+
+      const sourceMatches = this.database.listSourceMatches(item.id);
+      const snapshots = this.database.listSourceSnapshots(item.id);
+      sourceCheckTimes.push(
+        ...sourceMatches.map((match) => match.lastCheckedAt),
+        ...snapshots.map((snapshot) => snapshot.checkedAt),
+      );
+      for (const match of sourceMatches) {
+        if (!match.lastError || match.status === 'not_found') {
+          continue;
+        }
+        issues.push({
+          action: match.sourceUrl
+            ? {
+                label: `Refresh ${match.sourceKind}`,
+                payload: {
+                  sourceKind: match.sourceKind,
+                  trackedItemId: item.id,
+                  type: 'refreshMatchedSource',
+                },
+              }
+            : {
+                label: 'Refresh game',
+                payload: { trackedItemId: item.id, type: 'refreshTrackedItem' },
+              },
+          createdAt: match.lastCheckedAt ?? match.updatedAt,
+          detail: match.lastError,
+          gameTitle: item.title,
+          id: `source:error:${item.id}:${match.sourceKind}`,
+          kind: 'source_error',
+          severity:
+            match.status === 'failed' || match.status === 'blocked'
+              ? 'error'
+              : 'warning',
+          sourceKind: match.sourceKind,
+          title: `${match.sourceKind} source check failed for ${item.title}`,
+          trackedItemId: item.id,
+        });
+      }
+    }
+
+    for (const job of this.database.listDownloadJobs()) {
+      const item = itemsById.get(job.trackedItemId);
+      if (job.stage === 'failed') {
+        issues.push({
+          action: {
+            label: 'Poll download jobs',
+            payload: { type: 'pollDownloadJobs' },
+          },
+          createdAt: job.updatedAt,
+          detail:
+            job.errorMessage ??
+            job.statusMessage ??
+            'The latest download automation state is failed.',
+          gameTitle: item?.title ?? null,
+          id: `download:failed:${job.id}`,
+          kind: 'download_failed',
+          severity: 'error',
+          sourceKind: job.sourceKind ?? null,
+          title: item
+            ? `Download automation failed for ${item.title}`
+            : 'Download automation failed',
+          trackedItemId: job.trackedItemId,
+        });
+        continue;
+      }
+
+      const updatedAt = timestampMs(job.updatedAt);
+      if (
+        updatedAt != null &&
+        ['queued', 'downloading', 'extracting'].includes(job.stage) &&
+        generatedAt.getTime() - updatedAt > ACTIVITY_STALE_DOWNLOAD_MS
+      ) {
+        issues.push({
+          action: {
+            label: 'Poll download jobs',
+            payload: { type: 'pollDownloadJobs' },
+          },
+          createdAt: job.updatedAt,
+          detail: `No download progress has been recorded for ${formatDurationMs(
+            generatedAt.getTime() - updatedAt,
+          )}.`,
+          gameTitle: item?.title ?? null,
+          id: `download:stale:${job.id}`,
+          kind: 'download_stale',
+          severity: 'warning',
+          sourceKind: job.sourceKind ?? null,
+          title: item
+            ? `Download automation may be stuck for ${item.title}`
+            : 'Download automation may be stuck',
+          trackedItemId: job.trackedItemId,
+        });
+      }
+    }
+
+    const errorLogCount = recentLogs.filter(
+      (log) => log.level === 'error',
+    ).length;
+    if (errorLogCount > 0) {
+      issues.push({
+        createdAt: recentLogs[0]?.createdAt ?? generatedAtIso,
+        detail: `${errorLogCount} error log${errorLogCount === 1 ? '' : 's'} recorded in the last 24 hours.`,
+        id: 'logs:recent-errors',
+        kind: 'recent_errors',
+        severity: 'error',
+        title: 'Recent automation errors were recorded',
+      });
+    }
+
+    const dismissedIssueKeys =
+      this.database.listDismissedActivityIssueKeys();
+    const visibleIssues = issues
+      .map((issue) => {
+        const dismissalKey = getActivityIssueDismissalKey(issue);
+        return { ...issue, dismissalKey };
+      })
+      .filter((issue) => !dismissedIssueKeys.has(issue.dismissalKey));
+    const failedSteamFeeds = countActivityIssues(visibleIssues, [
+      'steamdb_error',
+    ]);
+    const staleSteamFeeds = countActivityIssues(visibleIssues, [
+      'steamdb_stale',
+    ]);
+    const sourceErrors = countActivityIssues(visibleIssues, ['source_error']);
+    const sourceWatchesDueOrExpired = countActivityIssues(visibleIssues, [
+      'source_watch_expired',
+      'source_watch_overdue',
+    ]);
+    const failedDownloads = countActivityIssues(visibleIssues, [
+      'download_failed',
+    ]);
+    const staleDownloads = countActivityIssues(visibleIssues, [
+      'download_stale',
+    ]);
+    const visibleRecentErrorCount = visibleIssues.some(
+      (issue) => issue.kind === 'recent_errors',
+    )
+      ? errorLogCount
+      : 0;
+    const visibleRecentLogCount =
+      visibleRecentErrorCount > 0
+        ? recentLogs.length
+        : recentLogs.filter((log) => log.level === 'warn').length;
+    const activeTasks = Array.from(this.activeActivityTasks.values());
+    const startupTask = activeTasks.find(
+      (task) => task.id === 'startup-catch-up',
+    );
+    const latestStartupLog = logs.find((log) =>
+      /^Startup catch-up/.test(log.message),
+    );
+    const steamDbWorstSeverity = worstActivitySeverityForKinds(visibleIssues, [
+      'scheduler_stale',
+      'steamdb_error',
+      'steamdb_rate_limited',
+      'steamdb_stale',
+    ]);
+    const sourceWorstSeverity = worstActivitySeverityForKinds(visibleIssues, [
+      'source_error',
+      'source_watch_expired',
+      'source_watch_overdue',
+    ]);
+    const automationWorstSeverity =
+      failedDownloads > 0 || visibleRecentErrorCount > 0
+        ? 'error'
+        : staleDownloads > 0 || visibleRecentLogCount > 0
+          ? 'warning'
+          : null;
+
+    return {
+      activeTasks,
+      generatedAt: generatedAtIso,
+      issues: sortActivityIssues(visibleIssues),
+      logs,
+      summary: [
+        {
+          detail: startupTask
+            ? (startupTask.detail ?? 'Startup maintenance is running.')
+            : latestStartupLog
+              ? `${latestStartupLog.message} at ${new Date(
+                  latestStartupLog.createdAt,
+                ).toLocaleString()}.`
+              : 'Startup maintenance has not reported during this session yet.',
+          id: 'startupCatchUp',
+          label: 'Startup Catch-Up',
+          status: startupTask ? 'running' : activityStatusFromSeverity(null),
+          value: startupTask ? 'Running' : 'Ready',
+        },
+        {
+          detail:
+            backoffMs > 0
+              ? `Retry available in ${formatDurationMs(backoffMs)}.`
+              : latestIsoTimestamp(steamFeedCheckTimes)
+                ? `Last feed check ${new Date(
+                    latestIsoTimestamp(steamFeedCheckTimes)!,
+                  ).toLocaleString()}.`
+                : 'No SteamDB feed checks have been recorded yet.',
+          id: 'steamDbMaintenance',
+          label: 'SteamDB Maintenance',
+          status: activeTasks.some((task) => task.id === 'steamdb-feeds')
+            ? 'running'
+            : activityStatusFromSeverity(steamDbWorstSeverity),
+          value:
+            failedSteamFeeds > 0
+              ? `${failedSteamFeeds} failed`
+              : staleSteamFeeds > 0
+                ? `${staleSteamFeeds} stale`
+                : backoffMs > 0
+                  ? 'Backoff'
+                  : 'Current',
+        },
+        {
+          detail: latestIsoTimestamp(sourceCheckTimes)
+            ? `Last source activity ${new Date(
+                latestIsoTimestamp(sourceCheckTimes)!,
+              ).toLocaleString()}.`
+            : 'No source maintenance activity has been recorded yet.',
+          id: 'sourceMaintenance',
+          label: 'Source Maintenance',
+          status: activeTasks.some((task) => task.id === 'source-watches')
+            ? 'running'
+            : activityStatusFromSeverity(sourceWorstSeverity),
+          value:
+            sourceErrors > 0
+              ? `${sourceErrors} errors`
+              : sourceWatchesDueOrExpired > 0
+                ? `${sourceWatchesDueOrExpired} due`
+                : 'Current',
+        },
+        {
+          detail:
+            visibleRecentLogCount > 0
+              ? `${visibleRecentLogCount} warning/error event${visibleRecentLogCount === 1 ? '' : 's'} in the last 24 hours.`
+              : 'No warning or error events in the last 24 hours.',
+          id: 'automationErrors',
+          label: 'Automation Errors',
+          status: activeTasks.some((task) => task.id === 'download-jobs')
+            ? 'running'
+            : activityStatusFromSeverity(automationWorstSeverity),
+          value:
+            failedDownloads > 0
+              ? `${failedDownloads} failed`
+              : staleDownloads > 0
+                ? `${staleDownloads} stale`
+                : visibleRecentLogCount > 0
+                  ? `${visibleRecentLogCount} recent`
+                  : 'Clear',
+        },
+      ],
+    };
+  }
+
+  async runActivityAction(
+    payload: ActivityActionPayload,
+  ): Promise<ActivityView> {
+    switch (payload.type) {
+      case 'dismissActivityIssue':
+        this.database.dismissActivityIssue({
+          dismissedAt: new Date().toISOString(),
+          issueId: payload.issueId,
+          issueKey: payload.issueKey,
+          trackedItemId: payload.trackedItemId ?? null,
+        });
+        break;
+      case 'pollDownloadJobs':
+        await this.pollDownloadJobs();
+        break;
+      case 'processSourceWatches':
+        await this.processDueWatches();
+        break;
+      case 'refreshMatchedSource':
+        await this.refreshMatchedSource(
+          payload.trackedItemId,
+          payload.sourceKind,
+        );
+        break;
+      case 'refreshSteamFeeds':
+        await this.pollSteamFeeds();
+        break;
+      case 'refreshTrackedItem':
+        await this.refreshTrackedItem(payload.trackedItemId);
+        break;
+      default:
+        throw new Error('Unsupported activity action.');
+    }
+    return this.getActivity();
   }
 
   getLatestDailyPollAt(): string | null {

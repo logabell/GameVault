@@ -10,8 +10,8 @@ import type {
   SteamPatchCandidate,
   SupportedSourceKind,
   TrackedItemView,
-} from '@vaulttrack/shared-types';
-import { TrackedItemTrackingStatus } from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
+import { TrackedItemTrackingStatus } from '@gamevault/shared-types';
 
 import {
   buildCreateMatchedDraftMessage,
@@ -202,7 +202,7 @@ describe('extension add-game workflow helpers', () => {
     expect(message).toMatchObject({
       selectedAppId: steamCandidate.appId,
       selectedSteamCandidate: steamCandidate,
-      type: 'vaulttrack:create-matched-draft',
+      type: 'gamevault:create-matched-draft',
     });
     expect('selectedDownloads' in message).toBe(false);
   });

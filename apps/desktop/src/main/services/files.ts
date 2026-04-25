@@ -95,8 +95,8 @@ async function dismountIsoImages(isoPaths: string[]): Promise<string[]> {
   const script = `
 $ErrorActionPreference = 'Stop'
 $imagePaths = @()
-if ($env:VAULTTRACK_ISO_PATHS) {
-  $imagePaths = $env:VAULTTRACK_ISO_PATHS | ConvertFrom-Json
+if ($env:GAMEVAULT_ISO_PATHS) {
+  $imagePaths = $env:GAMEVAULT_ISO_PATHS | ConvertFrom-Json
 }
 foreach ($imagePath in $imagePaths) {
   $image = Get-DiskImage -ImagePath $imagePath -ErrorAction SilentlyContinue
@@ -119,7 +119,7 @@ foreach ($imagePath in $imagePaths) {
     {
       env: {
         ...process.env,
-        VAULTTRACK_ISO_PATHS: JSON.stringify(isoPaths),
+        GAMEVAULT_ISO_PATHS: JSON.stringify(isoPaths),
       },
       windowsHide: true,
     },

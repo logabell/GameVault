@@ -2,70 +2,97 @@ import { contextBridge, ipcRenderer } from 'electron';
 
 const api = {
   authenticateMyJDownloader: (payload: { email: string; password: string }) =>
-    ipcRenderer.invoke('vault:authenticateMyJDownloader', payload),
+    ipcRenderer.invoke('gamevault:authenticateMyJDownloader', payload),
   applySteamMatch: (payload: unknown) =>
-    ipcRenderer.invoke('vault:applySteamMatch', payload),
+    ipcRenderer.invoke('gamevault:applySteamMatch', payload),
   cancelDownload: (trackedItemId: string) =>
-    ipcRenderer.invoke('vault:cancelDownload', trackedItemId),
+    ipcRenderer.invoke('gamevault:cancelDownload', trackedItemId),
+  confirmManualDownloadReady: (trackedItemId: string) =>
+    ipcRenderer.invoke('gamevault:confirmManualDownloadReady', trackedItemId),
   completeStagedInstall: (trackedItemId: string) =>
-    ipcRenderer.invoke('vault:completeStagedInstall', trackedItemId),
+    ipcRenderer.invoke('gamevault:completeStagedInstall', trackedItemId),
   disconnectMyJDownloader: () =>
-    ipcRenderer.invoke('vault:disconnectMyJDownloader'),
+    ipcRenderer.invoke('gamevault:disconnectMyJDownloader'),
+  detectBrowserExtension: () =>
+    ipcRenderer.invoke('gamevault:detectBrowserExtension'),
+  detectJDownloader: () => ipcRenderer.invoke('gamevault:detectJDownloader'),
   clearDownloadMirrorFailed: (payload: { trackedItemId: string; url: string }) =>
-    ipcRenderer.invoke('vault:clearDownloadMirrorFailed', payload),
-  getConnectionHealth: () => ipcRenderer.invoke('vault:getConnectionHealth'),
-  getLogs: () => ipcRenderer.invoke('vault:getLogs'),
-  getSettings: () => ipcRenderer.invoke('vault:getSettings'),
-  listTrackedItems: () => ipcRenderer.invoke('vault:listTrackedItems'),
+    ipcRenderer.invoke('gamevault:clearDownloadMirrorFailed', payload),
+  getConnectionHealth: (payload?: { forceRefresh?: boolean }) =>
+    ipcRenderer.invoke('gamevault:getConnectionHealth', payload ?? {}),
+  getDesktopHealth: (payload?: { forceRefresh?: boolean }) =>
+    ipcRenderer.invoke('gamevault:getDesktopHealth', payload ?? {}),
+  getExtensionSetupInfo: () =>
+    ipcRenderer.invoke('gamevault:getExtensionSetupInfo'),
+  getActivity: () => ipcRenderer.invoke('gamevault:getActivity'),
+  getLogs: () => ipcRenderer.invoke('gamevault:getLogs'),
+  getSettings: () => ipcRenderer.invoke('gamevault:getSettings'),
+  listTrackedItems: () => ipcRenderer.invoke('gamevault:listTrackedItems'),
   markDownloadFailed: (trackedItemId: string) =>
-    ipcRenderer.invoke('vault:markDownloadFailed', trackedItemId),
+    ipcRenderer.invoke('gamevault:markDownloadFailed', trackedItemId),
+  onDownloadProgress: (listener: (payload: unknown) => void) => {
+    const channel = 'gamevault:downloadProgress';
+    const wrappedListener = (_event: unknown, payload: unknown) => {
+      listener(payload);
+    };
+    ipcRenderer.on(channel, wrappedListener);
+    return () => {
+      ipcRenderer.removeListener(channel, wrappedListener);
+    };
+  },
   openDesktop: (trackedItemId?: string) =>
-    ipcRenderer.invoke('vault:openDesktop', trackedItemId),
+    ipcRenderer.invoke('gamevault:openDesktop', trackedItemId),
   openExternal: (target: string) =>
-    ipcRenderer.invoke('vault:openExternal', target),
-  pickDirectory: () => ipcRenderer.invoke('vault:pickDirectory'),
+    ipcRenderer.invoke('gamevault:openExternal', target),
+  pickDirectory: () => ipcRenderer.invoke('gamevault:pickDirectory'),
   discoverSourceMatches: (trackedItemId: string) =>
-    ipcRenderer.invoke('vault:discoverSourceMatches', trackedItemId),
+    ipcRenderer.invoke('gamevault:discoverSourceMatches', trackedItemId),
   refreshTrackedItem: (trackedItemId: string) =>
-    ipcRenderer.invoke('vault:refreshTrackedItem', trackedItemId),
+    ipcRenderer.invoke('gamevault:refreshTrackedItem', trackedItemId),
   refreshMatchedSource: (payload: unknown) =>
-    ipcRenderer.invoke('vault:refreshMatchedSource', payload),
+    ipcRenderer.invoke('gamevault:refreshMatchedSource', payload),
   removeTrackedItem: (payload: unknown) =>
-    ipcRenderer.invoke('vault:removeTrackedItem', payload),
+    ipcRenderer.invoke('gamevault:removeTrackedItem', payload),
+  runActivityAction: (payload: unknown) =>
+    ipcRenderer.invoke('gamevault:runActivityAction', payload),
   resolveSteamMatch: (payload: { queryTitle?: string | null; title: string }) =>
-    ipcRenderer.invoke('vault:resolveSteamMatch', payload),
+    ipcRenderer.invoke('gamevault:resolveSteamMatch', payload),
   resolveSteamPatches: (payload: { appId: number }) =>
-    ipcRenderer.invoke('vault:resolveSteamPatches', payload),
+    ipcRenderer.invoke('gamevault:resolveSteamPatches', payload),
   listSteamPatchEntries: (trackedItemId: string) =>
-    ipcRenderer.invoke('vault:listSteamPatchEntries', trackedItemId),
+    ipcRenderer.invoke('gamevault:listSteamPatchEntries', trackedItemId),
   retryDownload: (trackedItemId: string) =>
-    ipcRenderer.invoke('vault:retryDownload', trackedItemId),
+    ipcRenderer.invoke('gamevault:retryDownload', trackedItemId),
   retryDownloadWithSelection: (payload: unknown) =>
-    ipcRenderer.invoke('vault:retryDownloadWithSelection', payload),
+    ipcRenderer.invoke('gamevault:retryDownloadWithSelection', payload),
   queueUpdateFromSource: (payload: unknown) =>
-    ipcRenderer.invoke('vault:queueUpdateFromSource', payload),
+    ipcRenderer.invoke('gamevault:queueUpdateFromSource', payload),
+  registerExtensionNativeHost: (payload: unknown) =>
+    ipcRenderer.invoke('gamevault:registerExtensionNativeHost', payload),
   selectMyJDownloaderDevice: (deviceId: string) =>
-    ipcRenderer.invoke('vault:selectMyJDownloaderDevice', deviceId),
+    ipcRenderer.invoke('gamevault:selectMyJDownloaderDevice', deviceId),
   saveSettings: (payload: unknown) =>
-    ipcRenderer.invoke('vault:saveSettings', payload),
+    ipcRenderer.invoke('gamevault:saveSettings', payload),
+  saveOnboardingState: (payload: unknown) =>
+    ipcRenderer.invoke('gamevault:saveOnboardingState', payload),
   scanImportCandidates: (payload: unknown) =>
-    ipcRenderer.invoke('vault:scanImportCandidates', payload),
+    ipcRenderer.invoke('gamevault:scanImportCandidates', payload),
   ignoreImportFolder: (payload: unknown) =>
-    ipcRenderer.invoke('vault:ignoreImportFolder', payload),
+    ipcRenderer.invoke('gamevault:ignoreImportFolder', payload),
   restoreImportFolder: (payload: unknown) =>
-    ipcRenderer.invoke('vault:restoreImportFolder', payload),
+    ipcRenderer.invoke('gamevault:restoreImportFolder', payload),
   saveImportBatch: (payload: unknown) =>
-    ipcRenderer.invoke('vault:saveImportBatch', payload),
+    ipcRenderer.invoke('gamevault:saveImportBatch', payload),
   requestSteamDbBuildLookup: (appId: number) =>
-    ipcRenderer.invoke('vault:requestSteamDbBuildLookup', appId),
+    ipcRenderer.invoke('gamevault:requestSteamDbBuildLookup', appId),
   getSteamDbBuildLookup: (lookupId: string) =>
-    ipcRenderer.invoke('vault:getSteamDbBuildLookup', lookupId),
+    ipcRenderer.invoke('gamevault:getSteamDbBuildLookup', lookupId),
   updateInstallRecord: (payload: unknown) =>
-    ipcRenderer.invoke('vault:updateInstallRecord', payload),
+    ipcRenderer.invoke('gamevault:updateInstallRecord', payload),
   setManualSourceMatch: (payload: unknown) =>
-    ipcRenderer.invoke('vault:setManualSourceMatch', payload),
+    ipcRenderer.invoke('gamevault:setManualSourceMatch', payload),
   updateSourcePatch: (payload: unknown) =>
-    ipcRenderer.invoke('vault:updateSourcePatch', payload),
+    ipcRenderer.invoke('gamevault:updateSourcePatch', payload),
 };
 
-contextBridge.exposeInMainWorld('vaultTrackApi', api);
+contextBridge.exposeInMainWorld('gameVaultApi', api);

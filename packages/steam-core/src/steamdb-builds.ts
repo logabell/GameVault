@@ -1,4 +1,4 @@
-import type { SteamPatchCandidate } from '@vaulttrack/shared-types';
+import type { SteamPatchCandidate } from '@gamevault/shared-types';
 
 const MONTHS = new Map(
   [

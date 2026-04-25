@@ -2,17 +2,17 @@ import {
   parseSteamDbAppIdFromUrl,
   parseSteamDbBuildRowText,
   parseSteamDbBuildRowsFromDocument,
-} from '@vaulttrack/steam-core';
+} from '@gamevault/steam-core';
 import { icon } from '@fortawesome/fontawesome-svg-core';
 import { faCheck } from '@fortawesome/free-solid-svg-icons';
 
 import { detectSteamDbChallenge } from '../steamdb-challenge.js';
 
-const BUTTON_CLASS = 'vaulttrack-steamdb-select';
-const STYLE_ID = 'vaulttrack-steamdb-style';
+const BUTTON_CLASS = 'gamevault-steamdb-select';
+const STYLE_ID = 'gamevault-steamdb-style';
 const BACKFILL_DEBOUNCE_MS = 500;
 const SELECT_ICON_HTML = icon(faCheck, {
-  classes: ['vaulttrack-steamdb-select__icon'],
+  classes: ['gamevault-steamdb-select__icon'],
 }).html.join('');
 
 type SteamDbContextMode = 'select' | 'backfill';
@@ -50,7 +50,7 @@ function injectStyles(): void {
       letter-spacing: 0.02em;
       white-space: nowrap;
     }
-    .${BUTTON_CLASS} .vaulttrack-steamdb-select__icon {
+    .${BUTTON_CLASS} .gamevault-steamdb-select__icon {
       width: 12px;
       height: 12px;
       flex: 0 0 auto;
@@ -70,7 +70,7 @@ async function getSteamDbContextMode(
 ): Promise<SteamDbContextMode | null> {
   const response = await chrome.runtime.sendMessage({
     appId,
-    type: 'vaulttrack:get-steamdb-selection-context',
+    type: 'gamevault:get-steamdb-selection-context',
   });
   if (!response?.ok || !response.payload?.active) {
     return null;
@@ -80,18 +80,18 @@ async function getSteamDbContextMode(
 }
 
 function ensureActionHeader(row: HTMLTableRowElement): void {
-  if (row.dataset.vaulttrackHeaderBound === 'true') {
+  if (row.dataset.gamevaultHeaderBound === 'true') {
     return;
   }
-  row.dataset.vaulttrackHeaderBound = 'true';
+  row.dataset.gamevaultHeaderBound = 'true';
   const headerCell = document.createElement('th');
-  headerCell.textContent = 'VaultTrack';
+  headerCell.textContent = 'GameVault';
   headerCell.style.whiteSpace = 'nowrap';
   row.append(headerCell);
 }
 
 function ensureActionButton(row: HTMLTableRowElement, appId: number): void {
-  if (row.dataset.vaulttrackBound === 'true') {
+  if (row.dataset.gamevaultBound === 'true') {
     return;
   }
 
@@ -103,7 +103,7 @@ function ensureActionButton(row: HTMLTableRowElement, appId: number): void {
     return;
   }
 
-  row.dataset.vaulttrackBound = 'true';
+  row.dataset.gamevaultBound = 'true';
   const actionCell = document.createElement('td');
   const button = document.createElement('button');
   button.className = BUTTON_CLASS;
@@ -117,7 +117,7 @@ function ensureActionButton(row: HTMLTableRowElement, appId: number): void {
       appId,
       patches: parseSteamDbBuildRowsFromDocument(document, appId),
       selectedPatch: patch,
-      type: 'vaulttrack:steamdb-patch-selected',
+      type: 'gamevault:steamdb-patch-selected',
     });
   });
   actionCell.append(button);
@@ -192,7 +192,7 @@ function observeBuildBackfill(appId: number): void {
     void chrome.runtime.sendMessage({
       appId,
       patches: latestPatches,
-      type: 'vaulttrack:steamdb-builds-backfilled',
+      type: 'gamevault:steamdb-builds-backfilled',
     });
   };
 
@@ -210,7 +210,7 @@ function observeBuildBackfill(appId: number): void {
       appId,
       errorKind: failure.kind,
       message: failure.message,
-      type: 'vaulttrack:steamdb-builds-backfill-failed',
+      type: 'gamevault:steamdb-builds-backfill-failed',
     });
   };
 
@@ -223,7 +223,7 @@ function observeBuildBackfill(appId: number): void {
     void chrome.runtime.sendMessage({
       appId,
       message: challenge.message,
-      type: 'vaulttrack:steamdb-builds-challenge-required',
+      type: 'gamevault:steamdb-builds-challenge-required',
     });
   };
 

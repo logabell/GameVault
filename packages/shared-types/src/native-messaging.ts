@@ -123,6 +123,10 @@ export type NativeMessageRequest =
       payload: { trackedItemId: string };
     }
   | {
+      type: 'confirmManualDownloadReady';
+      payload: { trackedItemId: string };
+    }
+  | {
       type: 'completeStagedInstall';
       payload: { trackedItemId: string };
     }
@@ -148,7 +152,7 @@ export type NativeMessageRequest =
     }
   | {
       type: 'getConnectionHealth';
-      payload: EmptyPayload;
+      payload: { forceRefresh?: boolean };
     }
   | {
       type: 'authenticateMyJDownloader';
@@ -287,6 +291,11 @@ export type NativeMessageResponse =
   | {
       ok: true;
       type: 'cancelDownload';
+      payload: TrackedItemView;
+    }
+  | {
+      ok: true;
+      type: 'confirmManualDownloadReady';
       payload: TrackedItemView;
     }
   | {

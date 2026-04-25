@@ -77,16 +77,16 @@ async function readHtmlForSourceCapture() {
 }
 
 declare global {
-  var __vaultTrackContentBound__: boolean | undefined;
+  var __gameVaultContentBound__: boolean | undefined;
 }
 
-if (!globalThis.__vaultTrackContentBound__ && isSupportedDetailPage(location.href)) {
-  globalThis.__vaultTrackContentBound__ = true;
+if (!globalThis.__gameVaultContentBound__ && isSupportedDetailPage(location.href)) {
+  globalThis.__gameVaultContentBound__ = true;
 
   void readHtmlForSourceCapture().then((html) => {
     void chrome.runtime.sendMessage({
       fingerprint: hashText(html),
-      type: 'vaulttrack:page-ready',
+      type: 'gamevault:page-ready',
       url: location.href,
     });
   });
@@ -97,7 +97,7 @@ if (!globalThis.__vaultTrackContentBound__ && isSupportedDetailPage(location.hre
     if (copiedUrlMatchesPage(copiedText, location.href)) {
       void chrome.runtime.sendMessage({
         fingerprint: readFingerprint(),
-        type: 'vaulttrack:clipboard-copy',
+        type: 'gamevault:clipboard-copy',
         url: location.href,
       });
     }
@@ -105,7 +105,7 @@ if (!globalThis.__vaultTrackContentBound__ && isSupportedDetailPage(location.hre
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message.type === 'vaulttrack:get-page-probe') {
+  if (message.type === 'gamevault:get-page-probe') {
     void readHtmlForSourceCapture().then((html) => {
       sendResponse({
         fingerprint: hashText(html),
@@ -115,7 +115,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
-  if (message.type === 'vaulttrack:get-html') {
+  if (message.type === 'gamevault:get-html') {
     void readHtmlForSourceCapture().then((html) => {
       sendResponse({
         fingerprint: hashText(html),

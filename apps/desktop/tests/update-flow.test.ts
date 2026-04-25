@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type {
   MatchedSourceView,
   SteamPatchCandidate,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 import {
   formatEtaLabel,
   getLikelyPatchForUpdateSource,

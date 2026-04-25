@@ -15,10 +15,12 @@ import {
   faBan,
   faCalendarDays,
   faCheck,
+  faChevronLeft,
+  faChevronRight,
   faCircleInfo,
   faCircleQuestion,
-  faClock,
   faCloudArrowDown,
+  faCopy,
   faDesktop,
   faEllipsis,
   faFileImport,
@@ -34,9 +36,9 @@ import {
   faMoon,
   faPenToSquare,
   faPlus,
+  faPuzzlePiece,
   faRotateLeft,
   faRotateRight,
-  faScroll,
   faSort,
   faSortDown,
   faSortUp,
@@ -45,20 +47,33 @@ import {
   faTrash,
   faTriangleExclamation,
   faUpRightFromSquare,
+  faWaveSquare,
   faXmark,
 } from '@fortawesome/free-solid-svg-icons';
 
 import type {
+  ActivityActionPayload,
+  ActivityIssue,
+  ActivityView,
+  BrowserTarget,
+  BrowserExtensionInstallStatus,
   ConfirmedSteamMatch,
   ConnectionHealthSummary,
   DownloadMirrorRecord,
+  DesktopHealthSummary,
   EventLogRecord,
+  ExtensionSetupInfo,
   IgnoredImportFolderRecord,
   ImportCandidate,
   ImportScanPayload,
+  JDownloaderInstallStatus,
   LibraryRootRecord,
   MatchedSourceView,
   MyJDownloaderDeviceSummary,
+  NativeHostRegistrationMetadata,
+  NativeHostRegistrationResult,
+  OnboardingState,
+  RegisterExtensionNativeHostPayload,
   RemoveTrackedItemMode,
   SaveImportBatchPayload,
   SaveImportBatchResult,
@@ -75,11 +90,12 @@ import type {
   SupportedSourceKind,
   ThemeMode,
   TrackedItemView,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 import {
+  FIREFOX_EXTENSION_ID,
   getPatchHistoryKey,
   mergePatchHistory,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 
 import {
   getImportBuildLookupFailureTiming,
@@ -89,6 +105,7 @@ import {
   type ImportBuildLookupPauseReason,
 } from './import-queue-timing.js';
 import {
+  canDeleteTrackedItemFiles,
   canQueueSourceUpdate,
   filterLibraryItem,
   getDefaultLibrarySortDirection,
@@ -109,6 +126,15 @@ import {
   type LibraryStatusFilter,
 } from './library-controls.js';
 import {
+  canConfirmJDownloaderStep,
+  canConfirmMyJDownloaderStep,
+  getDesktopHealthMenuTitle,
+  getEmptyLibraryState,
+  isValidExtensionSetupId,
+  shouldShowFirstLaunchOnboarding,
+  type DesktopOnboardingStep,
+} from './onboarding.js';
+import {
   findSharedPatchMirrorUrl,
   formatEtaLabel,
   getLikelyPatchForUpdateSource,
@@ -120,8 +146,15 @@ import {
   type SteamPatchSuggestion,
   type UpdateMirrorSelectionPlan,
 } from './update-flow.js';
+import {
+  buildActivityReport,
+  getActivityLogContextRows,
+  sortActivityIssues,
+} from './activity-report.js';
 
-type Section = 'library' | 'imports' | 'logs' | 'settings';
+type Section = 'library' | 'imports' | 'activity' | 'settings';
+type ActivityLogFilter = 'all' | 'error' | 'warn';
+type BrowserSetupTab = 'chromium' | 'firefox';
 type LibraryViewMode = 'cards' | 'list';
 type ImportSortKey = 'folder' | 'patchMetadata' | 'steamMatch';
 type SortDirection = 'asc' | 'desc';
@@ -132,6 +165,7 @@ type ItemBusyAction =
   | 'cancelDownload'
   | 'clearMirrorFailed'
   | 'completeInstall'
+  | 'confirmDownloadReady'
   | 'deleteFiles'
   | 'markFailed'
   | 'refresh'
@@ -209,12 +243,36 @@ type ImportManualPatchModal = {
   releaseDate: string;
   version: string;
 };
+type AppDialogVariant = 'default' | 'danger';
+type AppDialogRequest = {
+  cancelLabel: string | null;
+  confirmLabel: string;
+  id: number;
+  kind: 'alert' | 'confirm';
+  message: string;
+  title: string;
+  variant: AppDialogVariant;
+};
+type AppDialogOptions = {
+  cancelLabel?: string;
+  confirmLabel?: string;
+  title?: string;
+  variant?: AppDialogVariant;
+};
 
-const DESKTOP_LIBRARY_VIEW_STORAGE_KEY = 'vaulttrack:desktop:library-view';
+const DESKTOP_LIBRARY_VIEW_STORAGE_KEY = 'gamevault:desktop:library-view';
 const PATCH_EDITOR_BACKFILL_POLL_INTERVAL_MS = 750;
 const PATCH_EDITOR_BACKFILL_POLL_TIMEOUT_MS = 26000;
 const STEAM_LEGACY_APP_ART_BASE =
   'https://cdn.cloudflare.steamstatic.com/steam/apps';
+const JDOWNLOADER_DOWNLOAD_URL = 'https://jdownloader.org/download/index';
+const MYJDOWNLOADER_SIGNUP_URL =
+  'https://my.jdownloader.org/login.html#register';
+const SOURCE_HOME_LINKS = [
+  { label: 'AnkerGames', url: 'https://ankergames.net' },
+  { label: 'ElAmigos', url: 'https://elamigos.site' },
+  { label: 'SteamRIP', url: 'https://steamrip.com' },
+];
 const SUPPORTED_RENDER_SOURCE_KINDS: SupportedSourceKind[] = [
   'elamigos',
   'steamrip',
@@ -248,10 +306,15 @@ const DEFAULT_SETTINGS_DRAFT = {
   sourceWatchDurationDays: '5',
   sourceWatchIntervalHours: '8',
 };
+const ACTIVITY_LOGS_PER_PAGE = 10;
+
+type DownloadProgressPayload = {
+  items: TrackedItemView[];
+};
 
 declare global {
   interface Window {
-    vaultTrackApi: {
+    gameVaultApi: {
       authenticateMyJDownloader(payload: {
         email: string;
         password: string;
@@ -265,13 +328,28 @@ declare global {
         match: ConfirmedSteamMatch;
       }): Promise<TrackedItemView>;
       cancelDownload(trackedItemId: string): Promise<TrackedItemView>;
+      confirmManualDownloadReady(
+        trackedItemId: string,
+      ): Promise<TrackedItemView>;
       completeStagedInstall(trackedItemId: string): Promise<TrackedItemView>;
       disconnectMyJDownloader(): Promise<ConnectionHealthSummary>;
-      getConnectionHealth(): Promise<ConnectionHealthSummary>;
+      detectBrowserExtension(): Promise<BrowserExtensionInstallStatus>;
+      detectJDownloader(): Promise<JDownloaderInstallStatus>;
+      getConnectionHealth(payload?: {
+        forceRefresh?: boolean;
+      }): Promise<ConnectionHealthSummary>;
+      getDesktopHealth(payload?: {
+        forceRefresh?: boolean;
+      }): Promise<DesktopHealthSummary>;
+      getExtensionSetupInfo(): Promise<ExtensionSetupInfo>;
+      getActivity(): Promise<ActivityView>;
       getLogs(): Promise<EventLogRecord[]>;
       getSettings(): Promise<SettingsView>;
       listTrackedItems(): Promise<TrackedItemView[]>;
       markDownloadFailed(trackedItemId: string): Promise<TrackedItemView>;
+      onDownloadProgress(
+        listener: (payload: DownloadProgressPayload) => void,
+      ): () => void;
       openDesktop(trackedItemId?: string): Promise<{ opened: true }>;
       openExternal(target: string): Promise<void>;
       pickDirectory(): Promise<string | null>;
@@ -285,6 +363,7 @@ declare global {
         trackedItemId: string;
         mode: RemoveTrackedItemMode;
       }): Promise<unknown>;
+      runActivityAction(payload: ActivityActionPayload): Promise<ActivityView>;
       resolveSteamMatch(payload: {
         queryTitle?: string | null;
         title: string;
@@ -305,6 +384,9 @@ declare global {
         sourceKind: SupportedSourceKind;
         trackedItemId: string;
       }): Promise<TrackedItemView>;
+      registerExtensionNativeHost(
+        payload: RegisterExtensionNativeHostPayload,
+      ): Promise<NativeHostRegistrationResult>;
       saveSettings(payload: {
         jDownloaderEnabled?: boolean;
         jDownloaderSourcePreferences?: SettingsView['jDownloaderSourcePreferences'];
@@ -316,6 +398,9 @@ declare global {
         sourceWatchIntervalHours?: number;
         themeMode?: ThemeMode | null;
       }): Promise<SettingsView>;
+      saveOnboardingState(
+        payload: Partial<OnboardingState>,
+      ): Promise<SettingsView>;
       scanImportCandidates(
         payload?: ImportScanPayload,
       ): Promise<ImportCandidate[]>;
@@ -378,7 +463,11 @@ function progressPercent(item: TrackedItemView): number | null {
   const total = item.currentDownload?.bytesTotal ?? null;
   if (!loaded || !total || total <= 0) return null;
   if (stage === 'queued' && loaded >= total) return null;
-  return Math.max(0, Math.min(100, Math.round((loaded / total) * 100)));
+  return Math.max(0, Math.min(100, (loaded / total) * 100));
+}
+
+function formatProgressPercent(progress: number): string {
+  return `${Math.round(progress)}%`;
 }
 
 function formatProgressAmount(
@@ -412,7 +501,9 @@ function formatDownloadSummary(
     return `${download.completedParts} of ${download.totalParts} complete`;
   }
   if (download.statusMessage) return download.statusMessage;
-  return progress != null ? `${progress}%` : formatLabel(download.stage);
+  return progress != null
+    ? formatProgressPercent(progress)
+    : formatLabel(download.stage);
 }
 
 function formatPartStatus(
@@ -442,7 +533,11 @@ function pathDirname(value: string | null | undefined): string {
   const separator = value.includes('\\') ? '\\' : '/';
   const parts = value.split(/[\\/]/).filter(Boolean);
   if (parts.length <= 1) return value;
-  const prefix = /^[a-z]:/i.test(parts[0] ?? '') ? '' : value.startsWith(separator) ? separator : '';
+  const prefix = /^[a-z]:/i.test(parts[0] ?? '')
+    ? ''
+    : value.startsWith(separator)
+      ? separator
+      : '';
   return `${prefix}${parts.slice(0, -1).join(separator)}`;
 }
 
@@ -463,7 +558,7 @@ function createOlderThanAvailablePatch(appId: number): SteamPatchCandidate {
     buildId: null,
     description:
       'Installed patch predates the available SteamDB patch history.',
-    link: `vaulttrack:older-than-available:${appId}`,
+    link: `gamevault:older-than-available:${appId}`,
     patchDate: '',
     patchTitle: 'Older than available / not listed',
     publishedAt: '',
@@ -552,6 +647,127 @@ function makeLocalId(): string {
 function libraryRootFallbackLabel(path: string): string {
   const parts = path.split(/[\\/]/).filter(Boolean);
   return parts.at(-1) ?? 'Library root';
+}
+
+type BrowserExtensionInstallation =
+  BrowserExtensionInstallStatus['installations'][number];
+
+const BROWSER_SETUP_TABS: Array<{ key: BrowserSetupTab; label: string }> = [
+  { key: 'chromium', label: 'Chrome / Edge' },
+  { key: 'firefox', label: 'Firefox' },
+];
+
+function browserTargetsForSetupTab(tab: BrowserSetupTab): BrowserTarget[] {
+  return tab === 'firefox' ? ['firefox'] : ['chrome', 'edge'];
+}
+
+function browserSetupTabLabel(tab: BrowserSetupTab): string {
+  return tab === 'firefox' ? 'Firefox' : 'Chrome / Edge';
+}
+
+function savedChromiumExtensionId(onboarding?: OnboardingState | null): string {
+  return (
+    onboarding?.extensionRegistrations?.chrome?.extensionId ??
+    onboarding?.extensionRegistrations?.edge?.extensionId ??
+    onboarding?.extensionRegistration?.extensionId ??
+    ''
+  );
+}
+
+function savedFirefoxExtensionId(onboarding?: OnboardingState | null): string {
+  return onboarding?.extensionRegistrations?.firefox?.extensionId ?? '';
+}
+
+function hasAnySavedExtensionRegistration(
+  onboarding?: OnboardingState | null,
+): boolean {
+  return Boolean(
+    onboarding?.extensionRegistration?.extensionId ||
+    Object.values(onboarding?.extensionRegistrations ?? {}).some(
+      (registration) => registration?.extensionId,
+    ),
+  );
+}
+
+function getExtensionManifestPath(extensionPath: string): string {
+  return `${extensionPath.replace(/[\\/]+$/g, '')}\\manifest.json`;
+}
+
+function browserExtensionBrowserLabel(
+  browser: BrowserExtensionInstallation['browser'],
+): string {
+  if (browser === 'chrome') {
+    return 'Chrome';
+  }
+  return browser === 'edge' ? 'Edge' : 'Firefox';
+}
+
+function browserExtensionInstallLabel(
+  install: BrowserExtensionInstallation,
+): string {
+  return `${browserExtensionBrowserLabel(install.browser)} ${install.profileName}`;
+}
+
+function browserExtensionStatusColor(
+  status: BrowserExtensionInstallStatus | null,
+): 'green' | 'yellow' | 'red' {
+  if (status?.enabled) {
+    return 'green';
+  }
+  return status?.detected ? 'yellow' : 'red';
+}
+
+function browserExtensionStatusTitle(
+  status: BrowserExtensionInstallStatus | null,
+): string {
+  if (status?.enabled) {
+    return 'Extension detected';
+  }
+  return status?.detected ? 'Extension disabled' : 'Extension not detected';
+}
+
+function extensionSetupStatusColor(
+  status: BrowserExtensionInstallStatus | null,
+  nativeMessagingRegistered: boolean,
+): 'green' | 'yellow' | 'red' {
+  if (status?.enabled) {
+    return 'green';
+  }
+  if (nativeMessagingRegistered) {
+    return 'yellow';
+  }
+  return browserExtensionStatusColor(status);
+}
+
+function extensionSetupStatusTitle(
+  status: BrowserExtensionInstallStatus | null,
+  nativeMessagingRegistered: boolean,
+): string {
+  if (status?.enabled) {
+    return 'Extension detected';
+  }
+  if (nativeMessagingRegistered) {
+    return 'Native messaging registered';
+  }
+  return browserExtensionStatusTitle(status);
+}
+
+function extensionSetupStatusMessage(
+  status: BrowserExtensionInstallStatus | null,
+  nativeMessagingRegistered: boolean,
+): string {
+  if (status?.enabled) {
+    return status.message;
+  }
+  if (nativeMessagingRegistered) {
+    return status?.detected
+      ? 'Native messaging is registered. Enable or reload the browser extension to complete the connection.'
+      : 'Native messaging is registered. Reload the unpacked extension, then open the popup once.';
+  }
+  return (
+    status?.message ??
+    'Check whether the GameVault extension is loaded in Chrome, Edge, or Firefox.'
+  );
 }
 
 function normalizeSettingsLibraryRoots(
@@ -883,22 +1099,52 @@ function canCancelDownload(item: TrackedItemView): boolean {
   );
 }
 
-function canCompleteManualInstall(item: TrackedItemView): boolean {
+function isManualElamigosFullReplacement(item: TrackedItemView): boolean {
+  const job = item.currentDownload;
+  if (
+    !job ||
+    job.provider !== 'manual' ||
+    job.sourceKind !== 'elamigos'
+  ) {
+    return false;
+  }
+  if (job.parts && job.parts.length > 0) {
+    return job.parts.some(
+      (part) => part.role === 'full' && Boolean(part.mirrorUrl?.trim()),
+    );
+  }
+  return Boolean(job.selectedMirrorUrl?.trim());
+}
+
+function canConfirmManualDownloadReady(item: TrackedItemView): boolean {
   return Boolean(
-    item.currentDownload?.provider === 'manual' &&
+    isManualElamigosFullReplacement(item) &&
+      item.currentDownload &&
+      item.currentDownload.stage !== 'staged' &&
       item.currentDownload.stage !== 'complete' &&
       item.currentDownload.stage !== 'failed',
+  );
+}
+
+function canCompleteManualInstall(item: TrackedItemView): boolean {
+  if (isManualElamigosFullReplacement(item)) {
+    return item.currentDownload?.stage === 'staged';
+  }
+  return Boolean(
+    item.currentDownload?.provider === 'manual' &&
+    item.currentDownload.stage !== 'complete' &&
+    item.currentDownload.stage !== 'failed',
   );
 }
 
 function canConfirmElamigosStagedInstall(item: TrackedItemView): boolean {
   return Boolean(
     item.currentDownload?.sourceKind === 'elamigos' &&
-      item.currentDownload.provider !== 'manual' &&
-      (item.currentDownload.stage === 'staged' ||
-        (item.currentDownload.stage === 'extracting' &&
-          item.currentDownload.statusMessage ===
-            'Waiting for JDownloader extraction to finish')),
+    item.currentDownload.provider !== 'manual' &&
+    (item.currentDownload.stage === 'staged' ||
+      (item.currentDownload.stage === 'extracting' &&
+        item.currentDownload.statusMessage ===
+          'Waiting for JDownloader extraction to finish')),
   );
 }
 
@@ -1204,12 +1450,11 @@ function extractPatchVersionFromTitle(
 }
 
 function getPatchDisplayVersion(
-  patch:
-    | Pick<SteamPatchCandidate, 'patchTitle' | 'version'>
-    | null
-    | undefined,
+  patch: Pick<SteamPatchCandidate, 'patchTitle' | 'version'> | null | undefined,
 ): string | null {
-  return patch?.version?.trim() || extractPatchVersionFromTitle(patch?.patchTitle);
+  return (
+    patch?.version?.trim() || extractPatchVersionFromTitle(patch?.patchTitle)
+  );
 }
 
 function getPatchTitleDisplay(
@@ -1460,12 +1705,9 @@ function sortImportCandidates(
   });
 }
 
-function resolveTheme(
-  themeMode: ThemeMode | null | undefined,
-  systemPrefersDark: boolean,
-): ResolvedTheme {
+function resolveTheme(themeMode: ThemeMode | null | undefined): ResolvedTheme {
   if (themeMode === 'light' || themeMode === 'dark') return themeMode;
-  return systemPrefersDark ? 'dark' : 'light';
+  return 'dark';
 }
 
 function getSteamPortraitCoverUrl(item: TrackedItemView): string | null {
@@ -1507,13 +1749,23 @@ function App() {
   );
   const [detailsItemId, setDetailsItemId] = useState<string | null>(null);
   const [items, setItems] = useState<TrackedItemView[]>([]);
-  const [logs, setLogs] = useState<EventLogRecord[]>([]);
+  const [activity, setActivity] = useState<ActivityView | null>(null);
+  const [activityActionBusy, setActivityActionBusy] = useState<string | null>(
+    null,
+  );
+  const [activityLogFilter, setActivityLogFilter] =
+    useState<ActivityLogFilter>('all');
+  const [activitySearch, setActivitySearch] = useState('');
+  const [activityLogPage, setActivityLogPage] = useState(1);
+  const [activityReportCopied, setActivityReportCopied] = useState(false);
   const [settings, setSettings] = useState<SettingsView>({
     myJDownloaderPasswordConfigured: false,
-    themeMode: 'system',
+    themeMode: 'dark',
   });
   const [connectionHealth, setConnectionHealth] =
     useState<ConnectionHealthSummary | null>(null);
+  const [desktopHealth, setDesktopHealth] =
+    useState<DesktopHealthSummary | null>(null);
   const [settingsDraft, setSettingsDraft] = useState(() => ({
     ...DEFAULT_SETTINGS_DRAFT,
   }));
@@ -1561,6 +1813,30 @@ function App() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<ItemBusyAction | null>(null);
   const [authBusy, setAuthBusy] = useState(false);
+  const [healthRefreshBusy, setHealthRefreshBusy] = useState(false);
+  const [onboardingOpen, setOnboardingOpen] = useState(false);
+  const [onboardingStep, setOnboardingStep] =
+    useState<DesktopOnboardingStep>('jdownloader');
+  const [onboardingBusy, setOnboardingBusy] = useState(false);
+  const [onboardingMessage, setOnboardingMessage] = useState<string | null>(
+    null,
+  );
+  const [setupCopiedKey, setSetupCopiedKey] = useState<string | null>(null);
+  const [browserExtensionSetupTab, setBrowserExtensionSetupTab] =
+    useState<BrowserSetupTab>('chromium');
+  const [settingsExtensionSetupExpanded, setSettingsExtensionSetupExpanded] =
+    useState(false);
+  const [jDownloaderStatus, setJDownloaderStatus] =
+    useState<JDownloaderInstallStatus | null>(null);
+  const [browserExtensionStatus, setBrowserExtensionStatus] =
+    useState<BrowserExtensionInstallStatus | null>(null);
+  const [extensionSetupInfo, setExtensionSetupInfo] =
+    useState<ExtensionSetupInfo | null>(null);
+  const [extensionIdDraft, setExtensionIdDraft] = useState(
+    savedChromiumExtensionId(settings.onboarding),
+  );
+  const [extensionRegistrationResult, setExtensionRegistrationResult] =
+    useState<NativeHostRegistrationResult | null>(null);
   const [themeBusy, setThemeBusy] = useState(false);
   const [settingsSaveStatus, setSettingsSaveStatus] =
     useState<SettingsSaveStatus>('idle');
@@ -1591,9 +1867,12 @@ function App() {
     patches: SteamPatchCandidate[];
     selectedKey: string | null;
   } | null>(null);
+  const [appDialog, setAppDialog] = useState<AppDialogRequest | null>(null);
+  const setupCopiedTimerRef = useRef<number | null>(null);
   const patchEditorRequestIdRef = useRef(0);
-  const [systemPrefersDark, setSystemPrefersDark] = useState(
-    window.matchMedia('(prefers-color-scheme: dark)').matches,
+  const appDialogRequestIdRef = useRef(0);
+  const appDialogResolverRef = useRef<((confirmed: boolean) => void) | null>(
+    null,
   );
 
   const libraryTabCounts = useMemo(
@@ -1633,7 +1912,7 @@ function App() {
     () => items.find((item) => item.item.id === detailsItemId) ?? null,
     [detailsItemId, items],
   );
-  const resolvedTheme = resolveTheme(settings.themeMode, systemPrefersDark);
+  const resolvedTheme = resolveTheme(settings.themeMode);
   const libraryAutomationWarning = getLibraryAutomationWarning({
     connectionHealth,
     rootLibraryPath: settings.rootLibraryPath,
@@ -1682,45 +1961,520 @@ function App() {
     importBusy && importMessage === 'Scanning library roots...';
   const importSaving =
     importBusy && importMessage === 'Saving selected imports...';
+  const emptyLibraryState = getEmptyLibraryState(
+    items.length,
+    visibleLibraryItems.length,
+  );
+  const jDownloaderReadyForOnboarding =
+    canConfirmJDownloaderStep(jDownloaderStatus);
+  const myJDownloaderReadyForOnboarding =
+    canConfirmMyJDownloaderStep(connectionHealth);
+  const firefoxSetupExtensionId =
+    extensionSetupInfo?.firefoxExtensionId ?? FIREFOX_EXTENSION_ID;
+  const activeBrowserSetupExtensionId =
+    browserExtensionSetupTab === 'firefox'
+      ? firefoxSetupExtensionId
+      : extensionIdDraft;
+  const extensionIdIsValid = isValidExtensionSetupId(
+    activeBrowserSetupExtensionId,
+    browserExtensionSetupTab === 'firefox' ? 'firefox' : 'chrome',
+  );
+  const sortedActivityIssues = useMemo(
+    () => sortActivityIssues(activity?.issues ?? []),
+    [activity],
+  );
+  const visibleActivityLogs = useMemo(() => {
+    const search = activitySearch.trim().toLowerCase();
+    return (activity?.logs ?? []).filter((log) => {
+      if (activityLogFilter !== 'all' && log.level !== activityLogFilter) {
+        return false;
+      }
+      if (!search) {
+        return true;
+      }
+      const contextText = getActivityLogContextRows(log)
+        .map((row) => `${row.label} ${row.value}`)
+        .join(' ');
+      return `${log.message} ${log.level} ${contextText}`
+        .toLowerCase()
+        .includes(search);
+    });
+  }, [activity, activityLogFilter, activitySearch]);
+  const activityLogPageCount = Math.max(
+    1,
+    Math.ceil(visibleActivityLogs.length / ACTIVITY_LOGS_PER_PAGE),
+  );
+  const currentActivityLogPage = Math.min(
+    activityLogPage,
+    activityLogPageCount,
+  );
+  const paginatedActivityLogs = useMemo(() => {
+    const start = (currentActivityLogPage - 1) * ACTIVITY_LOGS_PER_PAGE;
+    return visibleActivityLogs.slice(start, start + ACTIVITY_LOGS_PER_PAGE);
+  }, [currentActivityLogPage, visibleActivityLogs]);
+  const activityLogRangeStart =
+    visibleActivityLogs.length === 0
+      ? 0
+      : (currentActivityLogPage - 1) * ACTIVITY_LOGS_PER_PAGE + 1;
+  const activityLogRangeEnd = Math.min(
+    visibleActivityLogs.length,
+    currentActivityLogPage * ACTIVITY_LOGS_PER_PAGE,
+  );
+
+  const closeAppDialog = useCallback((confirmed: boolean) => {
+    appDialogResolverRef.current?.(confirmed);
+    appDialogResolverRef.current = null;
+    setAppDialog(null);
+  }, []);
+
+  const showAppDialog = useCallback(
+    (options: AppDialogOptions & { kind: AppDialogRequest['kind']; message: string }) =>
+      new Promise<boolean>((resolve) => {
+        appDialogResolverRef.current?.(false);
+        const kind = options.kind;
+        appDialogResolverRef.current = resolve;
+        setAppDialog({
+          cancelLabel:
+            kind === 'confirm' ? (options.cancelLabel ?? 'Cancel') : null,
+          confirmLabel:
+            options.confirmLabel ?? (kind === 'confirm' ? 'Confirm' : 'OK'),
+          id: ++appDialogRequestIdRef.current,
+          kind,
+          message: options.message,
+          title:
+            options.title ??
+            (kind === 'confirm' ? 'Confirm Action' : 'GameVault'),
+          variant: options.variant ?? 'default',
+        });
+      }),
+    [],
+  );
+
+  const showAlert = useCallback(
+    (message: string, options: AppDialogOptions = {}) =>
+      showAppDialog({
+        ...options,
+        kind: 'alert',
+        message,
+      }).then(() => undefined),
+    [showAppDialog],
+  );
+
+  const showConfirm = useCallback(
+    (message: string, options: AppDialogOptions = {}) =>
+      showAppDialog({
+        ...options,
+        kind: 'confirm',
+        message,
+      }),
+    [showAppDialog],
+  );
+
+  useEffect(() => {
+    setActivityLogPage((page) =>
+      Math.min(Math.max(page, 1), activityLogPageCount),
+    );
+  }, [activityLogPageCount]);
+
+  useEffect(
+    () => () => {
+      if (setupCopiedTimerRef.current !== null) {
+        window.clearTimeout(setupCopiedTimerRef.current);
+      }
+      appDialogResolverRef.current?.(false);
+      appDialogResolverRef.current = null;
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!appDialog) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeAppDialog(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [appDialog, closeAppDialog]);
 
   async function refreshItems() {
-    const [trackedItems, loadedLogs] = await Promise.all([
-      window.vaultTrackApi.listTrackedItems(),
-      window.vaultTrackApi.getLogs(),
+    const [trackedItems, loadedActivity] = await Promise.all([
+      window.gameVaultApi.listTrackedItems(),
+      window.gameVaultApi.getActivity(),
     ]);
     startTransition(() => {
       setItems(trackedItems);
-      setLogs(loadedLogs);
+      setActivity(loadedActivity);
     });
   }
 
-  function mergeTrackedItemView(updated: TrackedItemView) {
+  const mergeTrackedItemViews = useCallback((updatedItems: TrackedItemView[]) => {
+    if (updatedItems.length === 0) return;
+    const updates = new Map(
+      updatedItems.map((item) => [item.item.id, item] as const),
+    );
     startTransition(() => {
-      setItems((current) =>
-        current.map((item) =>
-          item.item.id === updated.item.id ? updated : item,
-        ),
-      );
-      setSourcesModal((current) =>
-        current?.item.item.id === updated.item.id
-          ? { ...current, item: updated }
-          : current,
-      );
-      setUpdateFlow((current) =>
-        current?.item.item.id === updated.item.id
-          ? { ...current, item: updated }
-          : current,
-      );
+      setItems((current) => {
+        const seen = new Set<string>();
+        const merged = current.map((item) => {
+          seen.add(item.item.id);
+          return updates.get(item.item.id) ?? item;
+        });
+        for (const updated of updatedItems) {
+          if (!seen.has(updated.item.id)) {
+            merged.push(updated);
+          }
+        }
+        return merged;
+      });
+      setSourcesModal((current) => {
+        if (!current) return current;
+        const updated = updates.get(current.item.item.id);
+        return updated ? { ...current, item: updated } : current;
+      });
+      setUpdateFlow((current) => {
+        if (!current) return current;
+        const updated = updates.get(current.item.item.id);
+        return updated ? { ...current, item: updated } : current;
+      });
+      setRetrySelection((current) => {
+        if (!current) return current;
+        const updated = updates.get(current.item.item.id);
+        return updated ? { ...current, item: updated } : current;
+      });
+      setImportedSourceEditor((current) => {
+        if (!current) return current;
+        const updated = updates.get(current.item.item.id);
+        return updated ? { ...current, item: updated } : current;
+      });
+      setPatchEditor((current) => {
+        if (!current) return current;
+        const updated = updates.get(current.item.item.id);
+        return updated ? { ...current, item: updated } : current;
+      });
     });
-  }
+  }, []);
 
-  async function refreshConnectionHealth() {
-    const nextHealth = await window.vaultTrackApi.getConnectionHealth();
+  const mergeTrackedItemView = useCallback((updated: TrackedItemView) => {
+    mergeTrackedItemViews([updated]);
+  }, [mergeTrackedItemViews]);
+
+  async function refreshConnectionHealth(options?: { forceRefresh?: boolean }) {
+    const nextHealth = await window.gameVaultApi.getConnectionHealth(options);
     setConnectionHealth(nextHealth);
     setAuthDraft((current) => ({
       ...current,
       selectedDeviceId: nextHealth.selectedDeviceId ?? current.selectedDeviceId,
     }));
+    return nextHealth;
+  }
+
+  async function refreshDesktopHealth(options?: { forceRefresh?: boolean }) {
+    const nextHealth = await window.gameVaultApi.getDesktopHealth(options);
+    setDesktopHealth(nextHealth);
+    return nextHealth;
+  }
+
+  async function refreshNavbarHealth(options?: { forceRefresh?: boolean }) {
+    setHealthRefreshBusy(true);
+    try {
+      const [nextConnectionHealth] = await Promise.all([
+        refreshConnectionHealth(options),
+        refreshDesktopHealth(options),
+      ]);
+      return nextConnectionHealth;
+    } finally {
+      setHealthRefreshBusy(false);
+    }
+  }
+
+  async function refreshJDownloaderStatus() {
+    const nextStatus = await window.gameVaultApi.detectJDownloader();
+    setJDownloaderStatus(nextStatus);
+    return nextStatus;
+  }
+
+  async function refreshExtensionSetupInfo() {
+    const nextInfo = await window.gameVaultApi.getExtensionSetupInfo();
+    setExtensionSetupInfo(nextInfo);
+    return nextInfo;
+  }
+
+  async function refreshBrowserExtensionStatus() {
+    const nextStatus = await window.gameVaultApi.detectBrowserExtension();
+    setBrowserExtensionStatus(nextStatus);
+    return nextStatus;
+  }
+
+  async function saveOnboardingPatch(patch: Partial<OnboardingState>) {
+    const nextSettings = await window.gameVaultApi.saveOnboardingState(patch);
+    setSettings(nextSettings);
+    syncSettingsDrafts(nextSettings);
+    syncAuthDraft(nextSettings);
+    setExtensionIdDraft(savedChromiumExtensionId(nextSettings.onboarding));
+    return nextSettings;
+  }
+
+  function timestampNow(): string {
+    return new Date().toISOString();
+  }
+
+  function openOnboardingGuide(step: DesktopOnboardingStep = 'jdownloader') {
+    setOnboardingStep(step);
+    setOnboardingMessage(null);
+    setOnboardingOpen(true);
+    if (step === 'myjdownloader') {
+      void refreshNavbarHealth({ forceRefresh: true }).catch(() => undefined);
+    }
+    if (step === 'extension') {
+      void Promise.allSettled([
+        refreshExtensionSetupInfo(),
+        refreshBrowserExtensionStatus(),
+        refreshDesktopHealth({ forceRefresh: true }),
+      ]);
+    }
+  }
+
+  async function confirmJDownloaderSetup() {
+    setOnboardingBusy(true);
+    setOnboardingMessage(null);
+    try {
+      const status = jDownloaderStatus ?? (await refreshJDownloaderStatus());
+      if (!canConfirmJDownloaderStep(status)) {
+        setOnboardingMessage(
+          'Install or start JDownloader, then refresh detection.',
+        );
+        return;
+      }
+      const nextSettings = await window.gameVaultApi.saveSettings({
+        jDownloaderEnabled: true,
+        jDownloaderSourcePreferences: {
+          elamigos: true,
+          steamrip: true,
+        },
+      });
+      setSettings(nextSettings);
+      syncSettingsDrafts(nextSettings);
+      await saveOnboardingPatch({
+        jDownloaderConfirmedAt: timestampNow(),
+        jDownloaderSkippedAt: null,
+      });
+      setOnboardingStep('myjdownloader');
+    } catch (error) {
+      setOnboardingMessage(
+        error instanceof Error
+          ? error.message
+          : 'Unable to confirm JDownloader setup.',
+      );
+    } finally {
+      setOnboardingBusy(false);
+    }
+  }
+
+  async function skipJDownloaderSetup() {
+    setOnboardingBusy(true);
+    setOnboardingMessage(null);
+    try {
+      await saveOnboardingPatch({
+        jDownloaderSkippedAt: timestampNow(),
+      });
+      setOnboardingStep('myjdownloader');
+    } finally {
+      setOnboardingBusy(false);
+    }
+  }
+
+  async function connectMyJDownloaderFromOnboarding() {
+    if (!authDraft.email || !authDraft.password) {
+      setOnboardingMessage(
+        'Enter your MyJDownloader email and password first.',
+      );
+      return;
+    }
+    setAuthBusy(true);
+    setOnboardingMessage(null);
+    try {
+      const nextHealth = await window.gameVaultApi.authenticateMyJDownloader({
+        email: authDraft.email,
+        password: authDraft.password,
+      });
+      setConnectionHealth(nextHealth);
+      setAuthDraft((current) => ({
+        ...current,
+        password: '',
+        selectedDeviceId:
+          nextHealth.selectedDeviceId ?? current.selectedDeviceId,
+      }));
+      await refreshDesktopHealth({ forceRefresh: true });
+      await refreshSettings();
+    } catch (error) {
+      setOnboardingMessage(
+        error instanceof Error
+          ? error.message
+          : 'Unable to connect MyJDownloader.',
+      );
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function selectMyJDownloaderDeviceFromOnboarding() {
+    if (!authDraft.selectedDeviceId) {
+      return;
+    }
+    setAuthBusy(true);
+    setOnboardingMessage(null);
+    try {
+      setConnectionHealth(
+        await window.gameVaultApi.selectMyJDownloaderDevice(
+          authDraft.selectedDeviceId,
+        ),
+      );
+      await refreshDesktopHealth({ forceRefresh: true });
+      await refreshSettings();
+    } catch (error) {
+      setOnboardingMessage(
+        error instanceof Error
+          ? error.message
+          : 'Unable to select this JDownloader device.',
+      );
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function confirmMyJDownloaderSetup() {
+    setOnboardingBusy(true);
+    setOnboardingMessage(null);
+    try {
+      const health = await refreshNavbarHealth({ forceRefresh: true });
+      if (!canConfirmMyJDownloaderStep(health)) {
+        setOnboardingMessage(
+          'Connect MyJDownloader and choose a device before confirming.',
+        );
+        return;
+      }
+      await saveOnboardingPatch({
+        myJDownloaderConfirmedAt: timestampNow(),
+        myJDownloaderSkippedAt: null,
+      });
+      setOnboardingStep('extension');
+    } finally {
+      setOnboardingBusy(false);
+    }
+  }
+
+  async function skipMyJDownloaderSetup() {
+    setOnboardingBusy(true);
+    setOnboardingMessage(null);
+    try {
+      await saveOnboardingPatch({
+        myJDownloaderSkippedAt: timestampNow(),
+      });
+      setOnboardingStep('extension');
+    } finally {
+      setOnboardingBusy(false);
+    }
+  }
+
+  async function registerExtensionForSetup(
+    tab: BrowserSetupTab = browserExtensionSetupTab,
+  ) {
+    setOnboardingBusy(true);
+    setOnboardingMessage(null);
+    try {
+      const setupExtensionId =
+        tab === 'firefox' ? firefoxSetupExtensionId : extensionIdDraft.trim();
+      const validationBrowser = tab === 'firefox' ? 'firefox' : 'chrome';
+      if (!isValidExtensionSetupId(setupExtensionId, validationBrowser)) {
+        setOnboardingMessage(
+          tab === 'firefox'
+            ? `Use the Firefox add-on ID ${FIREFOX_EXTENSION_ID}.`
+            : 'Enter the 32-character extension ID from Chrome or Edge.',
+        );
+        return;
+      }
+      const result = await window.gameVaultApi.registerExtensionNativeHost({
+        browsers: browserTargetsForSetupTab(tab),
+        extensionId: setupExtensionId,
+      });
+      setExtensionRegistrationResult(result);
+      if (tab === 'chromium') {
+        setExtensionIdDraft(result.extensionId);
+      }
+      const extensionRegistrations = Object.fromEntries(
+        result.browsers.map((browser) => [
+          browser,
+          {
+            browsers: [browser],
+            extensionId: result.extensionId,
+            manifestPath:
+              result.manifestPaths?.[browser] ?? result.manifestPath,
+            manifestPaths: result.manifestPaths,
+            registeredAt: result.registeredAt,
+          } satisfies NativeHostRegistrationMetadata,
+        ]),
+      ) as Partial<Record<BrowserTarget, NativeHostRegistrationMetadata>>;
+      const onboardingPatch: Partial<OnboardingState> = {
+        extensionConfirmedAt: timestampNow(),
+        extensionRegistrations,
+        extensionSkippedAt: null,
+      };
+      if (tab === 'chromium') {
+        onboardingPatch.extensionRegistration = {
+          browsers: result.browsers,
+          extensionId: result.extensionId,
+          manifestPath: result.manifestPath,
+          manifestPaths: result.manifestPaths,
+          registeredAt: result.registeredAt,
+        };
+      }
+      await saveOnboardingPatch(onboardingPatch);
+      await Promise.allSettled([
+        refreshExtensionSetupInfo(),
+        refreshBrowserExtensionStatus(),
+        refreshDesktopHealth({ forceRefresh: true }),
+      ]);
+      setOnboardingMessage(
+        `Native messaging is registered for ${browserSetupTabLabel(tab)}.`,
+      );
+    } catch (error) {
+      setOnboardingMessage(
+        error instanceof Error
+          ? error.message
+          : 'Unable to register the extension native host.',
+      );
+    } finally {
+      setOnboardingBusy(false);
+    }
+  }
+
+  async function finishOnboarding() {
+    setOnboardingBusy(true);
+    try {
+      await saveOnboardingPatch({
+        completedAt: timestampNow(),
+        skippedAt: null,
+      });
+      setOnboardingOpen(false);
+    } finally {
+      setOnboardingBusy(false);
+    }
+  }
+
+  async function skipExtensionAndCloseOnboarding() {
+    setOnboardingBusy(true);
+    try {
+      await saveOnboardingPatch({
+        extensionSkippedAt: timestampNow(),
+        skippedAt: timestampNow(),
+      });
+      setOnboardingOpen(false);
+    } finally {
+      setOnboardingBusy(false);
+    }
   }
 
   function syncSettingsDrafts(loadedSettings: SettingsView): void {
@@ -1768,16 +2522,17 @@ function App() {
   }
 
   async function refreshSettings() {
-    const nextSettings = await window.vaultTrackApi.getSettings();
+    const nextSettings = await window.gameVaultApi.getSettings();
     setSettings(nextSettings);
     syncSettingsDrafts(nextSettings);
     syncAuthDraft(nextSettings);
+    setExtensionIdDraft(savedChromiumExtensionId(nextSettings.onboarding));
   }
 
   async function saveTheme(themeMode: ThemeMode) {
     setThemeBusy(true);
     try {
-      setSettings(await window.vaultTrackApi.saveSettings({ themeMode }));
+      setSettings(await window.gameVaultApi.saveSettings({ themeMode }));
       await refreshSettings();
     } finally {
       setThemeBusy(false);
@@ -1788,7 +2543,7 @@ function App() {
     setSettingsSaveStatus('saving');
     try {
       setSettings(
-        await window.vaultTrackApi.saveSettings({
+        await window.gameVaultApi.saveSettings({
           jDownloaderEnabled: settingsDraft.jDownloaderEnabled,
           jDownloaderSourcePreferences:
             settingsDraft.jDownloaderSourcePreferences,
@@ -2052,7 +2807,7 @@ function App() {
     setImportBusy(true);
     setImportMessage('Scanning library roots...');
     try {
-      const candidates = await window.vaultTrackApi.scanImportCandidates();
+      const candidates = await window.gameVaultApi.scanImportCandidates();
       initializeImportRows(candidates);
       setImportMessage(
         candidates.length ? null : 'No untracked folders found.',
@@ -2070,11 +2825,12 @@ function App() {
     setImportBusy(true);
     setImportMessage(`Ignoring ${candidate.folderName}...`);
     try {
-      const ignoredImportFolders =
-        await window.vaultTrackApi.ignoreImportFolder({
+      const ignoredImportFolders = await window.gameVaultApi.ignoreImportFolder(
+        {
           folderName: candidate.folderName,
           rootPath: candidate.rootPath,
-        });
+        },
+      );
       setSettings((current) => ({
         ...current,
         ignoredImportFolders,
@@ -2115,7 +2871,7 @@ function App() {
     });
 
     try {
-      const feedResult = await window.vaultTrackApi.resolveSteamPatches({
+      const feedResult = await window.gameVaultApi.resolveSteamPatches({
         appId,
       });
       const patches = mergePatchCandidates(feedResult.patches);
@@ -2174,8 +2930,7 @@ function App() {
     }));
 
     try {
-      const lookup =
-        await window.vaultTrackApi.requestSteamDbBuildLookup(appId);
+      const lookup = await window.gameVaultApi.requestSteamDbBuildLookup(appId);
       setActiveImportBuildLookupRowId((current) => current ?? candidate.id);
       if (lookup.status === 'failed') {
         if (lookup.attentionKind === 'cloudflare') {
@@ -2218,7 +2973,7 @@ function App() {
         );
         return;
       }
-      await window.vaultTrackApi.openExternal(buildSteamDbPatchnotesUrl(appId));
+      await window.gameVaultApi.openExternal(buildSteamDbPatchnotesUrl(appId));
     } catch (error) {
       updateImportRow(candidate.id, (row) => ({
         ...row,
@@ -2321,7 +3076,7 @@ function App() {
     );
 
     try {
-      const result = await window.vaultTrackApi.resolveSteamMatch({
+      const result = await window.gameVaultApi.resolveSteamMatch({
         queryTitle: query,
         title: modal.candidate.title,
       });
@@ -2546,7 +3301,7 @@ function App() {
           };
         },
       );
-      const result = await window.vaultTrackApi.saveImportBatch({ rows });
+      const result = await window.gameVaultApi.saveImportBatch({ rows });
       setImportMessage(`${result.imported.length} imports saved.`);
       setImportCandidates((current) =>
         current.filter(
@@ -2738,7 +3493,7 @@ function App() {
       retryAfterMs: null,
     }));
 
-    void window.vaultTrackApi
+    void window.gameVaultApi
       .requestSteamDbBuildLookup(appId)
       .then((lookup) => {
         if (lookup.status === 'failed') {
@@ -2823,7 +3578,7 @@ function App() {
 
     const poll = () => {
       for (const pending of pendingLookups) {
-        void window.vaultTrackApi
+        void window.gameVaultApi
           .getSteamDbBuildLookup(pending.lookupId)
           .then((lookup) => {
             if (!lookup) {
@@ -2917,18 +3672,6 @@ function App() {
   ]);
 
   useEffect(() => {
-    const media = window.matchMedia('(prefers-color-scheme: dark)');
-    const listener = (event: MediaQueryListEvent) =>
-      setSystemPrefersDark(event.matches);
-    if (media.addEventListener) {
-      media.addEventListener('change', listener);
-      return () => media.removeEventListener('change', listener);
-    }
-    media.addListener(listener);
-    return () => media.removeListener(listener);
-  }, []);
-
-  useEffect(() => {
     document.documentElement.dataset.theme = resolvedTheme;
     document.documentElement.style.colorScheme = resolvedTheme;
   }, [resolvedTheme]);
@@ -2957,29 +3700,97 @@ function App() {
 
   useEffect(() => {
     void Promise.all([
-      window.vaultTrackApi.listTrackedItems(),
-      window.vaultTrackApi.getSettings(),
-      window.vaultTrackApi.getLogs(),
-      window.vaultTrackApi.getConnectionHealth(),
-    ]).then(([trackedItems, loadedSettings, loadedLogs, health]) => {
-      setItems(trackedItems);
-      setSettings(loadedSettings);
-      setLogs(loadedLogs);
-      setConnectionHealth(health);
-      syncSettingsDrafts(loadedSettings);
-      setAuthDraft({
-        email: loadedSettings.myJDownloaderEmail ?? '',
-        password: '',
-        selectedDeviceId: health.selectedDeviceId ?? '',
-      });
-    });
+      window.gameVaultApi.listTrackedItems(),
+      window.gameVaultApi.getSettings(),
+      window.gameVaultApi.getActivity(),
+      window.gameVaultApi.getConnectionHealth(),
+      window.gameVaultApi.getDesktopHealth(),
+    ]).then(
+      ([trackedItems, loadedSettings, loadedActivity, health, desktop]) => {
+        setItems(trackedItems);
+        setSettings(loadedSettings);
+        setActivity(loadedActivity);
+        setConnectionHealth(health);
+        setDesktopHealth(desktop);
+        syncSettingsDrafts(loadedSettings);
+        setAuthDraft({
+          email: loadedSettings.myJDownloaderEmail ?? '',
+          password: '',
+          selectedDeviceId: health.selectedDeviceId ?? '',
+        });
+        setExtensionIdDraft(
+          savedChromiumExtensionId(loadedSettings.onboarding),
+        );
+        if (
+          shouldShowFirstLaunchOnboarding(loadedSettings, trackedItems.length)
+        ) {
+          setOnboardingOpen(true);
+        }
+      },
+    );
   }, []);
 
   useEffect(() => {
+    return window.gameVaultApi.onDownloadProgress((payload) => {
+      mergeTrackedItemViews(payload.items);
+    });
+  }, [mergeTrackedItemViews]);
+
+  useEffect(() => {
+    if (!onboardingOpen) return;
+    void Promise.all([
+      refreshJDownloaderStatus(),
+      refreshBrowserExtensionStatus(),
+      refreshExtensionSetupInfo(),
+      refreshConnectionHealth(),
+      refreshDesktopHealth(),
+    ]).catch(() => undefined);
+  }, [onboardingOpen]);
+
+  useEffect(() => {
+    if (!onboardingOpen || onboardingStep !== 'extension') {
+      return;
+    }
+    void refreshBrowserExtensionStatus().catch(() => undefined);
+  }, [onboardingOpen, onboardingStep]);
+
+  useEffect(() => {
+    if (
+      !(onboardingOpen && onboardingStep === 'extension') &&
+      section !== 'settings'
+    ) {
+      return;
+    }
+    if (browserExtensionSetupTab !== 'chromium') {
+      return;
+    }
+    const installations = (browserExtensionStatus?.installations ?? []).filter(
+      (install) => install.browser === 'chrome' || install.browser === 'edge',
+    );
+    if (installations.length !== 1) {
+      return;
+    }
+    const detectedExtensionId = installations[0]!.extensionId;
+    const draft = extensionIdDraft.trim();
+    if (!draft || !isValidExtensionSetupId(draft)) {
+      setExtensionIdDraft(detectedExtensionId);
+    }
+  }, [
+    browserExtensionStatus,
+    browserExtensionSetupTab,
+    extensionIdDraft,
+    onboardingOpen,
+    onboardingStep,
+    section,
+  ]);
+
+  useEffect(() => {
     const refresh = () => {
-      void Promise.all([refreshConnectionHealth(), refreshItems()]).catch(
-        () => undefined,
-      );
+      void Promise.all([
+        refreshConnectionHealth(),
+        refreshDesktopHealth(),
+        refreshItems(),
+      ]).catch(() => undefined);
     };
     const refreshWhenVisible = () => {
       if (!document.hidden) {
@@ -2998,9 +3809,13 @@ function App() {
 
   useEffect(() => {
     if (section !== 'settings') return;
-    void Promise.all([refreshConnectionHealth(), refreshSettings()]).catch(
-      () => undefined,
-    );
+    void Promise.all([
+      refreshConnectionHealth(),
+      refreshDesktopHealth(),
+      refreshBrowserExtensionStatus(),
+      refreshExtensionSetupInfo(),
+      refreshSettings(),
+    ]).catch(() => undefined);
   }, [section]);
 
   function actionErrorMessage(error: unknown, fallback = 'Action failed.') {
@@ -3012,14 +3827,14 @@ function App() {
   ): Promise<void> {
     let primaryRefreshError: unknown = null;
     try {
-      await window.vaultTrackApi.refreshTrackedItem(trackedItemId);
+      await window.gameVaultApi.refreshTrackedItem(trackedItemId);
     } catch (error) {
       primaryRefreshError = error;
     }
 
     let updated: TrackedItemView;
     try {
-      updated = await window.vaultTrackApi.discoverSourceMatches(trackedItemId);
+      updated = await window.gameVaultApi.discoverSourceMatches(trackedItemId);
     } catch (error) {
       if (primaryRefreshError) {
         throw new Error(
@@ -3048,7 +3863,7 @@ function App() {
       await action();
       await refreshItems();
     } catch (error) {
-      window.alert(actionErrorMessage(error));
+      await showAlert(actionErrorMessage(error));
     } finally {
       setBusyId(null);
       setBusyAction(null);
@@ -3080,14 +3895,14 @@ function App() {
     setBusyId(item.item.id);
     setBusyAction('updateInstall');
     try {
-      await window.vaultTrackApi.updateInstallRecord({
+      await window.gameVaultApi.updateInstallRecord({
         installedSourceKind: importedSourceEditor.sourceKind,
         trackedItemId: item.item.id,
       });
       setImportedSourceEditor(null);
       await refreshItems();
     } catch (error) {
-      window.alert(error instanceof Error ? error.message : 'Action failed.');
+      await showAlert(error instanceof Error ? error.message : 'Action failed.');
     } finally {
       setBusyId(null);
       setBusyAction(null);
@@ -3099,7 +3914,7 @@ function App() {
     setBusyAction('sources');
     setSourceBusyKind('matches');
     try {
-      const updated = await window.vaultTrackApi.discoverSourceMatches(
+      const updated = await window.gameVaultApi.discoverSourceMatches(
         item.item.id,
       );
       setSourcesModal((current) =>
@@ -3107,7 +3922,7 @@ function App() {
       );
       await refreshItems();
     } catch (error) {
-      window.alert(error instanceof Error ? error.message : 'Action failed.');
+      await showAlert(error instanceof Error ? error.message : 'Action failed.');
     } finally {
       setBusyId(null);
       setBusyAction(null);
@@ -3121,7 +3936,7 @@ function App() {
     setBusyAction('sources');
     setSourceBusyKind('manual');
     try {
-      const updated = await window.vaultTrackApi.setManualSourceMatch({
+      const updated = await window.gameVaultApi.setManualSourceMatch({
         sourceKind: sourcesModal.manualSourceKind,
         sourceUrl: sourcesModal.manualUrl.trim(),
         trackedItemId: sourcesModal.item.item.id,
@@ -3138,7 +3953,7 @@ function App() {
       );
       await refreshItems();
     } catch (error) {
-      window.alert(error instanceof Error ? error.message : 'Action failed.');
+      await showAlert(error instanceof Error ? error.message : 'Action failed.');
     } finally {
       setBusyId(null);
       setBusyAction(null);
@@ -3152,7 +3967,7 @@ function App() {
     setBusyAction('sources');
     setSourceBusyKind(sourceKind);
     try {
-      const updated = await window.vaultTrackApi.refreshMatchedSource({
+      const updated = await window.gameVaultApi.refreshMatchedSource({
         sourceKind,
         trackedItemId: sourcesModal.item.item.id,
       });
@@ -3161,7 +3976,7 @@ function App() {
       );
       await refreshItems();
     } catch (error) {
-      window.alert(error instanceof Error ? error.message : 'Action failed.');
+      await showAlert(error instanceof Error ? error.message : 'Action failed.');
     } finally {
       setBusyId(null);
       setBusyAction(null);
@@ -3201,8 +4016,8 @@ function App() {
       params.item.latestPatch,
     ];
     const seedPatches = mergePatchCandidates(
-      seedCandidates.filter(
-        (patch): patch is SteamPatchCandidate => Boolean(patch),
+      seedCandidates.filter((patch): patch is SteamPatchCandidate =>
+        Boolean(patch),
       ),
     );
     const patchSelection = getUpdatePatchSelection(
@@ -3263,11 +4078,88 @@ function App() {
     };
   }
 
-  async function copyManualUpdateText(value: string) {
+  async function copyManualUpdateText(value: string, feedbackKey?: string) {
     try {
       await navigator.clipboard.writeText(value);
+      if (feedbackKey) {
+        setSetupCopiedKey(feedbackKey);
+        if (setupCopiedTimerRef.current !== null) {
+          window.clearTimeout(setupCopiedTimerRef.current);
+        }
+        setupCopiedTimerRef.current = window.setTimeout(() => {
+          setSetupCopiedKey((current) =>
+            current === feedbackKey ? null : current,
+          );
+          setupCopiedTimerRef.current = null;
+        }, 1600);
+      }
     } catch {
-      window.alert('Unable to copy to clipboard.');
+      await showAlert('Unable to copy to clipboard.');
+    }
+  }
+
+  async function copyActivityReport() {
+    if (!activity) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(
+        buildActivityReport({ activity, settings }),
+      );
+      setActivityReportCopied(true);
+      window.setTimeout(() => setActivityReportCopied(false), 2000);
+    } catch {
+      await showAlert('Unable to copy activity report.');
+    }
+  }
+
+  async function runActivityAction(issue: ActivityIssue) {
+    const action = issue.action;
+    if (!action || action.disabledReason) {
+      return;
+    }
+    if (action.target === 'settings') {
+      setSection('settings');
+      return;
+    }
+    if (!action.payload) {
+      return;
+    }
+
+    setActivityActionBusy(issue.id);
+    try {
+      const nextActivity = await window.gameVaultApi.runActivityAction(
+        action.payload,
+      );
+      const trackedItems = await window.gameVaultApi.listTrackedItems();
+      startTransition(() => {
+        setActivity(nextActivity);
+        setItems(trackedItems);
+      });
+    } finally {
+      setActivityActionBusy(null);
+    }
+  }
+
+  async function clearActivityIssue(issue: ActivityIssue) {
+    if (!issue.dismissalKey) {
+      return;
+    }
+
+    const busyKey = `clear:${issue.id}`;
+    setActivityActionBusy(busyKey);
+    try {
+      const nextActivity = await window.gameVaultApi.runActivityAction({
+        issueId: issue.id,
+        issueKey: issue.dismissalKey,
+        trackedItemId: issue.trackedItemId ?? null,
+        type: 'dismissActivityIssue',
+      });
+      startTransition(() => {
+        setActivity(nextActivity);
+      });
+    } finally {
+      setActivityActionBusy(null);
     }
   }
 
@@ -3289,7 +4181,7 @@ function App() {
     setSourceBusyKind(flow.sourceKind);
     let patches = flow.patches;
     try {
-      const persistedPatches = await window.vaultTrackApi.listSteamPatchEntries(
+      const persistedPatches = await window.gameVaultApi.listSteamPatchEntries(
         flow.item.item.id,
       );
       patches = mergePatchCandidates([...patches, ...persistedPatches]);
@@ -3305,7 +4197,7 @@ function App() {
           : current,
       );
 
-      const resolvedPatches = await window.vaultTrackApi.resolveSteamPatches({
+      const resolvedPatches = await window.gameVaultApi.resolveSteamPatches({
         appId: flow.item.item.steamAppId,
       });
       patches = mergePatchCandidates([...patches, ...resolvedPatches.patches]);
@@ -3349,7 +4241,7 @@ function App() {
       (entry) => entry.match.sourceKind === sourceKind,
     );
     if (!source) {
-      window.alert(
+      await showAlert(
         `No cached ${formatTrackedSourceKind(sourceKind)} source is available.`,
       );
       return;
@@ -3361,7 +4253,7 @@ function App() {
       sourceKind,
     });
     if (!selectedDownloadsFromUpdatePlan(mirrorPlan)) {
-      window.alert(getMissingUpdateMirrorMessage(mirrorPlan));
+      await showAlert(getMissingUpdateMirrorMessage(mirrorPlan));
       return;
     }
 
@@ -3387,7 +4279,7 @@ function App() {
   async function queueUpdateFlowDownload(flow: UpdateFlowState) {
     const selectedDownloads = selectedDownloadsFromUpdatePlan(flow.mirrorPlan);
     if (!selectedDownloads) {
-      window.alert(getMissingUpdateMirrorMessage(flow.mirrorPlan));
+      await showAlert(getMissingUpdateMirrorMessage(flow.mirrorPlan));
       return;
     }
 
@@ -3405,7 +4297,7 @@ function App() {
     setSourceBusyKind(flow.sourceKind);
     try {
       if (selectedPatch) {
-        const patchedItem = await window.vaultTrackApi.updateSourcePatch({
+        const patchedItem = await window.gameVaultApi.updateSourcePatch({
           selectedSteamPatch: selectedPatch,
           sourceKind: flow.sourceKind,
           steamPatchEntries: flow.patches,
@@ -3413,7 +4305,7 @@ function App() {
         });
         mergeTrackedItemView(patchedItem);
       }
-      const updated = await window.vaultTrackApi.queueUpdateFromSource({
+      const updated = await window.gameVaultApi.queueUpdateFromSource({
         selectedDownloads,
         sourceKind: flow.sourceKind,
         trackedItemId: flow.item.item.id,
@@ -3455,9 +4347,17 @@ function App() {
   ) {
     const confirmed =
       mode === 'delete_files'
-        ? window.confirm(getDeleteTrackedItemPrompt(item))
-        : window.confirm(
-            `Remove ${item.item.title} from VaultTrack tracking? Local files will stay in place.`,
+        ? await showConfirm(getDeleteTrackedItemPrompt(item), {
+            confirmLabel: 'Delete Files',
+            title: 'Delete Files',
+            variant: 'danger',
+          })
+        : await showConfirm(
+            `Remove ${item.item.title} from GameVault tracking? Local files will stay in place.`,
+            {
+              confirmLabel: 'Remove Tracking',
+              title: 'Remove Tracking',
+            },
           );
     if (!confirmed) {
       return;
@@ -3466,7 +4366,7 @@ function App() {
     await runItemAction(
       item.item.id,
       () =>
-        window.vaultTrackApi.removeTrackedItem({
+        window.gameVaultApi.removeTrackedItem({
           mode,
           trackedItemId: item.item.id,
         }),
@@ -3475,7 +4375,10 @@ function App() {
   }
 
   async function markDownloadFailed(item: TrackedItemView) {
-    const confirmed = window.confirm(getMarkDownloadFailedPrompt(item));
+    const confirmed = await showConfirm(getMarkDownloadFailedPrompt(item), {
+      confirmLabel: 'Mark Failed',
+      title: 'Mark Download Failed',
+    });
     if (!confirmed) {
       return;
     }
@@ -3483,11 +4386,17 @@ function App() {
     setBusyId(item.item.id);
     setBusyAction('markFailed');
     try {
-      const updated = await window.vaultTrackApi.markDownloadFailed(
+      const updated = await window.gameVaultApi.markDownloadFailed(
         item.item.id,
       );
       await refreshItems();
-      const retryNow = window.confirm('Retry this download with another link?');
+      const retryNow = await showConfirm(
+        'Retry this download with another link?',
+        {
+          confirmLabel: 'Retry',
+          title: 'Retry Download',
+        },
+      );
       if (retryNow) {
         const fullRows = updated.downloadMirrors.filter(
           (mirror) => mirror.kind === 'full',
@@ -3511,7 +4420,7 @@ function App() {
         });
       }
     } catch (error) {
-      window.alert(error instanceof Error ? error.message : 'Action failed.');
+      await showAlert(error instanceof Error ? error.message : 'Action failed.');
     } finally {
       setBusyId(null);
       setBusyAction(null);
@@ -3519,8 +4428,14 @@ function App() {
   }
 
   async function cancelDownload(item: TrackedItemView) {
-    const confirmed = window.confirm(
+    const confirmed = await showConfirm(
       `Cancel the current download for ${item.item.title}? Staged files will be deleted, and the JDownloader package will be removed if it exists. Installed library files will stay in place.`,
+      {
+        cancelLabel: 'Keep Download',
+        confirmLabel: 'Cancel Download',
+        title: 'Cancel Download',
+        variant: 'danger',
+      },
     );
     if (!confirmed) {
       return;
@@ -3528,7 +4443,7 @@ function App() {
 
     await runItemAction(
       item.item.id,
-      () => window.vaultTrackApi.cancelDownload(item.item.id),
+      () => window.gameVaultApi.cancelDownload(item.item.id),
       'cancelDownload',
     );
   }
@@ -3575,7 +4490,7 @@ function App() {
     await runItemAction(
       retrySelection.item.item.id,
       () =>
-        window.vaultTrackApi.retryDownloadWithSelection({
+        window.gameVaultApi.retryDownloadWithSelection({
           selectedDownloads: {
             fullUrl: retrySelection.fullUrl!,
             patchUrl: patchUrl ?? null,
@@ -3593,7 +4508,7 @@ function App() {
     setBusyId(retrySelection.item.item.id);
     setBusyAction('clearMirrorFailed');
     try {
-      const updated = await window.vaultTrackApi.clearDownloadMirrorFailed({
+      const updated = await window.gameVaultApi.clearDownloadMirrorFailed({
         trackedItemId: retrySelection.item.item.id,
         url,
       });
@@ -3602,7 +4517,7 @@ function App() {
       );
       await refreshItems();
     } catch (error) {
-      window.alert(error instanceof Error ? error.message : 'Action failed.');
+      await showAlert(error instanceof Error ? error.message : 'Action failed.');
     } finally {
       setBusyId(null);
       setBusyAction(null);
@@ -3669,7 +4584,7 @@ function App() {
       Date.now() - startedAt <= PATCH_EDITOR_BACKFILL_POLL_TIMEOUT_MS
     ) {
       await waitForMs(PATCH_EDITOR_BACKFILL_POLL_INTERVAL_MS);
-      const lookup = await window.vaultTrackApi.getSteamDbBuildLookup(lookupId);
+      const lookup = await window.gameVaultApi.getSteamDbBuildLookup(lookupId);
       if (patchEditorRequestIdRef.current !== requestId) {
         return;
       }
@@ -3697,8 +4612,7 @@ function App() {
   ): Promise<void> {
     setPatchEditorBackfillStatus(appId, requestId, 'loading');
     try {
-      const lookup =
-        await window.vaultTrackApi.requestSteamDbBuildLookup(appId);
+      const lookup = await window.gameVaultApi.requestSteamDbBuildLookup(appId);
       if (patchEditorRequestIdRef.current !== requestId) {
         return;
       }
@@ -3742,7 +4656,7 @@ function App() {
     setBusyAction('updatePatch');
     let patches: SteamPatchCandidate[] = seedPatches;
     try {
-      const persistedPatches = await window.vaultTrackApi.listSteamPatchEntries(
+      const persistedPatches = await window.gameVaultApi.listSteamPatchEntries(
         item.item.id,
       );
       if (patchEditorRequestIdRef.current !== requestId) {
@@ -3768,7 +4682,7 @@ function App() {
         void startPatchEditorBackfill(item.item.steamAppId, requestId);
       }
 
-      const result = await window.vaultTrackApi.resolveSteamPatches({
+      const result = await window.gameVaultApi.resolveSteamPatches({
         appId: item.item.steamAppId,
       });
       patches = mergePatchCandidates([...patches, ...result.patches]);
@@ -3820,7 +4734,7 @@ function App() {
     setBusyId(patchEditor.item.item.id);
     setBusyAction('updatePatch');
     try {
-      await window.vaultTrackApi.updateSourcePatch({
+      await window.gameVaultApi.updateSourcePatch({
         selectedSteamPatch: selectedPatch,
         steamPatchEntries: patchEditor.patches,
         trackedItemId: patchEditor.item.item.id,
@@ -3828,7 +4742,7 @@ function App() {
       closePatchEditor();
       await refreshItems();
     } catch (error) {
-      window.alert(error instanceof Error ? error.message : 'Action failed.');
+      await showAlert(error instanceof Error ? error.message : 'Action failed.');
     } finally {
       setBusyId(null);
       setBusyAction(null);
@@ -3855,7 +4769,7 @@ function App() {
       />
     ) : (
       <div className={`${className} is-placeholder`}>
-        <span>VaultTrack</span>
+        <span>GameVault</span>
       </div>
     );
   }
@@ -4043,6 +4957,31 @@ function App() {
     );
   }
 
+  function renderConfirmDownloadReadyButton(item: TrackedItemView) {
+    if (!canConfirmManualDownloadReady(item)) return null;
+    const itemBusy = busyId === item.item.id;
+    const confirming = itemBusy && busyAction === 'confirmDownloadReady';
+    return (
+      <button
+        aria-busy={confirming}
+        className="primary-inline-button confirm-install-button"
+        disabled={itemBusy}
+        onClick={() =>
+          void runItemAction(
+            item.item.id,
+            () =>
+              window.gameVaultApi.confirmManualDownloadReady(item.item.id),
+            'confirmDownloadReady',
+          )
+        }
+        type="button"
+      >
+        <FontAwesomeIcon aria-hidden="true" icon={faFolderOpen} />
+        <span>{confirming ? 'Checking...' : 'Confirm Download Ready'}</span>
+      </button>
+    );
+  }
+
   function renderConfirmInstallButton(item: TrackedItemView) {
     if (!canConfirmInstall(item)) return null;
     const itemBusy = busyId === item.item.id;
@@ -4055,7 +4994,7 @@ function App() {
         onClick={() =>
           void runItemAction(
             item.item.id,
-            () => window.vaultTrackApi.completeStagedInstall(item.item.id),
+            () => window.gameVaultApi.completeStagedInstall(item.item.id),
             'completeInstall',
           )
         }
@@ -4116,7 +5055,7 @@ function App() {
             <button
               onClick={(event) =>
                 runItemMenuAction(event, () => {
-                  void window.vaultTrackApi.openExternal(item.item.sourceUrl!);
+                  void window.gameVaultApi.openExternal(item.item.sourceUrl!);
                 })
               }
               role="menuitem"
@@ -4163,7 +5102,7 @@ function App() {
               <button
                 onClick={(event) =>
                   runItemMenuAction(event, () => {
-                    void window.vaultTrackApi.openExternal(
+                    void window.gameVaultApi.openExternal(
                       `https://store.steampowered.com/app/${item.item.steamAppId}/`,
                     );
                   })
@@ -4180,7 +5119,7 @@ function App() {
               <button
                 onClick={(event) =>
                   runItemMenuAction(event, () => {
-                    void window.vaultTrackApi.openExternal(
+                    void window.gameVaultApi.openExternal(
                       `https://steamdb.info/app/${item.item.steamAppId}/`,
                     );
                   })
@@ -4284,6 +5223,31 @@ function App() {
                 : 'Cancel Download'}
             </button>
           ) : null}
+          {canConfirmManualDownloadReady(item) ? (
+            <button
+              aria-busy={itemBusyAction === 'confirmDownloadReady'}
+              disabled={itemBusy}
+              onClick={(event) =>
+                runItemMenuAction(event, () => {
+                  void runItemAction(
+                    item.item.id,
+                    () =>
+                      window.gameVaultApi.confirmManualDownloadReady(
+                        item.item.id,
+                      ),
+                    'confirmDownloadReady',
+                  );
+                })
+              }
+              role="menuitem"
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faFolderOpen} />
+              {itemBusyAction === 'confirmDownloadReady'
+                ? 'Checking Download...'
+                : 'Confirm Download Ready'}
+            </button>
+          ) : null}
           {canConfirmInstall(item) ? (
             <button
               aria-busy={itemBusyAction === 'completeInstall'}
@@ -4293,7 +5257,7 @@ function App() {
                   void runItemAction(
                     item.item.id,
                     () =>
-                      window.vaultTrackApi.completeStagedInstall(item.item.id),
+                      window.gameVaultApi.completeStagedInstall(item.item.id),
                     'completeInstall',
                   );
                 })
@@ -4322,21 +5286,25 @@ function App() {
             <FontAwesomeIcon aria-hidden="true" icon={faXmark} />
             {itemBusyAction === 'remove' ? 'Removing...' : 'Remove Tracking'}
           </button>
-          <button
-            aria-busy={itemBusyAction === 'deleteFiles'}
-            className="is-danger"
-            disabled={itemBusy}
-            onClick={(event) =>
-              runItemMenuAction(event, () => {
-                void removeTrackedItem(item, 'delete_files');
-              })
-            }
-            role="menuitem"
-            type="button"
-          >
-            <FontAwesomeIcon aria-hidden="true" icon={faTrash} />
-            {itemBusyAction === 'deleteFiles' ? 'Deleting...' : 'Delete Files'}
-          </button>
+          {canDeleteTrackedItemFiles(item) ? (
+            <button
+              aria-busy={itemBusyAction === 'deleteFiles'}
+              className="is-danger"
+              disabled={itemBusy}
+              onClick={(event) =>
+                runItemMenuAction(event, () => {
+                  void removeTrackedItem(item, 'delete_files');
+                })
+              }
+              role="menuitem"
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faTrash} />
+              {itemBusyAction === 'deleteFiles'
+                ? 'Deleting...'
+                : 'Delete Files'}
+            </button>
+          ) : null}
         </div>
       </details>
     );
@@ -4558,8 +5526,7 @@ function App() {
                 const snapshot = source?.snapshot;
                 const matchedPatch = source?.matchedPatch;
                 const hasDownloadMirror = source?.downloadMirrors.some(
-                  (mirror) =>
-                    mirror.kind === 'full' || mirror.kind === 'patch',
+                  (mirror) => mirror.kind === 'full' || mirror.kind === 'patch',
                 );
                 const tags = getSourceOfferTags(item, sourceKind, source);
                 const sourceIssue = match?.lastError;
@@ -4641,7 +5608,7 @@ function App() {
                         {match?.sourceUrl ? (
                           <button
                             onClick={() =>
-                              void window.vaultTrackApi.openExternal(
+                              void window.gameVaultApi.openExternal(
                                 match.sourceUrl!,
                               )
                             }
@@ -4707,17 +5674,18 @@ function App() {
                 <label>
                   <span>Source</span>
                   <select
-                    onChange={(event) =>
+                    onChange={(event) => {
+                      const manualSourceKind = event.currentTarget
+                        .value as SupportedSourceKind;
                       setSourcesModal((current) =>
                         current
                           ? {
                               ...current,
-                              manualSourceKind: event.currentTarget
-                                .value as SupportedSourceKind,
+                              manualSourceKind,
                             }
                           : current,
-                      )
-                    }
+                      );
+                    }}
                     value={sourcesModal.manualSourceKind}
                   >
                     {SUPPORTED_RENDER_SOURCE_KINDS.map((sourceKind) => (
@@ -4730,13 +5698,12 @@ function App() {
                 <label>
                   <span>Detail URL</span>
                   <input
-                    onChange={(event) =>
+                    onChange={(event) => {
+                      const manualUrl = event.currentTarget.value;
                       setSourcesModal((current) =>
-                        current
-                          ? { ...current, manualUrl: event.currentTarget.value }
-                          : current,
-                      )
-                    }
+                        current ? { ...current, manualUrl } : current,
+                      );
+                    }}
                     placeholder="https://..."
                     value={sourcesModal.manualUrl}
                   />
@@ -4772,8 +5739,7 @@ function App() {
       },
       {
         label: 'Update link',
-        url:
-          job?.selectedPatchMirrorUrl || selectedDownloads?.patchUrl || '',
+        url: job?.selectedPatchMirrorUrl || selectedDownloads?.patchUrl || '',
       },
     ].filter((entry) => entry.url.trim().length > 0);
   }
@@ -4781,7 +5747,21 @@ function App() {
   function getManualUpdateSteps(flow: UpdateFlowState): string[] {
     const job = flow.item.currentDownload;
     const stagePath = job?.stagePath ?? flow.item.fileState.stagePath ?? '';
-    const finalPath = job?.finalPath ?? flow.item.fileState.finalPath ?? '';
+    const expectedElamigosPath =
+      flow.sourceKind === 'elamigos' && settings.rootLibraryPath
+        ? joinDisplayPath(
+            settings.rootLibraryPath,
+            flow.item.item.steamTitle || flow.item.item.title,
+          )
+        : '';
+    const finalPath =
+      flow.sourceKind === 'elamigos'
+        ? flow.item.installRecord?.installPath ||
+          expectedElamigosPath ||
+          flow.item.fileState.finalPath ||
+          job?.finalPath ||
+          ''
+        : job?.finalPath || flow.item.fileState.finalPath || '';
     const finalFolderName =
       pathBasename(finalPath) ||
       flow.item.item.steamTitle ||
@@ -4805,8 +5785,18 @@ function App() {
         .filter((name, index, names) => names.indexOf(name) === index) ?? [];
     const stagingTarget =
       partNames.length > 1
-        ? partNames.map((name) => joinDisplayPath(stagePath, name)).join(' and ')
+        ? partNames
+            .map((name) => joinDisplayPath(stagePath, name))
+            .join(' and ')
         : stagePath;
+    if (isManualElamigosFullReplacement(flow.item)) {
+      return [
+        `Save the ElAmigos installer files into ${stagingTarget || 'the staging folder'}.`,
+        'Use Confirm Download Ready on the library card after the installer files are saved.',
+        `Run the installer manually and install into ${finalPath || `the ${finalFolderName} library folder`}.`,
+        'Use Confirm Manual Install after the installed game folder exists.',
+      ];
+    }
     return [
       `Save the ElAmigos installer files into ${stagingTarget || 'the staging folder'}.`,
       `Run the installer/update manually and install into ${finalPath || `the ${finalFolderName} library folder`}.`,
@@ -4864,7 +5854,7 @@ function App() {
                     <button
                       className="ghost-button"
                       onClick={() =>
-                        void window.vaultTrackApi.openExternal(entry.url)
+                        void window.gameVaultApi.openExternal(entry.url)
                       }
                       type="button"
                     >
@@ -5132,6 +6122,8 @@ function App() {
     });
     const showUpdateButton = hasActionableSourceUpdate(item);
     const showResolvePatchButton = needsPatchMetadataAttention(item);
+    const showConfirmDownloadReadyButton =
+      canConfirmManualDownloadReady(item);
     const showConfirmInstallButton = canConfirmInstall(item);
     const showCancelDownloadButton =
       canCancelDownload(item) && !hasActiveProgress(item);
@@ -5161,12 +6153,14 @@ function App() {
             {renderLibraryProgress(item, progress)}
             {showUpdateButton ||
             showResolvePatchButton ||
+            showConfirmDownloadReadyButton ||
             showCancelDownloadButton ||
             showConfirmInstallButton ? (
               <div className="game-row__actions">
                 {showCancelDownloadButton
                   ? renderCancelDownloadButton(item)
                   : null}
+                {renderConfirmDownloadReadyButton(item)}
                 {renderConfirmInstallButton(item)}
                 {showUpdateButton ? (
                   <button
@@ -5176,7 +6170,7 @@ function App() {
                   >
                     <FontAwesomeIcon
                       aria-hidden="true"
-                      icon={faArrowDownWideShort}
+                      icon={faCloudArrowDown}
                     />
                     <span>Update</span>
                   </button>
@@ -5226,14 +6220,12 @@ function App() {
             {renderLibraryActionMenu(item)}
           </div>
           {renderLibraryProgress(item, progress)}
-          {showUpdateButton ||
-          showResolvePatchButton ||
-          showCancelDownloadButton ||
-          showConfirmInstallButton ? (
-            <div className="game-card__actions">
+          <div className="game-card__actions">
+            <div className="game-card__primary-actions">
               {showCancelDownloadButton
                 ? renderCancelDownloadButton(item)
                 : null}
+              {renderConfirmDownloadReadyButton(item)}
               {renderConfirmInstallButton(item)}
               {showUpdateButton ? (
                 <button
@@ -5243,7 +6235,7 @@ function App() {
                 >
                   <FontAwesomeIcon
                     aria-hidden="true"
-                    icon={faArrowDownWideShort}
+                    icon={faCloudArrowDown}
                   />
                   <span>Update</span>
                 </button>
@@ -5262,15 +6254,15 @@ function App() {
                 </button>
               ) : null}
             </div>
-          ) : null}
-          <button
-            aria-label="Additional details"
-            className="detail-toggle-button"
-            onClick={() => setDetailsItemId(item.item.id)}
-            type="button"
-          >
-            <FontAwesomeIcon aria-hidden="true" icon={faCircleInfo} />
-          </button>
+            <button
+              aria-label="Additional details"
+              className="detail-toggle-button"
+              onClick={() => setDetailsItemId(item.item.id)}
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faCircleInfo} />
+            </button>
+          </div>
         </div>
         {renderRefreshWorkflowOverlay(item)}
       </article>
@@ -5312,13 +6304,1074 @@ function App() {
 
   const deviceChoices = connectionHealth?.devices ?? [];
 
+  function renderBrowserExtensionSetupPanel(
+    context: 'onboarding' | 'settings',
+  ) {
+    const activeBrowserTargets = browserTargetsForSetupTab(
+      browserExtensionSetupTab,
+    );
+    const activeInstallations = (
+      browserExtensionStatus?.installations ?? []
+    ).filter((install) => activeBrowserTargets.includes(install.browser));
+    const activeBrowserStatus = browserExtensionStatus
+      ? {
+          ...browserExtensionStatus,
+          detected: activeInstallations.length > 0,
+          enabled: activeInstallations.some((install) => install.enabled),
+          installations: activeInstallations,
+          message: activeInstallations.length
+            ? browserExtensionStatus.message
+            : `GameVault extension was not found in ${browserSetupTabLabel(
+                browserExtensionSetupTab,
+              )}. Load the unpacked extension, then refresh detection.`,
+        }
+      : null;
+    const resultCoversActiveTab = Boolean(
+      extensionRegistrationResult?.browsers.some((browser) =>
+        activeBrowserTargets.includes(browser),
+      ),
+    );
+    const registeredExtensionId = resultCoversActiveTab
+      ? extensionRegistrationResult?.extensionId
+      : browserExtensionSetupTab === 'firefox'
+        ? savedFirefoxExtensionId(settings.onboarding)
+        : savedChromiumExtensionId(settings.onboarding);
+    const extensionRegisteredForActiveTab = Boolean(registeredExtensionId);
+    const extensionStatusColor = extensionSetupStatusColor(
+      activeBrowserStatus,
+      extensionRegisteredForActiveTab,
+    );
+    const connectedExtensionHealth =
+      extensionRegisteredForActiveTab &&
+      desktopHealth?.extension.color === 'green'
+        ? desktopHealth.extension
+        : null;
+    const displayedExtensionStatusColor = connectedExtensionHealth
+      ? 'green'
+      : extensionStatusColor;
+    const extensionStatusTitle = connectedExtensionHealth
+      ? connectedExtensionHealth.label
+      : extensionSetupStatusTitle(
+          activeBrowserStatus,
+          extensionRegisteredForActiveTab,
+        );
+    const extensionStatusMessage = connectedExtensionHealth
+      ? connectedExtensionHealth.message
+      : extensionSetupStatusMessage(
+          activeBrowserStatus,
+          extensionRegisteredForActiveTab,
+        );
+    const manifestPath = extensionSetupInfo?.extensionPath
+      ? getExtensionManifestPath(extensionSetupInfo.extensionPath)
+      : null;
+    const manifestCopyKey = 'manifest-file';
+    const extensionFolderCopyKey = 'extension-folder';
+    const extensionFolderCopied = setupCopiedKey === extensionFolderCopyKey;
+    const manifestCopied = setupCopiedKey === manifestCopyKey;
+    const setupExpanded =
+      context === 'onboarding' || settingsExtensionSetupExpanded;
+    const setupDetailsId = `browser-extension-setup-details-${context}`;
+    const instructions =
+      browserExtensionSetupTab === 'firefox'
+        ? [
+            {
+              body: 'In about:debugging, select Load Temporary Add-on.',
+              title: 'Load the temporary add-on',
+            },
+            {
+              body: 'Paste the manifest file path below into the File name field, then select Open.',
+              title: 'Choose manifest.json',
+            },
+            {
+              body: 'Select Register Firefox to complete native messaging setup.',
+              title: 'Register native messaging',
+            },
+          ]
+        : [
+            {
+              body: 'Go to the extensions page for your browser.',
+              copyValues: [
+                {
+                  label: 'Chrome extensions URL',
+                  value: 'chrome://extensions',
+                },
+                {
+                  label: 'Edge extensions URL',
+                  value: 'edge://extensions',
+                },
+              ],
+              title: 'Open browser extensions',
+            },
+            {
+              body: 'Turn on the developer switch in the extensions page.',
+              title: 'Enable Developer Mode',
+            },
+            {
+              body: 'Choose the GameVault extension folder below.',
+              title: 'Load the unpacked extension',
+            },
+            {
+              body: 'Paste the extension ID, then register the desktop host.',
+              title: 'Register native messaging',
+            },
+          ];
+
+    return (
+      <div className="browser-extension-setup-panel">
+        <div className="onboarding-status-card onboarding-status-card--extension">
+          <span
+            className={`health-dot ${displayedExtensionStatusColor}`}
+            aria-hidden="true"
+          />
+          <div>
+            <strong className="onboarding-status-title">
+              <FontAwesomeIcon aria-hidden="true" icon={faPuzzlePiece} />
+              <span>{extensionStatusTitle}</span>
+            </strong>
+            <p className="muted-text">{extensionStatusMessage}</p>
+            {activeInstallations.length ? (
+              <div className="onboarding-extension-installs">
+                {activeInstallations.map((install) => (
+                  <span
+                    className="onboarding-extension-install"
+                    key={`${install.browser}:${install.profileName}:${install.extensionId}`}
+                  >
+                    <strong>{browserExtensionInstallLabel(install)}</strong>
+                    <code>{install.extensionId}</code>
+                    <em>{install.enabled ? 'Enabled' : 'Disabled'}</em>
+                  </span>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        </div>
+
+        {context === 'settings' ? (
+          <button
+            aria-controls={setupDetailsId}
+            aria-expanded={settingsExtensionSetupExpanded}
+            className="ghost-button settings-icon-text-button browser-extension-setup-toggle"
+            onClick={() =>
+              setSettingsExtensionSetupExpanded((expanded) => !expanded)
+            }
+            type="button"
+          >
+            <FontAwesomeIcon aria-hidden="true" icon={faCircleInfo} />
+            <span>
+              {settingsExtensionSetupExpanded
+                ? 'Hide setup instructions'
+                : 'Show setup instructions'}
+            </span>
+          </button>
+        ) : null}
+
+        {setupExpanded ? (
+          <div className="browser-extension-setup-details" id={setupDetailsId}>
+            <div
+              className="browser-extension-setup-tabs"
+              role="tablist"
+              aria-label="Browser extension setup"
+            >
+              {BROWSER_SETUP_TABS.map((tab) => (
+                <button
+                  aria-selected={browserExtensionSetupTab === tab.key}
+                  className={`browser-extension-setup-tab ${
+                    browserExtensionSetupTab === tab.key ? 'is-active' : ''
+                  }`}
+                  key={tab.key}
+                  onClick={() => {
+                    setBrowserExtensionSetupTab(tab.key);
+                    setOnboardingMessage(null);
+                  }}
+                  role="tab"
+                  type="button"
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+
+            <ol className="onboarding-instruction-list">
+              {instructions.map((instruction) => (
+                <li key={instruction.title}>
+                  <strong>{instruction.title}</strong>
+                  <span>{instruction.body}</span>
+                  {instruction.copyValues?.length ? (
+                    <div className="onboarding-instruction-copy-list">
+                      {instruction.copyValues.map((copyValue) => {
+                        const copyKey = `instruction:${copyValue.value}`;
+                        const copied = setupCopiedKey === copyKey;
+                        return (
+                          <button
+                            aria-label={`${copied ? 'Copied' : 'Copy'} ${
+                              copyValue.label
+                            }`}
+                            className={`onboarding-instruction-copy-button ${
+                              copied ? 'is-copied' : ''
+                            }`}
+                            key={copyValue.value}
+                            onClick={() =>
+                              void copyManualUpdateText(
+                                copyValue.value,
+                                copyKey,
+                              )
+                            }
+                            title={`${copied ? 'Copied' : 'Copy'} ${
+                              copyValue.label
+                            }`}
+                            type="button"
+                          >
+                            <code>{copyValue.value}</code>
+                            <FontAwesomeIcon
+                              aria-hidden="true"
+                              icon={copied ? faCheck : faCopy}
+                            />
+                          </button>
+                        );
+                      })}
+                    </div>
+                  ) : null}
+                </li>
+              ))}
+            </ol>
+
+            {browserExtensionSetupTab === 'firefox' ? (
+              <div className="onboarding-path-row">
+                <div>
+                  <span className="field-label">Manifest file</span>
+                  <code>{manifestPath ?? 'Manifest path is loading...'}</code>
+                </div>
+                <button
+                  className={`ghost-button onboarding-copy-button settings-icon-text-button ${
+                    manifestCopied ? 'is-copied' : ''
+                  }`}
+                  disabled={!manifestPath}
+                  onClick={() =>
+                    void copyManualUpdateText(
+                      manifestPath ?? '',
+                      manifestCopyKey,
+                    )
+                  }
+                  type="button"
+                >
+                  <FontAwesomeIcon
+                    aria-hidden="true"
+                    icon={manifestCopied ? faCheck : faCopy}
+                  />
+                  <span>{manifestCopied ? 'Copied' : 'Copy'}</span>
+                </button>
+              </div>
+            ) : (
+              <>
+                <div className="onboarding-path-row">
+                  <div>
+                    <span className="field-label">Extension folder</span>
+                    <code>
+                      {extensionSetupInfo?.extensionPath ??
+                        'Extension path is loading...'}
+                    </code>
+                  </div>
+                  <button
+                    className={`ghost-button onboarding-copy-button settings-icon-text-button ${
+                      extensionFolderCopied ? 'is-copied' : ''
+                    }`}
+                    disabled={!extensionSetupInfo?.extensionPath}
+                    onClick={() =>
+                      void copyManualUpdateText(
+                        extensionSetupInfo?.extensionPath ?? '',
+                        extensionFolderCopyKey,
+                      )
+                    }
+                    type="button"
+                  >
+                    <FontAwesomeIcon
+                      aria-hidden="true"
+                      icon={extensionFolderCopied ? faCheck : faCopy}
+                    />
+                    <span>{extensionFolderCopied ? 'Copied' : 'Copy'}</span>
+                  </button>
+                </div>
+                <label className="field">
+                  <span className="field-label">Extension ID</span>
+                  <input
+                    onChange={(event) =>
+                      setExtensionIdDraft(event.currentTarget.value)
+                    }
+                    placeholder="abcdefghijklmnopabcdefghijklmnop"
+                    value={extensionIdDraft}
+                  />
+                </label>
+              </>
+            )}
+
+            {!extensionSetupInfo?.extensionPathExists ? (
+              <p className="onboarding-message">
+                Extension build output was not found yet. Run the extension
+                build, then refresh this setup guide.
+              </p>
+            ) : null}
+            {context === 'settings' && onboardingMessage ? (
+              <p className="onboarding-message">{onboardingMessage}</p>
+            ) : null}
+
+            <div className="action-row onboarding-inline-actions">
+              <button
+                className="ghost-button settings-icon-text-button"
+                onClick={() =>
+                  void Promise.all([
+                    refreshExtensionSetupInfo(),
+                    refreshBrowserExtensionStatus(),
+                    refreshDesktopHealth({ forceRefresh: true }),
+                  ]).catch(() => undefined)
+                }
+                type="button"
+              >
+                <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
+                <span>Refresh Detection</span>
+              </button>
+              <button
+                className="primary-button"
+                disabled={
+                  onboardingBusy ||
+                  !extensionSetupInfo?.extensionPathExists ||
+                  !extensionIdIsValid
+                }
+                onClick={() =>
+                  void registerExtensionForSetup(browserExtensionSetupTab)
+                }
+                type="button"
+              >
+                {onboardingBusy
+                  ? 'Registering...'
+                  : `Register ${browserSetupTabLabel(browserExtensionSetupTab)}`}
+              </button>
+            </div>
+            {extensionRegisteredForActiveTab ? (
+              <p className="onboarding-success">
+                Native messaging is registered for{' '}
+                {browserSetupTabLabel(browserExtensionSetupTab)}.
+              </p>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  function renderOnboardingWizard() {
+    if (!onboardingOpen) {
+      return null;
+    }
+
+    const steps: Array<{
+      key: DesktopOnboardingStep;
+      label: string;
+    }> = [
+      { key: 'jdownloader', label: 'JDownloader' },
+      { key: 'myjdownloader', label: 'MyJDownloader' },
+      { key: 'extension', label: 'Extension' },
+    ];
+    const activeStepIndex = steps.findIndex(
+      (step) => step.key === onboardingStep,
+    );
+    const extensionRegistered =
+      Boolean(extensionRegistrationResult?.extensionId) ||
+      hasAnySavedExtensionRegistration(settings.onboarding);
+
+    return (
+      <div
+        className="modal-backdrop modal-backdrop--stacked"
+        role="presentation"
+      >
+        <section
+          aria-labelledby="onboarding-title"
+          aria-modal="true"
+          className="modal-panel onboarding-modal"
+          role="dialog"
+        >
+          <header className="onboarding-header">
+            <div>
+              <p className="panel-title">First Launch Setup</p>
+              <h2 id="onboarding-title">Get GameVault ready</h2>
+            </div>
+            <button
+              aria-label="Close setup guide"
+              className="modal-close-button"
+              onClick={() => setOnboardingOpen(false)}
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faXmark} />
+            </button>
+          </header>
+
+          <div
+            className="onboarding-steps"
+            role="tablist"
+            aria-label="Setup steps"
+          >
+            {steps.map((step, index) => (
+              <button
+                aria-selected={onboardingStep === step.key}
+                className={`onboarding-step-tab ${
+                  onboardingStep === step.key ? 'is-active' : ''
+                }`}
+                key={step.key}
+                onClick={() => setOnboardingStep(step.key)}
+                role="tab"
+                type="button"
+              >
+                <span>{index + 1}</span>
+                {step.label}
+              </button>
+            ))}
+          </div>
+
+          {onboardingMessage ? (
+            <p className="onboarding-message">{onboardingMessage}</p>
+          ) : null}
+
+          {onboardingStep === 'jdownloader' ? (
+            <div className="onboarding-panel">
+              <div className="onboarding-status-card">
+                <span
+                  className={`health-dot ${
+                    jDownloaderStatus?.detected ? 'green' : 'red'
+                  }`}
+                />
+                <div>
+                  <strong>
+                    {jDownloaderStatus?.detected
+                      ? 'JDownloader detected'
+                      : 'JDownloader not detected'}
+                  </strong>
+                  <p className="muted-text">
+                    {jDownloaderStatus?.message ??
+                      'Check whether JDownloader is installed or running.'}
+                  </p>
+                  {jDownloaderStatus?.installPath ? (
+                    <code>{jDownloaderStatus.installPath}</code>
+                  ) : null}
+                </div>
+              </div>
+              <div className="action-row onboarding-inline-actions">
+                <button
+                  className="ghost-button settings-icon-text-button"
+                  disabled={onboardingBusy}
+                  onClick={() => void refreshJDownloaderStatus()}
+                  type="button"
+                >
+                  <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
+                  <span>Refresh</span>
+                </button>
+                <button
+                  className="ghost-button settings-icon-text-button"
+                  onClick={() =>
+                    void window.gameVaultApi.openExternal(
+                      JDOWNLOADER_DOWNLOAD_URL,
+                    )
+                  }
+                  type="button"
+                >
+                  <FontAwesomeIcon aria-hidden="true" icon={faCloudArrowDown} />
+                  <span>Download Now</span>
+                </button>
+              </div>
+              <p className="muted-text">
+                Skipping keeps supported sources on manual download steps. You
+                can enable JDownloader later in Settings.
+              </p>
+            </div>
+          ) : null}
+
+          {onboardingStep === 'myjdownloader' ? (
+            <div className="onboarding-panel">
+              <div className="onboarding-status-card">
+                <span
+                  className={`health-dot ${
+                    connectionHealth?.myJDownloader.color ?? 'red'
+                  }`}
+                />
+                <div>
+                  <strong>
+                    {connectionHealth?.myJDownloader.label ?? 'Not connected'}
+                  </strong>
+                  <p className="muted-text">
+                    {connectionHealth?.myJDownloader.message ??
+                      'Sign in to MyJDownloader to enable queued downloads.'}
+                  </p>
+                </div>
+              </div>
+              <div className="settings-grid integration-account-grid">
+                <label className="field">
+                  <span className="field-label">MyJDownloader email</span>
+                  <input
+                    onChange={(event) => {
+                      const email = event.currentTarget.value;
+                      setAuthDraft((current) => ({
+                        ...current,
+                        email,
+                      }));
+                    }}
+                    value={authDraft.email}
+                  />
+                </label>
+                <label className="field">
+                  <span className="field-label">
+                    Password{' '}
+                    {settings.myJDownloaderPasswordConfigured
+                      ? '(configured)'
+                      : ''}
+                  </span>
+                  <input
+                    onChange={(event) => {
+                      const password = event.currentTarget.value;
+                      setAuthDraft((current) => ({
+                        ...current,
+                        password,
+                      }));
+                    }}
+                    type="password"
+                    value={authDraft.password}
+                  />
+                </label>
+              </div>
+              {deviceChoices.length > 1 ? (
+                <label className="field">
+                  <span className="field-label">JDownloader device</span>
+                  <select
+                    onChange={(event) => {
+                      const selectedDeviceId = event.currentTarget.value;
+                      setAuthDraft((current) => ({
+                        ...current,
+                        selectedDeviceId,
+                      }));
+                    }}
+                    value={authDraft.selectedDeviceId}
+                  >
+                    <option value="">Choose a device</option>
+                    {deviceChoices.map((device) => (
+                      <option key={device.id} value={device.id}>
+                        {device.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
+              <div className="action-row onboarding-inline-actions">
+                <button
+                  className="primary-button"
+                  disabled={authBusy || !authDraft.email || !authDraft.password}
+                  onClick={() => void connectMyJDownloaderFromOnboarding()}
+                  type="button"
+                >
+                  {authBusy ? 'Connecting...' : 'Connect'}
+                </button>
+                <button
+                  className="ghost-button"
+                  disabled={authBusy || !authDraft.selectedDeviceId}
+                  onClick={() => void selectMyJDownloaderDeviceFromOnboarding()}
+                  type="button"
+                >
+                  Use Device
+                </button>
+                <button
+                  className="ghost-button settings-icon-text-button"
+                  onClick={() =>
+                    void window.gameVaultApi.openExternal(
+                      MYJDOWNLOADER_SIGNUP_URL,
+                    )
+                  }
+                  type="button"
+                >
+                  <FontAwesomeIcon
+                    aria-hidden="true"
+                    icon={faUpRightFromSquare}
+                  />
+                  <span>Sign Up</span>
+                </button>
+              </div>
+              <p className="muted-text">
+                Skipping leaves JDownloader automation off until credentials are
+                added from Settings.
+              </p>
+            </div>
+          ) : null}
+
+          {onboardingStep === 'extension' ? (
+            <div className="onboarding-panel">
+              {renderBrowserExtensionSetupPanel('onboarding')}
+            </div>
+          ) : null}
+
+          <footer className="onboarding-footer">
+            <button
+              className="ghost-button"
+              disabled={activeStepIndex === 0 || onboardingBusy}
+              onClick={() => setOnboardingStep(steps[activeStepIndex - 1]!.key)}
+              type="button"
+            >
+              Back
+            </button>
+            <div className="action-row">
+              {onboardingStep === 'jdownloader' ? (
+                <>
+                  <button
+                    className="ghost-button"
+                    disabled={onboardingBusy}
+                    onClick={() => void skipJDownloaderSetup()}
+                    type="button"
+                  >
+                    Skip for now
+                  </button>
+                  <button
+                    className="primary-button"
+                    disabled={onboardingBusy || !jDownloaderReadyForOnboarding}
+                    onClick={() => void confirmJDownloaderSetup()}
+                    type="button"
+                  >
+                    Confirm
+                  </button>
+                </>
+              ) : null}
+              {onboardingStep === 'myjdownloader' ? (
+                <>
+                  <button
+                    className="ghost-button"
+                    disabled={onboardingBusy}
+                    onClick={() => void skipMyJDownloaderSetup()}
+                    type="button"
+                  >
+                    Skip for now
+                  </button>
+                  <button
+                    className="primary-button"
+                    disabled={
+                      onboardingBusy || !myJDownloaderReadyForOnboarding
+                    }
+                    onClick={() => void confirmMyJDownloaderSetup()}
+                    type="button"
+                  >
+                    Confirm
+                  </button>
+                </>
+              ) : null}
+              {onboardingStep === 'extension' ? (
+                <>
+                  <button
+                    className="ghost-button"
+                    disabled={onboardingBusy}
+                    onClick={() => void skipExtensionAndCloseOnboarding()}
+                    type="button"
+                  >
+                    Skip Setup
+                  </button>
+                  <button
+                    className="primary-button"
+                    disabled={onboardingBusy || !extensionRegistered}
+                    onClick={() => void finishOnboarding()}
+                    type="button"
+                  >
+                    Finish
+                  </button>
+                </>
+              ) : null}
+            </div>
+          </footer>
+        </section>
+      </div>
+    );
+  }
+
+  function renderActivityIssueAction(issue: ActivityIssue) {
+    const action = issue.action;
+    if (!action && !issue.dismissalKey) {
+      return null;
+    }
+    const clearBusyKey = `clear:${issue.id}`;
+    const actionBusy = activityActionBusy === issue.id;
+    const clearBusy = activityActionBusy === clearBusyKey;
+    const anyBusy = actionBusy || clearBusy;
+    const actionDisabled = Boolean(action?.disabledReason || anyBusy);
+    const clearDisabled = Boolean(!issue.dismissalKey || anyBusy);
+    return (
+      <div className="activity-issue__action">
+        {action ? (
+          <button
+            className="ghost-button"
+            disabled={actionDisabled}
+            onClick={() => void runActivityAction(issue)}
+            type="button"
+          >
+            {actionBusy ? 'Working...' : action.label}
+          </button>
+        ) : null}
+        <button
+          className="ghost-button"
+          disabled={clearDisabled}
+          onClick={() => void clearActivityIssue(issue)}
+          type="button"
+        >
+          {clearBusy ? 'Clearing...' : 'Clear alert'}
+        </button>
+        {action?.disabledReason ? (
+          <span className="muted-text">{action.disabledReason}</span>
+        ) : null}
+      </div>
+    );
+  }
+
+  function renderActivityLog(log: EventLogRecord) {
+    const contextRows = getActivityLogContextRows(log);
+    return (
+      <article
+        className={`activity-log-row activity-log-row--${log.level}`}
+        key={log.id}
+      >
+        <div className="activity-log-row__main">
+          <div className="activity-log-row__title">
+            <span
+              className={`activity-severity activity-severity--${log.level}`}
+            >
+              {log.level.toUpperCase()}
+            </span>
+            <strong>{log.message}</strong>
+          </div>
+          <span className="muted-text">
+            {formatRelativeTime(log.createdAt)} |{' '}
+            {new Date(log.createdAt).toLocaleString()}
+          </span>
+        </div>
+        {contextRows.length > 0 ? (
+          <dl className="activity-context-grid">
+            {contextRows.map((row) => (
+              <div key={`${log.id}:${row.label}`}>
+                <dt>{row.label}</dt>
+                <dd>{row.value}</dd>
+              </div>
+            ))}
+          </dl>
+        ) : null}
+      </article>
+    );
+  }
+
+  function renderActivityPage() {
+    const summary = activity?.summary ?? [];
+    return (
+      <section className="surface-panel activity-page">
+        <div className="panel-heading">
+          <div>
+            <p className="panel-title">Activity</p>
+            <p className="muted-text">
+              Maintenance health, automation issues, and reportable diagnostics.
+            </p>
+          </div>
+          <div className="activity-toolbar">
+            <button
+              className="ghost-button"
+              disabled={!activity}
+              onClick={() => void refreshItems()}
+              type="button"
+            >
+              Refresh
+            </button>
+            <button
+              className="primary-button"
+              disabled={!activity}
+              onClick={() => void copyActivityReport()}
+              type="button"
+            >
+              {activityReportCopied ? 'Copied' : 'Copy Report'}
+            </button>
+          </div>
+        </div>
+
+        {activity?.activeTasks.length ? (
+          <div className="activity-active-strip" role="status">
+            {activity.activeTasks.map((task) => (
+              <div key={task.id}>
+                <strong>{task.title}</strong>
+                <span>
+                  {task.detail ?? 'Running'} | Started{' '}
+                  {formatRelativeTime(task.startedAt)}
+                </span>
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        <div className="activity-summary-grid">
+          {summary.map((card) => (
+            <article
+              className={`activity-summary-card activity-summary-card--${card.status}`}
+              key={card.id}
+            >
+              <span>{card.label}</span>
+              <strong>{card.value}</strong>
+              <p>{card.detail}</p>
+            </article>
+          ))}
+        </div>
+
+        <section className="activity-section">
+          <div className="activity-section__heading">
+            <div>
+              <h2>Attention</h2>
+              <p className="muted-text">
+                Stale maintenance, failed checks, and safe fix actions.
+              </p>
+            </div>
+            <span className="activity-count">
+              {sortedActivityIssues.length}
+            </span>
+          </div>
+          {sortedActivityIssues.length > 0 ? (
+            <div className="activity-issue-list">
+              {sortedActivityIssues.map((issue) => (
+                <article
+                  className={`activity-issue-card activity-issue-card--${issue.severity}`}
+                  key={issue.id}
+                >
+                  <div className="activity-issue-card__body">
+                    <div className="activity-log-row__title">
+                      <span
+                        className={`activity-severity activity-severity--${issue.severity}`}
+                      >
+                        {issue.severity === 'warning'
+                          ? 'WARN'
+                          : issue.severity.toUpperCase()}
+                      </span>
+                      <strong>{issue.title}</strong>
+                    </div>
+                    <p>{issue.detail}</p>
+                    <div className="activity-issue-meta">
+                      {issue.gameTitle ? <span>{issue.gameTitle}</span> : null}
+                      {issue.sourceKind ? (
+                        <span>{formatTrackedSourceKind(issue.sourceKind)}</span>
+                      ) : null}
+                      {issue.createdAt ? (
+                        <span>{formatRelativeTime(issue.createdAt)}</span>
+                      ) : null}
+                    </div>
+                  </div>
+                  {renderActivityIssueAction(issue)}
+                </article>
+              ))}
+            </div>
+          ) : (
+            <div className="empty-state">
+              <strong>No activity needs attention</strong>
+              <p className="muted-text">
+                Maintenance checks and automation logs look clear.
+              </p>
+            </div>
+          )}
+        </section>
+
+        <section className="activity-section">
+          <div className="activity-section__heading activity-section__heading--logs">
+            <div>
+              <h2>Logs</h2>
+              <p className="muted-text">
+                Recent events with report-friendly context.
+              </p>
+            </div>
+            <div className="activity-log-controls">
+              <div
+                className="activity-filter-group"
+                role="tablist"
+                aria-label="Log level"
+              >
+                {(['all', 'warn', 'error'] as ActivityLogFilter[]).map(
+                  (filter) => (
+                    <button
+                      aria-pressed={activityLogFilter === filter}
+                      className={
+                        activityLogFilter === filter ? 'is-active' : ''
+                      }
+                      key={filter}
+                      onClick={() => {
+                        setActivityLogFilter(filter);
+                        setActivityLogPage(1);
+                      }}
+                      type="button"
+                    >
+                      {filter === 'all' ? 'All' : filter.toUpperCase()}
+                    </button>
+                  ),
+                )}
+              </div>
+              <label className="search-field activity-log-search">
+                <FontAwesomeIcon aria-hidden="true" icon={faMagnifyingGlass} />
+                <input
+                  aria-label="Search activity logs"
+                  onChange={(event) => {
+                    setActivitySearch(event.currentTarget.value);
+                    setActivityLogPage(1);
+                  }}
+                  placeholder="Search logs"
+                  value={activitySearch}
+                />
+              </label>
+            </div>
+          </div>
+          {visibleActivityLogs.length > 0 ? (
+            <>
+              <div className="activity-log-list">
+                {paginatedActivityLogs.map(renderActivityLog)}
+              </div>
+              <nav
+                aria-label="Activity log pages"
+                className="activity-log-pagination"
+              >
+                <span className="muted-text">
+                  {activityLogRangeStart}-{activityLogRangeEnd} of{' '}
+                  {visibleActivityLogs.length}
+                </span>
+                <div className="activity-log-pagination__controls">
+                  <button
+                    aria-label="Previous activity log page"
+                    className="inline-icon-button"
+                    disabled={currentActivityLogPage <= 1}
+                    onClick={() =>
+                      setActivityLogPage((page) => Math.max(1, page - 1))
+                    }
+                    title="Previous page"
+                    type="button"
+                  >
+                    <FontAwesomeIcon aria-hidden="true" icon={faChevronLeft} />
+                  </button>
+                  <span className="activity-log-pagination__page">
+                    Page {currentActivityLogPage} of {activityLogPageCount}
+                  </span>
+                  <button
+                    aria-label="Next activity log page"
+                    className="inline-icon-button"
+                    disabled={currentActivityLogPage >= activityLogPageCount}
+                    onClick={() =>
+                      setActivityLogPage((page) =>
+                        Math.min(activityLogPageCount, page + 1),
+                      )
+                    }
+                    title="Next page"
+                    type="button"
+                  >
+                    <FontAwesomeIcon aria-hidden="true" icon={faChevronRight} />
+                  </button>
+                </div>
+              </nav>
+            </>
+          ) : (
+            <div className="empty-state">
+              <strong>No matching logs</strong>
+              <p className="muted-text">
+                Adjust the filter or refresh activity.
+              </p>
+            </div>
+          )}
+        </section>
+      </section>
+    );
+  }
+
+  function renderNavbarHealthMenu() {
+    const jDownloaderHealth = desktopHealth?.jDownloader ??
+      connectionHealth?.myJDownloader ?? {
+        color: 'red' as const,
+        label: 'JDownloader unavailable',
+        message: 'MyJDownloader health has not loaded yet.',
+      };
+    const extensionHealth = desktopHealth?.extension ?? {
+      color: 'yellow' as const,
+      label: 'Checking extension',
+      message: 'Extension health has not loaded yet.',
+    };
+    const overallHealth =
+      desktopHealth?.overall ??
+      ({
+        color: connectionHealth?.myJDownloader.color ?? 'red',
+        label: connectionHealth ? 'Health loading' : 'Health unavailable',
+        message: 'GameVault is loading health checks.',
+      } satisfies DesktopHealthSummary['overall']);
+    const healthTitle = getDesktopHealthMenuTitle(desktopHealth);
+    const rows = [
+      {
+        fixLabel: 'Fix JDownloader health',
+        health: jDownloaderHealth,
+        label: 'JDownloader',
+        onFix: () => openOnboardingGuide('myjdownloader'),
+      },
+      {
+        fixLabel: 'Fix extension health',
+        health: extensionHealth,
+        label: 'Extension',
+        onFix: () => openOnboardingGuide('extension'),
+      },
+    ];
+
+    return (
+      <details className="navbar-health-menu">
+        <summary
+          aria-label={healthTitle}
+          className="navbar-health-button"
+          title={healthTitle}
+        >
+          <span
+            aria-hidden="true"
+            className={`health-dot ${overallHealth.color}`}
+          />
+        </summary>
+        <div
+          className="navbar-health-panel"
+          role="group"
+          aria-label="Health checks"
+        >
+          <header className="navbar-health-panel__header">
+            <strong>Health</strong>
+            <button
+              aria-label="Refresh health"
+              className="inline-icon-button"
+              disabled={healthRefreshBusy}
+              onClick={() => void refreshNavbarHealth({ forceRefresh: true })}
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
+            </button>
+          </header>
+          {rows.map(({ fixLabel, health, label, onFix }) => (
+            <div className="navbar-health-row" key={label}>
+              <span
+                aria-hidden="true"
+                className={`health-dot ${health.color}`}
+              />
+              <div className="navbar-health-row__status">
+                <strong>{label}</strong>
+                <span>{health.label}</span>
+              </div>
+              {health.color !== 'green' ? (
+                <button
+                  aria-label={fixLabel}
+                  className="navbar-health-fix-button"
+                  onClick={onFix}
+                  type="button"
+                >
+                  Fix
+                </button>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      </details>
+    );
+  }
+
   return (
     <div className="desktop-shell">
       <header className="top-shelf">
         <div className="brand-lockup">
           <span className="brand-emblem" aria-hidden="true" />
           <div>
-            <strong>VaultTrack</strong>
+            <strong>GameVault</strong>
             <span>Library</span>
           </div>
         </div>
@@ -5355,6 +7408,7 @@ function App() {
           ))}
         </nav>
         <div className="utility-row">
+          {renderNavbarHealthMenu()}
           <button
             className={`utility-icon-button ${section === 'imports' ? 'is-active' : ''}`}
             onClick={() => setSection('imports')}
@@ -5365,13 +7419,13 @@ function App() {
             <FontAwesomeIcon aria-hidden="true" icon={faFileImport} />
           </button>
           <button
-            className={`utility-icon-button ${section === 'logs' ? 'is-active' : ''}`}
-            onClick={() => setSection('logs')}
-            aria-label="Logs"
-            title="Logs"
+            className={`utility-icon-button ${section === 'activity' ? 'is-active' : ''}`}
+            onClick={() => setSection('activity')}
+            aria-label="Activity"
+            title="Activity"
             type="button"
           >
-            <FontAwesomeIcon aria-hidden="true" icon={faScroll} />
+            <FontAwesomeIcon aria-hidden="true" icon={faWaveSquare} />
           </button>
           <button
             className={`utility-icon-button ${section === 'settings' ? 'is-active' : ''}`}
@@ -5554,8 +7608,42 @@ function App() {
                 libraryViewMode === 'cards' ? 'game-card-grid' : 'game-list'
               }
             >
-              {visibleLibraryItems.length ? (
+              {emptyLibraryState === 'items' ? (
                 visibleLibraryItems.map((item) => renderLibraryItem(item))
+              ) : emptyLibraryState === 'start' ? (
+                <div className="empty-state empty-state--library-start">
+                  <strong>Download game or import to begin.</strong>
+                  <p className="muted-text">
+                    Open a supported source site, or import existing folders
+                    from your library roots.
+                  </p>
+                  <div className="empty-state__source-links">
+                    {SOURCE_HOME_LINKS.map((link) => (
+                      <button
+                        className="ghost-button settings-icon-text-button"
+                        key={link.url}
+                        onClick={() =>
+                          void window.gameVaultApi.openExternal(link.url)
+                        }
+                        type="button"
+                      >
+                        <FontAwesomeIcon
+                          aria-hidden="true"
+                          icon={faUpRightFromSquare}
+                        />
+                        <span>{link.label}</span>
+                      </button>
+                    ))}
+                  </div>
+                  <button
+                    className="primary-button settings-icon-text-button"
+                    onClick={() => setSection('imports')}
+                    type="button"
+                  >
+                    <FontAwesomeIcon aria-hidden="true" icon={faFileImport} />
+                    <span>Import Now</span>
+                  </button>
+                </div>
               ) : (
                 <div className="empty-state">
                   <strong>No games match this view.</strong>
@@ -5571,8 +7659,18 @@ function App() {
         {section === 'settings' ? (
           <section className="settings-page">
             <header className="settings-page__header">
-              <h1>Settings</h1>
-              <p>Configure VaultTrack to fit your library and workflow.</p>
+              <div>
+                <h1>Settings</h1>
+                <p>Configure GameVault to fit your library and workflow.</p>
+              </div>
+              <button
+                className="ghost-button settings-icon-text-button"
+                onClick={() => openOnboardingGuide()}
+                type="button"
+              >
+                <FontAwesomeIcon aria-hidden="true" icon={faCircleInfo} />
+                <span>Open Setup Guide</span>
+              </button>
             </header>
 
             <section
@@ -5589,7 +7687,7 @@ function App() {
                 <div>
                   <h2 id="settings-scheduler-title">General / Scheduler</h2>
                   <p>
-                    Control how VaultTrack checks for updates and monitors your
+                    Control how GameVault checks for updates and monitors your
                     sources.
                   </p>
                 </div>
@@ -5597,12 +7695,12 @@ function App() {
               <div className="settings-scheduler-grid">
                 <label className="settings-number-field">
                   <span className="settings-label-with-help">
-                    Daily SteamDB Poll Hour
+                    SteamDB Patch Sync
                     <span
-                      aria-label="0 to 23 using your local time"
+                      aria-label="Updates upstream SteamDB patches for tracked games once per day at the selected local hour"
                       className="settings-help-icon"
                       role="img"
-                      title="0 to 23 using your local time"
+                      title="Updates upstream SteamDB patches for tracked games once per day at the selected local hour"
                     >
                       <FontAwesomeIcon
                         aria-hidden="true"
@@ -5625,19 +7723,19 @@ function App() {
                       type="number"
                       value={settingsDraft.pollDailyHourLocal}
                     />
-                    <span aria-hidden="true" className="settings-number-icon">
-                      <FontAwesomeIcon icon={faClock} />
+                    <span aria-hidden="true" className="settings-number-unit">
+                      hours
                     </span>
                   </span>
                 </label>
                 <label className="settings-number-field">
                   <span className="settings-label-with-help">
-                    Source Watch Interval (Hours)
+                    Download Source Sync
                     <span
-                      aria-label="How often sources are checked"
+                      aria-label="How often GameVault checks download sources after a tracked game gets a new upstream patch"
                       className="settings-help-icon"
                       role="img"
-                      title="How often sources are checked"
+                      title="How often GameVault checks download sources after a tracked game gets a new upstream patch"
                     >
                       <FontAwesomeIcon
                         aria-hidden="true"
@@ -5661,19 +7759,19 @@ function App() {
                       type="number"
                       value={settingsDraft.sourceWatchIntervalHours}
                     />
-                    <span aria-hidden="true" className="settings-number-icon">
-                      <FontAwesomeIcon icon={faClock} />
+                    <span aria-hidden="true" className="settings-number-unit">
+                      hours
                     </span>
                   </span>
                 </label>
                 <label className="settings-number-field">
                   <span className="settings-label-with-help">
-                    Source Watch Duration (Days)
+                    Source Watch Duration
                     <span
-                      aria-label="How long a new source match remains watched"
+                      aria-label="How many days after a new upstream patch is detected GameVault should monitor sources for a matching update"
                       className="settings-help-icon"
                       role="img"
-                      title="How long a new source match remains watched"
+                      title="How many days after a new upstream patch is detected GameVault should monitor sources for a matching update"
                     >
                       <FontAwesomeIcon
                         aria-hidden="true"
@@ -5697,8 +7795,8 @@ function App() {
                       type="number"
                       value={settingsDraft.sourceWatchDurationDays}
                     />
-                    <span aria-hidden="true" className="settings-number-icon">
-                      <FontAwesomeIcon icon={faClock} />
+                    <span aria-hidden="true" className="settings-number-unit">
+                      days
                     </span>
                   </span>
                 </label>
@@ -5706,10 +7804,10 @@ function App() {
                   <span className="settings-label-with-help">
                     Rename Game Folders on Import
                     <span
-                      aria-label="Uses the sanitized Steam title"
+                      aria-label="Normalize folder names with Steam game title"
                       className="settings-help-icon"
                       role="img"
-                      title="Uses the sanitized Steam title"
+                      title="Normalize folder names with Steam game title"
                     >
                       <FontAwesomeIcon
                         aria-hidden="true"
@@ -5728,9 +7826,6 @@ function App() {
                     type="checkbox"
                   />
                   <span aria-hidden="true" className="settings-toggle-track" />
-                  <small>
-                    Use the sanitized Steam title when imports are saved.
-                  </small>
                 </label>
               </div>
             </section>
@@ -5749,15 +7844,15 @@ function App() {
                 <div>
                   <h2 id="settings-library-roots-title">Library Roots</h2>
                   <p>
-                    Scan one folder level under each root. The primary root is
-                    mirrored for extension downloads.
+                    GameVault scans one folder level under each root. Extension
+                    downloads use the primary root.
                   </p>
                 </div>
                 <button
                   className="primary-button settings-icon-text-button"
                   disabled={settingsSaveStatus === 'saving'}
                   onClick={async () => {
-                    const picked = await window.vaultTrackApi.pickDirectory();
+                    const picked = await window.gameVaultApi.pickDirectory();
                     if (!picked) return;
                     setLibraryRootsDraft((current) => [
                       ...current,
@@ -5839,7 +7934,7 @@ function App() {
                             className="ghost-button settings-icon-text-button"
                             onClick={async () => {
                               const picked =
-                                await window.vaultTrackApi.pickDirectory();
+                                await window.gameVaultApi.pickDirectory();
                               if (picked) {
                                 updateLibraryRoot(root.id, {
                                   label:
@@ -5924,7 +8019,7 @@ function App() {
                           <button
                             className="ghost-button settings-icon-text-button"
                             onClick={async () => {
-                              await window.vaultTrackApi.restoreImportFolder({
+                              await window.gameVaultApi.restoreImportFolder({
                                 id: ignored.id,
                               });
                               await refreshSettings();
@@ -5947,6 +8042,29 @@ function App() {
                   )}
                 </div>
               </div>
+            </section>
+
+            <section
+              aria-labelledby="settings-browser-extension-title"
+              className="settings-card settings-card--browser-extension"
+            >
+              <div className="settings-card__heading">
+                <span
+                  aria-hidden="true"
+                  className="settings-card__icon settings-card__icon--integrations"
+                >
+                  <FontAwesomeIcon icon={faPuzzlePiece} />
+                </span>
+                <div>
+                  <h2 id="settings-browser-extension-title">
+                    Browser Extension Setup
+                  </h2>
+                  <p>
+                    Register Chrome, Edge, or Firefox with the desktop host.
+                  </p>
+                </div>
+              </div>
+              {renderBrowserExtensionSetupPanel('settings')}
             </section>
 
             <section
@@ -6112,6 +8230,48 @@ function App() {
                   </div>
                 </div>
               </div>
+              <div className="action-row integration-quick-actions">
+                <button
+                  className="ghost-button settings-icon-text-button"
+                  onClick={() => void refreshJDownloaderStatus()}
+                  type="button"
+                >
+                  <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
+                  <span>Check JDownloader</span>
+                </button>
+                <button
+                  className="ghost-button settings-icon-text-button"
+                  onClick={() =>
+                    void window.gameVaultApi.openExternal(
+                      JDOWNLOADER_DOWNLOAD_URL,
+                    )
+                  }
+                  type="button"
+                >
+                  <FontAwesomeIcon aria-hidden="true" icon={faCloudArrowDown} />
+                  <span>Download JDownloader</span>
+                </button>
+                <button
+                  className="ghost-button settings-icon-text-button"
+                  onClick={() =>
+                    void window.gameVaultApi.openExternal(
+                      MYJDOWNLOADER_SIGNUP_URL,
+                    )
+                  }
+                  type="button"
+                >
+                  <FontAwesomeIcon
+                    aria-hidden="true"
+                    icon={faUpRightFromSquare}
+                  />
+                  <span>Create MyJDownloader Account</span>
+                </button>
+              </div>
+              {jDownloaderStatus ? (
+                <p className="integration-detection-note muted-text">
+                  {jDownloaderStatus.message}
+                </p>
+              ) : null}
               <div className="integration-status-grid">
                 <div className="integration-status-card">
                   <span
@@ -6128,7 +8288,7 @@ function App() {
                     </strong>
                     <p className="muted-text">
                       {connectionHealth?.desktop.message ??
-                        'VaultTrack desktop bridge is unavailable.'}
+                        'GameVault desktop bridge is unavailable.'}
                     </p>
                   </div>
                 </div>
@@ -6224,11 +8384,12 @@ function App() {
                       setAuthBusy(true);
                       try {
                         setConnectionHealth(
-                          await window.vaultTrackApi.authenticateMyJDownloader({
+                          await window.gameVaultApi.authenticateMyJDownloader({
                             email: authDraft.email,
                             password: authDraft.password,
                           }),
                         );
+                        await refreshDesktopHealth({ forceRefresh: true });
                         setAuthDraft((current) => ({
                           ...current,
                           password: '',
@@ -6249,10 +8410,11 @@ function App() {
                       setAuthBusy(true);
                       try {
                         setConnectionHealth(
-                          await window.vaultTrackApi.selectMyJDownloaderDevice(
+                          await window.gameVaultApi.selectMyJDownloaderDevice(
                             authDraft.selectedDeviceId,
                           ),
                         );
+                        await refreshDesktopHealth({ forceRefresh: true });
                       } finally {
                         setAuthBusy(false);
                       }
@@ -6268,8 +8430,9 @@ function App() {
                       setAuthBusy(true);
                       try {
                         setConnectionHealth(
-                          await window.vaultTrackApi.disconnectMyJDownloader(),
+                          await window.gameVaultApi.disconnectMyJDownloader(),
                         );
+                        await refreshDesktopHealth({ forceRefresh: true });
                         setAuthDraft((current) => ({
                           ...current,
                           password: '',
@@ -6286,8 +8449,10 @@ function App() {
                   </button>
                   <button
                     className="ghost-button"
-                    disabled={authBusy}
-                    onClick={() => void refreshConnectionHealth()}
+                    disabled={authBusy || healthRefreshBusy}
+                    onClick={() =>
+                      void refreshNavbarHealth({ forceRefresh: true })
+                    }
                     type="button"
                   >
                     Refresh Status
@@ -6662,34 +8827,9 @@ function App() {
           </section>
         ) : null}
 
-        {section === 'logs' ? (
-          <section className="surface-panel">
-            <div className="panel-heading">
-              <div>
-                <p className="panel-title">Logs</p>
-                <p className="muted-text">
-                  Recent desktop events, refresh actions, and automation
-                  activity.
-                </p>
-              </div>
-            </div>
-            <div className="list-stack">
-              {logs.map((log) => (
-                <div className="list-card" key={log.id}>
-                  <strong>{log.message}</strong>
-                  <span className="muted-text">
-                    {log.level.toUpperCase()} |{' '}
-                    {new Date(log.createdAt).toLocaleString()}
-                  </span>
-                  {log.context ? (
-                    <code>{JSON.stringify(log.context)}</code>
-                  ) : null}
-                </div>
-              ))}
-            </div>
-          </section>
-        ) : null}
+        {section === 'activity' ? renderActivityPage() : null}
       </main>
+      {renderOnboardingWizard()}
       {importSteamSearch ? (
         <div className="modal-backdrop" role="presentation">
           <div
@@ -7218,7 +9358,7 @@ function App() {
                 <button
                   className="ghost-button patch-toolbar__button"
                   onClick={() =>
-                    void window.vaultTrackApi.openExternal(
+                    void window.gameVaultApi.openExternal(
                       buildSteamDbPatchnotesUrl(
                         patchEditor.item.item.steamAppId!,
                       ),
@@ -7284,6 +9424,76 @@ function App() {
                 busyAction === 'updatePatch'
                   ? 'Saving...'
                   : 'Save Patch'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {appDialog ? (
+        <div className="modal-backdrop app-dialog-backdrop" role="presentation">
+          <div
+            aria-describedby={`app-dialog-message-${appDialog.id}`}
+            aria-labelledby={`app-dialog-title-${appDialog.id}`}
+            aria-modal="true"
+            className={`modal-panel app-dialog app-dialog--${appDialog.variant}`}
+            role="alertdialog"
+          >
+            <div className="app-dialog__header">
+              <span className="app-dialog__icon" aria-hidden="true">
+                <FontAwesomeIcon
+                  icon={
+                    appDialog.kind === 'alert'
+                      ? faCircleInfo
+                      : appDialog.variant === 'danger'
+                        ? faTriangleExclamation
+                        : faCircleQuestion
+                  }
+                />
+              </span>
+              <div>
+                <p
+                  className="panel-title"
+                  id={`app-dialog-title-${appDialog.id}`}
+                >
+                  {appDialog.title}
+                </p>
+              </div>
+              <button
+                aria-label="Close dialog"
+                className="modal-close-button"
+                onClick={() => closeAppDialog(false)}
+                type="button"
+              >
+                <FontAwesomeIcon aria-hidden="true" icon={faXmark} />
+              </button>
+            </div>
+            <p
+              className="app-dialog__message"
+              id={`app-dialog-message-${appDialog.id}`}
+            >
+              {appDialog.message}
+            </p>
+            <div className="action-row app-dialog__actions">
+              {appDialog.cancelLabel ? (
+                <button
+                  className="ghost-button"
+                  onClick={() => closeAppDialog(false)}
+                  type="button"
+                >
+                  {appDialog.cancelLabel}
+                </button>
+              ) : null}
+              <button
+                autoFocus
+                className={
+                  appDialog.variant === 'danger'
+                    ? 'danger-button'
+                    : 'primary-button'
+                }
+                onClick={() => closeAppDialog(true)}
+                type="button"
+              >
+                {appDialog.confirmLabel}
               </button>
             </div>
           </div>

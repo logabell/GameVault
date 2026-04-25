@@ -1,5 +1,5 @@
 import { load } from 'cheerio';
-import type { ParsedSourcePayload, ReleaseDescriptor, SourceSnapshot } from '@vaulttrack/shared-types';
+import type { ParsedSourcePayload, ReleaseDescriptor, SourceSnapshot } from '@gamevault/shared-types';
 
 import type { RefreshTrackedItemInput, SourceAdapter } from '../types.js';
 import {
@@ -17,6 +17,8 @@ const FULL_LINE_RE =
 const UPDATED_TILL_LINE_RE =
   /updated\s+till\s+(?<date>\d{2}\.\d{2}\.\d{4})/i;
 const EXPLICIT_BUILD_RE = /\bbuild(?:\s*id)?\s*[:#]?\s*(?<build>\d{4,})\b/i;
+const EL_AMIGOS_RELEASE_RE = /\belamigos\s+release\b/i;
+const FALLBACK_FULL_RELEASE_VERSION = 'Full release';
 const MIRROR_HOST_LABELS = new Map<string, string>([
   ['1fichier.com', '1Fichier'],
   ['filecrypt.cc', 'FileCrypt'],
@@ -264,6 +266,28 @@ function findFullRelease($: ReturnType<typeof load>): ReleaseDescriptor | null {
   );
 }
 
+function findElAmigosReleaseLabel($: ReturnType<typeof load>): string | null {
+  const element = $('h1, h2, h3, h4, h5, p, div, span, strong')
+    .toArray()
+    .find((entry) => EL_AMIGOS_RELEASE_RE.test(compactText($(entry).text())));
+  return element ? compactText($(element).text()) : null;
+}
+
+function buildFallbackFullRelease(
+  $: ReturnType<typeof load>,
+  title: string,
+): ReleaseDescriptor {
+  const label = findElAmigosReleaseLabel($) ?? `${title} full release`;
+
+  return {
+    buildId: null,
+    isPatch: false,
+    label,
+    patchDate: null,
+    version: FALLBACK_FULL_RELEASE_VERSION,
+  };
+}
+
 export const elAmigosAdapter: SourceAdapter = {
   kind: 'elamigos',
   detectPage(url) {
@@ -288,13 +312,16 @@ export const elAmigosAdapter: SourceAdapter = {
         releaseDateSortKey(left.patchDate).localeCompare(releaseDateSortKey(right.patchDate)),
       )
       .at(-1);
-    const latestSourceRelease = latestUpdate ?? fullRelease;
+    const { fullDownloadUrls, patchDownloadUrls } = findDownloadAnchors($, url);
+    const fallbackFullRelease =
+      title && !latestUpdate && !fullRelease && fullDownloadUrls.length > 0
+        ? buildFallbackFullRelease($, title)
+        : null;
+    const latestSourceRelease = latestUpdate ?? fullRelease ?? fallbackFullRelease;
 
     if (!title || !latestSourceRelease) {
       throw new Error('Failed to parse ElAmigos detail page');
     }
-
-    const { fullDownloadUrls, patchDownloadUrls } = findDownloadAnchors($, url);
 
     return {
       coverUrl,
@@ -306,7 +333,7 @@ export const elAmigosAdapter: SourceAdapter = {
         latestSourceRelease.patchDate,
         [...fullDownloadUrls, ...patchDownloadUrls].map((entry) => entry.url).join('|'),
       ]),
-      fullRelease,
+      fullRelease: fullRelease ?? fallbackFullRelease,
       latestSourceRelease,
       normalizedTitle,
       notes: updates.map((entry) => entry.label),

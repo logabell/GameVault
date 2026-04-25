@@ -1,8 +1,14 @@
 {
   "manifest_version": 3,
-  "name": "VaultTrack",
+  "name": "GameVault",
   "version": "0.1.0",
-  "description": "Add supported game pages to VaultTrack and monitor library status.",
+  "description": "Add supported game pages to GameVault and monitor library status.",
+  "icons": {
+    "16": "icons/gamevault-16.png",
+    "32": "icons/gamevault-32.png",
+    "48": "icons/gamevault-48.png",
+    "128": "icons/gamevault-128.png"
+  },
   "permissions": [
     "activeTab",
     "alarms",
@@ -23,11 +29,24 @@
     "https://www.steamrip.com/*"
   ],
   "action": {
+    "default_icon": {
+      "16": "icons/gamevault-16.png",
+      "32": "icons/gamevault-32.png",
+      "48": "icons/gamevault-48.png",
+      "128": "icons/gamevault-128.png"
+    },
     "default_popup": "popup.html"
   },
   "background": {
+    "scripts": ["background.js"],
     "service_worker": "background.js",
     "type": "module"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "gamevault@vaulttrack.local",
+      "strict_min_version": "128.0"
+    }
   },
   "content_scripts": [
     {

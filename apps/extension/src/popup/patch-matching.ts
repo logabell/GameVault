@@ -1,7 +1,7 @@
 import type {
   ParsedSourcePayload,
   SteamPatchCandidate,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 
 export interface SteamPatchSuggestion {
   key: string;

@@ -9,6 +9,7 @@ import type {
   IgnoredImportFolderRecord,
   InstallRecord,
   LibraryRootRecord,
+  OnboardingState,
   ParsedSourcePayload,
   SettingsRecord,
   SourceMatch,
@@ -19,9 +20,10 @@ import type {
   SourceWatch,
   SteamPatchEntry,
   SteamPatchCandidate,
+  ThemeMode,
   TrackedItemRecord,
-} from '@vaulttrack/shared-types';
-import { mergePatchHistory } from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
+import { mergePatchHistory } from '@gamevault/shared-types';
 import initSqlJs, {
   type Database as SqlJsDatabase,
   type SqlJsStatic,
@@ -205,6 +207,13 @@ CREATE TABLE IF NOT EXISTS event_log (
   context_json TEXT,
   created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS activity_issue_dismissals (
+  issue_key TEXT PRIMARY KEY,
+  issue_id TEXT NOT NULL,
+  tracked_item_id TEXT,
+  dismissed_at TEXT NOT NULL
+);
 `;
 
 function randomId(): string {
@@ -228,6 +237,23 @@ function parseJsonArray<T>(value: string | null | undefined): T[] {
     return Array.isArray(parsed) ? (parsed as T[]) : [];
   } catch {
     return [];
+  }
+}
+
+function parseJsonObject<T extends object>(
+  value: string | null | undefined,
+): T | null {
+  if (!value) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as T)
+      : null;
+  } catch {
+    return null;
   }
 }
 
@@ -255,6 +281,12 @@ function normalizeJDownloaderSourcePreferences(
       steamrip: true,
     };
   }
+}
+
+function normalizeThemeMode(
+  value: string | null | undefined,
+): Extract<ThemeMode, 'dark' | 'light'> {
+  return value === 'light' ? 'light' : 'dark';
 }
 
 function getDefaultJDownloaderEnabled(map: Map<string, string | null>): boolean {
@@ -776,7 +808,7 @@ interface SteamDbBuildCacheRecord {
   patches: SteamPatchCandidate[];
 }
 
-export class VaultTrackDatabase {
+export class GameVaultDatabase {
   private constructor(
     private readonly db: SqlJsDatabase,
     private readonly filePath: string,
@@ -785,7 +817,7 @@ export class VaultTrackDatabase {
   static async open(
     filePath: string,
     wasmPath: string,
-  ): Promise<VaultTrackDatabase> {
+  ): Promise<GameVaultDatabase> {
     const SQL = (await initSqlJs({
       locateFile: () => wasmPath,
     })) as SqlJsStatic;
@@ -795,7 +827,35 @@ export class VaultTrackDatabase {
     db.exec(SCHEMA_SQL);
     applyMigrations(db);
     writeBinaryFileSync(filePath, db.export());
-    return new VaultTrackDatabase(db, filePath);
+    return new GameVaultDatabase(db, filePath);
+  }
+
+  static async countTrackedItems(
+    filePath: string,
+    wasmPath: string,
+  ): Promise<number | null> {
+    const persisted = await readFileIfExists(filePath);
+    if (!persisted) {
+      return null;
+    }
+
+    const SQL = (await initSqlJs({
+      locateFile: () => wasmPath,
+    })) as SqlJsStatic;
+    const db = new SQL.Database(persisted);
+    try {
+      const tableResult = db.exec(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tracked_items'",
+      );
+      if (!tableResult[0]?.values.length) {
+        return 0;
+      }
+
+      const countResult = db.exec('SELECT COUNT(*) FROM tracked_items');
+      return Number(countResult[0]?.values[0]?.[0] ?? 0);
+    } finally {
+      db.close();
+    }
   }
 
   private save(): void {
@@ -1829,6 +1889,60 @@ export class VaultTrackDatabase {
       : null;
   }
 
+  listDownloadJobs(): DownloadJobRecord[] {
+    return this.queryAll<{
+      id: string;
+      tracked_item_id: string;
+      source_kind: SupportedSourceKind | null;
+      package_name: string;
+      stage_path: string;
+      final_path: string;
+      stage: DownloadJobRecord['stage'];
+      provider: string | null;
+      package_id: number | null;
+      selected_mirror_url: string | null;
+      selected_patch_mirror_url: string | null;
+      bytes_loaded: number | null;
+      bytes_total: number | null;
+      speed: number | null;
+      eta_seconds: number | null;
+      status_message: string | null;
+      completed_parts: number | null;
+      total_parts: number | null;
+      created_at: string;
+      updated_at: string;
+      error_message: string | null;
+    }>(`SELECT * FROM download_jobs ORDER BY updated_at DESC`).map((row) => ({
+      bytesLoaded: row.bytes_loaded,
+      bytesTotal: row.bytes_total,
+      completedParts: row.completed_parts,
+      createdAt: row.created_at,
+      etaSeconds: row.eta_seconds,
+      errorMessage: row.error_message,
+      finalPath: row.final_path,
+      id: row.id,
+      parts: this.listDownloadJobParts(row.id),
+      packageId: row.package_id,
+      packageName: row.package_name,
+      provider:
+        row.provider === 'embedded_browser' || row.provider === 'direct_http'
+          ? 'direct_http'
+          : row.provider === 'manual'
+            ? 'manual'
+            : 'jdownloader',
+      sourceKind: row.source_kind,
+      selectedPatchMirrorUrl: row.selected_patch_mirror_url,
+      selectedMirrorUrl: row.selected_mirror_url,
+      speed: row.speed,
+      stage: row.stage,
+      stagePath: row.stage_path,
+      statusMessage: row.status_message,
+      totalParts: row.total_parts,
+      trackedItemId: row.tracked_item_id,
+      updatedAt: row.updated_at,
+    }));
+  }
+
   listDownloadJobParts(jobId: string): DownloadJobPartRecord[] {
     return this.queryAll<{
       id: string;
@@ -1987,6 +2101,37 @@ export class VaultTrackDatabase {
     this.exec(`DELETE FROM download_jobs WHERE id = ?`, [jobId]);
   }
 
+  dismissActivityIssue(params: {
+    dismissedAt: string;
+    issueId: string;
+    issueKey: string;
+    trackedItemId?: string | null;
+  }): void {
+    this.exec(
+      `INSERT INTO activity_issue_dismissals (
+         issue_key, issue_id, tracked_item_id, dismissed_at
+       ) VALUES (?, ?, ?, ?)
+       ON CONFLICT(issue_key) DO UPDATE SET
+          issue_id = excluded.issue_id,
+          tracked_item_id = excluded.tracked_item_id,
+          dismissed_at = excluded.dismissed_at`,
+      [
+        params.issueKey,
+        params.issueId,
+        params.trackedItemId ?? null,
+        params.dismissedAt,
+      ],
+    );
+  }
+
+  listDismissedActivityIssueKeys(): Set<string> {
+    return new Set(
+      this.queryAll<{ issue_key: string }>(
+        `SELECT issue_key FROM activity_issue_dismissals`,
+      ).map((row) => row.issue_key),
+    );
+  }
+
   deleteTrackedItemCascade(trackedItemId: string): void {
     const childTables = [
       'source_watches',
@@ -1999,6 +2144,7 @@ export class VaultTrackDatabase {
       'download_mirrors',
       'download_job_parts',
       'download_jobs',
+      'activity_issue_dismissals',
     ];
 
     for (const table of childTables) {
@@ -2040,8 +2186,13 @@ export class VaultTrackDatabase {
       ),
       lastDailyPollAt: map.get('scheduler.lastDailyPollAt') ?? null,
       libraryRoots,
+      lastExtensionActivityAt:
+        map.get('extension.lastNativeMessageAt') ?? null,
       myJDownloaderDeviceId: map.get('myjd.deviceId') ?? null,
       myJDownloaderEmail: map.get('myjd.email') ?? null,
+      onboarding: parseJsonObject<OnboardingState>(
+        map.get('onboarding.state'),
+      ),
       pollDailyHourLocal: Number(map.get('scheduler.pollDailyHourLocal') ?? 9),
       renameGameFoldersOnImport:
         map.get('import.renameGameFoldersOnImport') !== 'false',
@@ -2050,9 +2201,7 @@ export class VaultTrackDatabase {
       sourceWatchIntervalHours: Number(
         map.get('sourceWatch.intervalHours') ?? 8,
       ),
-      themeMode:
-        (map.get('appearance.themeMode') as SettingsRecord['themeMode']) ??
-        'system',
+      themeMode: normalizeThemeMode(map.get('appearance.themeMode')),
     };
   }
 

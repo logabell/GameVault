@@ -1,20 +1,20 @@
 {
-  "name": "@vaulttrack/extension",
+  "name": "@gamevault/extension",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "npm run build --workspace @vaulttrack/shared-types && npm run build --workspace @vaulttrack/source-core && npm run build --workspace @vaulttrack/steam-core && node ./scripts/build.mjs",
-    "dev": "npm run build --workspace @vaulttrack/shared-types && npm run build --workspace @vaulttrack/source-core && npm run build --workspace @vaulttrack/steam-core && node ./scripts/build.mjs --watch",
+    "build": "npm run build --workspace @gamevault/shared-types && npm run build --workspace @gamevault/source-core && npm run build --workspace @gamevault/steam-core && node ./scripts/build.mjs",
+    "dev": "npm run build --workspace @gamevault/shared-types && npm run build --workspace @gamevault/source-core && npm run build --workspace @gamevault/steam-core && node ./scripts/build.mjs --watch",
     "test": "vitest run"
   },
   "dependencies": {
     "@fortawesome/fontawesome-svg-core": "^7.2.0",
     "@fortawesome/free-solid-svg-icons": "^7.2.0",
     "@fortawesome/react-fontawesome": "^3.3.1",
-    "@vaulttrack/shared-types": "0.1.0",
-    "@vaulttrack/source-core": "0.1.0",
-    "@vaulttrack/steam-core": "0.1.0",
+    "@gamevault/shared-types": "0.1.0",
+    "@gamevault/source-core": "0.1.0",
+    "@gamevault/steam-core": "0.1.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   }

@@ -1,5 +1,13 @@
-import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import {
+  copyFile,
+  mkdir,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import esbuild from 'esbuild';
 
@@ -10,6 +18,32 @@ const srcDir = join(rootDir, 'src');
 await mkdir(join(distDir, 'main'), { recursive: true });
 await mkdir(join(distDir, 'renderer'), { recursive: true });
 await mkdir(join(distDir, 'native-host'), { recursive: true });
+
+async function copyDirectory(from, to) {
+  await mkdir(to, { recursive: true });
+  const entries = await readdir(from, { withFileTypes: true });
+  await Promise.all(
+    entries.map((entry) => {
+      const source = join(from, entry.name);
+      const target = join(to, entry.name);
+      return entry.isDirectory()
+        ? copyDirectory(source, target)
+        : copyFile(source, target);
+    }),
+  );
+}
+
+async function buildAndCopyExtension() {
+  await import(
+    pathToFileURL(resolve(rootDir, '..', 'extension', 'scripts', 'build.mjs'))
+      .href
+  );
+
+  const extensionDistDir = resolve(rootDir, '..', 'extension', 'dist');
+  const bundledExtensionDir = join(distDir, 'extension');
+  await rm(bundledExtensionDir, { force: true, recursive: true });
+  await copyDirectory(extensionDistDir, bundledExtensionDir);
+}
 
 await Promise.all([
   esbuild.build({
@@ -61,6 +95,8 @@ await copyFile(
   join(srcDir, 'renderer', 'styles.css'),
   join(distDir, 'renderer', 'styles.css'),
 );
+await copyDirectory(join(srcDir, 'assets'), join(distDir, 'assets'));
+await buildAndCopyExtension();
 await copyFile(
   resolve(rootDir, '../../node_modules/sql.js/dist/sql-wasm.wasm'),
   join(distDir, 'main', 'sql-wasm.wasm'),

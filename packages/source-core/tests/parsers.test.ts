@@ -1350,6 +1350,67 @@ describe('source parsers', () => {
     expect(parsed.fullDownloadUrls).toHaveLength(4);
   });
 
+  it('parses ElAmigos full-release pages without version metadata', () => {
+    const html = `
+      <html>
+        <head>
+          <title>Jay and Silent Bob Chronic Blunt Punch - ElAmigos official site</title>
+        </head>
+        <body>
+          <h2>Jay and Silent Bob Chronic Blunt Punch (2026), 4.32GB</h2>
+          <h3>ElAmigos release, game is already cracked after installation (crack by Codex/Rune).</h3>
+          <img src="https://elamigos.site/img/jay-and-silent-bob.jpg">
+          <h2>DDOWNLOAD</h2>
+          <h3><a href="https://filecrypt.cc/Container/BB10C1AC6E.html">https://filecrypt.cc/Container/BB10C1AC6E.html</a></h3>
+          <h3><a href="https://www.keeplinks.org/p16/69e7f77a949df">https://www.keeplinks.org/p16/69e7f77a949df</a></h3>
+          <h2>RAPIDGATOR</h2>
+          <h3><a href="https://filecrypt.cc/Container/97C388674D.html">https://filecrypt.cc/Container/97C388674D.html</a></h3>
+          <h3><a href="https://www.keeplinks.org/p16/69e7f773179b6">https://www.keeplinks.org/p16/69e7f773179b6</a></h3>
+        </body>
+      </html>
+    `;
+
+    const parsed = parseSupportedPage(
+      'https://elamigos.site/data/Jay_and_Silent_Bob_Chronic_Blunt_Punch_MULTi6_-_ElAmigos.html',
+      html,
+    );
+
+    expect(parsed.sourceKind).toBe('elamigos');
+    expect(parsed.title).toBe('Jay and Silent Bob Chronic Blunt Punch');
+    expect(parsed.latestSourceRelease).toEqual({
+      buildId: null,
+      isPatch: false,
+      label:
+        'ElAmigos release, game is already cracked after installation (crack by Codex/Rune).',
+      patchDate: null,
+      version: 'Full release',
+    });
+    expect(parsed.fullRelease).toEqual(parsed.latestSourceRelease);
+    expect(parsed.fullDownloadUrls).toEqual([
+      {
+        kind: 'full',
+        label: 'DDOWNLOAD FileCrypt',
+        url: 'https://filecrypt.cc/Container/BB10C1AC6E.html',
+      },
+      {
+        kind: 'full',
+        label: 'DDOWNLOAD Keeplinks',
+        url: 'https://www.keeplinks.org/p16/69e7f77a949df',
+      },
+      {
+        kind: 'full',
+        label: 'RAPIDGATOR FileCrypt',
+        url: 'https://filecrypt.cc/Container/97C388674D.html',
+      },
+      {
+        kind: 'full',
+        label: 'RAPIDGATOR Keeplinks',
+        url: 'https://www.keeplinks.org/p16/69e7f773179b6',
+      },
+    ]);
+    expect(parsed.patchDownloadUrls).toEqual([]);
+  });
+
   it('parses SteamRIP pages and keeps the full release as the latest source release', () => {
     const html = `
       <html>

@@ -9,11 +9,11 @@ import type {
   SteamPatchCandidate,
   SupportedSourceKind,
   TrackedItemView,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 export {
   getSourceComparisonLabel,
   inferSourceComparisonRows,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 
 import {
   findLikelySteamPatch,
@@ -35,7 +35,7 @@ export interface CreateMatchedDraftMessage {
   selectedSteamCandidate: SteamCandidate;
   sourceUrl?: string | null;
   tabId: number | null;
-  type: 'vaulttrack:create-matched-draft';
+  type: 'gamevault:create-matched-draft';
 }
 
 export interface SourceDownloadSelection {
@@ -161,7 +161,7 @@ export function getDownloadQueueTimeoutMessage(
 ): string {
   return provider === 'jdownloader'
     ? 'Download queueing timed out. Check MyJDownloader, then try again if the package was not added.'
-    : 'Download startup timed out. Check the VaultTrack desktop app, then try again if the curl download did not begin.';
+    : 'Download startup timed out. Check the GameVault desktop app, then try again if the curl download did not begin.';
 }
 
 export function normalizeComparableUrl(
@@ -337,7 +337,7 @@ export function buildCreateMatchedDraftMessage(
     selectedSteamCandidate: input.selectedSteamCandidate,
     sourceUrl: input.sourceUrl,
     tabId: input.tabId ?? null,
-    type: 'vaulttrack:create-matched-draft',
+    type: 'gamevault:create-matched-draft',
   };
 }
 
@@ -507,7 +507,7 @@ export function getSourceDownloadSelection(
   };
 }
 
-export { hasActionableSourceUpdate } from '@vaulttrack/shared-types';
+export { hasActionableSourceUpdate } from '@gamevault/shared-types';
 
 function sourceHasSelectableFullMirror(source: MatchedSourceView): boolean {
   return Boolean(

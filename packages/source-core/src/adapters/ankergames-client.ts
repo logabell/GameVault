@@ -1,4 +1,4 @@
-import type { ParsedSourcePayload } from '@vaulttrack/shared-types';
+import type { ParsedSourcePayload } from '@gamevault/shared-types';
 
 import { buildFingerprint } from '../utils.js';
 

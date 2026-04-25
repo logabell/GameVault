@@ -85,7 +85,7 @@ describe('planLibraryPaths', () => {
 
 describe('finalizeSteamRipExtraction', () => {
   it('promotes only the SteamRIP game folder and removes extracted extras', async () => {
-    const tempRoot = await mkdtemp(join(tmpdir(), 'vaulttrack-steamrip-'));
+    const tempRoot = await mkdtemp(join(tmpdir(), 'gamevault-steamrip-'));
     const rootLibraryPath = join(tempRoot, 'High Seas');
     const stageRootPath = join(rootLibraryPath, '_STAGING');
     const extractPath = join(stageRootPath, 'MOUSE P.I. For Hire', 'contents');
@@ -126,7 +126,7 @@ describe('finalizeSteamRipExtraction', () => {
 
   it('promotes a version-suffixed SteamRIP game folder from a release wrapper', async () => {
     const tempRoot = await mkdtemp(
-      join(tmpdir(), 'vaulttrack-steamrip-version-'),
+      join(tmpdir(), 'gamevault-steamrip-version-'),
     );
     const rootLibraryPath = join(tempRoot, 'High Seas');
     const stageRootPath = join(rootLibraryPath, '_STAGING');
@@ -168,7 +168,7 @@ describe('finalizeSteamRipExtraction', () => {
 
   it('promotes the sole non-extra SteamRIP folder even when its name differs from the Steam title', async () => {
     const tempRoot = await mkdtemp(
-      join(tmpdir(), 'vaulttrack-steamrip-arbitrary-'),
+      join(tmpdir(), 'gamevault-steamrip-arbitrary-'),
     );
     const rootLibraryPath = join(tempRoot, 'High Seas');
     const stageRootPath = join(rootLibraryPath, '_STAGING');
@@ -209,7 +209,7 @@ describe('finalizeSteamRipExtraction', () => {
   });
 
   it('promotes only the AnkerGames game folder and removes archive extras', async () => {
-    const tempRoot = await mkdtemp(join(tmpdir(), 'vaulttrack-ankergames-'));
+    const tempRoot = await mkdtemp(join(tmpdir(), 'gamevault-ankergames-'));
     const rootLibraryPath = join(tempRoot, 'High Seas');
     const stageRootPath = join(rootLibraryPath, '_STAGING');
     const extractPath = join(stageRootPath, 'Shape of Dreams_22630308');
@@ -254,7 +254,7 @@ describe('finalizeSteamRipExtraction', () => {
   });
 
   it('does not treat an empty AnkerGames game folder as extracted content', async () => {
-    const tempRoot = await mkdtemp(join(tmpdir(), 'vaulttrack-empty-anker-'));
+    const tempRoot = await mkdtemp(join(tmpdir(), 'gamevault-empty-anker-'));
     const rootLibraryPath = join(tempRoot, 'High Seas');
     const stageRootPath = join(rootLibraryPath, '_STAGING');
     const extractPath = join(stageRootPath, 'Shape of Dreams_22630308');
@@ -296,7 +296,7 @@ describe('finalizeSteamRipExtraction', () => {
   });
 
   it('replaces an existing non-empty install folder after staged extraction is valid', async () => {
-    const tempRoot = await mkdtemp(join(tmpdir(), 'vaulttrack-existing-'));
+    const tempRoot = await mkdtemp(join(tmpdir(), 'gamevault-existing-'));
     const rootLibraryPath = join(tempRoot, 'High Seas');
     const stageRootPath = join(rootLibraryPath, '_STAGING');
     const extractPath = join(stageRootPath, 'Shape of Dreams_22630308');
@@ -331,7 +331,7 @@ describe('finalizeSteamRipExtraction', () => {
 
 describe('extractSingleStagedZipArchive', () => {
   it('extracts the only top-level staged zip into the staging folder', async () => {
-    const tempRoot = await mkdtemp(join(tmpdir(), 'vaulttrack-zip-'));
+    const tempRoot = await mkdtemp(join(tmpdir(), 'gamevault-zip-'));
     try {
       const extractPath = join(tempRoot, 'Shape of Dreams_22630308');
       await mkdir(extractPath, { recursive: true });
@@ -378,7 +378,7 @@ describe('scanImportFolders', () => {
 
 describe('normalizeDuplicateNestedFolder', () => {
   it('moves duplicate extracted package folder contents up into the part folder', async () => {
-    const tempRoot = await mkdtemp(join(tmpdir(), 'vaulttrack-nested-'));
+    const tempRoot = await mkdtemp(join(tmpdir(), 'gamevault-nested-'));
     const partPath = join(
       tempRoot,
       'High Seas',
@@ -415,7 +415,7 @@ describe('normalizeDuplicateNestedFolder', () => {
 
 describe('removeKnownLibraryPaths', () => {
   it('removes only guarded final and staging paths', async () => {
-    const tempRoot = await mkdtemp(join(tmpdir(), 'vaulttrack-cleanup-'));
+    const tempRoot = await mkdtemp(join(tmpdir(), 'gamevault-cleanup-'));
     const rootLibraryPath = join(tempRoot, 'High Seas');
     const finalPath = join(rootLibraryPath, 'MOUSE P.I. For Hire');
     const stagePath = join(
@@ -468,7 +468,7 @@ describe('removeKnownLibraryPaths', () => {
   });
 
   it('refuses to delete the library root itself', async () => {
-    const tempRoot = await mkdtemp(join(tmpdir(), 'vaulttrack-cleanup-root-'));
+    const tempRoot = await mkdtemp(join(tmpdir(), 'gamevault-cleanup-root-'));
     const rootLibraryPath = join(tempRoot, 'High Seas');
 
     try {
@@ -490,7 +490,7 @@ describe('renameLibraryFolder', () => {
   const itWindows = process.platform === 'win32' ? it : it.skip;
 
   itWindows('treats case-only target differences as an existing folder no-op', async () => {
-    const tempRoot = await mkdtemp(join(tmpdir(), 'vaulttrack-rename-case-'));
+    const tempRoot = await mkdtemp(join(tmpdir(), 'gamevault-rename-case-'));
     const rootLibraryPath = join(tempRoot, 'High Seas');
     const currentPath = join(rootLibraryPath, 'A Little To The Left');
     const targetPath = join(rootLibraryPath, 'A Little to the Left');

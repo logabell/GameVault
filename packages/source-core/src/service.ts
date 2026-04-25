@@ -2,7 +2,7 @@ import type {
   ParsedSourcePayload,
   SourceSnapshot,
   SupportedSourceKind,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 
 import { ankerGamesAdapter } from './adapters/ankergames.js';
 import {

@@ -38,6 +38,12 @@ const DOWNLOAD_STATUSES = new Set<TrackedItemStatus>([
   TrackedItemStatus.Staged,
 ]);
 
+const FILE_DELETE_STATUSES = new Set<TrackedItemStatus>([
+  ...DOWNLOAD_STATUSES,
+  TrackedItemStatus.Installed,
+  TrackedItemStatus.Failed,
+]);
+
 export function getDefaultLibrarySortDirection(
   sortMode: LibrarySortMode,
 ): LibrarySortDirection {
@@ -62,6 +68,10 @@ export function hasActionableSourceUpdate(item: TrackedItemView): boolean {
     !needsPatchMetadataAttention(item) &&
     getTrackingStatus(item) === TrackedItemTrackingStatus.UpdateAvailable
   );
+}
+
+export function canDeleteTrackedItemFiles(item: TrackedItemView): boolean {
+  return FILE_DELETE_STATUSES.has(item.status);
 }
 
 export function isSourceBehindUpstream(item: TrackedItemView): boolean {

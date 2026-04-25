@@ -1,5 +1,5 @@
 {
-  "name": "@vaulttrack/source-core",
+  "name": "@gamevault/source-core",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -16,7 +16,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@vaulttrack/shared-types": "0.1.0",
+    "@gamevault/shared-types": "0.1.0",
     "cheerio": "^1.0.0"
   }
 }

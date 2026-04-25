@@ -1,17 +1,17 @@
-import type { SourceFetch } from '@vaulttrack/source-core';
+import type { SourceFetch } from '@gamevault/source-core';
 
 import { extractSingleStagedZipArchive } from './services/files.js';
 import type { MyJDownloaderService } from './services/myjdownloader.js';
 import {
-  VaultTrackService,
+  GameVaultService,
   type DirectHttpDownloadRunner,
   type SecureValueProvider,
-} from './services/vaulttrack-service.js';
-import type { VaultTrackDatabase } from './services/database.js';
+} from './services/gamevault-service.js';
+import type { GameVaultDatabase } from './services/database.js';
 import type { dismountIsoImagesUnderPath } from './services/files.js';
 
-export interface CreateVaultTrackServiceParams {
-  database: VaultTrackDatabase;
+export interface CreateGameVaultServiceParams {
+  database: GameVaultDatabase;
   dismountIsoUnderPath?: typeof dismountIsoImagesUnderPath;
   myJDownloader: MyJDownloaderService;
   notify: (event: 'debug' | 'error' | 'info' | 'warn', message: string) => void;
@@ -23,10 +23,10 @@ export interface CreateVaultTrackServiceParams {
   steamFetch?: typeof fetch;
 }
 
-export function createVaultTrackService(
-  params: CreateVaultTrackServiceParams,
-): VaultTrackService {
-  return new VaultTrackService(
+export function createGameVaultService(
+  params: CreateGameVaultServiceParams,
+): GameVaultService {
+  return new GameVaultService(
     params.database,
     params.myJDownloader,
     params.secrets,

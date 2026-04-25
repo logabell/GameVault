@@ -10,11 +10,11 @@ import {
   matchesLibraryStatusFilter,
   sortLibraryItems,
 } from '../src/renderer/library-controls.js';
-import type { SteamPatchEntry, TrackedItemView } from '@vaulttrack/shared-types';
+import type { SteamPatchEntry, TrackedItemView } from '@gamevault/shared-types';
 import {
   TrackedItemStatus,
   TrackedItemTrackingStatus,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 
 function makeItem(
   title: string,
@@ -323,7 +323,7 @@ describe('library controls', () => {
       'Mark Shape of Dreams as failed and stop its curl download?',
     );
     expect(getDeleteTrackedItemPrompt(item)).toBe(
-      'Delete Shape of Dreams from VaultTrack, stop its curl download, and delete staged/install files?',
+      'Delete Shape of Dreams from GameVault, stop its curl download, and delete staged/install files?',
     );
   });
 });

@@ -6,17 +6,22 @@ import { basename, dirname, join } from 'node:path';
 
 import type {
   ConfirmedSteamMatch,
+  ExtensionSetupInfo,
   ParsedSourcePayload,
   SteamPatchCandidate,
   SupportedSourceKind,
-} from '@vaulttrack/shared-types';
-import type { SourceFetch } from '@vaulttrack/source-core';
-import type { MyJDownloaderService } from '../src/main/services/myjdownloader.js';
-import { VaultTrackDatabase } from '../src/main/services/database.js';
+} from '@gamevault/shared-types';
+import type { SourceFetch } from '@gamevault/source-core';
 import {
-  VaultTrackService,
+  MyJDownloaderService,
+  type MyJDownloaderClient,
+} from '../src/main/services/myjdownloader.js';
+import { GameVaultDatabase } from '../src/main/services/database.js';
+import {
+  GameVaultService,
+  type DirectHttpDownloadProgressSnapshot,
   type DirectHttpDownloadRunner,
-} from '../src/main/services/vaulttrack-service.js';
+} from '../src/main/services/gamevault-service.js';
 import type { extractSingleStagedZipArchive } from '../src/main/services/files.js';
 
 function resolveSqlWasmPath(): string {
@@ -32,9 +37,9 @@ function resolveSqlWasmPath(): string {
 }
 
 async function openTestDatabase() {
-  const tempRoot = await mkdtemp(join(tmpdir(), 'vaulttrack-service-'));
-  const database = await VaultTrackDatabase.open(
-    join(tempRoot, 'vaulttrack.sqlite'),
+  const tempRoot = await mkdtemp(join(tmpdir(), 'gamevault-service-'));
+  const database = await GameVaultDatabase.open(
+    join(tempRoot, 'gamevault.sqlite'),
     resolveSqlWasmPath(),
   );
   return { database, tempRoot };
@@ -85,6 +90,57 @@ const selectedPatch: SteamPatchCandidate = {
   publishedAt: '2026-04-19T07:13:32.000Z',
   title: 'MOUSE: P.I. For Hire update for 19 April 2026',
 };
+
+const extensionSetupInfo: ExtensionSetupInfo = {
+  browsers: ['chrome', 'edge'],
+  extensionPath: 'C:\\projects\\vaultTrack\\apps\\extension\\dist',
+  extensionPathExists: true,
+  nativeHostName: 'com.gamevault.desktop',
+};
+
+const extensionRegistration = {
+  browsers: ['chrome' as const],
+  extensionId: 'abcdefghijklmnopabcdefghijklmnop',
+  manifestPath: 'C:\\Users\\Logan\\native-hosts\\com.gamevault.desktop.json',
+  registeredAt: '2026-04-24T12:00:00.000Z',
+};
+
+function createCredentialBackedService(params: {
+  database: GameVaultDatabase;
+  decrypt: (text: string) => string;
+}): GameVaultService {
+  const client: MyJDownloaderClient = {
+    async callDevice<T>(): Promise<T> {
+      throw new Error('Unexpected device call');
+    },
+    async disconnect(): Promise<void> {},
+    async listDevices() {
+      return [
+      { id: 'device-1', name: 'JDownloader', status: 'ONLINE' },
+      ];
+    },
+  };
+  const serviceRef: { current: GameVaultService | null } = { current: null };
+  const myJDownloader = new MyJDownloaderService(async () => {
+    if (!serviceRef.current) {
+      throw new Error('Service is not ready');
+    }
+    return serviceRef.current.getMyJDownloaderCredentials();
+  }, client);
+  const service = new GameVaultService(
+    params.database,
+    myJDownloader,
+    {
+      decrypt: params.decrypt,
+      encrypt: (text) => text,
+    },
+    () => undefined,
+    () => undefined,
+    async () => null,
+  );
+  serviceRef.current = service;
+  return service;
+}
 
 function rss(items: SteamPatchCandidate[]): string {
   return `
@@ -436,7 +492,7 @@ function replacedParsedSource(params: {
 }
 
 function seedReplacedSteamRipAlignmentScenario(
-  database: VaultTrackDatabase,
+  database: GameVaultDatabase,
   params: {
     includeSteamRipCatalogMetadata?: boolean;
     patchEntries?: Array<{
@@ -556,7 +612,7 @@ function seedReplacedSteamRipAlignmentScenario(
 }
 
 function createService(
-  database: VaultTrackDatabase,
+  database: GameVaultDatabase,
   queueLinks: unknown = vi.fn(async () => ({
     packageId: 9001,
     packageName: 'queued-package',
@@ -587,7 +643,7 @@ function createService(
     ),
   })),
   jDownloaderEnabled = true,
-): VaultTrackService {
+): GameVaultService {
   database.setSetting(
     'download.jdownloader.enabled',
     jDownloaderEnabled ? 'true' : 'false',
@@ -606,7 +662,7 @@ function createService(
     restartExtraction,
   } as unknown as MyJDownloaderService;
 
-  return new VaultTrackService(
+  return new GameVaultService(
     database,
     myJDownloader,
     {
@@ -665,7 +721,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe('VaultTrackService import workflow', () => {
+describe('GameVaultService import workflow', () => {
   it('defaults JDownloader behavior from credential state and preserves credentials when saving preferences', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -708,6 +764,123 @@ describe('VaultTrackService import workflow', () => {
         encryptedPassword: 'encrypted-secret',
         myJDownloaderEmail: 'logan@example.test',
       });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('persists onboarding setup state in settings', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const service = createService(database);
+
+      const saved = service.saveOnboardingState({
+        jDownloaderSkippedAt: '2026-04-24T12:00:00.000Z',
+        skippedAt: '2026-04-24T12:01:00.000Z',
+      });
+
+      expect(saved.onboarding).toMatchObject({
+        jDownloaderSkippedAt: '2026-04-24T12:00:00.000Z',
+        skippedAt: '2026-04-24T12:01:00.000Z',
+      });
+      expect(service.getSettings().onboarding?.updatedAt).toBeTruthy();
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('clears unreadable MyJDownloader credentials and returns reconnect health', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('myjd.email', 'logan@example.test');
+      database.setSetting('myjd.password', 'encrypted-secret');
+      database.setSetting('myjd.deviceId', 'device-1');
+      const service = createCredentialBackedService({
+        database,
+        decrypt: () => {
+          throw new Error('bad decrypt');
+        },
+      });
+
+      const health = await service.getConnectionHealth({ forceRefresh: true });
+
+      expect(health.myJDownloader).toMatchObject({
+        color: 'red',
+        label: 'Reconnect MyJDownloader',
+      });
+      expect(database.getSettings()).toMatchObject({
+        encryptedPassword: null,
+        myJDownloaderDeviceId: null,
+        myJDownloaderEmail: 'logan@example.test',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('summarizes extension health from setup and native-message activity', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const service = createService(database);
+      database.setSetting(
+        'onboarding.state',
+        JSON.stringify({ extensionRegistration }),
+      );
+      const now = new Date('2026-04-24T12:30:00.000Z');
+
+      await expect(
+        service.getDesktopHealth(
+          { ...extensionSetupInfo, extensionPathExists: false },
+          { now },
+        ),
+      ).resolves.toMatchObject({
+        extension: { color: 'red', label: 'Extension build missing' },
+        overall: { color: 'red' },
+      });
+
+      await expect(
+        service.getDesktopHealth(extensionSetupInfo, { now }),
+      ).resolves.toMatchObject({
+        extension: { color: 'yellow', label: 'Awaiting extension activity' },
+        overall: { color: 'yellow' },
+      });
+
+      database.setSetting(
+        'extension.lastNativeMessageAt',
+        '2026-04-24T11:30:00.000Z',
+      );
+      await expect(
+        service.getDesktopHealth(extensionSetupInfo, { now }),
+      ).resolves.toMatchObject({
+        extension: { color: 'yellow', label: 'Extension inactive' },
+        overall: { color: 'yellow' },
+      });
+
+      service.recordExtensionActivity(new Date('2026-04-24T12:20:00.000Z'));
+      await expect(
+        service.getDesktopHealth(extensionSetupInfo, { now }),
+      ).resolves.toMatchObject({
+        extension: { color: 'green', label: 'Extension connected' },
+        overall: { color: 'green' },
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('marks existing tracked libraries as onboarded when no onboarding state exists', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.upsertTrackedItem({
+        id: 'existing-game',
+        normalizedTitle: 'existing game',
+        sourceKind: 'manual',
+        sourceUrl: null,
+        title: 'Existing Game',
+      });
+      const service = createService(database);
+
+      expect(service.getSettings().onboarding?.completedAt).toBeTruthy();
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
@@ -1468,7 +1641,7 @@ describe('VaultTrackService import workflow', () => {
   });
 });
 
-describe('VaultTrackService SteamDB patch workflow', () => {
+describe('GameVaultService SteamDB patch workflow', () => {
   it('resolves SteamDB patches from the selected app id feed URL', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -2234,6 +2407,81 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         selectedMirrorUrl: ankerMirrorUrl,
         stage: 'queued',
       });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('emits live progress changes from direct HTTP downloads', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      const progressRef: {
+        current: ((snapshot: DirectHttpDownloadProgressSnapshot) => void) | null;
+      } = { current: null };
+      const startDirectHttpDownload = vi.fn<DirectHttpDownloadRunner>(
+        (params) => {
+          progressRef.current = params.onProgress;
+          return {
+            cancel: vi.fn(),
+            completion: new Promise<{ fileName: string; savePath: string }>(
+              () => undefined,
+            ),
+          };
+        },
+      );
+      const service = createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        fetch,
+        undefined,
+        undefined,
+        undefined,
+        startDirectHttpDownload,
+      );
+      const progressEvents: string[][] = [];
+      const unsubscribe = service.onDownloadProgressChange((event) => {
+        progressEvents.push(event.trackedItemIds);
+      });
+      const view = await service.addTrackedItem({
+        parsedSource: ankergamesDirectReadySource,
+        queueDownload: true,
+        selectedDownloads: { fullUrl: ankergamesProxyUrl },
+        selectedSteamPatch: selectedPatch,
+        steamMatch,
+      });
+      await waitForCondition(() => progressRef.current != null);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      progressEvents.length = 0;
+
+      const emitProgress = progressRef.current;
+      if (!emitProgress) {
+        throw new Error('Direct HTTP progress callback was not captured.');
+      }
+      emitProgress({
+        bytesLoaded: 512,
+        bytesTotal: 1024,
+        etaSeconds: 8,
+        speed: 64,
+        stage: 'downloading',
+        statusMessage: 'Downloading with curl',
+      });
+
+      await waitForCondition(() =>
+        progressEvents.some((ids) => ids.includes(view.item.id)),
+      );
+      expect(database.getDownloadJob(view.item.id)).toMatchObject({
+        bytesLoaded: 512,
+        bytesTotal: 1024,
+        etaSeconds: 8,
+        speed: 64,
+        stage: 'downloading',
+        statusMessage: 'Downloading with curl',
+      });
+      unsubscribe();
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
@@ -5068,12 +5316,27 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       const stagePath = queued.currentDownload!.stagePath;
       await mkdir(stagePath, { recursive: true });
       await writeFile(join(stagePath, 'setup.iso'), 'iso');
+      const installedPath = join(rootLibraryPath, 'Against the Storm');
+      await mkdir(installedPath, { recursive: true });
+      await writeFile(join(installedPath, 'AgainstTheStorm.exe'), 'old exe');
+
+      await expect(service.completeStagedInstall(queued.item.id)).rejects.toThrow(
+        'Confirm the ElAmigos download is ready',
+      );
+
+      const ready = await service.confirmManualDownloadReady(queued.item.id);
+
+      expect(existsSync(installedPath)).toBe(false);
+      expect(existsSync(stagePath)).toBe(true);
+      expect(ready.currentDownload).toMatchObject({
+        provider: 'manual',
+        stage: 'staged',
+      });
 
       await expect(service.completeStagedInstall(queued.item.id)).rejects.toThrow(
         'No completed ElAmigos install',
       );
 
-      const installedPath = join(rootLibraryPath, 'Against the Storm');
       await mkdir(installedPath, { recursive: true });
       await writeFile(join(installedPath, 'AgainstTheStorm.exe'), 'exe');
       const completed = await service.completeStagedInstall(queued.item.id);
@@ -5824,9 +6087,14 @@ describe('VaultTrackService SteamDB patch workflow', () => {
           title: 'Frostpunk 2',
         },
       });
+      const progressEvents: string[][] = [];
+      const unsubscribe = service.onDownloadProgressChange((event) => {
+        progressEvents.push(event.trackedItemIds);
+      });
 
       await service.pollDownloadJobs();
 
+      expect(progressEvents).toContainEqual([view.item.id]);
       expect(database.getDownloadJob(view.item.id)).toMatchObject({
         bytesLoaded: 140,
         bytesTotal: 200,
@@ -5835,6 +6103,7 @@ describe('VaultTrackService SteamDB patch workflow', () => {
         statusMessage: '1 of 2 complete',
         totalParts: 2,
       });
+      unsubscribe();
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
@@ -6019,6 +6288,225 @@ describe('VaultTrackService SteamDB patch workflow', () => {
             stage: 'staged',
           }),
         ],
+        stage: 'staged',
+        totalParts: 1,
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('deletes existing ElAmigos full replacement folders after installer files are staged', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootLibraryPath = join(tempRoot, 'Library');
+      database.setSetting('library.rootPath', rootLibraryPath);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const installedPath = join(rootLibraryPath, 'Against the Storm');
+      await mkdir(installedPath, { recursive: true });
+      await writeFile(join(installedPath, 'AgainstTheStorm.exe'), 'old exe');
+      const elamigosSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fullDownloadUrls: [
+          {
+            kind: 'full',
+            label: 'FULL',
+            url: 'https://gofile.io/d/full',
+          },
+        ],
+        latestSourceRelease: {
+          isPatch: false,
+          label: 'Patch 1.9.8',
+          patchDate: '03/30/2026',
+          version: '1.9.8',
+        },
+        normalizedTitle: 'against the storm',
+        patchDownloadUrls: [],
+        sourceKind: 'elamigos',
+        title: 'Against the Storm',
+      };
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9001,
+        packageName: 'Against the Storm_22900000',
+        parts: [
+          {
+            mirrorUrl: 'https://gofile.io/d/full',
+            packageId: 9001,
+            packageName: 'Against the Storm_22900000',
+            role: 'full' as const,
+          },
+        ],
+      }));
+      const getPackageProgress = vi.fn(async () => ({
+        bytesLoaded: 100,
+        bytesTotal: 100,
+        etaSeconds: 0,
+        packageId: 9001,
+        speed: null,
+        stage: 'staged' as const,
+        statusMessage: null,
+      }));
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        getPackageProgress,
+      );
+      const view = await service.addTrackedItem({
+        parsedSource: elamigosSource,
+        queueDownload: true,
+        selectedDownloads: {
+          fullUrl: 'https://gofile.io/d/full',
+        },
+        selectedSteamPatch: {
+          ...selectedPatch,
+          buildId: '22900000',
+          patchDate: '03/30/2026',
+        },
+        steamMatch: {
+          ...steamMatch,
+          normalizedTitle: 'against the storm',
+          title: 'Against the Storm',
+        },
+      });
+      database.upsertInstallRecord({
+        installedAt: '03/04/2025',
+        installedBuildId: '1758027',
+        installedSourceKind: 'steamrip',
+        installedSourceUrl: 'https://steamrip.com/against-the-storm',
+        installedVersion: '1.7.6',
+        installPath: installedPath,
+        trackedItemId: view.item.id,
+        updatedAt: '2026-04-23T12:00:00.000Z',
+      });
+      const stagePath = view.currentDownload?.stagePath;
+      expect(stagePath).toEqual(expect.any(String));
+      await writeFile(join(stagePath!, 'AgainstTheStorm.iso'), 'iso');
+
+      await service.pollDownloadJobs();
+
+      expect(existsSync(installedPath)).toBe(false);
+      expect(existsSync(stagePath!)).toBe(true);
+      expect(database.getDownloadJob(view.item.id)).toMatchObject({
+        completedParts: 1,
+        stage: 'staged',
+        totalParts: 1,
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('preserves ElAmigos install folders for update-only staged packages', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootLibraryPath = join(tempRoot, 'Library');
+      database.setSetting('library.rootPath', rootLibraryPath);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const installedPath = join(rootLibraryPath, 'MOUSE P.I. For Hire');
+      await mkdir(installedPath, { recursive: true });
+      await writeFile(join(installedPath, 'MousePI.exe'), 'old exe');
+      const elamigosSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fullDownloadUrls: [
+          {
+            kind: 'full',
+            label: 'FULL',
+            url: 'https://gofile.io/d/full',
+          },
+        ],
+        latestSourceRelease: {
+          isPatch: true,
+          label: 'update 1.0.1 - 1.0.5',
+          patchDate: '04/21/2026',
+          version: '1.0.5',
+        },
+        normalizedTitle: 'mouse pi for hire',
+        patchDownloadUrls: [
+          {
+            kind: 'patch',
+            label: 'UPDATE',
+            url: 'https://gofile.io/d/update',
+          },
+        ],
+        sourceKind: 'elamigos',
+        title: 'MOUSE P.I. For Hire',
+      };
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9002,
+        packageName: 'MOUSE P.I. For Hire_22852168_update',
+        parts: [
+          {
+            mirrorUrl: 'https://gofile.io/d/update',
+            packageId: 9002,
+            packageName: 'MOUSE P.I. For Hire_22852168_update',
+            role: 'patch' as const,
+          },
+        ],
+      }));
+      const getPackageProgress = vi.fn(async () => ({
+        bytesLoaded: 100,
+        bytesTotal: 100,
+        etaSeconds: 0,
+        packageId: 9002,
+        speed: null,
+        stage: 'staged' as const,
+        statusMessage: null,
+      }));
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        getPackageProgress,
+      );
+      const view = await service.addTrackedItem({
+        parsedSource: elamigosSource,
+        queueDownload: true,
+        selectedDownloads: {
+          fullUrl: '',
+          patchUrl: 'https://gofile.io/d/update',
+        },
+        selectedSteamPatch: {
+          ...selectedPatch,
+          buildId: '22852168',
+          patchDate: '04/21/2026',
+        },
+        steamMatch: {
+          ...steamMatch,
+          normalizedTitle: 'mouse pi for hire',
+          title: 'MOUSE P.I. For Hire',
+        },
+      });
+      database.upsertInstallRecord({
+        installedAt: '04/16/2026',
+        installedBuildId: '22800000',
+        installedSourceKind: 'elamigos',
+        installedSourceUrl: elamigosSource.sourceUrl,
+        installedVersion: '1.0.1',
+        installPath: installedPath,
+        trackedItemId: view.item.id,
+        updatedAt: '2026-04-23T12:00:00.000Z',
+      });
+      const stagePath = view.currentDownload?.stagePath;
+      expect(stagePath).toEqual(expect.any(String));
+      const updateStagePath = join(
+        stagePath!,
+        'MOUSE P.I. For Hire_22852168_update',
+      );
+      await mkdir(updateStagePath, { recursive: true });
+      await writeFile(join(updateStagePath, 'Update.exe'), 'update');
+
+      await service.pollDownloadJobs();
+
+      expect(existsSync(join(installedPath, 'MousePI.exe'))).toBe(true);
+      expect(database.getDownloadJob(view.item.id)).toMatchObject({
+        completedParts: 1,
         stage: 'staged',
         totalParts: 1,
       });
@@ -8239,6 +8727,208 @@ describe('VaultTrackService SteamDB patch workflow', () => {
       expect(database.getSteamFeedCheck(secondItem.id)).toBeNull();
       expect(service.getLatestDailyPollAt()).toBeNull();
       expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('reports stale maintenance, source errors, expired watches, and failed downloads in activity', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('scheduler.lastDailyPollAt', '2026-04-22T09:00:00.000Z');
+      const item = database.upsertTrackedItem({
+        normalizedTitle: parsedSource.normalizedTitle,
+        sourceKind: parsedSource.sourceKind,
+        sourceUrl: parsedSource.sourceUrl,
+        title: parsedSource.title,
+      });
+      database.upsertSteamMatch(item.id, steamMatch);
+      database.upsertSteamFeedCheck({
+        feedUrl: 'https://steamdb.info/api/PatchnotesRSS/?appid=2416450',
+        lastCheckedAt: '2026-04-22T10:00:00.000Z',
+        lastError: 'SteamDB RSS request failed: 500',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-22T10:00:00.000Z',
+      });
+      database.upsertWatch({
+        endsAt: '2026-04-23T12:00:00.000Z',
+        expiredAt: '2026-04-23T12:00:00.000Z',
+        lastCheckedAt: '2026-04-22T12:00:00.000Z',
+        nextCheckAt: '2026-04-23T10:00:00.000Z',
+        startedAt: '2026-04-20T12:00:00.000Z',
+        trackedItemId: item.id,
+      });
+      database.upsertSourceMatch({
+        confidence: 0,
+        createdAt: '2026-04-22T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-04-23T12:00:00.000Z',
+        lastError: 'Source temporarily blocked the request; retrying later.',
+        method: 'slug',
+        normalizedTitle: parsedSource.normalizedTitle,
+        score: 0,
+        sourceKind: 'ankergames',
+        sourceTitle: parsedSource.title,
+        sourceUrl: 'https://ankergames.net/game/mouse-p-i-for-hire',
+        status: 'failed',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-23T12:00:00.000Z',
+        usable: false,
+      });
+      database.upsertDownloadJob({
+        createdAt: '2026-04-23T12:00:00.000Z',
+        errorMessage: 'Download polling failed',
+        finalPath: 'C:\\Library\\MOUSE',
+        id: 'download-1',
+        packageName: 'MOUSE',
+        provider: 'jdownloader',
+        sourceKind: 'steamrip',
+        stage: 'failed',
+        stagePath: 'C:\\Library\\_STAGING\\MOUSE',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-23T13:00:00.000Z',
+      });
+
+      const activity = createService(database).getActivity();
+
+      expect(activity.issues.map((issue) => issue.kind)).toEqual(
+        expect.arrayContaining([
+          'download_failed',
+          'scheduler_stale',
+          'source_error',
+          'source_watch_expired',
+          'steamdb_error',
+        ]),
+      );
+      expect(activity.summary.find((card) => card.id === 'automationErrors'))
+        .toMatchObject({ status: 'error' });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('clears individual activity alerts without deleting the failed job', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: parsedSource.normalizedTitle,
+        sourceKind: parsedSource.sourceKind,
+        sourceUrl: parsedSource.sourceUrl,
+        title: parsedSource.title,
+      });
+      database.upsertDownloadJob({
+        createdAt: '2026-04-23T12:00:00.000Z',
+        errorMessage: 'Download polling failed',
+        finalPath: 'C:\\Library\\MOUSE',
+        id: 'download-1',
+        packageName: 'MOUSE',
+        provider: 'jdownloader',
+        sourceKind: 'steamrip',
+        stage: 'failed',
+        stagePath: 'C:\\Library\\_STAGING\\MOUSE',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-23T13:00:00.000Z',
+      });
+
+      const service = createService(database);
+      const issue = service
+        .getActivity()
+        .issues.find((entry) => entry.kind === 'download_failed');
+
+      expect(issue?.dismissalKey).toBeTruthy();
+
+      const activity = await service.runActivityAction({
+        issueId: issue!.id,
+        issueKey: issue!.dismissalKey!,
+        trackedItemId: issue!.trackedItemId,
+        type: 'dismissActivityIssue',
+      });
+
+      expect(
+        activity.issues.some((entry) => entry.id === issue!.id),
+      ).toBe(false);
+      expect(database.getDownloadJob(item.id)?.stage).toBe('failed');
+      expect(activity.summary.find((card) => card.id === 'automationErrors'))
+        .toMatchObject({ status: 'ok', value: 'Clear' });
+
+      database.upsertDownloadJob({
+        ...database.getDownloadJob(item.id)!,
+        errorMessage: 'Download polling failed again',
+        updatedAt: '2026-04-23T14:00:00.000Z',
+      });
+
+      expect(
+        service
+          .getActivity()
+          .issues.some((entry) => entry.kind === 'download_failed'),
+      ).toBe(true);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('runs activity actions and returns refreshed activity', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: parsedSource.normalizedTitle,
+        sourceKind: 'manual',
+        title: parsedSource.title,
+      });
+      database.upsertSteamMatch(item.id, steamMatch);
+      const newerPatch: SteamPatchCandidate = {
+        ...selectedPatch,
+        buildId: '22862861',
+        link: 'https://steamdb.info/patchnotes/22862861/?utm_source=rss',
+        patchTitle: 'MOUSE: P.I. For Hire update for 20 April 2026',
+        publishedAt: '2026-04-20T07:07:27.000Z',
+        title: 'MOUSE: P.I. For Hire update for 20 April 2026',
+      };
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response(rss([newerPatch]), { status: 200 })),
+      );
+
+      const activity = await createService(database).runActivityAction({
+        type: 'refreshSteamFeeds',
+      });
+
+      expect(database.listPatchEntries(item.id)[0]?.buildId).toBe('22862861');
+      expect(activity.summary.find((card) => card.id === 'steamDbMaintenance'))
+        .toBeTruthy();
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('surfaces SteamDB rate-limit backoff in activity actions', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: parsedSource.normalizedTitle,
+        sourceKind: 'manual',
+        title: parsedSource.title,
+      });
+      database.upsertSteamMatch(item.id, steamMatch);
+      const service = createService(database);
+      (
+        service as unknown as {
+          requestPacingStates: Map<
+            string,
+            { nextAllowedAt: number; queue: Promise<void> }
+          >;
+        }
+      ).requestPacingStates.set('steamdb-rss', {
+        nextAllowedAt: Date.now() + 60_000,
+        queue: Promise.resolve(),
+      });
+
+      const activity = service.getActivity();
+      const issue = activity.issues.find(
+        (entry) => entry.kind === 'steamdb_rate_limited',
+      );
+
+      expect(issue?.action?.disabledReason).toContain('retry');
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }

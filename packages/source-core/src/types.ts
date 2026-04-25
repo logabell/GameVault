@@ -2,7 +2,7 @@ import type {
   ParsedSourcePayload,
   SourceSnapshot,
   SupportedSourceKind,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 
 export interface RefreshTrackedItemInput {
   trackedItemId: string;

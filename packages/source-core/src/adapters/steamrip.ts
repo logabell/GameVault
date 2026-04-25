@@ -1,5 +1,5 @@
 import { load } from 'cheerio';
-import type { ParsedSourcePayload, SourceSnapshot } from '@vaulttrack/shared-types';
+import type { ParsedSourcePayload, SourceSnapshot } from '@gamevault/shared-types';
 
 import type { RefreshTrackedItemInput, SourceAdapter } from '../types.js';
 import { buildFingerprint, compactText, normalizeSlashDate, normalizeTitle } from '../utils.js';

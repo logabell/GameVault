@@ -2,7 +2,7 @@ import {
   getPatchHistoryKey,
   mergePatchHistory,
   type SteamPatchCandidate,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 
 export function getSteamPatchMergeKey(patch: SteamPatchCandidate): string {
   return getPatchHistoryKey(patch);

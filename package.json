@@ -1,5 +1,5 @@
 {
-  "name": "vaulttrack",
+  "name": "gamevault",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -13,8 +13,8 @@
   "scripts": {
     "build": "npm run build --workspaces --if-present",
     "clean": "node ./scripts/clean.mjs",
-    "dev:desktop": "npm run dev --workspace @vaulttrack/desktop",
-    "dev:extension": "npm run dev --workspace @vaulttrack/extension",
+    "dev:desktop": "npm run dev --workspace @gamevault/desktop",
+    "dev:extension": "npm run dev --workspace @gamevault/extension",
     "lint": "eslint .",
     "test": "vitest run",
     "typecheck": "tsc -b"

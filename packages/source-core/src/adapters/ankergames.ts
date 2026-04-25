@@ -2,7 +2,7 @@ import { load } from 'cheerio';
 import type {
   ParsedSourcePayload,
   SourceSnapshot,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 
 import type { RefreshTrackedItemInput, SourceAdapter } from '../types.js';
 import { buildFingerprint, compactText, normalizeTitle } from '../utils.js';

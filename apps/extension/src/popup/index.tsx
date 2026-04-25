@@ -13,9 +13,11 @@ import {
   faArrowLeft,
   faCheck,
   faCircleInfo,
+  faCloudArrowDown,
   faEllipsis,
   faFileImport,
   faFilter,
+  faFolderOpen,
   faGamepad,
   faGear,
   faList,
@@ -33,6 +35,8 @@ import {
 
 import type {
   ConnectionHealthSummary,
+  HealthColor,
+  HealthIndicator,
   LibrarySortDirection,
   LibrarySortMode,
   LibraryStatusFilter,
@@ -48,8 +52,9 @@ import type {
   SupportedSourceKind,
   ThemeMode,
   TrackedItemView,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 import {
+  canDeleteTrackedItemFiles,
   filterLibraryItem,
   getDefaultLibrarySortDirection,
   getScopedLibraryStatusFilterCounts,
@@ -58,7 +63,7 @@ import {
   matchesLibrarySearch,
   matchesLibraryStatusFilter,
   sortLibraryItems,
-} from '@vaulttrack/shared-types';
+} from '@gamevault/shared-types';
 
 import {
   buildCreateMatchedDraftMessage,
@@ -92,22 +97,51 @@ type HealthSeverity = 'yellow' | 'red' | null;
 type SettingsSaveStatus = 'idle' | 'saving' | 'saved';
 type SteamDbBackfillStatus = 'idle' | 'loading' | 'loaded' | 'failed';
 type LibraryAction = {
-  kind: 'completeInstall';
+  kind: 'completeInstall' | 'confirmDownloadReady';
   trackedItemId: string;
 } | null;
+
+const POPUP_DESKTOP_HEALTH_FALLBACK: HealthIndicator = {
+  color: 'red',
+  label: 'Desktop unavailable',
+  message: 'GameVault desktop bridge is unavailable.',
+};
+
+const POPUP_MYJD_HEALTH_FALLBACK: HealthIndicator = {
+  color: 'red',
+  label: 'JDownloader unavailable',
+  message: 'Reconnect MyJDownloader from the desktop app or settings.',
+};
 
 const STEAM_PATCH_MESSAGE_TIMEOUT_MS = 50000;
 const QUEUE_DOWNLOAD_MESSAGE_TIMEOUT_MS = 120000;
 const STATUS_REFRESH_MESSAGE_TIMEOUT_MS = 10000;
 const STEAMDB_BACKFILL_POLL_INTERVAL_MS = 750;
 const STEAMDB_BACKFILL_POLL_TIMEOUT_MS = 26000;
-const EXTENSION_LIBRARY_VIEW_STORAGE_KEY = 'vaulttrack:extension:library-view';
+const EXTENSION_LIBRARY_VIEW_STORAGE_KEY = 'gamevault:extension:library-view';
 const EXTENSION_POPUP_STATE_STORAGE_PREFIX =
-  'vaulttrack:extension:popup-state';
+  'gamevault:extension:popup-state';
 const EXTENSION_POPUP_STATE_VERSION = 1;
 const EXTENSION_POPUP_STATE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const STEAM_LEGACY_APP_ART_BASE =
   'https://cdn.cloudflare.steamstatic.com/steam/apps';
+const SUPPORTED_SOURCE_HOME_LINKS = [
+  {
+    host: 'elamigos.site',
+    label: 'ElAmigos',
+    url: 'https://elamigos.site/',
+  },
+  {
+    host: 'ankergames.net',
+    label: 'AnkerGames',
+    url: 'https://ankergames.net/',
+  },
+  {
+    host: 'steamrip.com',
+    label: 'SteamRIP',
+    url: 'https://steamrip.com/',
+  },
+];
 
 const lifecycleStatuses = new Set([
   'new',
@@ -477,7 +511,7 @@ function createOlderThanAvailablePatch(appId: number): SteamPatchCandidate {
     buildId: null,
     description:
       'Installed patch predates the available SteamDB patch history.',
-    link: `vaulttrack:older-than-available:${appId}`,
+    link: `gamevault:older-than-available:${appId}`,
     patchDate: '',
     patchTitle: 'Older than available / not listed',
     publishedAt: '',
@@ -530,7 +564,7 @@ function createManualSteamPatchCandidate(params: {
   return {
     appId: params.appId,
     buildId: params.buildId || null,
-    description: 'Manually added in VaultTrack.',
+    description: 'Manually added in GameVault.',
     link: `manual:${crypto.randomUUID()}`,
     patchDate,
     patchTitle,
@@ -771,7 +805,37 @@ function canMarkDownloadFailed(item: TrackedItemView): boolean {
   );
 }
 
+function isManualElamigosFullReplacement(item: TrackedItemView): boolean {
+  const job = item.currentDownload;
+  if (
+    !job ||
+    job.provider !== 'manual' ||
+    job.sourceKind !== 'elamigos'
+  ) {
+    return false;
+  }
+  if (job.parts && job.parts.length > 0) {
+    return job.parts.some(
+      (part) => part.role === 'full' && Boolean(part.mirrorUrl?.trim()),
+    );
+  }
+  return Boolean(job.selectedMirrorUrl?.trim());
+}
+
+function canConfirmManualDownloadReady(item: TrackedItemView): boolean {
+  return Boolean(
+    isManualElamigosFullReplacement(item) &&
+      item.currentDownload &&
+      item.currentDownload.stage !== 'staged' &&
+      item.currentDownload.stage !== 'complete' &&
+      item.currentDownload.stage !== 'failed',
+  );
+}
+
 function canCompleteStagedInstall(item: TrackedItemView): boolean {
+  if (isManualElamigosFullReplacement(item)) {
+    return item.currentDownload?.stage === 'staged';
+  }
   return item.item.sourceKind === 'elamigos' && item.status === 'staged';
 }
 
@@ -947,12 +1011,9 @@ function normalizeComparableTitle(value: string | null | undefined): string {
   return (value ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
-function resolveTheme(
-  themeMode: ThemeMode | null | undefined,
-  systemPrefersDark: boolean,
-): ResolvedTheme {
+function resolveTheme(themeMode: ThemeMode | null | undefined): ResolvedTheme {
   if (themeMode === 'light' || themeMode === 'dark') return themeMode;
-  return systemPrefersDark ? 'dark' : 'light';
+  return 'dark';
 }
 
 function getSteamPortraitCoverUrl(item: TrackedItemView): string | null {
@@ -987,6 +1048,41 @@ function resolveHealthSeverity(
   if (health.desktop.color === 'red') return 'red';
   if (health.desktop.color === 'yellow') return 'yellow';
   return null;
+}
+
+function getPopupDesktopHealth(
+  health: ConnectionHealthSummary | null,
+): HealthIndicator {
+  return health?.desktop ?? POPUP_DESKTOP_HEALTH_FALLBACK;
+}
+
+function getPopupJDownloaderHealth(
+  health: ConnectionHealthSummary | null,
+): HealthIndicator {
+  return health?.myJDownloader ?? POPUP_MYJD_HEALTH_FALLBACK;
+}
+
+function resolvePopupHealthColor(
+  health: ConnectionHealthSummary | null,
+): HealthColor {
+  const colors = [
+    getPopupDesktopHealth(health).color,
+    getPopupJDownloaderHealth(health).color,
+  ];
+  if (colors.includes('red')) return 'red';
+  if (colors.includes('yellow')) return 'yellow';
+  return 'green';
+}
+
+function getPopupHealthTitle(health: ConnectionHealthSummary | null): string {
+  switch (resolvePopupHealthColor(health)) {
+    case 'green':
+      return 'Desktop and JDownloader healthy';
+    case 'yellow':
+      return 'Desktop or JDownloader needs attention';
+    case 'red':
+      return 'Desktop or JDownloader disconnected';
+  }
 }
 
 function App() {
@@ -1045,7 +1141,7 @@ function App() {
   >(null);
   const [settings, setSettings] = useState<SettingsView>({
     myJDownloaderPasswordConfigured: false,
-    themeMode: 'system',
+    themeMode: 'dark',
   });
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -1078,9 +1174,6 @@ function App() {
   const [settingsSaveStatus, setSettingsSaveStatus] =
     useState<SettingsSaveStatus>('idle');
   const [rootLibraryPathDraft, setRootLibraryPathDraft] = useState('');
-  const [systemPrefersDark, setSystemPrefersDark] = useState(
-    window.matchMedia('(prefers-color-scheme: dark)').matches,
-  );
   const steamSearchRequestIdRef = useRef(0);
   const steamPatchesRef = useRef<SteamPatchCandidate[]>([]);
   const steamDbBackfillRequestIdRef = useRef(0);
@@ -1094,7 +1187,7 @@ function App() {
   const skipNextPopupStatePersistKeyRef = useRef<string | null>(null);
   const scrollStageRef = useRef<HTMLElement | null>(null);
 
-  const resolvedTheme = resolveTheme(settings.themeMode, systemPrefersDark);
+  const resolvedTheme = resolveTheme(settings.themeMode);
   const parsedSource = draftShell?.parsedSource ?? null;
   const deviceChoices = health?.devices ?? [];
   const themeChoices: Array<Extract<ThemeMode, 'dark' | 'light'>> = [
@@ -1350,10 +1443,10 @@ function App() {
       payload?: TrackedItemView[] | null;
     }>(
       {
-        type: 'vaulttrack:list-library',
+        type: 'gamevault:list-library',
       },
       STATUS_REFRESH_MESSAGE_TIMEOUT_MS,
-      'VaultTrack library refresh timed out.',
+      'GameVault library refresh timed out.',
     );
     if (response.ok && Array.isArray(response.payload)) {
       setLibraryItems(response.payload as TrackedItemView[]);
@@ -1478,10 +1571,10 @@ function App() {
     const confirmed =
       mode === 'delete_files'
         ? window.confirm(
-            `Delete ${item.item.title} from VaultTrack, JDownloader, and local files?`,
+            `Delete ${item.item.title} from GameVault, JDownloader, and local files?`,
           )
         : window.confirm(
-            `Remove ${item.item.title} from VaultTrack tracking? Local files will stay in place.`,
+            `Remove ${item.item.title} from GameVault tracking? Local files will stay in place.`,
           );
     if (!confirmed) {
       return;
@@ -1493,7 +1586,7 @@ function App() {
       const response = await chrome.runtime.sendMessage({
         mode,
         trackedItemId: item.item.id,
-        type: 'vaulttrack:remove-tracked-item',
+        type: 'gamevault:remove-tracked-item',
       });
       if (!response.ok) {
         setMessage(
@@ -1522,7 +1615,7 @@ function App() {
     try {
       const response = await chrome.runtime.sendMessage({
         trackedItemId: item.item.id,
-        type: 'vaulttrack:mark-download-failed',
+        type: 'gamevault:mark-download-failed',
       });
       if (!response.ok) {
         setMessage(
@@ -1569,7 +1662,7 @@ function App() {
     try {
       const response = await chrome.runtime.sendMessage({
         trackedItemId: item.item.id,
-        type: 'vaulttrack:complete-staged-install',
+        type: 'gamevault:complete-staged-install',
       });
       if (!response.ok) {
         setMessage(
@@ -1582,6 +1675,36 @@ function App() {
       const updated = response.payload as TrackedItemView;
       applyUpdatedTrackedItem(updated);
       setMessage(`${updated.item.title} marked installed.`);
+      await Promise.allSettled([refreshLibrary(), refreshDraftStatus()]);
+    } finally {
+      setBusy(false);
+      setLibraryAction(null);
+    }
+  }
+
+  async function confirmManualDownloadReady(item: TrackedItemView) {
+    setLibraryAction({
+      kind: 'confirmDownloadReady',
+      trackedItemId: item.item.id,
+    });
+    setBusy(true);
+    setMessage(`Checking staged files for ${item.item.title}...`);
+    try {
+      const response = await chrome.runtime.sendMessage({
+        trackedItemId: item.item.id,
+        type: 'gamevault:confirm-manual-download-ready',
+      });
+      if (!response.ok) {
+        setMessage(
+          response.message ??
+            response.error?.message ??
+            'Unable to confirm download readiness.',
+        );
+        return;
+      }
+      const updated = response.payload as TrackedItemView;
+      applyUpdatedTrackedItem(updated);
+      setMessage(`${updated.item.title} download is ready for install.`);
       await Promise.allSettled([refreshLibrary(), refreshDraftStatus()]);
     } finally {
       setBusy(false);
@@ -1630,7 +1753,7 @@ function App() {
       const response = await chrome.runtime.sendMessage({
         selectedDownloads,
         trackedItemId: retrySelection.item.item.id,
-        type: 'vaulttrack:retry-download',
+        type: 'gamevault:retry-download',
       });
       if (!response.ok) {
         setMessage(
@@ -1655,7 +1778,7 @@ function App() {
     try {
       const response = await chrome.runtime.sendMessage({
         trackedItemId: retrySelection.item.item.id,
-        type: 'vaulttrack:clear-download-mirror-failed',
+        type: 'gamevault:clear-download-mirror-failed',
         url,
       });
       if (!response.ok) {
@@ -1682,7 +1805,7 @@ function App() {
 
   async function refreshSettings() {
     const response = await chrome.runtime.sendMessage({
-      type: 'vaulttrack:get-settings',
+      type: 'gamevault:get-settings',
     });
     if (response.ok && response.payload) {
       const nextSettings = response.payload as SettingsView;
@@ -1704,10 +1827,10 @@ function App() {
           mode,
           sourceUrl,
           tabId: tabId ? Number(tabId) : null,
-          type: 'vaulttrack:get-draft-status',
+          type: 'gamevault:get-draft-status',
         },
         STATUS_REFRESH_MESSAGE_TIMEOUT_MS,
-        'VaultTrack draft status refresh timed out.',
+        'GameVault draft status refresh timed out.',
       );
 
       if (!response.ok || !response.payload) {
@@ -1735,13 +1858,42 @@ function App() {
     }
   }
 
+  async function refreshConnectionHealth() {
+    setConnectionPending(true);
+    try {
+      const response = await sendRuntimeMessageWithTimeout<{
+        message?: string | null;
+        ok?: boolean;
+        payload?: ConnectionHealthSummary | null;
+      }>(
+        {
+          type: 'gamevault:get-connection-health',
+        },
+        STATUS_REFRESH_MESSAGE_TIMEOUT_MS,
+        'GameVault health refresh timed out.',
+      );
+      if (!response.ok || !response.payload) {
+        if (response.message) {
+          setMessage(response.message);
+        }
+        return;
+      }
+
+      const nextHealth = response.payload as ConnectionHealthSummary;
+      setHealth(nextHealth);
+      setSelectedDeviceId(nextHealth.selectedDeviceId ?? '');
+    } finally {
+      setConnectionPending(false);
+    }
+  }
+
   async function saveTheme(themeMode: ThemeMode) {
     setThemeBusy(true);
     try {
       const response = await chrome.runtime.sendMessage({
         rootLibraryPath: rootLibraryPathDraft,
         themeMode,
-        type: 'vaulttrack:save-settings',
+        type: 'gamevault:save-settings',
       });
       if (response.ok && response.payload) {
         const nextSettings = response.payload as SettingsView;
@@ -1762,7 +1914,7 @@ function App() {
       const response = await chrome.runtime.sendMessage({
         rootLibraryPath: rootLibraryPathDraft,
         themeMode: settings.themeMode,
-        type: 'vaulttrack:save-settings',
+        type: 'gamevault:save-settings',
       });
       if (response.ok && response.payload) {
         const nextSettings = response.payload as SettingsView;
@@ -1771,7 +1923,7 @@ function App() {
         setSettingsSaveStatus('saved');
       } else {
         setSettingsSaveStatus('idle');
-        setMessage(response.message ?? 'Unable to save VaultTrack settings.');
+        setMessage(response.message ?? 'Unable to save GameVault settings.');
       }
     } catch (error) {
       setSettingsSaveStatus('idle');
@@ -1786,7 +1938,7 @@ function App() {
     setSettingsSaveStatus('saving');
     try {
       const response = await chrome.runtime.sendMessage({
-        type: 'vaulttrack:pick-directory',
+        type: 'gamevault:pick-directory',
       });
       if (response.ok) {
         if (typeof response.payload === 'string') {
@@ -1795,7 +1947,7 @@ function App() {
           const saveResponse = await chrome.runtime.sendMessage({
             rootLibraryPath: pickedPath,
             themeMode: settings.themeMode,
-            type: 'vaulttrack:save-settings',
+            type: 'gamevault:save-settings',
           });
           if (saveResponse.ok && saveResponse.payload) {
             const nextSettings = saveResponse.payload as SettingsView;
@@ -1807,7 +1959,7 @@ function App() {
             setSettingsSaveStatus('idle');
             setMessage(
               saveResponse.message ??
-                'Picked folder, but VaultTrack could not save it.',
+                'Picked folder, but GameVault could not save it.',
             );
           }
         } else {
@@ -1830,18 +1982,6 @@ function App() {
     const timer = window.setTimeout(() => setSettingsSaveStatus('idle'), 1800);
     return () => window.clearTimeout(timer);
   }, [settingsSaveStatus]);
-
-  useEffect(() => {
-    const media = window.matchMedia('(prefers-color-scheme: dark)');
-    const listener = (event: MediaQueryListEvent) =>
-      setSystemPrefersDark(event.matches);
-    if (media.addEventListener) {
-      media.addEventListener('change', listener);
-      return () => media.removeEventListener('change', listener);
-    }
-    media.addListener(listener);
-    return () => media.removeListener(listener);
-  }, []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = resolvedTheme;
@@ -1964,12 +2104,12 @@ function App() {
         mode,
         sourceUrl,
         tabId: tabId ? Number(tabId) : null,
-        type: 'vaulttrack:get-draft-shell',
+        type: 'gamevault:get-draft-shell',
       }),
-      chrome.runtime.sendMessage({ type: 'vaulttrack:get-settings' }),
-      chrome.runtime.sendMessage({ type: 'vaulttrack:list-library' }),
+      chrome.runtime.sendMessage({ type: 'gamevault:get-settings' }),
+      chrome.runtime.sendMessage({ type: 'gamevault:list-library' }),
       chrome.runtime.sendMessage({
-        type: 'vaulttrack:get-steamdb-pending-confirmation',
+        type: 'gamevault:get-steamdb-pending-confirmation',
       }),
     ]).then(([shellResult, settingsResult, libraryResult, pendingResult]) => {
       if (cancelled) return;
@@ -2231,7 +2371,7 @@ function App() {
       const response = await chrome.runtime.sendMessage({
         email,
         password,
-        type: 'vaulttrack:authenticate-myjd',
+        type: 'gamevault:authenticate-myjd',
       });
       if (!response.ok || !response.payload) {
         setMessage(
@@ -2256,7 +2396,7 @@ function App() {
     try {
       const response = await chrome.runtime.sendMessage({
         deviceId,
-        type: 'vaulttrack:select-myjd-device',
+        type: 'gamevault:select-myjd-device',
       });
       if (!response.ok || !response.payload) {
         setMessage(
@@ -2281,7 +2421,7 @@ function App() {
     setMessage(null);
     try {
       const response = await chrome.runtime.sendMessage({
-        type: 'vaulttrack:disconnect-myjd',
+        type: 'gamevault:disconnect-myjd',
       });
       if (response.ok && response.payload) {
         const nextHealth = response.payload as ConnectionHealthSummary;
@@ -2307,7 +2447,7 @@ function App() {
       queryTitle: requestedQuery,
       sourceUrl,
       tabId: tabId ? Number(tabId) : null,
-      type: 'vaulttrack:resolve-steam-match',
+      type: 'gamevault:resolve-steam-match',
     });
     if (requestId !== steamSearchRequestIdRef.current) {
       return;
@@ -2522,7 +2662,7 @@ function App() {
       const response = await chrome.runtime.sendMessage({
         sourceUrl: isLibraryUpdateFlow ? source.match.sourceUrl : currentSourceUrl,
         tabId: isLibraryUpdateFlow ? null : tabId ? Number(tabId) : null,
-        type: 'vaulttrack:open-source-detail-page',
+        type: 'gamevault:open-source-detail-page',
         url: source.match.sourceUrl,
       });
       if (!response?.ok) {
@@ -2541,6 +2681,36 @@ function App() {
     }
   }
 
+  async function openSupportedSourceHome(url: string) {
+    setMessage(null);
+    try {
+      const [activeBrowserTab] = await chrome.tabs.query({
+        active: true,
+        currentWindow: true,
+      });
+      if (!activeBrowserTab?.id) {
+        setMessage('Current browser tab is unavailable.');
+        return;
+      }
+
+      await chrome.tabs.update(activeBrowserTab.id, {
+        active: true,
+        url,
+      });
+      if (typeof activeBrowserTab.windowId === 'number') {
+        await chrome.windows.update(activeBrowserTab.windowId, {
+          focused: true,
+        });
+      }
+    } catch (error) {
+      setMessage(
+        error instanceof Error
+          ? error.message
+          : 'Unable to open source homepage.',
+      );
+    }
+  }
+
   async function syncTrackedSteamPatches(
     trackedItemId: string | null,
     appId: number,
@@ -2551,7 +2721,7 @@ function App() {
       appId,
       patches,
       trackedItemId,
-      type: 'vaulttrack:sync-tracked-steam-patches',
+      type: 'gamevault:sync-tracked-steam-patches',
     });
     if (response?.ok && response.payload) {
       applyUpdatedTrackedItem(response.payload as TrackedItemView);
@@ -2565,7 +2735,7 @@ function App() {
     if (!trackedItemId) return [];
     const response = await chrome.runtime.sendMessage({
       trackedItemId,
-      type: 'vaulttrack:list-steam-patch-entries',
+      type: 'gamevault:list-steam-patch-entries',
     });
     return Array.isArray(response?.payload)
       ? (response.payload as unknown[])
@@ -2579,7 +2749,7 @@ function App() {
     try {
       const response = await chrome.runtime.sendMessage({
         trackedItemId,
-        type: 'vaulttrack:discover-source-matches',
+        type: 'gamevault:discover-source-matches',
       });
       if (!response?.ok) {
         setMessage(
@@ -2629,7 +2799,7 @@ function App() {
       const response = await chrome.runtime.sendMessage({
         sourceKind,
         trackedItemId,
-        type: 'vaulttrack:refresh-matched-source',
+        type: 'gamevault:refresh-matched-source',
       });
       if (!response?.ok) {
         setMessage(
@@ -2785,7 +2955,7 @@ function App() {
           ? selectedSourceView?.match.sourceUrl
           : sourceUrl,
         tabId: isLibraryUpdateFlow ? null : tabId ? Number(tabId) : null,
-        type: 'vaulttrack:open-steamdb-patch-page',
+        type: 'gamevault:open-steamdb-patch-page',
       });
       if (!response.ok) {
         setMessage(response.message ?? 'Unable to open SteamDB.');
@@ -2832,7 +3002,7 @@ function App() {
   async function clearSteamDbConfirmation() {
     setSteamDbConfirmation(null);
     await chrome.runtime.sendMessage({
-      type: 'vaulttrack:clear-steamdb-pending-confirmation',
+      type: 'gamevault:clear-steamdb-pending-confirmation',
     });
   }
 
@@ -2889,7 +3059,7 @@ function App() {
       await waitForMs(STEAMDB_BACKFILL_POLL_INTERVAL_MS);
       const response = await chrome.runtime.sendMessage({
         appId,
-        type: 'vaulttrack:get-steamdb-build-backfill',
+        type: 'gamevault:get-steamdb-build-backfill',
       });
       if (steamDbBackfillRequestIdRef.current !== requestId) {
         return;
@@ -2931,7 +3101,7 @@ function App() {
       const response = await chrome.runtime.sendMessage({
         appId,
         trackedItemId,
-        type: 'vaulttrack:start-steamdb-build-backfill',
+        type: 'gamevault:start-steamdb-build-backfill',
       });
       if (steamDbBackfillRequestIdRef.current !== requestId) {
         return;
@@ -3039,7 +3209,7 @@ function App() {
       await waitForMs(STEAMDB_BACKFILL_POLL_INTERVAL_MS);
       const response = await chrome.runtime.sendMessage({
         appId,
-        type: 'vaulttrack:get-steamdb-build-backfill',
+        type: 'gamevault:get-steamdb-build-backfill',
       });
       if (sourcePatchEditorRequestIdRef.current !== requestId) {
         return;
@@ -3079,7 +3249,7 @@ function App() {
     try {
       const response = await chrome.runtime.sendMessage({
         appId,
-        type: 'vaulttrack:start-steamdb-build-backfill',
+        type: 'gamevault:start-steamdb-build-backfill',
       });
       if (sourcePatchEditorRequestIdRef.current !== requestId) {
         return;
@@ -3142,7 +3312,7 @@ function App() {
     try {
       const persistedResponse = await chrome.runtime.sendMessage({
         trackedItemId: item.item.id,
-        type: 'vaulttrack:list-steam-patch-entries',
+        type: 'gamevault:list-steam-patch-entries',
       });
       if (sourcePatchEditorRequestIdRef.current !== requestId) {
         return;
@@ -3193,7 +3363,7 @@ function App() {
       }>(
         {
           appId,
-          type: 'vaulttrack:resolve-steam-patches',
+          type: 'gamevault:resolve-steam-patches',
         },
         STEAM_PATCH_MESSAGE_TIMEOUT_MS,
       );
@@ -3291,7 +3461,7 @@ function App() {
         selectedSteamPatch: selectedPatch,
         steamPatchEntries: sourcePatchEditor.patches,
         trackedItemId: sourcePatchEditor.item.item.id,
-        type: 'vaulttrack:update-source-patch',
+        type: 'gamevault:update-source-patch',
       });
       if (!response?.ok) {
         throw new Error(
@@ -3373,7 +3543,7 @@ function App() {
         payload?: unknown;
       }>({
         appId,
-        type: 'vaulttrack:resolve-steam-patches',
+        type: 'gamevault:resolve-steam-patches',
       });
       if (!response.ok || !Array.isArray(response.payload)) {
         if (options.goToPatch) {
@@ -3522,7 +3692,7 @@ function App() {
           },
           sourceKind: selectedSourceView.match.sourceKind,
           trackedItemId,
-          type: 'vaulttrack:queue-draft-download',
+          type: 'gamevault:queue-draft-download',
         },
         QUEUE_DOWNLOAD_MESSAGE_TIMEOUT_MS,
         getDownloadQueueTimeoutMessage(selectedSourceView.match.sourceKind),
@@ -3602,6 +3772,9 @@ function App() {
     );
     const isCompletingInstall =
       libraryAction?.kind === 'completeInstall' &&
+      libraryAction.trackedItemId === item.item.id;
+    const isConfirmingDownloadReady =
+      libraryAction?.kind === 'confirmDownloadReady' &&
       libraryAction.trackedItemId === item.item.id;
     return (
       <details className="item-action-menu">
@@ -3692,6 +3865,22 @@ function App() {
               <span>Mark Failed</span>
             </button>
           ) : null}
+          {canConfirmManualDownloadReady(item) ? (
+            <button
+              aria-busy={isConfirmingDownloadReady}
+              disabled={busy}
+              onClick={() => void confirmManualDownloadReady(item)}
+              role="menuitem"
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faFolderOpen} />
+              <span>
+                {isConfirmingDownloadReady
+                  ? 'Checking...'
+                  : 'Confirm Download Ready'}
+              </span>
+            </button>
+          ) : null}
           {canCompleteStagedInstall(item) ? (
             <button
               aria-busy={isCompletingInstall}
@@ -3713,16 +3902,18 @@ function App() {
             <FontAwesomeIcon aria-hidden="true" icon={faXmark} />
             <span>Remove Tracking</span>
           </button>
-          <button
-            className="is-danger"
-            disabled={busy}
-            onClick={() => void removeTrackedItem(item, 'delete_files')}
-            role="menuitem"
-            type="button"
-          >
-            <FontAwesomeIcon aria-hidden="true" icon={faTrash} />
-            <span>Delete Files</span>
-          </button>
+          {canDeleteTrackedItemFiles(item) ? (
+            <button
+              className="is-danger"
+              disabled={busy}
+              onClick={() => void removeTrackedItem(item, 'delete_files')}
+              role="menuitem"
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faTrash} />
+              <span>Delete Files</span>
+            </button>
+          ) : null}
         </div>
       </details>
     );
@@ -3910,7 +4101,10 @@ function App() {
                     onClick={() => openLibraryUpdateFlow(item)}
                     type="button"
                   >
-                    <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
+                    <FontAwesomeIcon
+                      aria-hidden="true"
+                      icon={faCloudArrowDown}
+                    />
                     <span>Update</span>
                   </button>
                 ) : null}
@@ -3971,7 +4165,10 @@ function App() {
               onClick={() => openLibraryUpdateFlow(item)}
               type="button"
             >
-              <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
+              <FontAwesomeIcon
+                aria-hidden="true"
+                icon={faCloudArrowDown}
+              />
               <span>Update</span>
             </button>
           ) : null}
@@ -4007,10 +4204,10 @@ function App() {
     ? null
     : parsePending
     ? 'Reading page details'
-    : connectionPending
-      ? 'Refreshing desktop status'
+      : connectionPending
+        ? 'Refreshing desktop status'
       : trackedStatusPending
-        ? 'Checking Vault status'
+        ? 'Checking GameVault status'
         : null;
   const workflowCoverUrl = libraryUpdateItem
     ? getLibraryArtworkUrl(libraryUpdateItem, 'banner')
@@ -4020,14 +4217,67 @@ function App() {
     : currentPageHeroPresence;
   const workflowTitle = libraryUpdateItem?.item.title ?? parsedSource?.title;
   const hasGameWorkflow = Boolean(parsedSource || libraryUpdateItem);
+  const showUnsupportedHome = !hasGameWorkflow && !shellLoading && !parsePending;
+
+  function renderPopupHealthMenu() {
+    const desktopHealth = getPopupDesktopHealth(health);
+    const jDownloaderHealth = getPopupJDownloaderHealth(health);
+    const overallColor = resolvePopupHealthColor(health);
+    const healthTitle = getPopupHealthTitle(health);
+
+    return (
+      <details className="popup-health-menu">
+        <summary
+          aria-label={healthTitle}
+          className="popup-health-button"
+          title={healthTitle}
+        >
+          <span className={`health-dot ${overallColor}`} aria-hidden="true" />
+        </summary>
+        <div className="popup-health-panel" role="group" aria-label="Health">
+          <div className="popup-health-panel__header">
+            <span>Health</span>
+            <button
+              aria-label="Refresh health"
+              className="popup-health-refresh"
+              disabled={statusLoading || connectionPending}
+              onClick={(event) => {
+                event.stopPropagation();
+                void refreshConnectionHealth();
+              }}
+              title="Refresh health"
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
+            </button>
+          </div>
+          <div className="popup-health-row">
+            <span
+              className={`health-dot ${desktopHealth.color}`}
+              aria-hidden="true"
+            />
+            <strong>Desktop App</strong>
+          </div>
+          <div className="popup-health-row">
+            <span
+              className={`health-dot ${jDownloaderHealth.color}`}
+              aria-hidden="true"
+            />
+            <strong>JDownloader</strong>
+          </div>
+        </div>
+      </details>
+    );
+  }
 
   return (
     <div className="popup-shell">
       <header className="topbar">
         <div className="brand-lockup">
-          <span className="brand-mark">VaultTrack</span>
+          <span className="brand-mark">GameVault</span>
         </div>
-        <nav className="topbar-nav" aria-label="VaultTrack popup sections">
+        <nav className="topbar-nav" aria-label="GameVault popup sections">
+          {renderPopupHealthMenu()}
           <button
             className={`nav-pill ${activeTab === 'game' ? 'is-active' : ''}`}
             onClick={() => handlePopupTabClick('game')}
@@ -4118,12 +4368,49 @@ function App() {
                   <div>
                     <h1 className="hero-title">Waiting for supported page</h1>
                     <p className="muted-text">
-                      Open a supported ElAmigos or SteamRIP detail page.
+                      Open a supported AnkerGames, ElAmigos, or SteamRIP detail
+                      page.
                     </p>
                   </div>
                 </div>
               )}
             </section>
+
+            {showUnsupportedHome ? (
+              <section className="source-home" aria-labelledby="source-home-title">
+                <div className="section-heading source-home-heading">
+                  <div>
+                    <p className="section-title" id="source-home-title">
+                      Supported sources
+                    </p>
+                    <p className="muted-text">
+                      Open a source homepage, then choose a game detail page.
+                    </p>
+                  </div>
+                </div>
+                <div className="source-home-grid">
+                  {SUPPORTED_SOURCE_HOME_LINKS.map((source) => (
+                    <button
+                      aria-label={`Open ${source.label} homepage in current tab`}
+                      className="source-home-card"
+                      disabled={busy}
+                      key={source.url}
+                      onClick={() => void openSupportedSourceHome(source.url)}
+                      type="button"
+                    >
+                      <span className="source-home-card__copy">
+                        <strong>{source.label}</strong>
+                        <span>{source.host}</span>
+                      </span>
+                      <FontAwesomeIcon
+                        aria-hidden="true"
+                        icon={faUpRightFromSquare}
+                      />
+                    </button>
+                  ))}
+                </div>
+              </section>
+            ) : null}
 
             {gameStepLoadingLabel ? (
               <section className="surface-card panel-card compact-panel">
@@ -4161,7 +4448,7 @@ function App() {
                     isLibraryUpdateFlow ? 'is-update-flow' : ''
                   }`}
                   role="tablist"
-                  aria-label="Add to Vault workflow"
+                  aria-label="Add to GameVault workflow"
                 >
                   {!isLibraryUpdateFlow ? (
                     <button
@@ -4719,7 +5006,7 @@ function App() {
                 <div className="section-stack">
                   <div>
                     <p className="section-title">
-                      {isLibraryUpdateFlow ? 'Update Queued' : 'Added to VaultTrack'}
+                      {isLibraryUpdateFlow ? 'Update Queued' : 'Added to GameVault'}
                     </p>
                     <p className="muted-text">
                       {isLibraryUpdateFlow
@@ -4732,7 +5019,7 @@ function App() {
                       className="ghost-button"
                       onClick={() =>
                         void chrome.runtime.sendMessage({
-                          type: 'vaulttrack:open-desktop',
+                          type: 'gamevault:open-desktop',
                         })
                       }
                       type="button"
@@ -4782,7 +5069,7 @@ function App() {
                   className="ghost-button compact-button"
                   onClick={() =>
                     void chrome.runtime.sendMessage({
-                      type: 'vaulttrack:open-desktop',
+                      type: 'gamevault:open-desktop',
                     })
                   }
                   type="button"
@@ -5079,7 +5366,7 @@ function App() {
                     </strong>
                     <p className="muted-text">
                       {health?.desktop.message ??
-                        'VaultTrack desktop bridge is unavailable.'}
+                        'GameVault desktop bridge is unavailable.'}
                     </p>
                   </div>
                 </div>
@@ -5102,7 +5389,7 @@ function App() {
                 <div className="note-card">
                   <p className="muted-text">
                     If the desktop bridge is still waking up, wait a few seconds
-                    and refresh. VaultTrack stores MyJDownloader credentials in
+                    and refresh. GameVault stores MyJDownloader credentials in
                     the desktop app only, and downloads can still run there with
                     curl once your library root is set.
                   </p>

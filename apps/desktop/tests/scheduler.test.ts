@@ -1,0 +1,161 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import {
+  GameVaultScheduler,
+  shouldRunStartupSteamFeedCatchUp,
+} from '../src/main/services/scheduler.js';
+import type { GameVaultService } from '../src/main/services/gamevault-service.js';
+
+function createSchedulerService(overrides: Partial<{
+  getLatestDailyPollAt: () => string | null;
+  getSettings: () => { pollDailyHourLocal?: number };
+  hasActiveDownloadJobs: () => boolean;
+  pollDownloadJobs: (options?: unknown) => Promise<void>;
+  pollSteamFeeds: () => Promise<void>;
+  processDueWatches: (now?: Date) => Promise<void>;
+  recordActivityEvent: () => void;
+  beginActivityTask: () => () => void;
+}> = {}) {
+  return {
+    beginActivityTask: vi.fn(() => vi.fn()),
+    getLatestDailyPollAt: vi.fn(() => '2026-04-23T09:05:00'),
+    getSettings: vi.fn(() => ({ pollDailyHourLocal: 9 })),
+    hasActiveDownloadJobs: vi.fn(() => false),
+    pollDownloadJobs: vi.fn(async () => undefined),
+    pollSteamFeeds: vi.fn(async () => undefined),
+    processDueWatches: vi.fn(async () => undefined),
+    recordActivityEvent: vi.fn(),
+    ...overrides,
+  } as unknown as GameVaultService;
+}
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe('GameVaultScheduler', () => {
+  it('detects missed startup SteamDB catch-up before the configured daily hour', () => {
+    expect(
+      shouldRunStartupSteamFeedCatchUp({
+        lastPollAt: '2026-04-22T09:05:00',
+        now: new Date(2026, 3, 24, 8),
+        pollDailyHourLocal: 9,
+      }),
+    ).toBe(true);
+  });
+
+  it('skips startup SteamDB catch-up when the last expected poll already ran', () => {
+    expect(
+      shouldRunStartupSteamFeedCatchUp({
+        lastPollAt: '2026-04-23T09:05:00',
+        now: new Date(2026, 3, 24, 8),
+        pollDailyHourLocal: 9,
+      }),
+    ).toBe(false);
+  });
+
+  it('runs due source watches and download polling on startup', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 3, 24, 8));
+    const service = createSchedulerService();
+    const scheduler = new GameVaultScheduler(service);
+
+    scheduler.start();
+    await Promise.resolve();
+    await Promise.resolve();
+    scheduler.stop();
+
+    expect(service.processDueWatches).toHaveBeenCalledTimes(1);
+    expect(service.pollDownloadJobs).toHaveBeenCalledTimes(1);
+    expect(service.pollSteamFeeds).not.toHaveBeenCalled();
+  });
+
+  it('prevents overlapping interval ticks', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 3, 24, 8));
+    let releaseWatch!: () => void;
+    const processDueWatches = vi.fn(
+      () => new Promise<void>((resolve) => (releaseWatch = resolve)),
+    );
+    const service = createSchedulerService({ processDueWatches });
+    const scheduler = new GameVaultScheduler(service);
+
+    scheduler.start();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(processDueWatches).toHaveBeenCalledTimes(1);
+    releaseWatch();
+    await Promise.resolve();
+    scheduler.stop();
+  });
+
+  it('polls active download progress every second without activity chrome', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 3, 24, 8));
+    const service = createSchedulerService({
+      hasActiveDownloadJobs: vi.fn(() => true),
+    });
+    const scheduler = new GameVaultScheduler(service);
+
+    scheduler.start();
+    await Promise.resolve();
+    await Promise.resolve();
+    vi.mocked(service.pollDownloadJobs).mockClear();
+
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(service.pollDownloadJobs).toHaveBeenCalledWith({
+      activity: false,
+      lightweight: true,
+      skipIfRunning: true,
+    });
+    scheduler.stop();
+  });
+
+  it('skips live download polling when no active downloads exist', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 3, 24, 8));
+    const service = createSchedulerService({
+      hasActiveDownloadJobs: vi.fn(() => false),
+    });
+    const scheduler = new GameVaultScheduler(service);
+
+    scheduler.start();
+    await Promise.resolve();
+    await Promise.resolve();
+    vi.mocked(service.pollDownloadJobs).mockClear();
+
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(service.pollDownloadJobs).not.toHaveBeenCalled();
+    scheduler.stop();
+  });
+
+  it('does not overlap live download progress ticks', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 3, 24, 8));
+    let releasePoll!: () => void;
+    const service = createSchedulerService({
+      hasActiveDownloadJobs: vi.fn(() => true),
+      pollDownloadJobs: vi.fn(
+        () => new Promise<void>((resolve) => (releasePoll = resolve)),
+      ),
+    });
+    const scheduler = new GameVaultScheduler(service);
+
+    scheduler.start();
+    await Promise.resolve();
+    releasePoll();
+    await Promise.resolve();
+    vi.mocked(service.pollDownloadJobs).mockClear();
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(service.pollDownloadJobs).toHaveBeenCalledTimes(1);
+    releasePoll();
+    await Promise.resolve();
+    scheduler.stop();
+  });
+});

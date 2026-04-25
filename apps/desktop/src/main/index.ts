@@ -1,8 +1,14 @@
 import { spawn } from 'node:child_process';
-import { rm, stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { copyFile, mkdir, rm, stat } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 
-import type { ConfirmedSteamMatch } from '@vaulttrack/shared-types';
+import type {
+  BrowserExtensionInstallStatus,
+  ConfirmedSteamMatch,
+  ExtensionSetupInfo,
+  RegisterExtensionNativeHostPayload,
+} from '@gamevault/shared-types';
+import { FIREFOX_EXTENSION_ID } from '@gamevault/shared-types';
 import {
   app,
   BrowserWindow,
@@ -23,31 +29,171 @@ import {
   extractDirectHttpDownloadFileName,
   extractAnkerGamesDownloadFileName,
 } from './ankergames-download.js';
-import { createVaultTrackService } from './create-vaulttrack-service.js';
-import { VaultTrackDatabase } from './services/database.js';
+import { createGameVaultService } from './create-gamevault-service.js';
+import { GameVaultDatabase } from './services/database.js';
 import { NativeBridgeServer } from './services/bridge.js';
+import { detectBrowserExtension } from './services/browser-extension-detection.js';
+import { detectJDownloader } from './services/jdownloader-detection.js';
 import { MyJDownloaderService } from './services/myjdownloader.js';
-import { VaultTrackScheduler } from './services/scheduler.js';
 import {
-  type VaultTrackService,
+  GAMEVAULT_NATIVE_HOST_NAME,
+  registerExtensionNativeHost,
+} from './services/native-host-registration.js';
+import { GameVaultScheduler } from './services/scheduler.js';
+import {
+  type GameVaultService,
   type StartDirectHttpDownloadParams,
-} from './services/vaulttrack-service.js';
+} from './services/gamevault-service.js';
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let bridge: NativeBridgeServer | null = null;
-let scheduler: VaultTrackScheduler | null = null;
+let scheduler: GameVaultScheduler | null = null;
 let quitting = false;
 const backgroundLaunch = process.argv.includes('--background');
+const DATABASE_FILE_NAME = 'gamevault.sqlite';
+const GAMEVAULT_APP_USER_MODEL_ID = 'GameVault';
+const LEGACY_DATABASE_FILE_NAME = 'vaulttrack.sqlite';
+
+function getAssetPath(fileName: string) {
+  return join(__dirname, '..', 'assets', fileName);
+}
 
 function createTrayIcon() {
-  return nativeImage.createFromDataURL(
-    'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAQAAAC1+jfqAAAAQ0lEQVR42mNgoBAwUqifgYGB4T8Ghv9nYGBg2I8BikETMVE2zMDA8J+BgYHhPwMDA1NkYGBgYOBfYo0JjIEYBhaGAQDxLA9aP42gnQAAAABJRU5ErkJggg==',
+  const icon = nativeImage.createFromPath(
+    getAssetPath('gamevault-icon-32.png'),
   );
+  return icon.isEmpty()
+    ? nativeImage.createFromPath(getAssetPath('gamevault-icon-256.png'))
+    : icon;
+}
+
+function getWindowIconPath() {
+  return getAssetPath('gamevault-icon.ico');
+}
+
+function applyWindowShellDetails(window: BrowserWindow) {
+  const iconPath = getWindowIconPath();
+  window.setIcon(iconPath);
+  if (process.platform === 'win32') {
+    window.setAppDetails({
+      appIconIndex: 0,
+      appIconPath: iconPath,
+      appId: GAMEVAULT_APP_USER_MODEL_ID,
+    });
+  }
 }
 
 function getRendererUrl() {
   return join(__dirname, '..', 'renderer', 'index.html');
+}
+
+function getNativeHostBundlePath() {
+  return join(__dirname, '..', 'native-host', 'index.cjs');
+}
+
+async function getExtensionSetupInfo(): Promise<ExtensionSetupInfo> {
+  const bundledExtensionPath = join(__dirname, '..', 'extension');
+  const devExtensionPath = resolve(
+    __dirname,
+    '..',
+    '..',
+    '..',
+    'extension',
+    'dist',
+  );
+  const bundledManifestPath = join(bundledExtensionPath, 'manifest.json');
+  const devManifestPath = join(devExtensionPath, 'manifest.json');
+
+  if (await fileExists(bundledManifestPath)) {
+    return {
+      browsers: ['chrome', 'edge', 'firefox'],
+      extensionPath: bundledExtensionPath,
+      extensionPathExists: true,
+      firefoxExtensionId: FIREFOX_EXTENSION_ID,
+      nativeHostName: GAMEVAULT_NATIVE_HOST_NAME,
+    };
+  }
+
+  const devExtensionExists = await fileExists(devManifestPath);
+  return {
+    browsers: ['chrome', 'edge', 'firefox'],
+    extensionPath: devExtensionExists ? devExtensionPath : bundledExtensionPath,
+    extensionPathExists: devExtensionExists,
+    firefoxExtensionId: FIREFOX_EXTENSION_ID,
+    nativeHostName: GAMEVAULT_NATIVE_HOST_NAME,
+  };
+}
+
+async function detectBrowserExtensionForSetup(): Promise<BrowserExtensionInstallStatus> {
+  const setupInfo = await getExtensionSetupInfo();
+  return detectBrowserExtension({
+    extensionPath: setupInfo.extensionPath,
+    manifestName: 'GameVault',
+  });
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    error.code === 'ENOENT'
+  );
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await stat(filePath);
+    return true;
+  } catch (error) {
+    if (isNotFoundError(error)) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+function migrationTimestamp(): string {
+  return new Date().toISOString().replace(/\D/g, '').slice(0, 14);
+}
+
+async function migrateLegacyDatabaseIfNeeded(params: {
+  databasePath: string;
+  legacyDatabasePath: string;
+  wasmPath: string;
+}): Promise<void> {
+  if (!(await fileExists(params.legacyDatabasePath))) {
+    return;
+  }
+
+  const legacyTrackedItems = await GameVaultDatabase.countTrackedItems(
+    params.legacyDatabasePath,
+    params.wasmPath,
+  );
+  if (!legacyTrackedItems || legacyTrackedItems <= 0) {
+    return;
+  }
+
+  const currentTrackedItems = await GameVaultDatabase.countTrackedItems(
+    params.databasePath,
+    params.wasmPath,
+  );
+  if (currentTrackedItems && currentTrackedItems > 0) {
+    return;
+  }
+
+  await mkdir(dirname(params.databasePath), { recursive: true });
+  if (await fileExists(params.databasePath)) {
+    await copyFile(
+      params.databasePath,
+      `${params.databasePath}.pre-gamevault-migration-${migrationTimestamp()}`,
+    );
+  }
+  await copyFile(params.legacyDatabasePath, params.databasePath);
+  console.info(
+    `Migrated ${legacyTrackedItems} tracked items from ${params.legacyDatabasePath} to ${params.databasePath}`,
+  );
 }
 
 function createWindow(options?: { showOnReady?: boolean }) {
@@ -58,14 +204,16 @@ function createWindow(options?: { showOnReady?: boolean }) {
   mainWindow = new BrowserWindow({
     backgroundColor: '#f4efe5',
     height: 840,
+    icon: getWindowIconPath(),
     show: false,
-    title: 'VaultTrack',
+    title: 'GameVault',
     webPreferences: {
       contextIsolation: true,
       preload: join(__dirname, 'preload.cjs'),
     },
     width: 1280,
   });
+  applyWindowShellDetails(mainWindow);
   void mainWindow.loadFile(getRendererUrl());
 
   mainWindow.on('close', (event) => {
@@ -133,7 +281,16 @@ function probeCurlDownload(candidate: string): Promise<{
   return new Promise((resolve, reject) => {
     const probe = spawn(
       'curl.exe',
-      ['-sS', '-I', '-L', '--connect-timeout', '15', '--max-time', '40', candidate],
+      [
+        '-sS',
+        '-I',
+        '-L',
+        '--connect-timeout',
+        '15',
+        '--max-time',
+        '40',
+        candidate,
+      ],
       {
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
@@ -164,9 +321,7 @@ function probeCurlDownload(candidate: string): Promise<{
   });
 }
 
-function startDirectHttpDownload(
-  params: StartDirectHttpDownloadParams,
-) {
+function startDirectHttpDownload(params: StartDirectHttpDownloadParams) {
   let settled = false;
   let activeCurlProcess: ReturnType<typeof spawn> | null = null;
   let activeCurlProgressTimer: NodeJS.Timeout | null = null;
@@ -399,7 +554,7 @@ function startDirectHttpDownload(
 }
 
 async function bootstrap() {
-  app.setAppUserModelId('VaultTrack');
+  app.setAppUserModelId(GAMEVAULT_APP_USER_MODEL_ID);
   if (!app.requestSingleInstanceLock()) {
     app.quit();
     return;
@@ -417,19 +572,29 @@ async function bootstrap() {
   createWindow({ showOnReady: !backgroundLaunch });
 
   const userDataPath = app.getPath('userData');
-  const database = await VaultTrackDatabase.open(
-    join(userDataPath, 'vaulttrack.sqlite'),
-    join(__dirname, 'sql-wasm.wasm'),
+  const databasePath = join(userDataPath, DATABASE_FILE_NAME);
+  const legacyDatabasePath = join(
+    app.getPath('appData'),
+    '@vaulttrack',
+    'desktop',
+    LEGACY_DATABASE_FILE_NAME,
   );
+  const wasmPath = join(__dirname, 'sql-wasm.wasm');
+  await migrateLegacyDatabaseIfNeeded({
+    databasePath,
+    legacyDatabasePath,
+    wasmPath,
+  });
+  const database = await GameVaultDatabase.open(databasePath, wasmPath);
 
-  const serviceRef: { current: VaultTrackService | null } = { current: null };
+  const serviceRef: { current: GameVaultService | null } = { current: null };
   const myJDownloader = new MyJDownloaderService(async () => {
     if (!serviceRef.current) {
-      throw new Error('VaultTrack service is not initialized.');
+      throw new Error('GameVault service is not initialized.');
     }
     return serviceRef.current.getMyJDownloaderCredentials();
   });
-  const service = createVaultTrackService({
+  const service = createGameVaultService({
     database,
     myJDownloader,
     notify: (level, message) => {
@@ -438,7 +603,8 @@ async function bootstrap() {
       }
       new Notification({
         body: message,
-        title: level === 'error' ? 'VaultTrack Error' : 'VaultTrack',
+        icon: getAssetPath('gamevault-icon-256.png'),
+        title: level === 'error' ? 'GameVault Error' : 'GameVault',
       }).show();
     },
     pickDirectoryDialog: async () => {
@@ -468,6 +634,28 @@ async function bootstrap() {
       net.fetch(input instanceof URL ? input.toString() : input, init),
   });
   serviceRef.current = service;
+  service.onDownloadProgressChange(({ trackedItemIds }) => {
+    const targetWindow = mainWindow;
+    if (!targetWindow || targetWindow.isDestroyed()) {
+      return;
+    }
+    void service
+      .listTrackedItemsByIds(trackedItemIds)
+      .then((items) => {
+        if (
+          items.length === 0 ||
+          !mainWindow ||
+          mainWindow.isDestroyed()
+        ) {
+          return;
+        }
+        mainWindow.webContents.send('gamevault:downloadProgress', { items });
+      })
+      .catch((error) => {
+        console.warn('Failed to send live download progress', error);
+      });
+  });
+  service.getSettings();
   void service.ensureSteamLibraryCoversBackfilled().catch((error) => {
     console.warn('Steam library cover backfill failed', error);
   });
@@ -475,11 +663,11 @@ async function bootstrap() {
   bridge = new NativeBridgeServer(service);
   await bridge.start();
 
-  scheduler = new VaultTrackScheduler(service);
+  scheduler = new GameVaultScheduler(service);
   scheduler.start();
 
   tray = new Tray(createTrayIcon());
-  tray.setToolTip('VaultTrack');
+  tray.setToolTip('GameVault');
   tray.setContextMenu(
     Menu.buildFromTemplate([
       {
@@ -487,7 +675,7 @@ async function bootstrap() {
           createWindow().show();
           createWindow().focus();
         },
-        label: 'Open VaultTrack',
+        label: 'Open GameVault',
       },
       {
         click: () => {
@@ -503,45 +691,71 @@ async function bootstrap() {
     createWindow().focus();
   });
 
-  ipcMain.handle('vault:listTrackedItems', () => service.listTrackedItems());
-  ipcMain.handle('vault:getConnectionHealth', () =>
-    service.getConnectionHealth(),
+  ipcMain.handle('gamevault:listTrackedItems', () =>
+    service.listTrackedItems(),
   );
-  ipcMain.handle('vault:getSettings', () => service.getSettings());
-  ipcMain.handle('vault:authenticateMyJDownloader', (_event, payload) =>
+  ipcMain.handle('gamevault:detectBrowserExtension', () =>
+    detectBrowserExtensionForSetup(),
+  );
+  ipcMain.handle('gamevault:detectJDownloader', () => detectJDownloader());
+  ipcMain.handle('gamevault:getExtensionSetupInfo', () =>
+    getExtensionSetupInfo(),
+  );
+  ipcMain.handle(
+    'gamevault:registerExtensionNativeHost',
+    (_event, payload: RegisterExtensionNativeHostPayload) =>
+      registerExtensionNativeHost({
+        browsers: payload.browsers,
+        extensionId: payload.extensionId,
+        nativeHostBundlePath: getNativeHostBundlePath(),
+      }),
+  );
+  ipcMain.handle('gamevault:getConnectionHealth', (_event, payload) =>
+    service.getConnectionHealth(payload),
+  );
+  ipcMain.handle('gamevault:getDesktopHealth', async (_event, payload) =>
+    service.getDesktopHealth(await getExtensionSetupInfo(), payload),
+  );
+  ipcMain.handle('gamevault:getSettings', () => service.getSettings());
+  ipcMain.handle('gamevault:authenticateMyJDownloader', (_event, payload) =>
     service.authenticateMyJDownloader(payload.email, payload.password),
   );
-  ipcMain.handle('vault:disconnectMyJDownloader', () =>
+  ipcMain.handle('gamevault:disconnectMyJDownloader', () =>
     service.disconnectMyJDownloader(),
   );
-  ipcMain.handle('vault:saveSettings', (_event, payload) =>
+  ipcMain.handle('gamevault:saveSettings', (_event, payload) =>
     service.saveSettings(payload),
   );
-  ipcMain.handle('vault:scanImportCandidates', (_event, payload) =>
+  ipcMain.handle('gamevault:saveOnboardingState', (_event, payload) =>
+    service.saveOnboardingState(payload),
+  );
+  ipcMain.handle('gamevault:scanImportCandidates', (_event, payload) =>
     service.scanImportCandidates(payload),
   );
-  ipcMain.handle('vault:ignoreImportFolder', (_event, payload) =>
+  ipcMain.handle('gamevault:ignoreImportFolder', (_event, payload) =>
     service.ignoreImportFolder(payload),
   );
-  ipcMain.handle('vault:restoreImportFolder', (_event, payload) =>
+  ipcMain.handle('gamevault:restoreImportFolder', (_event, payload) =>
     service.restoreImportFolder(payload),
   );
-  ipcMain.handle('vault:saveImportBatch', (_event, payload) =>
+  ipcMain.handle('gamevault:saveImportBatch', (_event, payload) =>
     service.saveImportBatch(payload),
   );
-  ipcMain.handle('vault:requestSteamDbBuildLookup', (_event, appId: number) =>
-    service.requestSteamDbBuildLookup(appId),
+  ipcMain.handle(
+    'gamevault:requestSteamDbBuildLookup',
+    (_event, appId: number) => service.requestSteamDbBuildLookup(appId),
   );
-  ipcMain.handle('vault:getSteamDbBuildLookup', (_event, lookupId: string) =>
-    service.getSteamDbBuildLookup(lookupId),
+  ipcMain.handle(
+    'gamevault:getSteamDbBuildLookup',
+    (_event, lookupId: string) => service.getSteamDbBuildLookup(lookupId),
   );
-  ipcMain.handle('vault:updateInstallRecord', (_event, payload) =>
+  ipcMain.handle('gamevault:updateInstallRecord', (_event, payload) =>
     service.updateInstallRecord(payload),
   );
-  ipcMain.handle('vault:updateSourcePatch', (_event, payload) =>
+  ipcMain.handle('gamevault:updateSourcePatch', (_event, payload) =>
     service.updateSourcePatch(payload),
   );
-  ipcMain.handle('vault:resolveSteamMatch', (_event, payload) =>
+  ipcMain.handle('gamevault:resolveSteamMatch', (_event, payload) =>
     service.resolveSteamMatch(
       payload.title,
       'manual',
@@ -549,44 +763,46 @@ async function bootstrap() {
       payload.queryTitle ?? null,
     ),
   );
-  ipcMain.handle('vault:resolveSteamPatches', (_event, payload) =>
+  ipcMain.handle('gamevault:resolveSteamPatches', (_event, payload) =>
     service.resolveSteamPatches(payload.appId),
   );
   ipcMain.handle(
-    'vault:listSteamPatchEntries',
+    'gamevault:listSteamPatchEntries',
     (_event, trackedItemId: string) =>
       service.listSteamPatchEntries(trackedItemId),
   );
   ipcMain.handle(
-    'vault:applySteamMatch',
+    'gamevault:applySteamMatch',
     (_event, payload: { trackedItemId: string; match: ConfirmedSteamMatch }) =>
       service.applySteamMatch(payload.trackedItemId, payload.match),
   );
-  ipcMain.handle('vault:refreshTrackedItem', (_event, trackedItemId: string) =>
-    service.refreshTrackedItem(trackedItemId),
+  ipcMain.handle(
+    'gamevault:refreshTrackedItem',
+    (_event, trackedItemId: string) =>
+      service.refreshTrackedItem(trackedItemId),
   );
   ipcMain.handle(
-    'vault:discoverSourceMatches',
+    'gamevault:discoverSourceMatches',
     (_event, trackedItemId: string) =>
       service.discoverSourceMatches(trackedItemId, {
         bypassBackoff: true,
         forceCatalog: true,
       }),
   );
-  ipcMain.handle('vault:refreshMatchedSource', (_event, payload) =>
+  ipcMain.handle('gamevault:refreshMatchedSource', (_event, payload) =>
     service.refreshMatchedSource(payload.trackedItemId, payload.sourceKind),
   );
-  ipcMain.handle('vault:setManualSourceMatch', (_event, payload) =>
+  ipcMain.handle('gamevault:setManualSourceMatch', (_event, payload) =>
     service.setManualSourceMatch(payload),
   );
-  ipcMain.handle('vault:retryDownload', (_event, trackedItemId: string) =>
+  ipcMain.handle('gamevault:retryDownload', (_event, trackedItemId: string) =>
     service.retryDownload(trackedItemId),
   );
-  ipcMain.handle('vault:queueUpdateFromSource', (_event, payload) =>
+  ipcMain.handle('gamevault:queueUpdateFromSource', (_event, payload) =>
     service.queueUpdateFromSource(payload),
   );
   ipcMain.handle(
-    'vault:retryDownloadWithSelection',
+    'gamevault:retryDownloadWithSelection',
     (_event, payload: { selectedDownloads?: unknown; trackedItemId: string }) =>
       service.retryDownload(
         payload.trackedItemId,
@@ -598,14 +814,21 @@ async function bootstrap() {
           | undefined,
       ),
   );
-  ipcMain.handle('vault:markDownloadFailed', (_event, trackedItemId: string) =>
-    service.markDownloadFailed(trackedItemId),
+  ipcMain.handle(
+    'gamevault:markDownloadFailed',
+    (_event, trackedItemId: string) =>
+      service.markDownloadFailed(trackedItemId),
   );
-  ipcMain.handle('vault:cancelDownload', (_event, trackedItemId: string) =>
+  ipcMain.handle('gamevault:cancelDownload', (_event, trackedItemId: string) =>
     service.cancelDownload(trackedItemId),
   );
   ipcMain.handle(
-    'vault:clearDownloadMirrorFailed',
+    'gamevault:confirmManualDownloadReady',
+    (_event, trackedItemId: string) =>
+      service.confirmManualDownloadReady(trackedItemId),
+  );
+  ipcMain.handle(
+    'gamevault:clearDownloadMirrorFailed',
     (_event, payload: { trackedItemId: string; url: string }) =>
       service.markDownloadMirrorFailed(
         payload.trackedItemId,
@@ -614,23 +837,27 @@ async function bootstrap() {
       ),
   );
   ipcMain.handle(
-    'vault:completeStagedInstall',
+    'gamevault:completeStagedInstall',
     (_event, trackedItemId: string) =>
       service.completeStagedInstall(trackedItemId),
   );
-  ipcMain.handle('vault:removeTrackedItem', (_event, payload) =>
+  ipcMain.handle('gamevault:removeTrackedItem', (_event, payload) =>
     service.removeTrackedItem(payload),
   );
   ipcMain.handle(
-    'vault:selectMyJDownloaderDevice',
+    'gamevault:selectMyJDownloaderDevice',
     (_event, deviceId: string) => service.selectMyJDownloaderDevice(deviceId),
   );
-  ipcMain.handle('vault:getLogs', () => service.getLogs());
-  ipcMain.handle('vault:pickDirectory', () => service.pickDirectory());
-  ipcMain.handle('vault:openExternal', (_event, target: string) =>
+  ipcMain.handle('gamevault:getActivity', () => service.getActivity());
+  ipcMain.handle('gamevault:runActivityAction', (_event, payload) =>
+    service.runActivityAction(payload),
+  );
+  ipcMain.handle('gamevault:getLogs', () => service.getLogs());
+  ipcMain.handle('gamevault:pickDirectory', () => service.pickDirectory());
+  ipcMain.handle('gamevault:openExternal', (_event, target: string) =>
     shell.openExternal(target),
   );
-  ipcMain.handle('vault:openDesktop', (_event, trackedItemId?: string) =>
+  ipcMain.handle('gamevault:openDesktop', (_event, trackedItemId?: string) =>
     service.openDesktop(trackedItemId),
   );
 
