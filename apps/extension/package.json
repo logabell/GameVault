@@ -1,6 +1,6 @@
 {
   "name": "@gamevault/extension",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -12,9 +12,9 @@
     "@fortawesome/fontawesome-svg-core": "^7.2.0",
     "@fortawesome/free-solid-svg-icons": "^7.2.0",
     "@fortawesome/react-fontawesome": "^3.3.1",
-    "@gamevault/shared-types": "0.1.0",
-    "@gamevault/source-core": "0.1.0",
-    "@gamevault/steam-core": "0.1.0",
+    "@gamevault/shared-types": "1.0.0",
+    "@gamevault/source-core": "1.0.0",
+    "@gamevault/steam-core": "1.0.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   }

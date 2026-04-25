@@ -10,3 +10,4 @@ packages/*/tests/*.test.d.ts.map
 apps/desktop/.vite
 apps/extension/.cache
 apps/desktop/dev-data
+apps/desktop/release

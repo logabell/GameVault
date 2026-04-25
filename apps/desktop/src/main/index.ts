@@ -52,8 +52,12 @@ let scheduler: GameVaultScheduler | null = null;
 let quitting = false;
 const backgroundLaunch = process.argv.includes('--background');
 const DATABASE_FILE_NAME = 'gamevault.sqlite';
-const GAMEVAULT_APP_USER_MODEL_ID = 'GameVault';
+const GAMEVAULT_APP_USER_MODEL_ID = 'com.gamevault.desktop';
 const LEGACY_DATABASE_FILE_NAME = 'vaulttrack.sqlite';
+
+function getAsarUnpackedPath(filePath: string) {
+  return filePath.replace(/([/\\])app\.asar([/\\])/, '$1app.asar.unpacked$2');
+}
 
 function getAssetPath(fileName: string) {
   return join(__dirname, '..', 'assets', fileName);
@@ -89,7 +93,7 @@ function getRendererUrl() {
 }
 
 function getNativeHostBundlePath() {
-  return join(__dirname, '..', 'native-host', 'index.cjs');
+  return getAsarUnpackedPath(join(__dirname, '..', 'native-host', 'index.cjs'));
 }
 
 async function getExtensionSetupInfo(): Promise<ExtensionSetupInfo> {

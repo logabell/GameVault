@@ -14,6 +14,10 @@ import { path7z } from '7zip-bin-full';
 
 const execFileAsync = promisify(execFile);
 
+function getAsarUnpackedPath(filePath: string) {
+  return filePath.replace(/([/\\])app\.asar([/\\])/, '$1app.asar.unpacked$2');
+}
+
 function normalizeTitle(input: string): string {
   return input
     .toLowerCase()
@@ -293,7 +297,7 @@ async function extractZipArchive(
 ): Promise<void> {
   await ensureDirectory(destinationPath);
   await execFileAsync(
-    path7z,
+    getAsarUnpackedPath(path7z),
     ['x', zipPath, `-o${destinationPath}`, '-y', '-bso0', '-bsp0'],
     {
       maxBuffer: 64 * 1024 * 1024,
