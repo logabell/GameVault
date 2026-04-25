@@ -1,57 +1,87 @@
-# GameVault Development Setup
+# Development Setup
+
+This page covers development commands and quality checks. For end-user setup, see [Installation](INSTALLATION.md).
 
 ## Prerequisites
 
-- Node 22.x
-- Chrome, Edge, or Firefox
+- Node 22.x.
+- Chrome, Edge, or Firefox for extension testing.
 
-## Build
+## Repository Layout
+
+```text
+apps/
+  desktop/        Electron tray app, native bridge, SQLite database, services, renderer UI
+  extension/      Browser extension background/content/popup scripts and manifest
+packages/
+  shared-types/   Shared models, native-message contracts, status helpers, library controls
+  source-core/    Source parsers, catalog discovery, source matching helpers
+  steam-core/     Steam search, covers, SteamDB RSS/build parsing, watch helpers
+scripts/          Repo-level maintenance scripts
+docs/             Project documentation
+```
+
+## Common Commands
 
 ```powershell
 npm install
-npm run build
+npm run build          # Build all workspaces
+npm run dev:desktop    # Build and run the Electron desktop app
+npm run dev:extension  # Watch/rebuild the browser extension
+npm run lint           # ESLint
+npm run typecheck      # TypeScript project references
+npm test               # Vitest
+npm run check:unused   # Knip unused-code/dependency check
+npm run clean          # Remove generated build/cache output
 ```
 
-## Run the desktop tray app
-
-```powershell
-npm run dev:desktop
-```
-
-## Load the extension in Chrome or Edge
-
-1. Open `chrome://extensions` or `edge://extensions`
-2. Enable developer mode
-3. Load unpacked from `C:\projects\GameVault\apps\extension\dist`
-4. Copy the extension id shown in the browser
-5. After the first load, keep using the same unpacked extension. You do not need to reinstall it for normal code changes.
-
-## Load the extension in Firefox
-
-1. Open `about:debugging#/runtime/this-firefox`
-2. Click `Load Temporary Add-on`
-3. Select `C:\projects\GameVault\apps\extension\dist\manifest.json`
-4. Confirm the add-on ID is `gamevault@vaulttrack.local`
-
-## Extension dev loop
+## Extension Dev Loop
 
 ```powershell
 npm run dev:extension
 ```
 
-- This keeps rebuilding `apps/extension/dist` on file changes.
+- This keeps rebuilding `apps\extension\dist` on file changes.
 - In the browser, click `Reload` on the GameVault extension after code changes.
-- Reopen the popup after reload. For content-script changes, refresh the supported page too.
+- Reopen the popup after reload.
+- For content-script changes, refresh the supported page too.
 
-## Register native messaging
+## Native Messaging During Development
+
+Register Chrome/Edge native messaging after loading the unpacked extension:
 
 ```powershell
 node .\apps\desktop\scripts\register-native-host.mjs --extension-id=YOUR_EXTENSION_ID --browser=both
+```
+
+Register Firefox native messaging:
+
+```powershell
 node .\apps\desktop\scripts\register-native-host.mjs --browser=firefox
 ```
 
-## Remove native messaging
+Remove native messaging:
 
 ```powershell
 node .\apps\desktop\scripts\unregister-native-host.mjs
 ```
+
+## Quality Gate
+
+Run this before a production-facing push:
+
+```powershell
+npm run lint
+npm run typecheck
+npm test
+npm run build
+npm run check:unused
+npm audit --omit=dev
+```
+
+## Cleanup Guidance
+
+- Keep source parsers and native-message contracts conservative; they are shared by the desktop app and extension.
+- Add focused tests when changing database behavior, source parsing, download/provider selection, native messaging, or update status logic.
+- Prefer compatibility-preserving migrations. Do not remove old migrations or legacy database-opening paths unless there is a deliberate migration plan.
+- Treat unused-code tooling as a signal to triage, not as automatic permission to delete source entrypoints.
