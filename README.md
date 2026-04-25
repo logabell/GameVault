@@ -41,6 +41,10 @@ GameVault stores its operational data locally. Library files remain under the ro
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
 - [Development Setup](docs/DEVELOPMENT.md)
 
+## License
+
+GameVault is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE) for the full license text.
+
 ## Intended Use
 
 GameVault is a personal library and update-tracking tool. Use it only with games and download sources you are legally allowed to access, preserve, or install. GameVault does not host files, provide source-site credentials, bypass DRM, crack software, or grant rights to third-party content.
