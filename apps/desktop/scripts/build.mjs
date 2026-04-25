@@ -105,8 +105,25 @@ await copyFile(
 const packageJson = JSON.parse(
   await readFile(resolve(rootDir, 'package.json'), 'utf8'),
 );
-packageJson.main = './dist/main/index.cjs';
+const runtimeDependencies = ['7zip-bin-full', 'sql.js'];
+const distPackageJson = {
+  name: packageJson.name,
+  version: packageJson.version,
+  private: packageJson.private,
+  description: packageJson.description,
+  productName: packageJson.productName,
+  type: packageJson.type,
+  main: './main/index.cjs',
+  dependencies: Object.fromEntries(
+    runtimeDependencies
+      .map((dependency) => [
+        dependency,
+        packageJson.dependencies?.[dependency],
+      ])
+      .filter((entry) => Boolean(entry[1])),
+  ),
+};
 await writeFile(
   join(distDir, 'package.json'),
-  JSON.stringify(packageJson, null, 2),
+  JSON.stringify(distPackageJson, null, 2),
 );

@@ -1,25 +1,70 @@
 {
   "name": "@gamevault/desktop",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
+  "description": "Desktop companion app for tracking GameVault library updates.",
+  "author": "GameVault",
+  "productName": "GameVault",
   "type": "module",
   "main": "./dist/main/index.cjs",
   "scripts": {
     "build": "npm run build --workspace @gamevault/shared-types && npm run build --workspace @gamevault/source-core && npm run build --workspace @gamevault/steam-core && node ./scripts/build.mjs",
     "dev": "npm run build && electron .",
+    "package:windows": "npm run build && set CSC_IDENTITY_AUTO_DISCOVERY=false&& electron-builder --win nsis --x64 --publish=never",
     "test": "vitest run"
   },
   "dependencies": {
+    "7zip-bin-full": "^26.0.1",
+    "sql.js": "^1.14.1"
+  },
+  "devDependencies": {
     "@fortawesome/fontawesome-svg-core": "^7.2.0",
     "@fortawesome/free-solid-svg-icons": "^7.2.0",
     "@fortawesome/react-fontawesome": "^3.3.1",
-    "@gamevault/shared-types": "0.1.0",
-    "@gamevault/source-core": "0.1.0",
-    "@gamevault/steam-core": "0.1.0",
-    "7zip-bin-full": "^26.0.1",
-    "electron": "^41.2.1",
+    "@gamevault/shared-types": "1.0.0",
+    "@gamevault/source-core": "1.0.0",
+    "@gamevault/steam-core": "1.0.0",
+    "electron": "41.2.1",
     "react": "^19.1.0",
-    "react-dom": "^19.1.0",
-    "sql.js": "^1.14.1"
+    "react-dom": "^19.1.0"
+  },
+  "build": {
+    "appId": "com.gamevault.desktop",
+    "productName": "GameVault",
+    "asar": true,
+    "asarUnpack": [
+      "dist/native-host/**/*",
+      "node_modules/7zip-bin-full/**/*"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "win": {
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "src/assets/gamevault-icon.ico",
+      "artifactName": "GameVault-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "installerIcon": "src/assets/gamevault-icon.ico",
+      "uninstallerIcon": "src/assets/gamevault-icon.ico",
+      "shortcutName": "GameVault"
+    }
   }
 }
