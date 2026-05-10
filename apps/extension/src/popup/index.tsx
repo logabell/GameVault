@@ -90,7 +90,7 @@ import { getSteamPatchKey } from './patch-matching.js';
 import { mergeSteamPatchLists } from './patch-list.js';
 
 type PopupTab = 'game' | 'library' | 'settings';
-type FlowStep = 'game' | 'steam' | 'patch' | 'done';
+type FlowStep = 'game' | 'steam' | 'patch';
 type LibraryViewMode = 'cards' | 'list';
 type ResolvedTheme = 'light' | 'dark';
 type HealthSeverity = 'yellow' | 'red' | null;
@@ -633,12 +633,7 @@ function isPopupTab(value: unknown): value is PopupTab {
 }
 
 function isFlowStep(value: unknown): value is FlowStep {
-  return (
-    value === 'game' ||
-    value === 'steam' ||
-    value === 'patch' ||
-    value === 'done'
-  );
+  return value === 'game' || value === 'steam' || value === 'patch';
 }
 
 function isSupportedSourceKind(value: unknown): value is SupportedSourceKind {
@@ -716,8 +711,14 @@ function readStoredPopupStateForKey(
 
     const selectedAppId =
       typeof record.selectedAppId === 'number' ? record.selectedAppId : null;
+    const storedStep = record.step as unknown;
     return {
-      activeTab: isPopupTab(record.activeTab) ? record.activeTab : 'game',
+      activeTab:
+        storedStep === 'done'
+          ? 'library'
+          : isPopupTab(record.activeTab)
+            ? record.activeTab
+            : 'game',
       libraryUpdateItemId:
         typeof record.libraryUpdateItemId === 'string'
           ? record.libraryUpdateItemId
@@ -758,7 +759,7 @@ function readStoredPopupStateForKey(
         typeof record.steamSearchQuery === 'string'
           ? record.steamSearchQuery
           : '',
-      step: isFlowStep(record.step) ? record.step : 'steam',
+      step: isFlowStep(storedStep) ? storedStep : 'steam',
       version: EXTENSION_POPUP_STATE_VERSION,
     };
   } catch {
@@ -2091,7 +2092,7 @@ function App() {
   }, [resolvedTheme]);
 
   useEffect(() => {
-    if (activeTab === 'game') {
+    if (activeTab === 'game' || activeTab === 'library') {
       scrollStageRef.current?.scrollTo({ top: 0 });
     }
   }, [activeTab, step]);
@@ -3731,24 +3732,26 @@ function App() {
       }
       setFinishQueued(true);
       const queuedProvider = response.payload?.currentDownload?.provider;
-      setMessage(
+      const queuedMessage =
         isLibraryUpdateFlow
           ? 'Update queued.'
           : getDownloadQueueSuccessMessage(
               selectedSourceView.match.sourceKind,
               queuedProvider,
-            ),
-      );
-      setStep('done');
+            );
+      setMessage(queuedProvider === 'jdownloader' ? queuedMessage : null);
+      if (response.payload) {
+        applyUpdatedTrackedItem(response.payload);
+      }
       refreshPopupStateInBackground();
-      libraryRedirectTimerRef.current = window.setTimeout(() => {
-        if (isLibraryUpdateFlow) {
-          restoreDetectedWorkflow('library', { clearMessage: false });
-        } else {
-          setActiveTab('library');
-        }
-        libraryRedirectTimerRef.current = null;
-      }, 500);
+      void refreshLibrary();
+      if (isLibraryUpdateFlow) {
+        restoreDetectedWorkflow('library', {
+          clearMessage: queuedProvider !== 'jdownloader',
+        });
+      } else {
+        setActiveTab('library');
+      }
       if (steamDbConfirmation) {
         void clearSteamDbConfirmation();
       }
@@ -4464,7 +4467,7 @@ function App() {
               </section>
             ) : null}
 
-            {hasGameWorkflow && step !== 'done' ? (
+            {hasGameWorkflow ? (
               <section className="surface-card panel-card">
                 <div
                   className={`step-row ${
@@ -5024,36 +5027,6 @@ function App() {
               </section>
             ) : null}
 
-            {hasGameWorkflow && step === 'done' ? (
-              <section className="surface-card panel-card">
-                <div className="section-stack">
-                  <div>
-                    <p className="section-title">
-                      {isLibraryUpdateFlow ? 'Update Queued' : 'Added to GameVault'}
-                    </p>
-                    <p className="muted-text">
-                      {isLibraryUpdateFlow
-                        ? 'The selected update was queued for this library item.'
-                        : 'The selected mirror was queued and the title now appears in your library.'}
-                    </p>
-                  </div>
-                  <div className="action-row">
-                    <button
-                      className="ghost-button"
-                      onClick={() =>
-                        void chrome.runtime.sendMessage({
-                          type: 'gamevault:open-desktop',
-                        })
-                      }
-                      type="button"
-                    >
-                      <FontAwesomeIcon aria-hidden="true" icon={faFileImport} />
-                      Open Desktop
-                    </button>
-                  </div>
-                </div>
-              </section>
-            ) : null}
           </>
         ) : null}
 
@@ -5138,6 +5111,8 @@ function App() {
                     >
                       <option value="name">Name</option>
                       <option value="status">Status</option>
+                      <option value="patchesBehind">Patches behind</option>
+                      <option value="recentlyAdded">Recently added</option>
                       <option value="recentlyUpdated">Recently updated</option>
                     </select>
                   </label>
@@ -5413,8 +5388,8 @@ function App() {
                   <p className="muted-text">
                     If the desktop bridge is still waking up, wait a few seconds
                     and refresh. GameVault stores MyJDownloader credentials in
-                    the desktop app only, and downloads can still run there with
-                    curl once your library root is set.
+                    the desktop app only, and downloads can still run there once
+                    your library root is set.
                   </p>
                 </div>
               ) : null}

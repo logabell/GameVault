@@ -80,7 +80,7 @@ export function getLibraryAutomationWarning(params: {
 
 export function getDeleteTrackedItemPrompt(item: TrackedItemView): string {
   if (item.currentDownload?.provider === 'direct_http') {
-    return `Delete ${item.item.title} from GameVault, stop its curl download, and delete staged/install files?`;
+    return `Delete ${item.item.title} from GameVault, stop its download, and delete staged/install files?`;
   }
   if (item.currentDownload?.provider === 'manual') {
     return `Delete ${item.item.title} from GameVault and delete manual staging/install files?`;
@@ -91,7 +91,7 @@ export function getDeleteTrackedItemPrompt(item: TrackedItemView): string {
 
 export function getMarkDownloadFailedPrompt(item: TrackedItemView): string {
   if (item.currentDownload?.provider === 'direct_http') {
-    return `Mark ${item.item.title} as failed and stop its curl download?`;
+    return `Mark ${item.item.title} as failed and stop its download?`;
   }
   if (item.currentDownload?.provider === 'manual') {
     return `Cancel the manual download for ${item.item.title} and delete staged files?`;

@@ -318,7 +318,7 @@ function probeCurlDownload(candidate: string): Promise<{
       reject(
         new Error(
           stderr.trim() ||
-            `curl probe exited with code ${String(code ?? 'unknown')}.`,
+            `Download probe exited with code ${String(code ?? 'unknown')}.`,
         ),
       );
     });
@@ -398,7 +398,7 @@ function startDirectHttpDownload(params: StartDirectHttpDownloadParams) {
       const start = async () => {
         const normalized = params.url.trim();
 
-        emitProgress('queued', 'Starting curl download');
+        emitProgress('queued', 'Starting download');
         let probeResult: {
           contentDisposition: string | null;
           contentLength: number | null;
@@ -440,7 +440,7 @@ function startDirectHttpDownload(params: StartDirectHttpDownloadParams) {
           bytesLoaded: 0,
           recordedAt: Date.now(),
         };
-        emitProgress('downloading', 'Downloading with curl');
+        emitProgress('downloading', 'Downloading');
 
         const curl = spawn(
           'curl.exe',
@@ -488,7 +488,7 @@ function startDirectHttpDownload(params: StartDirectHttpDownloadParams) {
               bytesLoaded: nextBytesLoaded,
               recordedAt: now,
             };
-            emitProgress('downloading', 'Downloading with curl');
+            emitProgress('downloading', 'Downloading');
           } catch {
             // The file can be missing while curl is negotiating the transfer.
           }
@@ -525,7 +525,7 @@ function startDirectHttpDownload(params: StartDirectHttpDownloadParams) {
           settleDownload(
             new Error(
               stderr.trim() ||
-                `curl download exited with code ${String(code ?? 'unknown')}.`,
+                `Download exited with code ${String(code ?? 'unknown')}.`,
             ),
           );
         });
@@ -658,6 +658,13 @@ async function bootstrap() {
       .catch((error) => {
         console.warn('Failed to send live download progress', error);
       });
+  });
+  service.onActivityChange((activity) => {
+    const targetWindow = mainWindow;
+    if (!targetWindow || targetWindow.isDestroyed()) {
+      return;
+    }
+    targetWindow.webContents.send('gamevault:activityChange', { activity });
   });
   service.getSettings();
   void service.ensureSteamLibraryCoversBackfilled().catch((error) => {

@@ -3,7 +3,9 @@ import { describe, expect, it } from 'vitest';
 import type { ActivityView } from '@gamevault/shared-types';
 import {
   buildActivityReport,
+  getActivityTaskProgressLabel,
   getActivityLogContextRows,
+  getNavbarAutomationStatus,
   sortActivityIssues,
 } from '../src/renderer/activity-report.js';
 
@@ -84,5 +86,54 @@ describe('activity report helpers', () => {
     expect(report).toContain('%USERPROFILE%');
     expect(report).not.toContain('secret');
     expect(report).not.toContain('Logan');
+  });
+
+  it('formats active task progress when totals are known', () => {
+    expect(
+      getActivityTaskProgressLabel({
+        id: 'steamdb-feeds',
+        progressCurrent: 3,
+        progressTotal: 12,
+        startedAt: '2026-04-24T12:00:00.000Z',
+        status: 'running',
+        title: 'Checking SteamDB feeds',
+      }),
+    ).toBe('3/12');
+  });
+
+  it('only summarizes navbar automation status while sync tasks are running', () => {
+    expect(
+      getNavbarAutomationStatus({
+        ...activity,
+        activeTasks: [
+          {
+            id: 'steamdb-feeds',
+            progressCurrent: 3,
+            progressTotal: 12,
+            startedAt: '2026-04-24T12:00:00.000Z',
+            status: 'running',
+            title: 'Checking SteamDB feeds',
+          },
+        ],
+      }),
+    ).toMatchObject({ label: 'Syncing updates 3/12', status: 'running' });
+
+    expect(
+      getNavbarAutomationStatus({
+        ...activity,
+        activeTasks: [
+          {
+            id: 'download-jobs',
+            progressCurrent: 1,
+            progressTotal: 2,
+            startedAt: '2026-04-24T12:00:00.000Z',
+            status: 'running',
+            title: 'Checking download jobs',
+          },
+        ],
+      }),
+    ).toBeNull();
+
+    expect(getNavbarAutomationStatus(activity)).toBeNull();
   });
 });

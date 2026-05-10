@@ -8,7 +8,10 @@ import type {
   SupportedSourceKind,
   TrackedItemView,
 } from '../src/index.js';
-import { inferSourceComparisonRows } from '../src/index.js';
+import {
+  getSourceComparisonLabel,
+  inferSourceComparisonRows,
+} from '../src/index.js';
 
 const now = '2026-04-22T12:00:00.000Z';
 
@@ -369,6 +372,49 @@ describe('source comparison inference', () => {
     });
   });
 
+  it('counts AnkerGames lag from a listed build id when the exact row is absent', () => {
+    const latestPatch = patch(
+      '22520000',
+      'Example update for 27 March 2026',
+      '03/27/2026',
+      '2026-03-27T12:00:00.000Z',
+    );
+    const olderPatch = patch(
+      '22510000',
+      'Example update for 26 March 2026',
+      '03/26/2026',
+      '2026-03-26T12:00:00.000Z',
+    );
+    const ankergames = {
+      ...sourceView('ankergames', {
+        observedBuildId: '22516568',
+        observedVersion: 'V 1.2.0.7-28a3',
+      }),
+      isUpdateSource: true,
+      updateStatus: 'newer_than_installed' as const,
+    };
+
+    const rows = inferSourceComparisonRows(trackedItem([ankergames]), [
+      latestPatch,
+      olderPatch,
+    ]);
+
+    expect(rows[0]).toMatchObject({
+      isUpdateSource: true,
+      matchedPatch: null,
+      snapshot: {
+        observedBuildId: '22516568',
+        observedVersion: 'V 1.2.0.7-28a3',
+      },
+      updateStatus: 'source_behind_upstream',
+      versionsBehindLatest: 1,
+      versionsBehindLatestIsLowerBound: false,
+    });
+    expect(getSourceComparisonLabel(rows[0]!, trackedItem([rows[0]!]))).toBe(
+      '1 behind',
+    );
+  });
+
   it('infers a missing SteamRIP build from a matching ElAmigos version', () => {
     const hotfixPatch = patch(
       '19434067',
@@ -471,5 +517,43 @@ describe('source comparison inference', () => {
       updateStatus: 'matches_upstream',
       versionsBehindLatest: 0,
     });
+  });
+
+  it('does not treat an older version-only SteamRIP source as newer than the installed build', () => {
+    const ankergames = sourceView('ankergames', {
+      observedBuildId: '21459233',
+      observedVersion: 'V 3.6.0',
+    });
+    const steamrip = {
+      ...sourceView('steamrip', {
+        observedBuildId: null,
+        observedVersion: '3.5.10B',
+      }),
+      isUpdateSource: true,
+      updateStatus: 'newer_than_installed' as const,
+    };
+    const item: TrackedItemView = {
+      ...trackedItem([ankergames, steamrip]),
+      installRecord: {
+        installedAt: '2026-05-10',
+        installedBuildId: '21459233',
+        installedSourceKind: 'ankergames',
+        installedSourceUrl: 'https://ankergames.example.test/shape-of-dreams',
+        installedVersion: 'V 3.6.0',
+        trackedItemId: 'tracked-1',
+        updatedAt: now,
+      },
+    };
+
+    const rows = inferSourceComparisonRows(item, []);
+    const inferredSteamRip = rows.find(
+      (source) => source.match.sourceKind === 'steamrip',
+    );
+
+    expect(inferredSteamRip).toMatchObject({
+      isUpdateSource: false,
+      updateStatus: 'unknown',
+    });
+    expect(getSourceComparisonLabel(steamrip, item)).toBe('Unknown');
   });
 });

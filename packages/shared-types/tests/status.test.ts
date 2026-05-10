@@ -226,6 +226,90 @@ describe('deriveTrackedItemStatus', () => {
     ).toBe(TrackedItemTrackingStatus.UpdateAvailable);
   });
 
+  it('does not let a stale expired watch hide an available source update', () => {
+    expect(
+      deriveTrackedItemTrackingStatus({
+        currentWatch: {
+          endsAt: '2026-04-23T12:00:00.000Z',
+          expiredAt: '2026-04-23T12:00:00.000Z',
+          nextCheckAt: '2026-04-24T12:00:00.000Z',
+          startedAt: '2026-04-20T12:00:00.000Z',
+          trackedItemId: 'item',
+        },
+        hasSteamMatch: true,
+        installRecord: {
+          installedBuildId: '1',
+          installedVersion: '1.0.0',
+          trackedItemId: 'item',
+          updatedAt: '2026-04-22T12:00:00.000Z',
+        },
+        sourceMatches: [
+          {
+            downloadMirrors: [],
+            isUpdateSource: true,
+            match: {
+              confidence: 1,
+              createdAt: '2026-04-22T12:00:00.000Z',
+              isPrimary: false,
+              method: 'slug',
+              normalizedTitle: 'example',
+              score: 1,
+              sourceKind: 'steamrip',
+              status: 'verified',
+              trackedItemId: 'item',
+              updatedAt: '2026-04-22T12:00:00.000Z',
+              usable: true,
+            },
+            snapshot: null,
+            updateStatus: 'matches_upstream',
+          },
+        ],
+      }),
+    ).toBe(TrackedItemTrackingStatus.UpdateAvailable);
+  });
+
+  it('keeps expired visible when source catch-up remains unresolved', () => {
+    expect(
+      deriveTrackedItemTrackingStatus({
+        currentWatch: {
+          endsAt: '2026-04-23T12:00:00.000Z',
+          expiredAt: '2026-04-23T12:00:00.000Z',
+          nextCheckAt: '2026-04-24T12:00:00.000Z',
+          startedAt: '2026-04-20T12:00:00.000Z',
+          trackedItemId: 'item',
+        },
+        hasSteamMatch: true,
+        installRecord: {
+          installedBuildId: '1',
+          installedVersion: '1.0.0',
+          trackedItemId: 'item',
+          updatedAt: '2026-04-22T12:00:00.000Z',
+        },
+        sourceMatches: [
+          {
+            downloadMirrors: [],
+            isUpdateSource: false,
+            match: {
+              confidence: 1,
+              createdAt: '2026-04-22T12:00:00.000Z',
+              isPrimary: false,
+              method: 'slug',
+              normalizedTitle: 'example',
+              score: 1,
+              sourceKind: 'steamrip',
+              status: 'verified',
+              trackedItemId: 'item',
+              updatedAt: '2026-04-22T12:00:00.000Z',
+              usable: true,
+            },
+            snapshot: null,
+            updateStatus: 'source_behind_upstream',
+          },
+        ],
+      }),
+    ).toBe(TrackedItemTrackingStatus.WatchWindowExpired);
+  });
+
   it('uses installed as the primary status when the final folder exists', () => {
     expect(
       deriveTrackedItemStatus({
@@ -298,6 +382,35 @@ describe('deriveTrackedItemStatus', () => {
         latestPatch,
         selectedPatch: latestPatch,
         versionsBehindLatest: 0,
+      }),
+    ).toBe(TrackedItemTrackingStatus.WatchingSource);
+  });
+
+  it('does not mark discovered drafts update available without an install context', () => {
+    expect(
+      deriveTrackedItemTrackingStatus({
+        hasSteamMatch: true,
+        sourceMatches: [
+          {
+            downloadMirrors: [],
+            isUpdateSource: true,
+            match: {
+              confidence: 1,
+              createdAt: '2026-04-22T12:00:00.000Z',
+              isPrimary: false,
+              method: 'slug',
+              normalizedTitle: 'graveyard keeper',
+              score: 1,
+              sourceKind: 'steamrip',
+              status: 'verified',
+              trackedItemId: 'item',
+              updatedAt: '2026-04-22T12:00:00.000Z',
+              usable: true,
+            },
+            snapshot: null,
+            updateStatus: 'matches_upstream',
+          },
+        ],
       }),
     ).toBe(TrackedItemTrackingStatus.WatchingSource);
   });

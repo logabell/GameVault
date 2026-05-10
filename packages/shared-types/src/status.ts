@@ -29,6 +29,11 @@ export interface PatchLagComputationInput {
   selectedPatch?: SteamPatchEntry | null;
 }
 
+export interface BuildLagComputationInput {
+  buildId?: string | null;
+  feedEntries?: SteamPatchEntry[] | null;
+}
+
 export interface PatchLagComputationResult {
   selectedPatchMissingFromFeed: boolean;
   versionsBehindLatest: number | null;
@@ -69,6 +74,11 @@ function patchTimestamp(entry: SteamPatchEntry): number {
 
   const dated = new Date(entry.patchDate).getTime();
   return Number.isNaN(dated) ? 0 : dated;
+}
+
+function numericBuildIdValue(value: string | null | undefined): bigint | null {
+  const trimmed = value?.trim();
+  return trimmed && /^\d+$/.test(trimmed) ? BigInt(trimmed) : null;
 }
 
 function hasMatchedSourceUpdate(
@@ -172,6 +182,68 @@ export function derivePatchLag(
   };
 }
 
+export function derivePatchLagFromBuildId(
+  input: BuildLagComputationInput,
+): PatchLagComputationResult {
+  const selectedBuildId = numericBuildIdValue(input.buildId);
+  if (selectedBuildId == null) {
+    return {
+      selectedPatchMissingFromFeed: false,
+      versionsBehindLatest: null,
+      versionsBehindLatestIsLowerBound: false,
+    };
+  }
+
+  const feedEntries = mergePatchHistory(input.feedEntries ?? []).filter(
+    (entry) =>
+      entry.selectionSource !== 'manual' &&
+      entry.selectionSource !== 'older_than_available',
+  );
+  const exactPatch = feedEntries.find(
+    (entry) => numericBuildIdValue(entry.buildId) === selectedBuildId,
+  );
+  if (exactPatch) {
+    return derivePatchLag({ feedEntries, selectedPatch: exactPatch });
+  }
+
+  const comparableBuildIds = feedEntries
+    .map((entry) => numericBuildIdValue(entry.buildId))
+    .filter((value): value is bigint => value != null);
+  if (comparableBuildIds.length === 0) {
+    return {
+      selectedPatchMissingFromFeed: feedEntries.length > 0,
+      versionsBehindLatest: null,
+      versionsBehindLatestIsLowerBound: false,
+    };
+  }
+
+  const newerBuildCount = comparableBuildIds.filter(
+    (buildId) => buildId > selectedBuildId,
+  ).length;
+  const newestKnownBuildId = comparableBuildIds.reduce((newest, buildId) =>
+    buildId > newest ? buildId : newest,
+  );
+  const oldestKnownBuildId = comparableBuildIds.reduce((oldest, buildId) =>
+    buildId < oldest ? buildId : oldest,
+  );
+  if (selectedBuildId > newestKnownBuildId) {
+    return {
+      selectedPatchMissingFromFeed: true,
+      versionsBehindLatest: null,
+      versionsBehindLatestIsLowerBound: false,
+    };
+  }
+
+  return {
+    selectedPatchMissingFromFeed: true,
+    versionsBehindLatest:
+      selectedBuildId < oldestKnownBuildId
+        ? comparableBuildIds.length
+        : newerBuildCount,
+    versionsBehindLatestIsLowerBound: selectedBuildId < oldestKnownBuildId,
+  };
+}
+
 export function derivePatchMetadataStatus(
   input: PatchMetadataStatusInput,
 ): PatchMetadataStatus {
@@ -251,40 +323,39 @@ export function deriveTrackedItemTrackingStatus(
     return TrackedItemTrackingStatus.NeedsMatch;
   }
 
-  if (input.currentWatch?.expiredAt) {
-    return TrackedItemTrackingStatus.WatchWindowExpired;
-  }
-
-  if (isDiscoveredDraft(input)) {
-    return TrackedItemTrackingStatus.WatchingSource;
-  }
-
-  if (selectedPatchIsLatest(input)) {
-    return TrackedItemTrackingStatus.UpToDate;
-  }
-
-  if (hasMatchedSourceUpdate(input.sourceMatches)) {
-    return TrackedItemTrackingStatus.UpdateAvailable;
-  }
-
-  if (hasMatchedSourceBehind(input.sourceMatches)) {
-    return TrackedItemTrackingStatus.SourceBehindUpstream;
-  }
-
   const hasComparableSourceSnapshot =
     input.sourceSnapshot && input.sourceSnapshot.sourceKind !== 'manual';
-  if (!hasComparableSourceSnapshot) {
-    return TrackedItemTrackingStatus.WatchingSource;
-  }
-
   const sourceVersion = input.sourceSnapshot?.observedBuildId
     ? `${input.sourceSnapshot.observedVersion}:${input.sourceSnapshot.observedBuildId}`
     : input.sourceSnapshot?.observedVersion;
   const installedVersion = input.installRecord?.installedBuildId
     ? `${input.installRecord.installedVersion ?? ''}:${input.installRecord.installedBuildId}`
     : input.installRecord?.installedVersion;
+  const installedMatchesSource = Boolean(
+    installedVersion && sourceVersion && installedVersion === sourceVersion,
+  );
+  const matchedSourceUpdate = hasMatchedSourceUpdate(input.sourceMatches);
+
+  if (isDiscoveredDraft(input)) {
+    return input.currentWatch?.expiredAt && !matchedSourceUpdate
+      ? TrackedItemTrackingStatus.WatchWindowExpired
+      : TrackedItemTrackingStatus.WatchingSource;
+  }
 
   if (
+    selectedPatchIsLatest(input) &&
+    (!input.installRecord || installedMatchesSource) &&
+    (!matchedSourceUpdate || installedMatchesSource)
+  ) {
+    return TrackedItemTrackingStatus.UpToDate;
+  }
+
+  if (matchedSourceUpdate) {
+    return TrackedItemTrackingStatus.UpdateAvailable;
+  }
+
+  if (
+    hasComparableSourceSnapshot &&
     input.latestPatch?.buildId &&
     input.sourceSnapshot?.observedBuildId &&
     input.latestPatch.buildId === input.sourceSnapshot.observedBuildId &&
@@ -300,14 +371,7 @@ export function deriveTrackedItemTrackingStatus(
   }
 
   if (
-    input.latestPatch?.buildId &&
-    input.sourceSnapshot?.observedBuildId &&
-    input.latestPatch.buildId !== input.sourceSnapshot.observedBuildId
-  ) {
-    return TrackedItemTrackingStatus.SourceBehindUpstream;
-  }
-
-  if (
+    hasComparableSourceSnapshot &&
     installedVersion &&
     sourceVersion &&
     installedVersion === sourceVersion &&
@@ -315,6 +379,26 @@ export function deriveTrackedItemTrackingStatus(
       input.latestPatch.buildId === input.sourceSnapshot?.observedBuildId)
   ) {
     return TrackedItemTrackingStatus.UpToDate;
+  }
+
+  if (input.currentWatch?.expiredAt) {
+    return TrackedItemTrackingStatus.WatchWindowExpired;
+  }
+
+  if (hasMatchedSourceBehind(input.sourceMatches)) {
+    return TrackedItemTrackingStatus.SourceBehindUpstream;
+  }
+
+  if (!hasComparableSourceSnapshot) {
+    return TrackedItemTrackingStatus.WatchingSource;
+  }
+
+  if (
+    input.latestPatch?.buildId &&
+    input.sourceSnapshot?.observedBuildId &&
+    input.latestPatch.buildId !== input.sourceSnapshot.observedBuildId
+  ) {
+    return TrackedItemTrackingStatus.SourceBehindUpstream;
   }
 
   return TrackedItemTrackingStatus.WatchingSource;

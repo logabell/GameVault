@@ -208,7 +208,7 @@ describe('finalizeSteamRipExtraction', () => {
     }
   });
 
-  it('promotes only the AnkerGames game folder and removes archive extras', async () => {
+  it('promotes the AnkerGames game folder and preserves its Run Me helper', async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), 'gamevault-ankergames-'));
     const rootLibraryPath = join(tempRoot, 'High Seas');
     const stageRootPath = join(rootLibraryPath, '_STAGING');
@@ -244,9 +244,9 @@ describe('finalizeSteamRipExtraction', () => {
       await expect(pathExists(join(finalPath, 'Read Me.txt'))).resolves.toBe(
         false,
       );
-      await expect(pathExists(join(finalPath, 'Run me!.bat'))).resolves.toBe(
-        false,
-      );
+      await expect(
+        readFile(join(finalPath, 'Run me!.bat'), 'utf8'),
+      ).resolves.toBe('bat');
       await expect(pathExists(extractPath)).resolves.toBe(false);
     } finally {
       await rm(tempRoot, { force: true, recursive: true });

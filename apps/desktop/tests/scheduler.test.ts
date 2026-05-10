@@ -12,9 +12,10 @@ function createSchedulerService(overrides: Partial<{
   hasActiveDownloadJobs: () => boolean;
   pollDownloadJobs: (options?: unknown) => Promise<void>;
   pollSteamFeeds: () => Promise<void>;
-  processDueWatches: (now?: Date) => Promise<void>;
+  processDueWatches: (now?: Date, options?: unknown) => Promise<void>;
   recordActivityEvent: () => void;
   beginActivityTask: () => () => void;
+  shouldRunSteamFeedMaintenance: (now?: Date) => boolean;
 }> = {}) {
   return {
     beginActivityTask: vi.fn(() => vi.fn()),
@@ -25,6 +26,7 @@ function createSchedulerService(overrides: Partial<{
     pollSteamFeeds: vi.fn(async () => undefined),
     processDueWatches: vi.fn(async () => undefined),
     recordActivityEvent: vi.fn(),
+    shouldRunSteamFeedMaintenance: vi.fn(() => false),
     ...overrides,
   } as unknown as GameVaultService;
 }
@@ -66,8 +68,34 @@ describe('GameVaultScheduler', () => {
     scheduler.stop();
 
     expect(service.processDueWatches).toHaveBeenCalledTimes(1);
+    expect(service.processDueWatches).toHaveBeenCalledWith(
+      expect.any(Date),
+      { includeExpired: true },
+    );
     expect(service.pollDownloadJobs).toHaveBeenCalledTimes(1);
     expect(service.pollSteamFeeds).not.toHaveBeenCalled();
+  });
+
+  it('checks SteamDB maintenance on every interval tick', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 3, 24, 8));
+    const shouldRunSteamFeedMaintenance = vi
+      .fn()
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
+    const service = createSchedulerService({ shouldRunSteamFeedMaintenance });
+    const scheduler = new GameVaultScheduler(service);
+
+    scheduler.start();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(service.pollSteamFeeds).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(shouldRunSteamFeedMaintenance).toHaveBeenCalledTimes(2);
+    expect(service.pollSteamFeeds).toHaveBeenCalledTimes(1);
+    scheduler.stop();
   });
 
   it('prevents overlapping interval ticks', async () => {

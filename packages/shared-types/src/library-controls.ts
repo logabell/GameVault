@@ -6,7 +6,12 @@ import {
 
 export type LibraryFilter = 'tracked' | 'updates';
 export type LibrarySortDirection = 'asc' | 'desc';
-export type LibrarySortMode = 'name' | 'recentlyUpdated' | 'status';
+export type LibrarySortMode =
+  | 'name'
+  | 'patchesBehind'
+  | 'recentlyAdded'
+  | 'recentlyUpdated'
+  | 'status';
 export type LibraryStatusFilter =
   | 'all'
   | 'downloads'
@@ -47,7 +52,11 @@ const FILE_DELETE_STATUSES = new Set<TrackedItemStatus>([
 export function getDefaultLibrarySortDirection(
   sortMode: LibrarySortMode,
 ): LibrarySortDirection {
-  return sortMode === 'recentlyUpdated' ? 'desc' : 'asc';
+  return sortMode === 'recentlyUpdated' ||
+    sortMode === 'recentlyAdded' ||
+    sortMode === 'patchesBehind'
+    ? 'desc'
+    : 'asc';
 }
 
 export function getTrackingStatus(
@@ -184,6 +193,11 @@ export function sortLibraryItems(
 ): TrackedItemView[] {
   const directionMultiplier = direction === 'asc' ? 1 : -1;
   return [...items].sort((left, right) => {
+    const activeDownloadCompare = compareActiveDownloadPinned(left, right);
+    if (activeDownloadCompare !== 0) {
+      return activeDownloadCompare;
+    }
+
     if (sortMode === 'name') {
       return compareTitle(left, right) * directionMultiplier;
     }
@@ -193,13 +207,43 @@ export function sortLibraryItems(
         getLibraryRecentlyUpdatedTimestamp(right);
       return updatedCompare * directionMultiplier || compareTitle(left, right);
     }
+    if (sortMode === 'recentlyAdded') {
+      const addedCompare =
+        getLibraryRecentlyAddedTimestamp(left) -
+        getLibraryRecentlyAddedTimestamp(right);
+      return addedCompare * directionMultiplier || compareTitle(left, right);
+    }
     if (sortMode === 'status') {
       const statusCompare =
         getLibraryStatusSortRank(left) - getLibraryStatusSortRank(right);
       return statusCompare * directionMultiplier || compareTitle(left, right);
     }
+    if (sortMode === 'patchesBehind') {
+      return (
+        comparePatchesBehind(left, right, direction) || compareTitle(left, right)
+      );
+    }
     return 0;
   });
+}
+
+function compareActiveDownloadPinned(
+  left: TrackedItemView,
+  right: TrackedItemView,
+): number {
+  const leftActive = DOWNLOAD_STATUSES.has(left.status);
+  const rightActive = DOWNLOAD_STATUSES.has(right.status);
+  if (leftActive !== rightActive) {
+    return leftActive ? -1 : 1;
+  }
+  if (!leftActive || !rightActive) {
+    return 0;
+  }
+
+  const updatedCompare =
+    getDateTimestamp(right.currentDownload?.updatedAt ?? right.item.updatedAt) -
+    getDateTimestamp(left.currentDownload?.updatedAt ?? left.item.updatedAt);
+  return updatedCompare || compareTitle(left, right);
 }
 
 export function getLibraryStatusSortRank(item: TrackedItemView): number {
@@ -214,6 +258,28 @@ function compareTitle(left: TrackedItemView, right: TrackedItemView): number {
   return left.item.title.localeCompare(right.item.title);
 }
 
+function comparePatchesBehind(
+  left: TrackedItemView,
+  right: TrackedItemView,
+  direction: LibrarySortDirection,
+): number {
+  const leftValue = getPatchesBehindValue(left);
+  const rightValue = getPatchesBehindValue(right);
+
+  if (leftValue === null && rightValue === null) return 0;
+  if (leftValue === null) return 1;
+  if (rightValue === null) return -1;
+
+  const valueCompare = leftValue - rightValue;
+  return direction === 'asc' ? valueCompare : -valueCompare;
+}
+
+function getPatchesBehindValue(item: TrackedItemView): number | null {
+  return typeof item.versionsBehindLatest === 'number'
+    ? item.versionsBehindLatest
+    : null;
+}
+
 function getDateTimestamp(value: string | null | undefined): number {
   if (!value) return 0;
   const timestamp = new Date(value).getTime();
@@ -226,4 +292,8 @@ function getLibraryRecentlyUpdatedTimestamp(item: TrackedItemView): number {
     getDateTimestamp(item.latestPatch?.patchDate) ||
     getDateTimestamp(item.item.updatedAt)
   );
+}
+
+function getLibraryRecentlyAddedTimestamp(item: TrackedItemView): number {
+  return getDateTimestamp(item.item.createdAt);
 }

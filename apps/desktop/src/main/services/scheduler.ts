@@ -94,51 +94,39 @@ export class GameVaultScheduler {
   }
 
   private async tick(startup: boolean): Promise<void> {
-    const settings = this.service.getSettings();
     const now = new Date();
-    const lastPoll = this.service.getLatestDailyPollAt();
-    const lastPollDate = lastPoll ? new Date(lastPoll) : null;
-    const shouldPollDaily =
-      now.getHours() >= (settings.pollDailyHourLocal ?? 9) &&
-      (!lastPollDate || lastPollDate.toDateString() !== now.toDateString());
-    const shouldPollStartupCatchUp =
-      startup &&
-      !shouldPollDaily &&
-      shouldRunStartupSteamFeedCatchUp({
-        lastPollAt: lastPoll,
-        now,
-        pollDailyHourLocal: settings.pollDailyHourLocal,
-      });
     const endStartupTask = startup
       ? this.service.beginActivityTask({
           detail: 'Checking missed SteamDB, source, and download maintenance.',
           id: 'startup-catch-up',
-          title: 'Running startup catch-up',
+          title: 'Starting maintenance',
         })
       : null;
 
     try {
+      const steamDbMaintenanceDue =
+        this.service.shouldRunSteamFeedMaintenance(now);
       if (startup) {
-        this.service.recordActivityEvent('info', 'Startup catch-up started', {
-          steamDbCatchUpDue: shouldPollDaily || shouldPollStartupCatchUp,
+        this.service.recordActivityEvent('info', 'Startup maintenance started', {
+          steamDbMaintenanceDue,
         });
       }
 
-      if (shouldPollDaily || shouldPollStartupCatchUp) {
+      if (steamDbMaintenanceDue) {
         await this.service.pollSteamFeeds();
       }
 
-      await this.service.processDueWatches(now);
+      await this.service.processDueWatches(now, { includeExpired: true });
       await this.service.pollDownloadJobs();
 
       if (startup) {
-        this.service.recordActivityEvent('info', 'Startup catch-up completed', {
-          steamDbCatchUpDue: shouldPollDaily || shouldPollStartupCatchUp,
+        this.service.recordActivityEvent('info', 'Startup maintenance completed', {
+          steamDbMaintenanceDue,
         });
       }
     } catch (error) {
       if (startup) {
-        this.service.recordActivityEvent('warn', 'Startup catch-up failed', {
+        this.service.recordActivityEvent('warn', 'Startup maintenance failed', {
           error:
             error instanceof Error
               ? error.message

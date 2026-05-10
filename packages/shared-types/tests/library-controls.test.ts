@@ -126,6 +126,113 @@ describe('shared library controls', () => {
     ).toEqual(['Newest', 'Middle', 'Oldest']);
   });
 
+  it('pins active downloads above the selected sort order', () => {
+    const items = [
+      makeItem('Alpha Installed'),
+      makeItem('Omega Complete', {
+        currentDownload: {
+          createdAt: '2026-04-01T00:00:00.000Z',
+          finalPath: 'D:/Games/Omega Complete',
+          id: 'job-complete',
+          packageName: 'Omega Complete',
+          stage: 'complete',
+          stagePath: 'D:/Games/_STAGING/Omega Complete',
+          trackedItemId: 'omega-complete',
+          updatedAt: '2026-04-20T00:00:00.000Z',
+        },
+      }),
+      makeItem('Zulu Downloading', {
+        currentDownload: {
+          createdAt: '2026-04-01T00:00:00.000Z',
+          finalPath: 'D:/Games/Zulu Downloading',
+          id: 'job-downloading',
+          packageName: 'Zulu Downloading',
+          stage: 'downloading',
+          stagePath: 'D:/Games/_STAGING/Zulu Downloading',
+          trackedItemId: 'zulu-downloading',
+          updatedAt: '2026-04-20T00:00:00.000Z',
+        },
+        status: TrackedItemStatus.Downloading,
+      }),
+      makeItem('Yankee Queued', {
+        currentDownload: {
+          createdAt: '2026-04-01T00:00:00.000Z',
+          finalPath: 'D:/Games/Yankee Queued',
+          id: 'job-queued',
+          packageName: 'Yankee Queued',
+          stage: 'queued',
+          stagePath: 'D:/Games/_STAGING/Yankee Queued',
+          trackedItemId: 'yankee-queued',
+          updatedAt: '2026-04-21T00:00:00.000Z',
+        },
+        status: TrackedItemStatus.Queued,
+      }),
+    ];
+
+    expect(
+      sortLibraryItems(items, 'name', 'asc').map((item) => item.item.title),
+    ).toEqual([
+      'Yankee Queued',
+      'Zulu Downloading',
+      'Alpha Installed',
+      'Omega Complete',
+    ]);
+  });
+
+  it('sorts by patches behind and leaves unknown lag last', () => {
+    const items = [
+      makeItem('Unknown Lag', { versionsBehindLatest: null }),
+      makeItem('Current', { versionsBehindLatest: 0 }),
+      makeItem('Far Behind', { versionsBehindLatest: 5 }),
+      makeItem('One Behind', { versionsBehindLatest: 1 }),
+    ];
+
+    expect(
+      sortLibraryItems(items, 'patchesBehind', 'desc').map(
+        (item) => item.item.title,
+      ),
+    ).toEqual(['Far Behind', 'One Behind', 'Current', 'Unknown Lag']);
+    expect(
+      sortLibraryItems(items, 'patchesBehind', 'asc').map(
+        (item) => item.item.title,
+      ),
+    ).toEqual(['Current', 'One Behind', 'Far Behind', 'Unknown Lag']);
+  });
+
+  it('sorts by recently added timestamps', () => {
+    const items = [
+      makeItem('Middle', {
+        item: {
+          ...makeItem('Middle').item,
+          createdAt: '2026-04-15T00:00:00.000Z',
+        },
+      }),
+      makeItem('Newest', {
+        item: {
+          ...makeItem('Newest').item,
+          createdAt: '2026-04-20T00:00:00.000Z',
+        },
+      }),
+      makeItem('Oldest', {
+        item: {
+          ...makeItem('Oldest').item,
+          createdAt: '2026-04-10T00:00:00.000Z',
+        },
+      }),
+    ];
+
+    expect(
+      sortLibraryItems(items, 'recentlyAdded', 'desc').map(
+        (item) => item.item.title,
+      ),
+    ).toEqual(['Newest', 'Middle', 'Oldest']);
+    expect(
+      sortLibraryItems(items, 'recentlyAdded', 'asc').map(
+        (item) => item.item.title,
+      ),
+    ).toEqual(['Oldest', 'Middle', 'Newest']);
+  });
+
   it('scopes status filters and counts to tab and search', () => {
     const items = [
       makeItem('Alpha Update', {

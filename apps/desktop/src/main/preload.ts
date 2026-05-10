@@ -30,6 +30,16 @@ const api = {
   listTrackedItems: () => ipcRenderer.invoke('gamevault:listTrackedItems'),
   markDownloadFailed: (trackedItemId: string) =>
     ipcRenderer.invoke('gamevault:markDownloadFailed', trackedItemId),
+  onActivityChange: (listener: (payload: unknown) => void) => {
+    const channel = 'gamevault:activityChange';
+    const wrappedListener = (_event: unknown, payload: unknown) => {
+      listener(payload);
+    };
+    ipcRenderer.on(channel, wrappedListener);
+    return () => {
+      ipcRenderer.removeListener(channel, wrappedListener);
+    };
+  },
   onDownloadProgress: (listener: (payload: unknown) => void) => {
     const channel = 'gamevault:downloadProgress';
     const wrappedListener = (_event: unknown, payload: unknown) => {

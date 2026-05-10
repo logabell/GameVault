@@ -515,6 +515,8 @@ export interface ActivitySummaryCard {
 export interface ActivityTask {
   id: string;
   detail?: string | null;
+  progressCurrent?: number | null;
+  progressTotal?: number | null;
   startedAt: string;
   status: 'running';
   title: string;

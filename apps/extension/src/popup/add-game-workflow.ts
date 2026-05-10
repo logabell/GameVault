@@ -152,7 +152,7 @@ export function getDownloadQueueSuccessMessage(
 ): string {
   return provider === 'jdownloader'
     ? 'Queued in MyJDownloader.'
-    : 'Download is starting in the desktop app with curl.';
+    : 'Download is starting.';
 }
 
 export function getDownloadQueueTimeoutMessage(
@@ -161,7 +161,7 @@ export function getDownloadQueueTimeoutMessage(
 ): string {
   return provider === 'jdownloader'
     ? 'Download queueing timed out. Check MyJDownloader, then try again if the package was not added.'
-    : 'Download startup timed out. Check the GameVault desktop app, then try again if the curl download did not begin.';
+    : 'Download startup timed out. Check the GameVault desktop app, then try again if the download did not begin.';
 }
 
 export function normalizeComparableUrl(

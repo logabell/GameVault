@@ -1767,7 +1767,10 @@ export class GameVaultDatabase {
       : null;
   }
 
-  listDueWatches(nowIso: string): SourceWatch[] {
+  listDueWatches(
+    nowIso: string,
+    options: { includeExpired?: boolean } = {},
+  ): SourceWatch[] {
     return this.queryAll<{
       tracked_item_id: string;
       started_at: string;
@@ -1777,8 +1780,9 @@ export class GameVaultDatabase {
       expired_at: string | null;
     }>(
       `SELECT * FROM source_watches
-       WHERE expired_at IS NULL AND next_check_at <= ?`,
-      [nowIso],
+       WHERE next_check_at <= ?
+         AND (? = 1 OR expired_at IS NULL)`,
+      [nowIso, options.includeExpired ? 1 : 0],
     ).map((row) => ({
       endsAt: row.ends_at,
       expiredAt: row.expired_at,

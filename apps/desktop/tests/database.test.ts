@@ -465,7 +465,7 @@ describe('GameVaultDatabase cleanup metadata', () => {
         errorMessage: null,
         parts: [baseJob.parts![0]!],
         stage: 'queued',
-        statusMessage: 'Starting curl download',
+        statusMessage: 'Starting download',
         totalParts: 1,
         updatedAt: '2026-04-23T19:05:00.000Z',
       });

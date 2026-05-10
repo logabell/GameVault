@@ -942,7 +942,7 @@ describe('source parsers', () => {
         sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
         stableDownloadUrl: 'https://ankergames.net/generate-download-url/2557',
       }),
-    ).rejects.toThrow('curl-ready dlproxy or DataNodes URL');
+    ).rejects.toThrow('direct dlproxy or DataNodes URL');
   });
 
   it('rejects Ankergames dlproxy stable URLs instead of resolving them', async () => {

@@ -1,5 +1,6 @@
 import type {
   ActivityIssue,
+  ActivityTask,
   ActivityView,
   EventLogRecord,
   SettingsView,
@@ -68,6 +69,51 @@ export function sortActivityIssues(
     const rightTime = new Date(right.createdAt ?? 0).getTime();
     return rightTime - leftTime;
   });
+}
+
+export interface NavbarAutomationStatus {
+  detail: string;
+  label: string;
+  status: 'running';
+}
+
+const NAVBAR_SYNC_TASK_IDS = new Set([
+  'startup-catch-up',
+  'steamdb-feeds',
+  'source-watches',
+]);
+
+export function getActivityTaskProgressLabel(
+  task: ActivityTask,
+): string | null {
+  const current = task.progressCurrent;
+  const total = task.progressTotal;
+  if (
+    typeof current !== 'number' ||
+    typeof total !== 'number' ||
+    total <= 0
+  ) {
+    return null;
+  }
+  return `${Math.max(0, Math.min(current, total))}/${total}`;
+}
+
+export function getNavbarAutomationStatus(
+  activity: ActivityView | null,
+): NavbarAutomationStatus | null {
+  const activeTask =
+    activity?.activeTasks.find((task) => NAVBAR_SYNC_TASK_IDS.has(task.id)) ??
+    null;
+  if (!activeTask) {
+    return null;
+  }
+
+  const progressLabel = getActivityTaskProgressLabel(activeTask);
+  return {
+    detail: activeTask.detail ?? activeTask.title,
+    label: progressLabel ? `Syncing updates ${progressLabel}` : 'Syncing updates',
+    status: 'running',
+  };
 }
 
 export function getActivityLogContextRows(

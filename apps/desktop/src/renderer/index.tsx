@@ -149,6 +149,8 @@ import {
 import {
   buildActivityReport,
   getActivityLogContextRows,
+  getActivityTaskProgressLabel,
+  getNavbarAutomationStatus,
   sortActivityIssues,
 } from './activity-report.js';
 
@@ -312,6 +314,10 @@ type DownloadProgressPayload = {
   items: TrackedItemView[];
 };
 
+type ActivityChangePayload = {
+  activity: ActivityView;
+};
+
 declare global {
   interface Window {
     gameVaultApi: {
@@ -347,6 +353,9 @@ declare global {
       getSettings(): Promise<SettingsView>;
       listTrackedItems(): Promise<TrackedItemView[]>;
       markDownloadFailed(trackedItemId: string): Promise<TrackedItemView>;
+      onActivityChange(
+        listener: (payload: ActivityChangePayload) => void,
+      ): () => void;
       onDownloadProgress(
         listener: (payload: DownloadProgressPayload) => void,
       ): () => void;
@@ -1981,6 +1990,10 @@ function App() {
   );
   const sortedActivityIssues = useMemo(
     () => sortActivityIssues(activity?.issues ?? []),
+    [activity],
+  );
+  const navbarAutomationStatus = useMemo(
+    () => getNavbarAutomationStatus(activity),
     [activity],
   );
   const visibleActivityLogs = useMemo(() => {
@@ -3735,6 +3748,12 @@ function App() {
       mergeTrackedItemViews(payload.items);
     });
   }, [mergeTrackedItemViews]);
+
+  useEffect(() => {
+    return window.gameVaultApi.onActivityChange((payload) => {
+      setActivity(payload.activity);
+    });
+  }, []);
 
   useEffect(() => {
     if (!onboardingOpen) return;
@@ -7088,15 +7107,25 @@ function App() {
 
         {activity?.activeTasks.length ? (
           <div className="activity-active-strip" role="status">
-            {activity.activeTasks.map((task) => (
-              <div key={task.id}>
-                <strong>{task.title}</strong>
-                <span>
-                  {task.detail ?? 'Running'} | Started{' '}
-                  {formatRelativeTime(task.startedAt)}
-                </span>
-              </div>
-            ))}
+            {activity.activeTasks.map((task) => {
+              const progressLabel = getActivityTaskProgressLabel(task);
+              return (
+                <div key={task.id}>
+                  <strong>
+                    {task.title}
+                    {progressLabel ? (
+                      <span className="activity-task-progress">
+                        {progressLabel}
+                      </span>
+                    ) : null}
+                  </strong>
+                  <span>
+                    {task.detail ?? 'Running'} | Started{' '}
+                    {formatRelativeTime(task.startedAt)}
+                  </span>
+                </div>
+              );
+            })}
           </div>
         ) : null}
 
@@ -7407,6 +7436,22 @@ function App() {
             </button>
           ))}
         </nav>
+        {navbarAutomationStatus ? (
+          <div
+            aria-label={`Activity status: ${navbarAutomationStatus.label}. ${navbarAutomationStatus.detail}`}
+            aria-live="polite"
+            className={`navbar-automation-status navbar-automation-status--${navbarAutomationStatus.status}`}
+            role="status"
+            title={navbarAutomationStatus.detail}
+          >
+            <span aria-hidden="true" className="inline-spinner" />
+            <span className="navbar-automation-status__label">
+              {navbarAutomationStatus.label}
+            </span>
+          </div>
+        ) : (
+          <div className="navbar-automation-status-slot" aria-hidden="true" />
+        )}
         <div className="utility-row">
           {renderNavbarHealthMenu()}
           <button
@@ -7528,6 +7573,8 @@ function App() {
                     >
                       <option value="name">Name</option>
                       <option value="status">Status</option>
+                      <option value="patchesBehind">Patches behind</option>
+                      <option value="recentlyAdded">Recently added</option>
                       <option value="recentlyUpdated">Recently updated</option>
                     </select>
                   </label>
@@ -8117,14 +8164,14 @@ function App() {
                   <span aria-hidden="true" className="settings-toggle-track" />
                   <small>
                     When this is off, SteamRIP and ElAmigos use manual steps;
-                    AnkerGames still uses curl.
+                    AnkerGames uses direct downloads.
                   </small>
                 </label>
                 <div className="download-source-grid">
                   <div className="download-source-row">
                     <div>
                       <strong>Ankergames</strong>
-                      <span>Direct curl</span>
+                      <span>Direct download</span>
                     </div>
                     <span className="download-source-badge">
                       JDownloader not supported

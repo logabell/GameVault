@@ -4,7 +4,7 @@ import type {
   SteamPatchEntry,
   TrackedItemView,
 } from './models.js';
-import { derivePatchLag } from './status.js';
+import { derivePatchLag, derivePatchLagFromBuildId } from './status.js';
 
 function formatStatusLabel(value: string | null | undefined): string {
   if (!value) return 'Unknown';
@@ -29,6 +29,39 @@ export function normalizeSourceComparisonVersion(
     .replace(/\s+/g, ' ')
     .replace(/(\d)\s*r$/i, '$1');
   return normalized || null;
+}
+
+export function numericSourceVersionSegments(
+  value: string | null | undefined,
+): number[] | null {
+  const normalized = normalizeSourceComparisonVersion(value);
+  const numericVersion = normalized?.match(
+    /^(?<version>\d+(?:\.\d+)*)(?:[a-z][a-z0-9]*)?$/i,
+  )?.groups?.version;
+  if (!numericVersion) {
+    return null;
+  }
+  return numericVersion.split('.').map((segment) => Number(segment));
+}
+
+export function compareNumericSourceVersions(
+  left: string | null | undefined,
+  right: string | null | undefined,
+): number | null {
+  const leftSegments = numericSourceVersionSegments(left);
+  const rightSegments = numericSourceVersionSegments(right);
+  if (!leftSegments || !rightSegments) {
+    return null;
+  }
+  const length = Math.max(leftSegments.length, rightSegments.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftValue = leftSegments[index] ?? 0;
+    const rightValue = rightSegments[index] ?? 0;
+    if (leftValue !== rightValue) {
+      return leftValue > rightValue ? 1 : -1;
+    }
+  }
+  return 0;
 }
 
 export function isPlaceholderSteamPatchTitle(
@@ -409,6 +442,71 @@ function inferSteamRipBuildFromPeers(
   });
 }
 
+function inferSourceLagFromBuildId(
+  source: MatchedSourceView,
+  patchEntries: SteamPatchEntry[],
+): MatchedSourceView {
+  if (!source.match.usable || source.matchedPatch) {
+    return source;
+  }
+
+  const buildId = sourceBuildId(source);
+  if (!buildId) {
+    return source;
+  }
+
+  const patchLag = derivePatchLagFromBuildId({
+    buildId,
+    feedEntries: patchEntries,
+  });
+  if (typeof patchLag.versionsBehindLatest !== 'number') {
+    return source;
+  }
+
+  const versionsBehindLatest = patchLag.versionsBehindLatest;
+  return {
+    ...source,
+    isUpdateSource:
+      source.isUpdateSource ||
+      (versionsBehindLatest === 0 && source.match.usable),
+    updateStatus:
+      versionsBehindLatest === 0
+        ? 'matches_upstream'
+        : 'source_behind_upstream',
+    versionsBehindLatest,
+    versionsBehindLatestIsLowerBound:
+      patchLag.versionsBehindLatestIsLowerBound,
+  };
+}
+
+function normalizeInstallRelativeSourceStatus(
+  source: MatchedSourceView,
+  item: TrackedItemView | null | undefined,
+): MatchedSourceView {
+  if (
+    source.updateStatus !== 'newer_than_installed' ||
+    sourceBuildId(source) ||
+    !item?.installRecord?.installedVersion
+  ) {
+    return source;
+  }
+
+  const versionComparison = compareNumericSourceVersions(
+    sourceVersion(source),
+    item.installRecord.installedVersion,
+  );
+  if (versionComparison === null || versionComparison > 0) {
+    return source;
+  }
+
+  return {
+    ...source,
+    isUpdateSource: false,
+    updateStatus:
+      versionComparison === 0 ? 'same_as_installed' : 'unknown',
+  };
+}
+
 export function inferSourceComparisonRows(
   item: TrackedItemView | null | undefined,
   patches: SteamPatchCandidate[],
@@ -432,9 +530,12 @@ export function inferSourceComparisonRows(
     inferElamigosDatePatch(source, directlyResolvedSources, patchEntries),
   );
 
-  return dateResolvedSources.map((source) =>
-    inferSteamRipBuildFromPeers(source, dateResolvedSources, patchEntries),
-  );
+  return dateResolvedSources
+    .map((source) =>
+      inferSteamRipBuildFromPeers(source, dateResolvedSources, patchEntries),
+    )
+    .map((source) => inferSourceLagFromBuildId(source, patchEntries))
+    .map((source) => normalizeInstallRelativeSourceStatus(source, item));
 }
 
 function hasInstallComparisonContext(
@@ -447,11 +548,13 @@ export function getSourceComparisonLabel(
   source: MatchedSourceView,
   item: TrackedItemView | null | undefined,
 ): string {
-  if (typeof source.versionsBehindLatest === 'number') {
-    return source.versionsBehindLatest === 0
+  const normalizedSource = normalizeInstallRelativeSourceStatus(source, item);
+
+  if (typeof normalizedSource.versionsBehindLatest === 'number') {
+    return normalizedSource.versionsBehindLatest === 0
       ? 'Latest'
-      : `${source.versionsBehindLatest}${
-          source.versionsBehindLatestIsLowerBound ? '+' : ''
+      : `${normalizedSource.versionsBehindLatest}${
+          normalizedSource.versionsBehindLatestIsLowerBound ? '+' : ''
         } behind`;
   }
 
@@ -462,9 +565,9 @@ export function getSourceComparisonLabel(
   ]);
   const status =
     !hasInstallComparisonContext(item) &&
-    installRelativeStatuses.has(source.updateStatus)
+    installRelativeStatuses.has(normalizedSource.updateStatus)
       ? 'unknown'
-      : source.updateStatus;
+      : normalizedSource.updateStatus;
 
   return formatStatusLabel(status);
 }

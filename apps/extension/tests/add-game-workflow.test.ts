@@ -711,11 +711,11 @@ describe('extension add-game workflow helpers', () => {
       }),
     ).toBeNull();
     expect(getDownloadQueueSuccessMessage('ankergames')).toBe(
-      'Download is starting in the desktop app with curl.',
+      'Download is starting.',
     );
   });
 
-  it('allows SteamRIP and ElAmigos to use curl when MyJDownloader is not ready', () => {
+  it('allows SteamRIP and ElAmigos to use direct downloads when MyJDownloader is not ready', () => {
     expect(
       isSourceReadyForAutomation({
         health: healthyDesktopOnly,
@@ -731,7 +731,7 @@ describe('extension add-game workflow helpers', () => {
       }),
     ).toBeNull();
     expect(getDownloadQueueSuccessMessage('steamrip')).toBe(
-      'Download is starting in the desktop app with curl.',
+      'Download is starting.',
     );
     expect(getDownloadQueueSuccessMessage('steamrip', 'jdownloader')).toBe(
       'Queued in MyJDownloader.',

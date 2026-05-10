@@ -127,6 +127,60 @@ describe('library controls', () => {
     ).toEqual(['Oldest', 'Middle', 'Newest']);
   });
 
+  it('sorts patches behind in both directions with unknown lag last', () => {
+    const items = [
+      makeItem('Unknown Lag', { versionsBehindLatest: null }),
+      makeItem('Current', { versionsBehindLatest: 0 }),
+      makeItem('Far Behind', { versionsBehindLatest: 5 }),
+      makeItem('One Behind', { versionsBehindLatest: 1 }),
+    ];
+
+    expect(
+      sortLibraryItems(items, 'patchesBehind', 'desc').map(
+        (item) => item.item.title,
+      ),
+    ).toEqual(['Far Behind', 'One Behind', 'Current', 'Unknown Lag']);
+    expect(
+      sortLibraryItems(items, 'patchesBehind', 'asc').map(
+        (item) => item.item.title,
+      ),
+    ).toEqual(['Current', 'One Behind', 'Far Behind', 'Unknown Lag']);
+  });
+
+  it('sorts recently added in both directions', () => {
+    const items = [
+      makeItem('Middle', {
+        item: {
+          ...makeItem('Middle').item,
+          createdAt: '2026-04-15T00:00:00.000Z',
+        },
+      }),
+      makeItem('Newest', {
+        item: {
+          ...makeItem('Newest').item,
+          createdAt: '2026-04-20T00:00:00.000Z',
+        },
+      }),
+      makeItem('Oldest', {
+        item: {
+          ...makeItem('Oldest').item,
+          createdAt: '2026-04-10T00:00:00.000Z',
+        },
+      }),
+    ];
+
+    expect(
+      sortLibraryItems(items, 'recentlyAdded', 'desc').map(
+        (item) => item.item.title,
+      ),
+    ).toEqual(['Newest', 'Middle', 'Oldest']);
+    expect(
+      sortLibraryItems(items, 'recentlyAdded', 'asc').map(
+        (item) => item.item.title,
+      ),
+    ).toEqual(['Oldest', 'Middle', 'Newest']);
+  });
+
   it('keeps the updates tab and status filter limited to actionable source updates', () => {
     const updateAvailable = makeItem('Update Available', {
       trackingStatus: TrackedItemTrackingStatus.UpdateAvailable,
@@ -320,10 +374,10 @@ describe('library controls', () => {
     });
 
     expect(getMarkDownloadFailedPrompt(item)).toBe(
-      'Mark Shape of Dreams as failed and stop its curl download?',
+      'Mark Shape of Dreams as failed and stop its download?',
     );
     expect(getDeleteTrackedItemPrompt(item)).toBe(
-      'Delete Shape of Dreams from GameVault, stop its curl download, and delete staged/install files?',
+      'Delete Shape of Dreams from GameVault, stop its download, and delete staged/install files?',
     );
   });
 });

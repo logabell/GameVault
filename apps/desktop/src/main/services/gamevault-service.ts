@@ -42,6 +42,7 @@ import type {
   SourceMatchMethod,
   SourceMatchStatus,
   SettingsView,
+  SourceWatch,
   SourceSnapshot,
   SupportedSourceKind,
   SyncTrackedSteamPatchEntriesPayload,
@@ -63,10 +64,12 @@ import {
   deriveTrackedItemTrackingStatus,
   findSteamPatchByDateAndVersion,
   findUniqueSteamPatchByTitleVersion,
+  compareNumericSourceVersions,
   extractSteamPatchTitleVersion,
   getSteamPatchIdentityKey,
   inferSourceComparisonRows,
   normalizeSourceComparisonVersion,
+  numericSourceVersionSegments,
 } from '@gamevault/shared-types';
 import {
   isAnkerGamesDirectDownloadUrl,
@@ -376,36 +379,6 @@ function normalizeSourceVersion(
   return normalizeSourceComparisonVersion(value);
 }
 
-function numericVersionSegments(
-  value: string | null | undefined,
-): number[] | null {
-  const normalized = normalizeSourceVersion(value);
-  if (!normalized || !/^\d+(?:\.\d+)*$/.test(normalized)) {
-    return null;
-  }
-  return normalized.split('.').map((segment) => Number(segment));
-}
-
-function compareNumericVersions(
-  left: string | null | undefined,
-  right: string | null | undefined,
-): number | null {
-  const leftSegments = numericVersionSegments(left);
-  const rightSegments = numericVersionSegments(right);
-  if (!leftSegments || !rightSegments) {
-    return null;
-  }
-  const length = Math.max(leftSegments.length, rightSegments.length);
-  for (let index = 0; index < length; index += 1) {
-    const leftValue = leftSegments[index] ?? 0;
-    const rightValue = rightSegments[index] ?? 0;
-    if (leftValue !== rightValue) {
-      return leftValue > rightValue ? 1 : -1;
-    }
-  }
-  return 0;
-}
-
 function dateOnlyTimestamp(value: string | null | undefined): number | null {
   if (!value) {
     return null;
@@ -680,6 +653,8 @@ interface DownloadProgressChangeEvent {
 type DownloadProgressChangeListener = (
   event: DownloadProgressChangeEvent,
 ) => void;
+
+type ActivityChangeListener = (activity: ActivityView) => void;
 
 interface PollDownloadJobsOptions {
   activity?: boolean;
@@ -1263,6 +1238,7 @@ function hasRegisteredBrowserExtension(
 }
 
 export class GameVaultService {
+  private readonly activityChangeListeners = new Set<ActivityChangeListener>();
   private readonly downloadQueueLocks = new Map<string, Promise<void>>();
   private readonly downloadProgressChangeListeners =
     new Set<DownloadProgressChangeListener>();
@@ -1314,6 +1290,24 @@ export class GameVaultService {
     return () => {
       this.downloadProgressChangeListeners.delete(listener);
     };
+  }
+
+  onActivityChange(listener: ActivityChangeListener): () => void {
+    this.activityChangeListeners.add(listener);
+    return () => {
+      this.activityChangeListeners.delete(listener);
+    };
+  }
+
+  private emitActivityChange(): void {
+    if (this.activityChangeListeners.size === 0) {
+      return;
+    }
+
+    const activity = this.getActivity();
+    for (const listener of this.activityChangeListeners) {
+      listener(activity);
+    }
   }
 
   private queueDownloadProgressChange(trackedItemId: string): void {
@@ -1455,6 +1449,7 @@ export class GameVaultService {
   ): void {
     this.database.appendEvent({ context, level, message });
     this.notify(level, message);
+    this.emitActivityChange();
   }
 
   recordActivityEvent(
@@ -1468,27 +1463,67 @@ export class GameVaultService {
   beginActivityTask(params: {
     detail?: string | null;
     id: string;
+    progressCurrent?: number | null;
+    progressTotal?: number | null;
     title: string;
   }): () => void {
     const task: ActivityTask = {
       detail: params.detail ?? null,
       id: params.id,
+      progressCurrent: params.progressCurrent ?? null,
+      progressTotal: params.progressTotal ?? null,
       startedAt: new Date().toISOString(),
       status: 'running',
       title: params.title,
     };
     this.activeActivityTasks.set(params.id, task);
+    this.emitActivityChange();
     return () => {
       if (
         this.activeActivityTasks.get(params.id)?.startedAt === task.startedAt
       ) {
         this.activeActivityTasks.delete(params.id);
+        this.emitActivityChange();
       }
     };
   }
 
+  private updateActivityTaskProgress(
+    id: string,
+    progress: {
+      current?: number | null;
+      detail?: string | null;
+      total?: number | null;
+    },
+  ): void {
+    const task = this.activeActivityTasks.get(id);
+    if (!task) {
+      return;
+    }
+
+    const nextTask: ActivityTask = {
+      ...task,
+      detail:
+        progress.detail === undefined ? task.detail : (progress.detail ?? null),
+      progressCurrent:
+        progress.current === undefined
+          ? (task.progressCurrent ?? null)
+          : progress.current,
+      progressTotal:
+        progress.total === undefined ? (task.progressTotal ?? null) : progress.total,
+    };
+    this.activeActivityTasks.set(id, nextTask);
+    this.emitActivityChange();
+  }
+
   private async withActivityTask<T>(
-    params: { detail?: string | null; id: string; title: string },
+    params: {
+      detail?: string | null;
+      id: string;
+      progressCurrent?: number | null;
+      progressTotal?: number | null;
+      title: string;
+    },
     run: () => Promise<T>,
   ): Promise<T> {
     const endTask = this.beginActivityTask(params);
@@ -1905,7 +1940,7 @@ export class GameVaultService {
               : ('failed' as const),
             statusMessage: (await directoryHasEntries(partPath))
               ? 'Staged files found'
-              : 'Curl download did not finish cleanly',
+              : 'Download did not finish cleanly',
             updatedAt: now,
           };
         }),
@@ -1920,7 +1955,7 @@ export class GameVaultService {
           job: recoveredJob,
           markMirrorsFailed: false,
           message:
-            'ElAmigos curl download did not finish cleanly. Retry the download to continue.',
+            'ElAmigos download did not finish cleanly. Retry the download to continue.',
           trackedItemId: item.id,
         });
         return this.database.getDownloadJob(item.id) ?? recoveredJob;
@@ -1972,7 +2007,7 @@ export class GameVaultService {
 
     if (!hasExtractedGameFolder) {
       const label = sourceKind === 'ankergames' ? 'AnkerGames' : 'SteamRIP';
-      const message = `${label} curl download did not finish cleanly. Retry the download to continue.`;
+      const message = `${label} download did not finish cleanly. Retry the download to continue.`;
       this.markDownloadJobFailed({
         job,
         markMirrorsFailed: false,
@@ -2023,7 +2058,7 @@ export class GameVaultService {
       job,
       parts,
       sourceKind: params.parsedSource.sourceKind,
-      statusMessage: 'Starting curl download',
+      statusMessage: 'Starting download',
     });
 
     for (const part of parts) {
@@ -2037,7 +2072,7 @@ export class GameVaultService {
         !isAnkerGamesProxyDownloadUrl(directDownloadUrl)
       ) {
         throw new Error(
-          'AnkerGames download did not resolve to a curl-ready dlproxy or DataNodes URL.',
+          'AnkerGames download did not resolve to a direct dlproxy or DataNodes URL.',
         );
       }
 
@@ -2054,7 +2089,7 @@ export class GameVaultService {
               ...candidate,
               errorMessage: null,
               stage: 'queued' as const,
-              statusMessage: 'Starting curl download',
+              statusMessage: 'Starting download',
               updatedAt: startingAt,
             }
           : candidate,
@@ -2133,7 +2168,7 @@ export class GameVaultService {
         });
         if (!(await this.extractStagedZipArchive({ extractPath }))) {
           throw new Error(
-            'AnkerGames curl download completed, but no staged ZIP was found to extract.',
+            'AnkerGames download completed, but no staged ZIP was found to extract.',
           );
         }
         const item = this.database.findTrackedItemById(params.trackedItemId);
@@ -2144,7 +2179,7 @@ export class GameVaultService {
           item,
           job,
           sourceKind: 'ankergames',
-          statusMessage: 'Downloaded and installed with curl',
+          statusMessage: 'Downloaded and installed',
           updatedParts: parts,
         });
         this.upsertDownloadJob(completedJob);
@@ -2163,7 +2198,7 @@ export class GameVaultService {
         });
         if (extractedArchives.length === 0) {
           throw new Error(
-            'SteamRIP curl download completed, but no extractable archive was found.',
+            'SteamRIP download completed, but no extractable archive was found.',
           );
         }
         parts = parts.map((candidate) =>
@@ -2195,7 +2230,7 @@ export class GameVaultService {
           () => undefined,
         );
         throw new Error(
-          'ElAmigos curl download did not produce an extractable archive. The selected mirror likely returned an HTML page or unsupported container.',
+          'ElAmigos download did not produce an extractable archive. The selected mirror likely returned an HTML page or unsupported container.',
         );
       }
       parts = parts.map((candidate) =>
@@ -2243,7 +2278,7 @@ export class GameVaultService {
         item,
         job: currentJob,
         sourceKind: 'steamrip',
-        statusMessage: 'Downloaded and installed with curl',
+        statusMessage: 'Downloaded and installed',
         updatedParts: this.getDownloadJobParts(currentJob, 'steamrip'),
       });
       this.upsertDownloadJob(completedJob);
@@ -2576,7 +2611,7 @@ export class GameVaultService {
         .filter((snapshot) => snapshot.sourceKind !== 'steamrip')
         .map((snapshot) => snapshot.observedVersion),
     ].filter((value): value is string =>
-      Boolean(numericVersionSegments(value)),
+      Boolean(numericSourceVersionSegments(value)),
     );
   }
 
@@ -2584,7 +2619,7 @@ export class GameVaultService {
     trackedItemId: string,
     version: string | null | undefined,
   ): boolean {
-    if (!numericVersionSegments(version)) {
+    if (!numericSourceVersionSegments(version)) {
       return false;
     }
     const baselines =
@@ -2593,7 +2628,7 @@ export class GameVaultService {
       return false;
     }
     return baselines.every(
-      (baseline) => compareNumericVersions(version, baseline) === 1,
+      (baseline) => compareNumericSourceVersions(version, baseline) === 1,
     );
   }
 
@@ -2817,7 +2852,18 @@ export class GameVaultService {
 
   private getItemSourceSnapshot(
     item: TrackedItemRecord,
+    preferredSourceKind?: SupportedSourceKind | null,
   ): SourceSnapshot | null {
+    if (preferredSourceKind) {
+      const preferredSnapshot = this.database.getSourceSnapshot(
+        item.id,
+        preferredSourceKind,
+      );
+      if (preferredSnapshot) {
+        return preferredSnapshot;
+      }
+    }
+
     return (
       (item.sourceKind
         ? this.database.getSourceSnapshot(item.id, item.sourceKind)
@@ -2835,12 +2881,19 @@ export class GameVaultService {
 
     const settings = this.database.getSettings();
     const steamMatch = this.database.getSteamMatch(trackedItemId);
-    let sourceSnapshot = this.getItemSourceSnapshot(item);
+    const installRecord = this.database.getInstallRecord(trackedItemId);
+    const storedDownload = this.database.getDownloadJob(trackedItemId);
+    const preferredSnapshotSourceKind =
+      storedDownload?.sourceKind ?? installRecord?.installedSourceKind ?? null;
+    let sourceSnapshot = this.getItemSourceSnapshot(
+      item,
+      preferredSnapshotSourceKind === 'manual'
+        ? null
+        : preferredSnapshotSourceKind,
+    );
     let sourceSnapshots = this.database.listSourceSnapshots(trackedItemId);
     const sourceMatches = this.database.listSourceMatches(trackedItemId);
-    const installRecord = this.database.getInstallRecord(trackedItemId);
     const currentWatch = this.database.getWatch(trackedItemId);
-    const storedDownload = this.database.getDownloadJob(trackedItemId);
     const steamFeedCheck = this.database.getSteamFeedCheck(trackedItemId);
     const downloadMirrors = this.database.listDownloadMirrors(trackedItemId);
     const selectedMirror =
@@ -2853,7 +2906,12 @@ export class GameVaultService {
       this.database.listPatchEntries(trackedItemId),
     );
     this.reconcileSourcePatchAlignments(trackedItemId);
-    sourceSnapshot = this.getItemSourceSnapshot(item);
+    sourceSnapshot = this.getItemSourceSnapshot(
+      item,
+      preferredSnapshotSourceKind === 'manual'
+        ? null
+        : preferredSnapshotSourceKind,
+    );
     sourceSnapshots = this.database.listSourceSnapshots(trackedItemId);
     const latestPatch = patchEntries[0] ?? null;
     const rawMatchedSourceViews = sourceMatches.map((match) => {
@@ -4324,11 +4382,24 @@ export class GameVaultService {
       installedComparableVersion &&
       sourceComparableVersionValue
     ) {
-      return installedComparableVersion === sourceComparableVersionValue
-        ? 'same_as_installed'
-        : match.method === 'recent_updates'
-          ? 'possible_update'
-          : 'newer_than_installed';
+      if (installedComparableVersion === sourceComparableVersionValue) {
+        return 'same_as_installed';
+      }
+
+      const versionComparison = compareNumericSourceVersions(
+        sourceComparableVersionValue,
+        installedComparableVersion,
+      );
+      if (versionComparison === 0) {
+        return 'same_as_installed';
+      }
+      if (versionComparison != null && versionComparison < 0) {
+        return 'unknown';
+      }
+
+      return match.method === 'recent_updates'
+        ? 'possible_update'
+        : 'newer_than_installed';
     }
 
     const installIdentity = installRecord?.installedBuildId
@@ -5010,9 +5081,6 @@ export class GameVaultService {
         });
         return (
           status === 'source_behind_upstream' ||
-          status === 'matches_upstream' ||
-          status === 'newer_than_installed' ||
-          status === 'possible_update' ||
           status === 'unknown'
         );
       });
@@ -5137,7 +5205,7 @@ export class GameVaultService {
       } catch (error) {
         this.appendEvent(
           'warn',
-          'Unable to resolve AnkerGames curl-ready mirror before queueing',
+          'Unable to resolve AnkerGames direct mirror before queueing',
           {
             error:
               error instanceof Error
@@ -5363,7 +5431,7 @@ export class GameVaultService {
         const job: DownloadJobRecord = {
           ...placeholderJob,
           provider,
-          statusMessage: 'Preparing curl download',
+          statusMessage: 'Preparing download',
           updatedAt: new Date().toISOString(),
         };
         this.upsertDownloadJob(job);
@@ -5756,6 +5824,7 @@ export class GameVaultService {
     if (
       trackingStatus !== TrackedItemTrackingStatus.SourceBehindUpstream &&
       trackingStatus !== TrackedItemTrackingStatus.UpdateAvailable &&
+      trackingStatus !== TrackedItemTrackingStatus.WatchWindowExpired &&
       trackingStatus !== TrackedItemTrackingStatus.WatchingSource &&
       this.database.getWatch(trackedItemId)
     ) {
@@ -6539,8 +6608,12 @@ export class GameVaultService {
     if (activeJobs.length === 0) {
       return;
     }
+    const activeJobItemIds = new Set(
+      activeJobs.map((job) => job.trackedItemId),
+    );
 
     const pollJobs = async () => {
+      let processed = 0;
       await this.withDownloadProgressBatch(async () => {
         for (const item of this.database.listTrackedItems()) {
           const job = this.database.getDownloadJob(item.id);
@@ -6553,7 +6626,7 @@ export class GameVaultService {
               : null);
           if (
             !job ||
-            !jobSourceKind ||
+            !activeJobItemIds.has(item.id) ||
             job.stage === 'failed' ||
             job.stage === 'complete'
           ) {
@@ -6561,6 +6634,9 @@ export class GameVaultService {
           }
 
           try {
+            if (!jobSourceKind) {
+              continue;
+            }
             if (isDirectHttpProvider(job.provider)) {
               if (!this.activeDirectHttpDownloads.has(item.id)) {
                 const recoveredJob = await this.recoverDirectHttpDownloadJob(
@@ -6807,6 +6883,13 @@ export class GameVaultService {
               stage: 'failed',
               updatedAt: new Date().toISOString(),
             });
+          } finally {
+            processed += 1;
+            this.updateActivityTaskProgress('download-jobs', {
+              current: processed,
+              detail: `Checked ${processed}/${activeJobs.length} download job${activeJobs.length === 1 ? '' : 's'}.`,
+              total: activeJobs.length,
+            });
           }
         }
       });
@@ -6819,8 +6902,10 @@ export class GameVaultService {
 
     await this.withActivityTask(
       {
-        detail: `Checking ${activeJobs.length} active download job${activeJobs.length === 1 ? '' : 's'}.`,
+        detail: `Checking 0/${activeJobs.length} active download job${activeJobs.length === 1 ? '' : 's'}.`,
         id: 'download-jobs',
+        progressCurrent: 0,
+        progressTotal: activeJobs.length,
         title: 'Checking download jobs',
       },
       pollJobs,
@@ -6831,6 +6916,27 @@ export class GameVaultService {
     const nextAllowedAt =
       this.requestPacingStates.get('steamdb-rss')?.nextAllowedAt ?? 0;
     return Math.max(0, nextAllowedAt - Date.now());
+  }
+
+  shouldRunSteamFeedMaintenance(now = new Date()): boolean {
+    const matches = this.database.listSteamMatches();
+    if (matches.length === 0) {
+      return false;
+    }
+
+    const settings = this.database.getSettings();
+    const pollHour = clampNumber(settings.pollDailyHourLocal ?? 9, 0, 23);
+    const expectedPollAt = latestExpectedDailyPollAt(now, pollHour);
+    if (isBeforeWithGrace(settings.lastDailyPollAt, expectedPollAt)) {
+      return true;
+    }
+
+    return matches.some((match) =>
+      isBeforeWithGrace(
+        this.database.getSteamFeedCheck(match.trackedItemId)?.lastCheckedAt,
+        expectedPollAt,
+      ),
+    );
   }
 
   async pollSteamFeeds(): Promise<void> {
@@ -6855,10 +6961,16 @@ export class GameVaultService {
       return;
     }
 
+    const matchCount = this.database.listSteamMatches().length;
     this.steamFeedPollPromise = this.withActivityTask(
       {
-        detail: 'Refreshing SteamDB patch history RSS feeds.',
+        detail:
+          matchCount > 0
+            ? `Checking 0/${matchCount} SteamDB feed${matchCount === 1 ? '' : 's'}.`
+            : 'Refreshing SteamDB patch history RSS feeds.',
         id: 'steamdb-feeds',
+        progressCurrent: matchCount > 0 ? 0 : null,
+        progressTotal: matchCount > 0 ? matchCount : null,
         title: 'Checking SteamDB feeds',
       },
       () => this.pollSteamFeedsInternal(),
@@ -6872,6 +6984,7 @@ export class GameVaultService {
     const matches = this.database.listSteamMatches();
     let checked = 0;
     let failed = 0;
+    let processed = 0;
     let stoppedByRateLimit = false;
     for (const match of matches) {
       try {
@@ -6900,6 +7013,13 @@ export class GameVaultService {
           );
           break;
         }
+      } finally {
+        processed += 1;
+        this.updateActivityTaskProgress('steamdb-feeds', {
+          current: processed,
+          detail: `Checked ${processed}/${matches.length} SteamDB feed${matches.length === 1 ? '' : 's'}.`,
+          total: matches.length,
+        });
       }
     }
     if (!stoppedByRateLimit) {
@@ -6952,16 +7072,69 @@ export class GameVaultService {
     return this.steamLibraryCoverBackfillPromise;
   }
 
-  async processDueWatches(now = new Date()): Promise<void> {
-    const dueWatches = this.database.listDueWatches(now.toISOString());
+  private async refreshWatchedSources(watch: SourceWatch): Promise<void> {
+    await this.discoverSourceMatches(watch.trackedItemId).catch((error) => {
+      this.appendEvent('warn', 'Source match discovery failed during watch', {
+        error:
+          error instanceof Error ? error.message : 'Unknown discovery error',
+        trackedItemId: watch.trackedItemId,
+      });
+    });
+
+    const matches = this.database
+      .listSourceMatches(watch.trackedItemId)
+      .filter((match) => match.usable && match.sourceUrl);
+    if (matches.length === 0) {
+      const item = this.database.findTrackedItemById(watch.trackedItemId);
+      if (item?.sourceKind && item.sourceKind !== 'manual' && item.sourceUrl) {
+        await this.refreshTrackedItem(watch.trackedItemId).catch((error) => {
+          this.appendEvent('warn', 'Primary source refresh failed during watch', {
+            error:
+              error instanceof Error
+                ? error.message
+                : 'Unknown source refresh error',
+            trackedItemId: watch.trackedItemId,
+          });
+        });
+      }
+      return;
+    }
+
+    for (const match of matches) {
+      await this.refreshMatchedSource(watch.trackedItemId, match.sourceKind, {
+        bypassBackoff: false,
+        forceCatalog: false,
+      }).catch((error) => {
+        this.appendEvent('warn', 'Matched source refresh failed', {
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Unknown source refresh error',
+          sourceKind: match.sourceKind,
+          trackedItemId: watch.trackedItemId,
+        });
+      });
+    }
+  }
+
+  async processDueWatches(
+    now = new Date(),
+    options: { includeExpired?: boolean } = {},
+  ): Promise<void> {
+    const nowIso = now.toISOString();
+    const dueWatches = this.database.listDueWatches(nowIso, {
+      includeExpired: options.includeExpired ?? false,
+    });
     if (dueWatches.length === 0) {
       return;
     }
 
     await this.withActivityTask(
       {
-        detail: `Checking ${dueWatches.length} source watch${dueWatches.length === 1 ? '' : 'es'}.`,
+        detail: `Checking 0/${dueWatches.length} source watch${dueWatches.length === 1 ? '' : 'es'}.`,
         id: 'source-watches',
+        progressCurrent: 0,
+        progressTotal: dueWatches.length,
         title: 'Checking watched sources',
       },
       async () => {
@@ -6972,86 +7145,50 @@ export class GameVaultService {
           72,
         );
         let expired = 0;
+        let processed = 0;
+        let recovered = 0;
         for (const watch of dueWatches) {
-          if (new Date(watch.endsAt).getTime() <= now.getTime()) {
-            this.database.expireWatch(watch.trackedItemId, now.toISOString());
-            expired += 1;
-            continue;
-          }
+          try {
+            await this.refreshWatchedSources(watch);
 
-          await this.discoverSourceMatches(watch.trackedItemId).catch(
-            (error) => {
-              this.appendEvent(
-                'warn',
-                'Source match discovery failed during watch',
-                {
-                  error:
-                    error instanceof Error
-                      ? error.message
-                      : 'Unknown discovery error',
-                  trackedItemId: watch.trackedItemId,
-                },
-              );
-            },
-          );
-          const matches = this.database
-            .listSourceMatches(watch.trackedItemId)
-            .filter((match) => match.usable && match.sourceUrl);
-          if (matches.length === 0) {
-            const item = this.database.findTrackedItemById(watch.trackedItemId);
-            if (
-              item?.sourceKind &&
-              item.sourceKind !== 'manual' &&
-              item.sourceUrl
-            ) {
-              await this.refreshTrackedItem(watch.trackedItemId).catch(
-                (error) => {
-                  this.appendEvent(
-                    'warn',
-                    'Primary source refresh failed during watch',
-                    {
-                      error:
-                        error instanceof Error
-                          ? error.message
-                          : 'Unknown source refresh error',
-                      trackedItemId: watch.trackedItemId,
-                    },
-                  );
-                },
-              );
+            const currentWatch = this.database.getWatch(watch.trackedItemId);
+            if (!currentWatch) {
+              if (watch.expiredAt) {
+                recovered += 1;
+              }
+              continue;
             }
-          } else {
-            for (const match of matches) {
-              await this.refreshMatchedSource(
-                watch.trackedItemId,
-                match.sourceKind,
-                {
-                  bypassBackoff: false,
-                  forceCatalog: false,
-                },
-              ).catch((error) => {
-                this.appendEvent('warn', 'Matched source refresh failed', {
-                  error:
-                    error instanceof Error
-                      ? error.message
-                      : 'Unknown source refresh error',
-                  sourceKind: match.sourceKind,
-                  trackedItemId: watch.trackedItemId,
-                });
-              });
+
+            const shouldExpire =
+              currentWatch.expiredAt ||
+              new Date(currentWatch.endsAt).getTime() <= now.getTime();
+            if (!currentWatch.expiredAt && shouldExpire) {
+              expired += 1;
             }
+
+            this.database.upsertWatch({
+              ...currentWatch,
+              expiredAt: shouldExpire
+                ? (currentWatch.expiredAt ?? nowIso)
+                : null,
+              lastCheckedAt: nowIso,
+              nextCheckAt: new Date(
+                now.getTime() + intervalHours * 60 * 60 * 1000,
+              ).toISOString(),
+            });
+          } finally {
+            processed += 1;
+            this.updateActivityTaskProgress('source-watches', {
+              current: processed,
+              detail: `Checked ${processed}/${dueWatches.length} source watch${dueWatches.length === 1 ? '' : 'es'}.`,
+              total: dueWatches.length,
+            });
           }
-          this.database.upsertWatch({
-            ...watch,
-            lastCheckedAt: now.toISOString(),
-            nextCheckAt: new Date(
-              now.getTime() + intervalHours * 60 * 60 * 1000,
-            ).toISOString(),
-          });
         }
         this.appendEvent('info', 'Source watch processing completed', {
-          checked: dueWatches.length - expired,
+          checked: dueWatches.length,
           expired,
+          recovered,
         });
       },
     );
@@ -8429,7 +8566,7 @@ export class GameVaultService {
       (task) => task.id === 'startup-catch-up',
     );
     const latestStartupLog = logs.find((log) =>
-      /^Startup catch-up/.test(log.message),
+      /^Startup (catch-up|maintenance)/.test(log.message),
     );
     const steamDbWorstSeverity = worstActivitySeverityForKinds(visibleIssues, [
       'scheduler_stale',
@@ -8548,7 +8685,7 @@ export class GameVaultService {
         await this.pollDownloadJobs();
         break;
       case 'processSourceWatches':
-        await this.processDueWatches();
+        await this.processDueWatches(new Date(), { includeExpired: true });
         break;
       case 'refreshMatchedSource':
         await this.refreshMatchedSource(

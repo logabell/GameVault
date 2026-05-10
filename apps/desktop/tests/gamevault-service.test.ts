@@ -164,6 +164,26 @@ function rss(items: SteamPatchCandidate[]): string {
   `;
 }
 
+function steamRipDetailHtml(params: {
+  buildId: string;
+  title?: string;
+  version: string;
+}): string {
+  return `
+    <html>
+      <body>
+        <h1>${params.title ?? parsedSource.title}</h1>
+        <div class="entry-content">
+          <p>Game Info</p>
+          <p>Version: ${params.version}</p>
+          <p>Build: ${params.buildId}</p>
+          <a href="https://gofile.io/d/example">Download Mirror</a>
+        </div>
+      </body>
+    </html>
+  `;
+}
+
 function steamCoverPayload(appId: number, fileName: string): string {
   return JSON.stringify({
     response: {
@@ -2056,6 +2076,88 @@ describe('GameVaultService SteamDB patch workflow', () => {
     }
   });
 
+  it('uses the installed source snapshot after updating from another source', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootPath = join(tempRoot, 'Library');
+      const finalPath = join(rootPath, 'MOUSE P.I. For Hire');
+      database.setSetting('library.rootPath', rootPath);
+      await mkdir(finalPath, { recursive: true });
+      await writeFile(join(finalPath, 'MousePI.exe'), 'game');
+
+      const item = database.upsertTrackedItem({
+        normalizedTitle: parsedSource.normalizedTitle,
+        sourceKind: 'steamrip',
+        sourceUrl: parsedSource.sourceUrl,
+        title: parsedSource.title,
+      });
+      database.upsertSteamMatch(item.id, steamMatch);
+      database.upsertPatchEntries([
+        { ...selectedPatch, trackedItemId: item.id },
+        {
+          appId: steamMatch.appId,
+          buildId: '22800000',
+          link: 'https://steamdb.info/patchnotes/22800000/',
+          patchDate: '04/18/2026',
+          patchTitle: 'MOUSE: P.I. For Hire update for 18 April 2026',
+          publishedAt: '2026-04-18T07:13:32.000Z',
+          title: 'MOUSE: P.I. For Hire update for 18 April 2026',
+          trackedItemId: item.id,
+        },
+      ]);
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-18T12:00:00.000Z',
+        fingerprint: parsedSource.fingerprint,
+        observedBuildId: '22800000',
+        observedPatchDate: '04/18/2026',
+        observedPatchLink: 'https://steamdb.info/patchnotes/22800000/',
+        observedPatchTitle: 'MOUSE: P.I. For Hire update for 18 April 2026',
+        observedVersion: '1.0.4',
+        patchSelectionSource: 'rss',
+        sourceKind: 'steamrip',
+        sourceUrl: parsedSource.sourceUrl,
+        trackedItemId: item.id,
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-19T12:00:00.000Z',
+        fingerprint: 'ankergames-mouse-pi',
+        observedBuildId: selectedPatch.buildId ?? null,
+        observedPatchDate: selectedPatch.patchDate,
+        observedPatchLink: selectedPatch.link,
+        observedPatchTitle: selectedPatch.patchTitle,
+        observedVersion: 'V 1.0.5.8168',
+        patchSelectionSource: selectedPatch.selectionSource ?? 'rss',
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.net/game/mouse-p-i-for-hire',
+        trackedItemId: item.id,
+      });
+      database.upsertInstallRecord({
+        installedAt: selectedPatch.patchDate,
+        installedBuildId: selectedPatch.buildId ?? null,
+        installedSourceKind: 'ankergames',
+        installedSourceUrl: 'https://ankergames.net/game/mouse-p-i-for-hire',
+        installedVersion: 'V 1.0.5.8168',
+        installPath: finalPath,
+        trackedItemId: item.id,
+        updatedAt: '2026-04-19T12:00:00.000Z',
+      });
+
+      const [view] = await createService(database).listTrackedItems();
+
+      expect(view?.status).toBe('installed');
+      expect(view?.sourceSnapshot?.sourceKind).toBe('ankergames');
+      expect(view?.selectedPatch?.buildId).toBe(selectedPatch.buildId);
+      expect(view?.installRecord).toMatchObject({
+        installedBuildId: selectedPatch.buildId,
+        installedSourceKind: 'ankergames',
+      });
+      expect(view?.versionsBehindLatest).toBe(0);
+      expect(view?.trackingStatus).toBe('up_to_date');
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('marks an update available when another source is newer than installed but still behind upstream', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -2467,7 +2569,7 @@ describe('GameVaultService SteamDB patch workflow', () => {
         etaSeconds: 8,
         speed: 64,
         stage: 'downloading',
-        statusMessage: 'Downloading with curl',
+        statusMessage: 'Downloading',
       });
 
       await waitForCondition(() =>
@@ -2479,7 +2581,7 @@ describe('GameVaultService SteamDB patch workflow', () => {
         etaSeconds: 8,
         speed: 64,
         stage: 'downloading',
-        statusMessage: 'Downloading with curl',
+        statusMessage: 'Downloading',
       });
       unsubscribe();
     } finally {
@@ -5779,7 +5881,7 @@ describe('GameVaultService SteamDB patch workflow', () => {
       expect(database.getDownloadJob(queued.item.id)).toMatchObject({
         provider: 'direct_http',
         stage: 'complete',
-        statusMessage: 'Downloaded and installed with curl',
+        statusMessage: 'Downloaded and installed',
       });
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
@@ -5838,7 +5940,7 @@ describe('GameVaultService SteamDB patch workflow', () => {
       await recoveredService.pollDownloadJobs();
 
       expect(existsSync(join(finalPath, 'ShapeOfDreams.exe'))).toBe(true);
-      expect(existsSync(join(finalPath, 'Run me!.bat'))).toBe(false);
+      expect(existsSync(join(finalPath, 'Run me!.bat'))).toBe(true);
       expect(existsSync(stagePath!)).toBe(false);
       expect(database.getDownloadJob(queued.item.id)).toMatchObject({
         provider: 'direct_http',
@@ -5980,11 +6082,11 @@ describe('GameVaultService SteamDB patch workflow', () => {
 
       expect(database.getDownloadJob(queued.item.id)).toMatchObject({
         errorMessage:
-          'AnkerGames curl download did not finish cleanly. Retry the download to continue.',
+          'AnkerGames download did not finish cleanly. Retry the download to continue.',
         provider: 'direct_http',
         stage: 'failed',
         statusMessage:
-          'AnkerGames curl download did not finish cleanly. Retry the download to continue.',
+          'AnkerGames download did not finish cleanly. Retry the download to continue.',
       });
       expect(database.getInstallRecord(queued.item.id)).toBeNull();
     } finally {
@@ -6678,13 +6780,245 @@ describe('GameVaultService SteamDB patch workflow', () => {
         ),
       );
 
-      await createService(database).pollSteamFeeds();
+      const service = createService(database);
+      const steamProgress: string[] = [];
+      const unsubscribe = service.onActivityChange((activity) => {
+        const task = activity.activeTasks.find(
+          (candidate) => candidate.id === 'steamdb-feeds',
+        );
+        if (
+          typeof task?.progressCurrent === 'number' &&
+          typeof task.progressTotal === 'number'
+        ) {
+          steamProgress.push(`${task.progressCurrent}/${task.progressTotal}`);
+        }
+      });
+      await service.pollSteamFeeds();
+      unsubscribe();
 
       expect(database.listPatchEntries(item.id)[0]?.buildId).toBe('22862861');
       expect(database.getWatch(item.id)).toMatchObject({
         endsAt: expect.stringContaining('2026'),
         trackedItemId: item.id,
       });
+      expect(steamProgress).toContain('0/1');
+      expect(steamProgress).toContain('1/1');
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('detects stale per-game SteamDB feed checks even when daily maintenance is current', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const now = new Date(2026, 3, 24, 12);
+      const item = database.upsertTrackedItem({
+        normalizedTitle: parsedSource.normalizedTitle,
+        sourceKind: parsedSource.sourceKind,
+        sourceUrl: parsedSource.sourceUrl,
+        title: parsedSource.title,
+      });
+      database.upsertSteamMatch(item.id, steamMatch);
+      database.setSetting(
+        'scheduler.lastDailyPollAt',
+        new Date(2026, 3, 24, 9, 5).toISOString(),
+      );
+
+      const service = createService(database);
+      expect(service.shouldRunSteamFeedMaintenance(now)).toBe(true);
+
+      database.upsertSteamFeedCheck({
+        feedUrl: 'https://steamdb.info/api/PatchnotesRSS/?appid=2416450',
+        lastCheckedAt: new Date(2026, 3, 24, 9, 10).toISOString(),
+        lastError: null,
+        lastSuccessfulAt: new Date(2026, 3, 24, 9, 10).toISOString(),
+        trackedItemId: item.id,
+        updatedAt: new Date(2026, 3, 24, 9, 10).toISOString(),
+      });
+
+      expect(service.shouldRunSteamFeedMaintenance(now)).toBe(false);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('recovers an expired source watch when a fresh source check finds an update', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: parsedSource.normalizedTitle,
+        sourceKind: parsedSource.sourceKind,
+        sourceUrl: parsedSource.sourceUrl,
+        title: parsedSource.title,
+      });
+      database.upsertSteamMatch(item.id, steamMatch);
+      database.upsertInstallRecord({
+        installedBuildId: selectedPatch.buildId,
+        installedSourceKind: parsedSource.sourceKind,
+        installedSourceUrl: parsedSource.sourceUrl,
+        installedVersion: parsedSource.latestSourceRelease.version,
+        trackedItemId: item.id,
+        updatedAt: '2026-04-20T12:00:00.000Z',
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-20T12:00:00.000Z',
+        fingerprint: parsedSource.fingerprint,
+        observedBuildId: selectedPatch.buildId,
+        observedPatchDate: selectedPatch.patchDate,
+        observedPatchLink: selectedPatch.link,
+        observedPatchTitle: selectedPatch.patchTitle,
+        observedVersion: parsedSource.latestSourceRelease.version,
+        sourceKind: parsedSource.sourceKind,
+        sourceUrl: parsedSource.sourceUrl,
+        trackedItemId: item.id,
+      });
+      database.upsertWatch({
+        endsAt: '2026-04-23T12:00:00.000Z',
+        expiredAt: '2026-04-23T12:00:00.000Z',
+        lastCheckedAt: '2026-04-22T12:00:00.000Z',
+        nextCheckAt: '2026-04-23T20:00:00.000Z',
+        startedAt: '2026-04-20T12:00:00.000Z',
+        trackedItemId: item.id,
+      });
+      const newerPatch: SteamPatchCandidate = {
+        ...selectedPatch,
+        buildId: '22862861',
+        link: 'https://steamdb.info/patchnotes/22862861/?utm_source=rss',
+        patchDate: '04/20/2026',
+        patchTitle: 'MOUSE: P.I. For Hire update for 20 April 2026',
+        publishedAt: '2026-04-20T07:07:27.000Z',
+        title: 'MOUSE: P.I. For Hire update for 20 April 2026',
+      };
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response(rss([newerPatch, selectedPatch]), { status: 200 })),
+      );
+      const sourceFetch: SourceFetch = vi.fn(async (input: string) =>
+        input === parsedSource.sourceUrl
+          ? new Response(
+              steamRipDetailHtml({ buildId: '22862861', version: '1.0.5' }),
+              { status: 200 },
+            )
+          : new Response('', { status: 200 }),
+      );
+      const service = createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      );
+      const watchProgress: string[] = [];
+      const unsubscribe = service.onActivityChange((activity) => {
+        const task = activity.activeTasks.find(
+          (candidate) => candidate.id === 'source-watches',
+        );
+        if (
+          typeof task?.progressCurrent === 'number' &&
+          typeof task.progressTotal === 'number'
+        ) {
+          watchProgress.push(`${task.progressCurrent}/${task.progressTotal}`);
+        }
+      });
+
+      await service.processDueWatches(new Date('2026-04-24T12:00:00.000Z'), {
+        includeExpired: true,
+      });
+      unsubscribe();
+
+      const view = (await service.listTrackedItems()).find(
+        (candidate) => candidate.item.id === item.id,
+      );
+      expect(database.getWatch(item.id)).toBeNull();
+      expect(view?.trackingStatus).toBe('update_available');
+      expect(watchProgress).toContain('0/1');
+      expect(watchProgress).toContain('1/1');
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('keeps an expired watch scheduled when a fresh source check is still behind upstream', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: parsedSource.normalizedTitle,
+        sourceKind: parsedSource.sourceKind,
+        sourceUrl: parsedSource.sourceUrl,
+        title: parsedSource.title,
+      });
+      database.upsertSteamMatch(item.id, steamMatch);
+      const newerPatch: SteamPatchCandidate = {
+        ...selectedPatch,
+        buildId: '22862861',
+        link: 'https://steamdb.info/patchnotes/22862861/?utm_source=rss',
+        patchDate: '04/20/2026',
+        patchTitle: 'MOUSE: P.I. For Hire update for 20 April 2026',
+        publishedAt: '2026-04-20T07:07:27.000Z',
+        title: 'MOUSE: P.I. For Hire update for 20 April 2026',
+      };
+      database.upsertPatchEntries([
+        { ...newerPatch, trackedItemId: item.id },
+        { ...selectedPatch, trackedItemId: item.id },
+      ]);
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-20T12:00:00.000Z',
+        fingerprint: parsedSource.fingerprint,
+        observedBuildId: selectedPatch.buildId,
+        observedPatchDate: selectedPatch.patchDate,
+        observedPatchLink: selectedPatch.link,
+        observedPatchTitle: selectedPatch.patchTitle,
+        observedVersion: parsedSource.latestSourceRelease.version,
+        sourceKind: parsedSource.sourceKind,
+        sourceUrl: parsedSource.sourceUrl,
+        trackedItemId: item.id,
+      });
+      database.upsertWatch({
+        endsAt: '2026-04-23T12:00:00.000Z',
+        expiredAt: '2026-04-23T12:00:00.000Z',
+        lastCheckedAt: '2026-04-22T12:00:00.000Z',
+        nextCheckAt: '2026-04-23T20:00:00.000Z',
+        startedAt: '2026-04-20T12:00:00.000Z',
+        trackedItemId: item.id,
+      });
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response(rss([newerPatch, selectedPatch]), { status: 200 })),
+      );
+      const sourceFetch: SourceFetch = vi.fn(async (input: string) =>
+        input === parsedSource.sourceUrl
+          ? new Response(
+              steamRipDetailHtml({
+                buildId: selectedPatch.buildId!,
+                version: parsedSource.latestSourceRelease.version,
+              }),
+              { status: 200 },
+            )
+          : new Response('', { status: 200 }),
+      );
+      const service = createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      );
+
+      await service.processDueWatches(new Date('2026-04-24T12:00:00.000Z'), {
+        includeExpired: true,
+      });
+
+      const watch = database.getWatch(item.id);
+      const view = (await service.listTrackedItems()).find(
+        (candidate) => candidate.item.id === item.id,
+      );
+      expect(watch?.expiredAt).toBeTruthy();
+      expect(new Date(watch!.nextCheckAt).getTime()).toBeGreaterThan(
+        new Date('2026-04-24T12:00:00.000Z').getTime(),
+      );
+      expect(view?.trackingStatus).toBe('watch_window_expired');
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
@@ -7471,6 +7805,117 @@ describe('GameVaultService SteamDB patch workflow', () => {
     }
   });
 
+  it('counts AnkerGames update source lag from saved build history when the exact build row is absent', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'example game',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:example-game',
+        title: 'Example Game',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 22516568,
+        coverUrl: null,
+        matchedAt: '2026-04-22T12:00:00.000Z',
+        normalizedTitle: 'example game',
+        title: 'Example Game',
+      });
+      database.upsertPatchEntries([
+        {
+          appId: 22516568,
+          buildId: '22520000',
+          link: 'https://steamdb.info/patchnotes/22520000/',
+          patchDate: '03/27/2026',
+          patchTitle: 'Example Game update for 27 March 2026',
+          publishedAt: '2026-03-27T12:00:00.000Z',
+          title: 'Example Game update for 27 March 2026',
+          trackedItemId: item.id,
+        },
+        {
+          appId: 22516568,
+          buildId: '22510000',
+          link: 'https://steamdb.info/patchnotes/22510000/',
+          patchDate: '03/26/2026',
+          patchTitle: 'Example Game update for 26 March 2026',
+          publishedAt: '2026-03-26T12:00:00.000Z',
+          title: 'Example Game update for 26 March 2026',
+          trackedItemId: item.id,
+        },
+      ]);
+      database.upsertInstallRecord({
+        installedAt: '03/26/2026',
+        installedBuildId: '22510000',
+        installedVersion: 'V 1.2.0.0',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-22T12:00:00.000Z',
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-22T12:00:00.000Z',
+        fingerprint: 'manual-example-game',
+        observedBuildId: '22510000',
+        observedPatchDate: '03/26/2026',
+        observedPatchLink: 'https://steamdb.info/patchnotes/22510000/',
+        observedPatchTitle: 'Example Game update for 26 March 2026',
+        observedVersion: 'V 1.2.0.0',
+        patchSelectionSource: 'rss',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:example-game',
+        trackedItemId: item.id,
+      });
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-04-22T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-04-22T12:00:00.000Z',
+        lastError: null,
+        method: 'slug',
+        normalizedTitle: 'example game',
+        score: 1,
+        sourceKind: 'ankergames',
+        sourceTitle: 'Example Game',
+        sourceUrl: 'https://ankergames.net/game/example-game',
+        status: 'probable',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-22T12:00:00.000Z',
+        usable: true,
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-22T12:00:00.000Z',
+        fingerprint: 'ankergames-example-game',
+        observedBuildId: '22516568',
+        observedPatchDate: null,
+        observedPatchLink: null,
+        observedPatchTitle: null,
+        observedVersion: 'V 1.2.0.7-28a3',
+        patchSelectionSource: null,
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.net/game/example-game',
+        trackedItemId: item.id,
+      });
+
+      const [view] = await createService(database).listTrackedItems();
+      const ankergames = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'ankergames',
+      );
+
+      expect(ankergames).toMatchObject({
+        isUpdateSource: true,
+        matchedPatch: null,
+        snapshot: {
+          observedBuildId: '22516568',
+          observedVersion: 'V 1.2.0.7-28a3',
+        },
+        updateStatus: 'source_behind_upstream',
+        versionsBehindLatest: 1,
+        versionsBehindLatestIsLowerBound: false,
+      });
+      expect(view?.trackingStatus).toBe('update_available');
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('canonicalizes AnkerGames from patch-title version when the listed build is invalid', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -8076,6 +8521,91 @@ describe('GameVaultService SteamDB patch workflow', () => {
         observedBuildId: null,
         observedPatchDate: null,
         observedVersion: '1.0.1096',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('does not mark an older version-only SteamRIP source as newer than an installed AnkerGames build', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'dead as disco',
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.net/game/dead-as-disco',
+        title: 'Dead as Disco',
+      });
+      database.upsertInstallRecord({
+        installedAt: '2026-05-10',
+        installedBuildId: '21459233',
+        installedSourceKind: 'ankergames',
+        installedSourceUrl: 'https://ankergames.net/game/dead-as-disco',
+        installedVersion: 'V 3.6.0',
+        trackedItemId: item.id,
+        updatedAt: '2026-05-10T12:00:00.000Z',
+      });
+      for (const source of [
+        {
+          buildId: '21459233',
+          kind: 'ankergames' as const,
+          method: 'steam_app_id' as const,
+          url: 'https://ankergames.net/game/dead-as-disco',
+          version: 'V 3.6.0',
+        },
+        {
+          buildId: null,
+          kind: 'steamrip' as const,
+          method: 'fuzzy_title' as const,
+          url: 'https://steamrip.com/dead-as-disco-free-download/',
+          version: '3.5.10B',
+        },
+      ]) {
+        database.upsertSourceMatch({
+          confidence: 1,
+          createdAt: '2026-05-10T12:00:00.000Z',
+          isPrimary: source.kind === 'ankergames',
+          lastCheckedAt: '2026-05-10T12:00:00.000Z',
+          lastError: null,
+          method: source.method,
+          normalizedTitle: 'dead as disco',
+          score: 1,
+          sourceKind: source.kind,
+          sourceTitle: 'Dead as Disco',
+          sourceUrl: source.url,
+          status: 'verified',
+          trackedItemId: item.id,
+          updatedAt: '2026-05-10T12:00:00.000Z',
+          usable: true,
+        });
+        database.upsertSourceSnapshot({
+          checkedAt: '2026-05-10T12:00:00.000Z',
+          fingerprint: `${source.kind}-dead-as-disco`,
+          observedBuildId: source.buildId,
+          observedPatchDate: null,
+          observedPatchLink: null,
+          observedPatchTitle: null,
+          observedVersion: source.version,
+          patchSelectionSource: null,
+          sourceKind: source.kind,
+          sourceUrl: source.url,
+          trackedItemId: item.id,
+        });
+      }
+
+      const [view] = await createService(database).listTrackedItems();
+      const steamrip = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'steamrip',
+      );
+
+      expect(steamrip).toMatchObject({
+        isUpdateSource: false,
+        matchedPatch: null,
+        snapshot: {
+          observedBuildId: null,
+          observedVersion: '3.5.10B',
+        },
+        updateStatus: 'unknown',
       });
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
