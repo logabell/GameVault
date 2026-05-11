@@ -8,6 +8,7 @@ import type {
   ActivityView,
   CacheSteamDbBuildLookupPayload,
   CompleteSteamDbBuildLookupPayload,
+  CompleteSteamWishlistRemovalPayload,
   ConnectionHealthSummary,
   ConfirmedSteamMatch,
   DesktopHealthSummary,
@@ -28,7 +29,13 @@ import type {
   LibraryRootRecord,
   OnboardingState,
   ParsedSourcePayload,
+  PlayniteExecutableSelectionRecord,
+  PlayniteIntegrationStatus,
+  PlayniteManifest,
+  PlayniteSyncStatus,
+  SavePlayniteExecutableSelectionPayload,
   QueueDraftDownloadPayload,
+  PendingSteamWishlistAction,
   RefreshResult,
   RemoveTrackedItemPayload,
   RemoveTrackedItemResult,
@@ -47,6 +54,12 @@ import type {
   SupportedSourceKind,
   SyncTrackedSteamPatchEntriesPayload,
   SteamDbBuildLookupState,
+  SteamWishlistCachedItem,
+  SteamWishlistLibraryMatch,
+  SteamWishlistRemovalRecord,
+  SteamWishlistSyncItem,
+  SteamWishlistSyncPayload,
+  SteamWishlistView,
   ThemeMode,
   SteamPatchCandidate,
   SteamPatchEntry,
@@ -57,6 +70,7 @@ import type {
   UpdateSteamDbBuildLookupPayload,
 } from '@gamevault/shared-types';
 import {
+  TrackedItemStatus,
   TrackedItemTrackingStatus,
   derivePatchMetadataStatus,
   derivePatchLag,
@@ -89,16 +103,30 @@ import {
 } from '@gamevault/source-core';
 import {
   buildSteamDbPatchFeedUrl,
+  buildSteamStoreAppUrl,
   compareSourceToUpstream,
   confirmSteamMatch,
   createWatchWindow,
+  fetchSteamWishlistApiItems,
+  fetchSteamWishlistMetadata,
   isSteamLibraryCoverUrl,
+  normalizeSteamTitle,
   parseSteamDbPatchCandidates,
   resolveSteamLibraryCoverUrl,
   resolveSteamMatch as resolveSteamSearch,
 } from '@gamevault/steam-core';
-import { rm } from 'node:fs/promises';
+import {
+  copyFile,
+  mkdir,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
+import { execFile } from 'node:child_process';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { promisify } from 'node:util';
 
 import { GameVaultDatabase } from './database.js';
 import {
@@ -112,6 +140,7 @@ import {
   normalizeDuplicateNestedFolder,
   planLibraryPaths,
   planPortableArchiveExtractPathFromJob,
+  pathHasContent,
   pathExists,
   renameLibraryFolder,
   removeKnownLibraryPaths,
@@ -120,8 +149,16 @@ import {
   scanImportFolders,
 } from './files.js';
 import { MyJDownloaderService } from './myjdownloader.js';
+import {
+  assertSafePlaynitePluginInstallTarget,
+  buildPlayniteManifest,
+  getPlayniteExecutableExclusionReason,
+  scanPlayniteExecutableSelection,
+} from './playnite.js';
 
 type RendererSettingsView = SettingsView;
+
+const execFileAsync = promisify(execFile);
 
 const IS_TEST_ENV =
   process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST);
@@ -135,6 +172,7 @@ const IMPORT_STEAM_MATCH_CONCURRENCY = 3;
 const STEAMDB_BUILD_LOOKUP_TTL_MS = 60 * 60 * 1000;
 const SOURCE_CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
 const STEAMRIP_UPLOAD_PATCH_WINDOW_DAYS = 2;
+const STEAM_WISHLIST_REFRESH_STALE_MS = 5 * 60 * 1000;
 const WAITING_FOR_JDOWNLOADER_EXTRACTION_STATUS =
   'Waiting for JDownloader extraction to finish';
 const SOURCE_MATCH_PROBABLE_SCORE = 0.92;
@@ -151,6 +189,8 @@ const ACTIVITY_STALE_GRACE_MS = 5 * 60 * 1000;
 const STEAMDB_BACKOFF_EVENT_INTERVAL_MS = 30 * 60 * 1000;
 const EXTENSION_ACTIVITY_RECENT_MS = 30 * 60 * 1000;
 const EXTENSION_ACTIVITY_SETTING_KEY = 'extension.lastNativeMessageAt';
+const PLAYNITE_PLUGIN_FOLDER_NAME = 'GameVault';
+const PLAYNITE_PLUGIN_VERSION = '0.1.6';
 
 const SOURCE_CATALOG_URLS: Record<SupportedSourceKind, string[]> = {
   ankergames: [
@@ -179,6 +219,10 @@ interface RequestPacingOptions {
 interface SourceDiscoveryOptions {
   bypassBackoff?: boolean;
   forceCatalog?: boolean;
+}
+
+interface AppendEventOptions {
+  notify?: boolean;
 }
 
 interface SourceCandidateProbe {
@@ -872,6 +916,97 @@ function pathIsInsideOrEqual(parentPath: string, targetPath: string): boolean {
   );
 }
 
+async function directoryExists(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+async function copyDirectoryRecursive(sourcePath: string, targetPath: string): Promise<void> {
+  await mkdir(targetPath, { recursive: true });
+  const entries = await readdir(sourcePath, { withFileTypes: true });
+  await Promise.all(
+    entries.map(async (entry) => {
+      const sourceEntryPath = join(sourcePath, entry.name);
+      const targetEntryPath = join(targetPath, entry.name);
+      if (entry.isDirectory()) {
+        await copyDirectoryRecursive(sourceEntryPath, targetEntryPath);
+        return;
+      }
+      if (entry.isFile()) {
+        await copyFile(sourceEntryPath, targetEntryPath);
+      }
+    }),
+  );
+}
+
+async function playniteIsRunning(): Promise<boolean> {
+  if (process.platform !== 'win32') {
+    return false;
+  }
+  try {
+    const { stdout } = await execFileAsync('tasklist.exe', [
+      '/FI',
+      'IMAGENAME eq Playnite.DesktopApp.exe',
+      '/FO',
+      'CSV',
+      '/NH',
+    ]);
+    return stdout
+      .split(/\r?\n/)
+      .some((line) => line.toLowerCase().includes('playnite.desktopapp.exe'));
+  } catch {
+    return false;
+  }
+}
+
+async function readPlaynitePluginVersion(
+  pluginInstallPath: string | null,
+): Promise<string | null> {
+  if (!pluginInstallPath) {
+    return null;
+  }
+  try {
+    const manifestText = await readFile(
+      join(pluginInstallPath, 'extension.yaml'),
+      'utf8',
+    );
+    const versionLine = manifestText
+      .split(/\r?\n/)
+      .find((line) => line.trim().toLowerCase().startsWith('version:'));
+    return versionLine?.split(':').slice(1).join(':').trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function promoteSinglePlayniteCandidate(
+  selection: PlayniteExecutableSelectionRecord,
+): PlayniteExecutableSelectionRecord {
+  if (
+    selection.status !== 'needs_review' &&
+    selection.status !== 'missing'
+  ) {
+    return selection;
+  }
+  const candidates = selection.candidates.filter(
+    (candidate) => !candidate.excluded && candidate.score > 0,
+  );
+  if (candidates.length !== 1) {
+    return selection;
+  }
+  const candidate = candidates[0]!;
+  return {
+    ...selection,
+    confidence: 'high',
+    selectedExePath: candidate.fullPath,
+    status: 'auto_selected',
+    updatedAt: new Date().toISOString(),
+  };
+}
+
 function getAnkerGamesBrowserDownloadUrl(
   mirror: DownloadDescriptor,
 ): string | null {
@@ -1111,6 +1246,11 @@ export interface SecureValueProvider {
   encrypt(text: string): string;
 }
 
+export interface PlayniteIntegrationPaths {
+  appDataPath?: string;
+  pluginBundlePath?: string;
+}
+
 async function fetchWithTimeout(
   url: string,
   init: RequestInit,
@@ -1281,6 +1421,7 @@ export class GameVaultService {
     private readonly extractStagedZipArchive: typeof extractSingleStagedZipArchive = extractSingleStagedZipArchive,
     private readonly steamFetch: typeof fetch = (input, init) =>
       fetch(input, init),
+    private readonly playnitePaths: PlayniteIntegrationPaths = {},
   ) {}
 
   onDownloadProgressChange(
@@ -1446,9 +1587,12 @@ export class GameVaultService {
     level: EventLogRecord['level'],
     message: string,
     context?: Record<string, unknown>,
+    options: AppendEventOptions = {},
   ): void {
     this.database.appendEvent({ context, level, message });
-    this.notify(level, message);
+    if (options.notify !== false) {
+      this.notify(level, message);
+    }
     this.emitActivityChange();
   }
 
@@ -1548,6 +1692,7 @@ export class GameVaultService {
     job: DownloadJobRecord,
     trackedItemId: string,
     warningMessage: string,
+    options: { notifyFailure?: boolean } = {},
   ): Promise<void> {
     if (!isJDownloaderProvider(job.provider)) {
       return;
@@ -1564,13 +1709,18 @@ export class GameVaultService {
         stagePath: job.stagePath,
       })
       .catch((error) => {
-        this.appendEvent('warn', warningMessage, {
-          error:
-            error instanceof Error
-              ? error.message
-              : 'Unknown JDownloader cleanup error',
-          trackedItemId,
-        });
+        this.appendEvent(
+          'warn',
+          warningMessage,
+          {
+            error:
+              error instanceof Error
+                ? error.message
+                : 'Unknown JDownloader cleanup error',
+            trackedItemId,
+          },
+          { notify: options.notifyFailure !== false },
+        );
       });
   }
 
@@ -1603,35 +1753,49 @@ export class GameVaultService {
     }
 
     try {
-      const health = await this.myJDownloader.getHealth();
+      const health = await this.myJDownloader.getHealth({
+        forceRefresh: true,
+      });
       if (health.color === 'green') {
         return 'jdownloader';
       }
 
       this.appendEvent(
-        'info',
-        'Falling back to manual download because JDownloader is not ready',
+        'warn',
+        'JDownloader is not ready for download queueing',
         {
           jDownloaderStatus: health.color,
           sourceKind: params.sourceKind,
           trackedItemId: params.trackedItemId,
         },
       );
-      return 'manual';
+      throw new Error(
+        `${health.message} Open JDownloader, wait for MyJDownloader to show the selected device online, then try again.`,
+      );
     } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : 'Unknown JDownloader health error';
+      if (
+        message.includes('Open JDownloader') ||
+        message.includes('Select a MyJDownloader device') ||
+        message.includes('Sign in to MyJDownloader')
+      ) {
+        throw error;
+      }
       this.appendEvent(
         'warn',
-        'Falling back to manual download because JDownloader status could not be checked',
+        'JDownloader status could not be checked for download queueing',
         {
-          error:
-            error instanceof Error
-              ? error.message
-              : 'Unknown JDownloader health error',
+          error: message,
           sourceKind: params.sourceKind,
           trackedItemId: params.trackedItemId,
         },
       );
-      return 'manual';
+      throw new Error(
+        `${message} Open JDownloader, wait for MyJDownloader to show the selected device online, then try again.`,
+      );
     }
   }
 
@@ -1864,6 +2028,31 @@ export class GameVaultService {
     }
 
     return nextJob;
+  }
+
+  private async exportPlayniteManifestAfterInstall(
+    trackedItemId: string,
+  ): Promise<void> {
+    if (!this.database.getSettings().playniteIntegrationEnabled) {
+      return;
+    }
+
+    try {
+      await this.exportPlayniteManifest({ rescan: true });
+    } catch (error) {
+      this.appendEvent(
+        'warn',
+        'Unable to refresh Playnite manifest after install',
+        {
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Unknown Playnite manifest export error',
+          trackedItemId,
+        },
+        { notify: false },
+      );
+    }
   }
 
   private getDownloadJobParts(
@@ -2183,6 +2372,7 @@ export class GameVaultService {
           updatedParts: parts,
         });
         this.upsertDownloadJob(completedJob);
+        await this.exportPlayniteManifestAfterInstall(params.trackedItemId);
         return;
       }
 
@@ -2282,6 +2472,7 @@ export class GameVaultService {
         updatedParts: this.getDownloadJobParts(currentJob, 'steamrip'),
       });
       this.upsertDownloadJob(completedJob);
+      await this.exportPlayniteManifestAfterInstall(params.trackedItemId);
     }
   }
 
@@ -2484,6 +2675,71 @@ export class GameVaultService {
       title: patchTitle,
       trackedItemId,
       version: sourceSnapshot.observedVersion,
+    };
+  }
+
+  private getSelectedPatchFromInstallRecord(
+    trackedItemId: string,
+    steamMatch: ConfirmedSteamMatch | null,
+    installRecord: InstallRecord | null,
+    patchEntries: SteamPatchEntry[],
+  ): SteamPatchEntry | null {
+    if (!installRecord || !steamMatch) {
+      return null;
+    }
+
+    const installedBuildId = numericSteamBuildId(
+      installRecord.installedBuildId,
+    );
+    if (installedBuildId) {
+      const buildMatch = patchEntries.find(
+        (entry) => entry.buildId === installedBuildId,
+      );
+      if (buildMatch) {
+        return buildMatch;
+      }
+    }
+
+    const installedVersion = installRecord.installedVersion?.trim();
+    const installedAt = installRecord.installedAt?.trim();
+    if (installedVersion) {
+      const metadataMatch = patchEntries.find((entry) => {
+        const dateMatches = installedAt ? entry.patchDate === installedAt : true;
+        const versionMatches =
+          entry.version?.trim() === installedVersion ||
+          entry.patchTitle === installedVersion;
+        return dateMatches && versionMatches;
+      });
+      if (metadataMatch) {
+        return metadataMatch;
+      }
+    }
+
+    if (!installedBuildId) {
+      return null;
+    }
+
+    const patchTitle =
+      installedVersion ??
+      `SteamDB build ${installedBuildId}`;
+    const installedAtDate = installedAt ? new Date(installedAt) : null;
+    const publishedAt =
+      installedAtDate && !Number.isNaN(installedAtDate.getTime())
+        ? installedAtDate.toISOString()
+        : '';
+    return {
+      appId: steamMatch.appId,
+      buildId: installedBuildId,
+      link: installedBuildId
+        ? `https://steamdb.info/patchnotes/${installedBuildId}/`
+        : '',
+      patchDate: installedAt ?? '',
+      patchTitle,
+      publishedAt,
+      selectionSource: null,
+      title: patchTitle,
+      trackedItemId,
+      version: installedVersion ?? null,
     };
   }
 
@@ -2971,12 +3227,19 @@ export class GameVaultService {
       } as TrackedItemView,
       patchEntries,
     );
-    const selectedPatch = this.getSelectedPatch(
-      trackedItemId,
-      steamMatch,
-      sourceSnapshot,
-      patchEntries,
-    );
+    const selectedPatch =
+      this.getSelectedPatchFromInstallRecord(
+        trackedItemId,
+        steamMatch,
+        installRecord,
+        patchEntries,
+      ) ??
+      this.getSelectedPatch(
+        trackedItemId,
+        steamMatch,
+        sourceSnapshot,
+        patchEntries,
+      );
     const patchLag = derivePatchLag({
       feedEntries: patchEntries,
       selectedPatch,
@@ -3047,7 +3310,7 @@ export class GameVaultService {
             finalPath,
           }
         : recoveredDownload;
-    const finalPathExists = finalPath ? await pathExists(finalPath) : false;
+    const finalPathExists = finalPath ? await pathHasContent(finalPath) : false;
     const hasKnownFinalPath =
       Boolean(installRecord) ||
       currentDownload?.stage === 'complete' ||
@@ -3147,6 +3410,807 @@ export class GameVaultService {
         .filter((item) => requestedIds.has(item.id))
         .map((item) => this.buildTrackedItemView(item.id)),
     );
+  }
+
+  private getDefaultPlayniteExtensionsPath(): string | null {
+    const appData = process.env.APPDATA?.trim();
+    return appData ? join(appData, 'Playnite', 'Extensions') : null;
+  }
+
+  private getPlayniteExtensionsPath(): string | null {
+    return (
+      this.database.getSettings().playniteExtensionsPath?.trim() ||
+      this.getDefaultPlayniteExtensionsPath()
+    );
+  }
+
+  private getPlayniteAppDataPath(): string {
+    return (
+      this.playnitePaths.appDataPath ??
+      (process.env.APPDATA
+        ? join(process.env.APPDATA, 'GameVault')
+        : join(process.cwd(), '.gamevault'))
+    );
+  }
+
+  private getPlayniteManifestPath(): string {
+    const configured = this.database.getSettings().playniteManifestPath?.trim();
+    if (configured) {
+      return configured;
+    }
+    return join(this.getPlayniteAppDataPath(), 'playnite-library.json');
+  }
+
+  private getPlayniteSyncStatusPath(): string {
+    return join(this.getPlayniteAppDataPath(), 'playnite-sync-status.json');
+  }
+
+  private getPlaynitePluginBundlePath(): string {
+    return (
+      this.playnitePaths.pluginBundlePath ??
+      resolve(__dirname, '..', 'playnite-plugin')
+    );
+  }
+
+  private async buildInstalledSteamMatchedViews(): Promise<TrackedItemView[]> {
+    const views = await Promise.all(
+      this.database
+        .listTrackedItems()
+        .map((item) => this.buildTrackedItemView(item.id)),
+    );
+    return views.filter(
+      (view) =>
+        view.status === TrackedItemStatus.Installed &&
+        Boolean(view.item.steamAppId) &&
+        Boolean(view.installRecord?.installPath?.trim()),
+    );
+  }
+
+  private normalizePlayniteExecutableSelections(
+    selections: PlayniteExecutableSelectionRecord[],
+  ): PlayniteExecutableSelectionRecord[] {
+    return selections.map((selection) => {
+      const normalized = promoteSinglePlayniteCandidate(selection);
+      if (normalized !== selection) {
+        this.database.upsertPlayniteExecutableSelection(normalized);
+      }
+      return normalized;
+    });
+  }
+
+  async refreshPlayniteExecutableSelections(): Promise<
+    PlayniteExecutableSelectionRecord[]
+  > {
+    const views = await this.buildInstalledSteamMatchedViews();
+    return this.refreshPlayniteExecutableSelectionsForViews(views);
+  }
+
+  private async refreshPlayniteExecutableSelectionsForViews(
+    views: TrackedItemView[],
+  ): Promise<PlayniteExecutableSelectionRecord[]> {
+    const selections: PlayniteExecutableSelectionRecord[] = [];
+    for (const view of views) {
+      const installPath =
+        view.installRecord?.installPath ?? view.fileState.finalPath ?? null;
+      if (!installPath) {
+        continue;
+      }
+      const previous = this.database.getPlayniteExecutableSelection(
+        view.item.id,
+      );
+      const selection = await scanPlayniteExecutableSelection({
+        installPath,
+        previousSelection: previous,
+        steamAppId: view.item.steamAppId,
+        steamTitle: view.item.steamTitle,
+        title: view.item.title,
+        trackedItemId: view.item.id,
+      });
+      this.database.upsertPlayniteExecutableSelection(selection);
+      selections.push(selection);
+    }
+    return this.normalizePlayniteExecutableSelections(selections);
+  }
+
+  private async refreshStalePlayniteExecutableSelections(
+    views: TrackedItemView[],
+    selections: PlayniteExecutableSelectionRecord[],
+  ): Promise<PlayniteExecutableSelectionRecord[]> {
+    const selectionsByItemId = new Map(
+      selections.map((selection) => [selection.trackedItemId, selection]),
+    );
+    let changed = false;
+
+    for (const view of views) {
+      const installPath =
+        view.installRecord?.installPath ?? view.fileState.finalPath ?? null;
+      if (!installPath) {
+        continue;
+      }
+
+      const selection = selectionsByItemId.get(view.item.id);
+      const selectedPathExists = selection?.selectedExePath
+        ? await pathExists(selection.selectedExePath)
+        : false;
+      const selectedPathExcluded =
+        selection?.selectedExePath && selectedPathExists
+          ? getPlayniteExecutableExclusionReason(
+              selection.selectedExePath,
+              installPath,
+            ) !== null
+          : false;
+      if (
+        selection?.selectedExePath &&
+        selectedPathExists &&
+        !selectedPathExcluded &&
+        selection.status !== 'needs_review' &&
+        selection.status !== 'missing'
+      ) {
+        continue;
+      }
+
+      if (
+        !selection ||
+        selection.selectedExePath ||
+        selection.status === 'missing'
+      ) {
+        const refreshed = await scanPlayniteExecutableSelection({
+          installPath,
+          previousSelection: selection,
+          steamAppId: view.item.steamAppId,
+          steamTitle: view.item.steamTitle,
+          title: view.item.title,
+          trackedItemId: view.item.id,
+        });
+        this.database.upsertPlayniteExecutableSelection(refreshed);
+        selectionsByItemId.set(view.item.id, refreshed);
+        changed = true;
+      }
+    }
+
+    const normalized = this.normalizePlayniteExecutableSelections([
+      ...selectionsByItemId.values(),
+    ]);
+    return changed ? normalized : selections;
+  }
+
+  async exportPlayniteManifest(options: {
+    rescan?: boolean;
+  } = {}): Promise<PlayniteManifest> {
+    const views = await this.buildInstalledSteamMatchedViews();
+    const selections = options.rescan
+      ? await this.refreshPlayniteExecutableSelectionsForViews(views)
+      : await this.refreshStalePlayniteExecutableSelections(
+          views,
+          this.normalizePlayniteExecutableSelections(
+            this.database.listPlayniteExecutableSelections(),
+          ),
+        );
+    const manifest = buildPlayniteManifest(views, selections);
+    const manifestPath = this.getPlayniteManifestPath();
+    await mkdir(dirname(manifestPath), { recursive: true });
+    await writeFile(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
+    this.database.setSetting('playnite.manifestPath', manifestPath);
+    return manifest;
+  }
+
+  private async getPlayniteSyncStatus(
+    manifest: PlayniteManifest,
+  ): Promise<PlayniteSyncStatus> {
+    const statusPath = this.getPlayniteSyncStatusPath();
+    const fallback: PlayniteSyncStatus = {
+      current: false,
+      exportableGames: manifest.games.length,
+      importableGames: 0,
+      lastError: null,
+      lastSyncedAt: null,
+      manifestGeneratedAt: null,
+      pluginSeen: false,
+      statusPath,
+      syncedGames: 0,
+    };
+
+    let raw: Record<string, unknown>;
+    try {
+      raw = JSON.parse(await readFile(statusPath, 'utf8')) as Record<
+        string,
+        unknown
+      >;
+    } catch {
+      return fallback;
+    }
+
+    const numberValue = (value: unknown): number | null =>
+      typeof value === 'number' && Number.isFinite(value)
+        ? Math.max(0, Math.floor(value))
+        : null;
+    const stringValue = (value: unknown): string | null =>
+      typeof value === 'string' && value.trim() ? value : null;
+    const exportableGames =
+      numberValue(raw.exportableGames) ?? manifest.games.length;
+    const syncedGames = Math.min(
+      numberValue(raw.syncedGames) ?? 0,
+      manifest.games.length,
+    );
+    const manifestPath = stringValue(raw.manifestPath);
+    const configuredManifestPath = this.getPlayniteManifestPath();
+    const sameManifestPath =
+      !manifestPath ||
+      resolve(manifestPath).toLowerCase() ===
+        resolve(configuredManifestPath).toLowerCase();
+    const current =
+      sameManifestPath && exportableGames === manifest.games.length;
+
+    return {
+      current,
+      exportableGames: manifest.games.length,
+      importableGames: numberValue(raw.importableGames) ?? 0,
+      lastError: stringValue(raw.lastError),
+      lastSyncedAt: stringValue(raw.seenAt),
+      manifestGeneratedAt: stringValue(raw.manifestGeneratedAt),
+      pluginSeen: true,
+      statusPath,
+      syncedGames,
+    };
+  }
+
+  async getPlayniteStatus(options: {
+    refresh?: boolean;
+  } = {}): Promise<PlayniteIntegrationStatus> {
+    const settings = this.database.getSettings();
+    let manifest = null as ReturnType<typeof buildPlayniteManifest> | null;
+    let selections = this.normalizePlayniteExecutableSelections(
+      this.database.listPlayniteExecutableSelections(),
+    );
+    if (options.refresh) {
+      manifest = await this.exportPlayniteManifest({
+        rescan: true,
+      });
+      selections = this.normalizePlayniteExecutableSelections(
+        this.database.listPlayniteExecutableSelections(),
+      );
+    } else if (settings.playniteIntegrationEnabled && selections.length > 0) {
+      manifest = await this.exportPlayniteManifest({
+        rescan: false,
+      });
+    }
+
+    const views = await this.buildInstalledSteamMatchedViews();
+    const currentManifest = manifest ?? buildPlayniteManifest(views, selections);
+    const eligibleItemIds = new Set(views.map((view) => view.item.id));
+    const itemsById = new Map(
+      this.database.listTrackedItems().map((item) => [item.id, item]),
+    );
+    const pendingReviews = selections
+      .filter(
+        (selection) =>
+          eligibleItemIds.has(selection.trackedItemId) &&
+          (selection.status === 'needs_review' ||
+            selection.status === 'missing'),
+      )
+      .map((selection) => {
+        const item = itemsById.get(selection.trackedItemId);
+        return {
+          gameTitle: item?.title ?? selection.trackedItemId,
+          selection,
+          steamAppId: selection.steamAppId ?? null,
+          trackedItemId: selection.trackedItemId,
+        };
+      });
+
+    const extensionsPath = this.getPlayniteExtensionsPath();
+    const pluginInstallPath = extensionsPath
+      ? join(extensionsPath, PLAYNITE_PLUGIN_FOLDER_NAME)
+      : null;
+    const installed = pluginInstallPath
+      ? await directoryExists(pluginInstallPath)
+      : false;
+    const installedPluginVersion = installed
+      ? await readPlaynitePluginVersion(pluginInstallPath)
+      : null;
+    const syncStatus = await this.getPlayniteSyncStatus(currentManifest);
+    return {
+      bundledPluginVersion: PLAYNITE_PLUGIN_VERSION,
+      enabled: settings.playniteIntegrationEnabled === true,
+      exportableGames: currentManifest.games.length,
+      installed,
+      installedPluginVersion,
+      manifestPath: this.getPlayniteManifestPath(),
+      pendingReviewCount: pendingReviews.length,
+      pendingReviews,
+      pluginInstallPath,
+      pluginInstalledAt: settings.playnitePluginInstalledAt ?? null,
+      pluginUpdateAvailable:
+        installed && installedPluginVersion !== PLAYNITE_PLUGIN_VERSION,
+      pluginVersion: settings.playnitePluginVersion ?? null,
+      playniteExtensionsPath: extensionsPath,
+      syncStatus,
+    };
+  }
+
+  async installPlaynitePlugin(params: {
+    extensionsPath?: string | null;
+  } = {}): Promise<PlayniteIntegrationStatus> {
+    const extensionsPath =
+      params.extensionsPath?.trim() || this.getPlayniteExtensionsPath();
+    if (!extensionsPath) {
+      throw new Error(
+        'Playnite extensions path is not configured. Choose the Playnite Extensions folder first.',
+      );
+    }
+    const pluginBundlePath = this.getPlaynitePluginBundlePath();
+    if (!(await directoryExists(pluginBundlePath))) {
+      throw new Error(
+        `Bundled Playnite plugin was not found at ${pluginBundlePath}.`,
+      );
+    }
+    if (await playniteIsRunning()) {
+      throw new Error(
+        'Playnite is currently open. Close Playnite completely, then install the GameVault plugin before starting Playnite again.',
+      );
+    }
+    await mkdir(extensionsPath, { recursive: true });
+    const pluginInstallPath = join(extensionsPath, PLAYNITE_PLUGIN_FOLDER_NAME);
+    assertSafePlaynitePluginInstallTarget({
+      extensionsPath,
+      pluginInstallPath,
+      protectedPaths: [
+        ...(this.database.getSettings().libraryRoots ?? []).map(
+          (root) => root.path,
+        ),
+        ...this.database
+          .listInstallRecords()
+          .map((record) => record.installPath),
+      ],
+    });
+    try {
+      await rm(pluginInstallPath, { force: true, recursive: true });
+      await copyDirectoryRecursive(pluginBundlePath, pluginInstallPath);
+    } catch (error) {
+      const code =
+        error && typeof error === 'object' && 'code' in error
+          ? String((error as { code?: unknown }).code)
+          : '';
+      if (code === 'EACCES' || code === 'EPERM') {
+        throw new Error(
+          'Playnite is using the GameVault plugin files. Close Playnite completely, then install the plugin again.',
+        );
+      }
+      throw error;
+    }
+    this.database.setSetting('playnite.extensionsPath', extensionsPath);
+    this.database.setSetting('playnite.integrationEnabled', 'true');
+    this.database.setSetting('playnite.pluginInstalledAt', new Date().toISOString());
+    this.database.setSetting('playnite.pluginVersion', PLAYNITE_PLUGIN_VERSION);
+    await this.exportPlayniteManifest({ rescan: true });
+    this.appendEvent('info', 'Installed Playnite plugin', {
+      pluginInstallPath,
+    });
+    this.emitActivityChange();
+    return this.getPlayniteStatus();
+  }
+
+  async savePlayniteExecutableSelection(
+    payload: SavePlayniteExecutableSelectionPayload,
+  ): Promise<PlayniteIntegrationStatus> {
+    const item = this.database.findTrackedItemById(payload.trackedItemId);
+    if (!item) {
+      throw new Error(`Tracked item ${payload.trackedItemId} not found`);
+    }
+    const view = await this.buildTrackedItemView(payload.trackedItemId);
+    const installPath =
+      view.installRecord?.installPath ?? view.fileState.finalPath ?? null;
+    if (!installPath) {
+      throw new Error('This game does not have an install path to review.');
+    }
+    if (!pathIsInsideOrEqual(installPath, payload.executablePath)) {
+      throw new Error(
+        'Selected executable must be inside the game install folder.',
+      );
+    }
+    if (!(await pathExists(payload.executablePath))) {
+      throw new Error('Selected executable does not exist.');
+    }
+    const previous = this.database.getPlayniteExecutableSelection(item.id);
+    const candidates =
+      previous?.candidates.map((candidate) =>
+        resolve(candidate.fullPath).toLowerCase() ===
+        resolve(payload.executablePath).toLowerCase()
+          ? {
+              ...candidate,
+              excluded: false,
+              reasons: [...new Set([...candidate.reasons, 'Selected manually'])],
+            }
+          : candidate,
+      ) ?? [];
+    this.database.upsertPlayniteExecutableSelection({
+      candidates,
+      confidence: 'high',
+      reviewedAt: new Date().toISOString(),
+      selectedExePath: resolve(payload.executablePath),
+      status: 'reviewed',
+      steamAppId: view.item.steamAppId ?? null,
+      trackedItemId: item.id,
+      updatedAt: new Date().toISOString(),
+    });
+    await this.exportPlayniteManifest({ rescan: false });
+    this.appendEvent('info', 'Saved Playnite executable selection', {
+      executablePath: payload.executablePath,
+      trackedItemId: item.id,
+    });
+    this.emitActivityChange();
+    return this.getPlayniteStatus();
+  }
+
+  private getSteamWishlistSettings(): {
+    fetchedAt: string | null;
+    lastError: string | null;
+    profileUrl: string | null;
+    source: SteamWishlistView['source'];
+    steamId: string | null;
+  } {
+    const source = this.database.getSetting('steamWishlist.source');
+    return {
+      fetchedAt: this.database.getSetting('steamWishlist.fetchedAt'),
+      lastError: this.database.getSetting('steamWishlist.lastError'),
+      profileUrl: this.database.getSetting('steamWishlist.profileUrl'),
+      source:
+        source === 'extension_session' || source === 'public_api'
+          ? source
+          : 'cache',
+      steamId: this.database.getSetting('steamWishlist.steamId'),
+    };
+  }
+
+  private saveSteamWishlistSettings(params: {
+    fetchedAt?: string | null;
+    lastError?: string | null;
+    profileUrl?: string | null;
+    source?: SteamWishlistView['source'] | null;
+    steamId?: string | null;
+  }): void {
+    if (params.fetchedAt !== undefined) {
+      this.database.setSetting('steamWishlist.fetchedAt', params.fetchedAt);
+    }
+    if (params.lastError !== undefined) {
+      this.database.setSetting('steamWishlist.lastError', params.lastError);
+    }
+    if (params.profileUrl !== undefined) {
+      this.database.setSetting('steamWishlist.profileUrl', params.profileUrl);
+    }
+    if (params.source !== undefined) {
+      this.database.setSetting('steamWishlist.source', params.source);
+    }
+    if (params.steamId !== undefined) {
+      this.database.setSetting('steamWishlist.steamId', params.steamId);
+    }
+  }
+
+  private async buildSteamWishlistLibraryMatch(
+    appId: number,
+    trackedItemsByAppId: Map<number, TrackedItemView>,
+  ): Promise<SteamWishlistLibraryMatch> {
+    const match = trackedItemsByAppId.get(appId);
+    if (!match) {
+      return {
+        finalPathExists: false,
+        status: 'not_in_library',
+      };
+    }
+
+    const installed =
+      match.status === TrackedItemStatus.Installed ||
+      match.fileState.finalPathExists ||
+      Boolean(match.installRecord?.installedAt);
+    return {
+      finalPath: match.fileState.finalPath,
+      finalPathExists: match.fileState.finalPathExists,
+      status: installed ? 'installed' : 'tracked',
+      trackedItemId: match.item.id,
+      trackedStatus: match.status,
+      title: match.item.title,
+    };
+  }
+
+  private async buildSteamWishlistView(
+    sourceOverride?: SteamWishlistView['source'],
+  ): Promise<SteamWishlistView> {
+    const settings = this.getSteamWishlistSettings();
+    const trackedItems = await this.listTrackedItems();
+    const trackedItemsByAppId = new Map<number, TrackedItemView>();
+    for (const item of trackedItems) {
+      if (item.item.steamAppId) {
+        trackedItemsByAppId.set(item.item.steamAppId, item);
+      }
+    }
+    const pendingActions = this.database.listPendingSteamWishlistActions({
+      profileUrl: settings.profileUrl,
+      steamId: settings.steamId,
+    });
+    const pendingRemovalByAppId = new Map(
+      this.database
+        .listSteamWishlistActions('pending')
+        .filter(
+          (action) => action.actionType === 'remove' && action.appId != null,
+        )
+        .map((action) => [action.appId!, action] as const),
+    );
+    const cachedItems = this.database.listSteamWishlistItems();
+    const items = await Promise.all(
+      cachedItems.map(async (item) => {
+        const library = await this.buildSteamWishlistLibraryMatch(
+          item.appId,
+          trackedItemsByAppId,
+        );
+        return {
+          ...item,
+          canRemoveFromSteamWishlist:
+            library.status === 'installed' &&
+            !pendingRemovalByAppId.has(item.appId),
+          library,
+          removalPending: pendingRemovalByAppId.get(item.appId) ?? null,
+        };
+      }),
+    );
+
+    return {
+      fetchedAt: settings.fetchedAt,
+      items,
+      lastError: settings.lastError,
+      pendingActions,
+      profileUrl: settings.profileUrl,
+      source: sourceOverride ?? settings.source,
+      steamId: settings.steamId,
+      totalCount: items.length,
+    };
+  }
+
+  private async refreshSteamWishlistFromPublicApi(
+    steamId: string,
+  ): Promise<void> {
+    const apiItems = await fetchSteamWishlistApiItems(steamId, this.steamFetch);
+    await this.replaceSteamWishlistCache({
+      fetchedAt: new Date().toISOString(),
+      items: apiItems,
+      profileUrl: `https://store.steampowered.com/wishlist/profiles/${steamId}/`,
+      source: 'public_api',
+      steamId,
+    });
+  }
+
+  private async replaceSteamWishlistCache(
+    payload: SteamWishlistSyncPayload,
+  ): Promise<void> {
+    const fetchedAt = payload.fetchedAt ?? new Date().toISOString();
+    const byAppId = new Map<number, SteamWishlistCachedItem>();
+    const inputItems = new Map<number, SteamWishlistSyncItem>();
+    for (const item of payload.items) {
+      if (!Number.isInteger(item.appId) || item.appId <= 0) continue;
+      inputItems.set(item.appId, {
+        appId: item.appId,
+        dateAdded: item.dateAdded ?? null,
+        priority: item.priority ?? null,
+      });
+    }
+
+    if (payload.steamId) {
+      try {
+        for (const item of await fetchSteamWishlistApiItems(
+          payload.steamId,
+          this.steamFetch,
+        )) {
+          if (!inputItems.has(item.appId)) continue;
+          inputItems.set(item.appId, {
+            appId: item.appId,
+            dateAdded: item.dateAdded ?? inputItems.get(item.appId)?.dateAdded,
+            priority: item.priority ?? inputItems.get(item.appId)?.priority,
+          });
+        }
+      } catch {
+        // Session-derived app ids are still useful without public priority/date metadata.
+      }
+    }
+
+    const metadataByAppId = new Map(
+      await fetchSteamWishlistMetadata([...inputItems.keys()], this.steamFetch)
+        .then((metadata) =>
+          metadata.map((entry) => [entry.appId, entry] as const),
+        )
+        .catch(() => []),
+    );
+    for (const item of inputItems.values()) {
+      const metadata = metadataByAppId.get(item.appId);
+      const title = metadata?.title ?? `Steam App ${item.appId}`;
+      byAppId.set(item.appId, {
+        appId: item.appId,
+        coverUrl: metadata?.coverUrl ?? null,
+        dateAdded: item.dateAdded ?? null,
+        lastSeenAt: fetchedAt,
+        normalizedTitle: normalizeSteamTitle(title),
+        priceLabel: metadata?.priceLabel ?? null,
+        priority: item.priority ?? null,
+        releaseDate: metadata?.releaseDate ?? null,
+        reviewSummary: metadata?.reviewSummary ?? null,
+        storeUrl: metadata?.storeUrl ?? buildSteamStoreAppUrl(item.appId),
+        title,
+      });
+    }
+
+    this.database.replaceSteamWishlistItems([...byAppId.values()]);
+    this.saveSteamWishlistSettings({
+      fetchedAt,
+      lastError: null,
+      profileUrl: payload.profileUrl ?? null,
+      source: payload.source ?? 'extension_session',
+      steamId: payload.steamId ?? null,
+    });
+  }
+
+  async getSteamWishlist(): Promise<SteamWishlistView> {
+    const settings = this.getSteamWishlistSettings();
+    const fetchedAtMs = settings.fetchedAt
+      ? new Date(settings.fetchedAt).getTime()
+      : 0;
+    if (
+      settings.steamId &&
+      this.database.listSteamWishlistItems().length === 0 &&
+      (!settings.fetchedAt ||
+        Number.isNaN(fetchedAtMs) ||
+        Date.now() - fetchedAtMs > STEAM_WISHLIST_REFRESH_STALE_MS) &&
+      !this.database
+        .listSteamWishlistActions('pending')
+        .some((action) => action.actionType === 'sync')
+    ) {
+      try {
+        await this.refreshSteamWishlistFromPublicApi(settings.steamId);
+        return this.buildSteamWishlistView('public_api');
+      } catch (error) {
+        this.saveSteamWishlistSettings({
+          lastError:
+            error instanceof Error
+              ? error.message
+              : 'Unable to load Steam wishlist.',
+        });
+      }
+    }
+    return this.buildSteamWishlistView();
+  }
+
+  async requestSteamWishlistRefresh(): Promise<SteamWishlistView> {
+    const pendingSync = this.database
+      .listSteamWishlistActions('pending')
+      .find((action) => action.actionType === 'sync');
+    if (!pendingSync) {
+      this.database.createSteamWishlistAction({
+        actionType: 'sync',
+        title: 'Steam wishlist sync',
+      });
+      this.appendEvent('info', 'Requested Steam wishlist sync');
+    }
+    return this.buildSteamWishlistView();
+  }
+
+  async syncSteamWishlist(
+    payload: SteamWishlistSyncPayload,
+  ): Promise<SteamWishlistView> {
+    await this.replaceSteamWishlistCache(payload);
+    for (const action of this.database
+      .listSteamWishlistActions('pending')
+      .filter((candidate) => candidate.actionType === 'sync')) {
+      this.database.completeSteamWishlistAction({
+        actionId: action.id,
+        status: 'complete',
+      });
+    }
+    this.appendEvent('info', 'Synced Steam wishlist', {
+      count: payload.items.length,
+      steamId: payload.steamId ?? null,
+    });
+    return this.buildSteamWishlistView('extension_session');
+  }
+
+  listPendingSteamWishlistActions(): PendingSteamWishlistAction[] {
+    const settings = this.getSteamWishlistSettings();
+    const actions = this.database.listPendingSteamWishlistActions({
+      profileUrl: settings.profileUrl,
+      steamId: settings.steamId,
+    });
+    const hasPendingSync = actions.some((action) => action.actionType === 'sync');
+    const fetchedAtMs = settings.fetchedAt
+      ? new Date(settings.fetchedAt).getTime()
+      : 0;
+    if (
+      !hasPendingSync &&
+      (!settings.fetchedAt ||
+        Number.isNaN(fetchedAtMs) ||
+        Date.now() - fetchedAtMs > STEAM_WISHLIST_REFRESH_STALE_MS)
+    ) {
+      const action = this.database.createSteamWishlistAction({
+        actionType: 'sync',
+        title: 'Steam wishlist sync',
+      });
+      actions.push({
+        actionType: 'sync',
+        appId: null,
+        id: action.id,
+        profileUrl: settings.profileUrl,
+        requestedAt: action.requestedAt,
+        steamId: settings.steamId,
+        title: action.title,
+        trackedItemId: null,
+      });
+    }
+    return actions;
+  }
+
+  async requestSteamWishlistRemoval(payload: {
+    appId: number;
+    trackedItemId?: string | null;
+  }): Promise<SteamWishlistView> {
+    const wishlistItem = this.database
+      .listSteamWishlistItems()
+      .find((item) => item.appId === payload.appId);
+    const trackedItem = payload.trackedItemId
+      ? await this.buildTrackedItemView(payload.trackedItemId)
+      : (await this.listTrackedItems()).find(
+          (item) => item.item.steamAppId === payload.appId,
+        );
+    if (!trackedItem) {
+      throw new Error('This wishlist game is not matched in GameVault.');
+    }
+    if (trackedItem.item.steamAppId !== payload.appId) {
+      throw new Error('The matched GameVault item does not match this Steam AppID.');
+    }
+    const installed =
+      trackedItem.status === TrackedItemStatus.Installed ||
+      trackedItem.fileState.finalPathExists ||
+      Boolean(trackedItem.installRecord?.installedAt);
+    if (!installed) {
+      throw new Error(
+        'Only installed GameVault games can be removed from the Steam wishlist.',
+      );
+    }
+    if (this.database.findPendingSteamWishlistRemoval(payload.appId)) {
+      return this.buildSteamWishlistView();
+    }
+
+    this.database.createSteamWishlistAction({
+      actionType: 'remove',
+      appId: payload.appId,
+      title: wishlistItem?.title ?? trackedItem.item.steamTitle ?? trackedItem.item.title,
+      trackedItemId: trackedItem.item.id,
+    });
+    this.appendEvent('info', 'Queued Steam wishlist removal', {
+      appId: payload.appId,
+      trackedItemId: trackedItem.item.id,
+    });
+    return this.buildSteamWishlistView();
+  }
+
+  completeSteamWishlistRemoval(
+    payload: CompleteSteamWishlistRemovalPayload,
+  ): SteamWishlistRemovalRecord {
+    const action = this.database.completeSteamWishlistAction({
+      actionId: payload.actionId,
+      errorMessage: payload.success ? null : payload.errorMessage,
+      status: payload.success ? 'complete' : 'failed',
+    });
+    if (payload.success) {
+      this.database.deleteSteamWishlistItem(payload.appId);
+      this.appendEvent('info', 'Removed Steam wishlist item', {
+        appId: payload.appId,
+      });
+    } else {
+      this.saveSteamWishlistSettings({
+        lastError:
+          payload.errorMessage ?? 'Steam wishlist removal failed in browser.',
+      });
+      this.appendEvent('warn', 'Steam wishlist removal failed', {
+        appId: payload.appId,
+        errorMessage: payload.errorMessage ?? null,
+      });
+    }
+    return action;
   }
 
   async getTrackedItemStatusBySourceUrl(
@@ -3851,6 +4915,7 @@ export class GameVaultService {
             trackedItemId,
             url: mirror.url,
           },
+          { notify: false },
         );
       }
 
@@ -6456,6 +7521,8 @@ export class GameVaultService {
       });
     }
 
+    await this.exportPlayniteManifestAfterInstall(trackedItemId);
+
     this.appendEvent('info', 'Reconciled local install during refresh', {
       finalPath,
       trackedItemId,
@@ -6645,6 +7712,9 @@ export class GameVaultService {
                   jobSourceKind,
                 );
                 this.upsertDownloadJob(recoveredJob);
+                if (recoveredJob.stage === 'complete') {
+                  await this.exportPlayniteManifestAfterInstall(item.id);
+                }
               }
               continue;
             }
@@ -6867,6 +7937,9 @@ export class GameVaultService {
               });
             }
             this.upsertDownloadJob(nextJob);
+            if (nextJob.stage === 'complete') {
+              await this.exportPlayniteManifestAfterInstall(item.id);
+            }
           } catch (error) {
             this.upsertDownloadJob({
               ...job,
@@ -7220,6 +8293,12 @@ export class GameVaultService {
       myJDownloaderPasswordConfigured: Boolean(settings.encryptedPassword),
       onboarding: settings.onboarding ?? null,
       pollDailyHourLocal: settings.pollDailyHourLocal,
+      playniteExtensionsPath: settings.playniteExtensionsPath ?? null,
+      playniteIntegrationEnabled:
+        settings.playniteIntegrationEnabled ?? false,
+      playniteManifestPath: settings.playniteManifestPath ?? null,
+      playnitePluginInstalledAt: settings.playnitePluginInstalledAt ?? null,
+      playnitePluginVersion: settings.playnitePluginVersion ?? null,
       renameGameFoldersOnImport: settings.renameGameFoldersOnImport ?? true,
       rootLibraryPath: settings.rootLibraryPath,
       sourceWatchDurationDays: settings.sourceWatchDurationDays ?? 5,
@@ -7236,6 +8315,9 @@ export class GameVaultService {
     myJDownloaderEmail?: string | null;
     myJDownloaderPassword?: string | null;
     pollDailyHourLocal?: number;
+    playniteExtensionsPath?: string | null;
+    playniteIntegrationEnabled?: boolean;
+    playniteManifestPath?: string | null;
     renameGameFoldersOnImport?: boolean;
     rootLibraryPath?: string | null;
     sourceWatchDurationDays?: number;
@@ -7284,6 +8366,24 @@ export class GameVaultService {
       this.database.setSetting(
         'scheduler.pollDailyHourLocal',
         String(input.pollDailyHourLocal),
+      );
+    }
+    if (input.playniteIntegrationEnabled !== undefined) {
+      this.database.setSetting(
+        'playnite.integrationEnabled',
+        input.playniteIntegrationEnabled ? 'true' : 'false',
+      );
+    }
+    if (input.playniteExtensionsPath !== undefined) {
+      this.database.setSetting(
+        'playnite.extensionsPath',
+        input.playniteExtensionsPath?.trim() || null,
+      );
+    }
+    if (input.playniteManifestPath !== undefined) {
+      this.database.setSetting(
+        'playnite.manifestPath',
+        input.playniteManifestPath?.trim() || null,
       );
     }
     if (typeof input.sourceWatchIntervalHours === 'number') {
@@ -7866,7 +8966,7 @@ export class GameVaultService {
         sourceSnapshot.observedVersion,
       patchSelectionSource: selectionSource,
     });
-    if (!params.sourceKind && item.sourceKind === 'manual') {
+    if (!params.sourceKind) {
       const installRecord = this.database.getInstallRecord(
         params.trackedItemId,
       );
@@ -8198,6 +9298,8 @@ export class GameVaultService {
       });
     }
 
+    await this.exportPlayniteManifestAfterInstall(trackedItemId);
+
     this.appendEvent('info', 'Marked staged install as complete', {
       trackedItemId,
     });
@@ -8230,6 +9332,7 @@ export class GameVaultService {
           job,
           payload.trackedItemId,
           'Unable to remove JDownloader package during cleanup',
+          { notifyFailure: false },
         );
       }
 

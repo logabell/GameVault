@@ -2,6 +2,7 @@ import type {
   ConnectionHealthSummary,
   DownloadMirrorRecord,
   DownloadProvider,
+  JDownloaderSourcePreferences,
   MatchedSourceView,
   ParsedSourcePayload,
   SelectedDownloads,
@@ -56,13 +57,26 @@ interface HeroPresenceState {
 }
 
 function sourceRequiresMyJDownloader(
-  _sourceKind: SupportedSourceKind | null | undefined,
+  sourceKind: SupportedSourceKind | null | undefined,
+  jDownloaderEnabled: boolean | null | undefined,
+  sourcePreferences: JDownloaderSourcePreferences | null | undefined,
 ): boolean {
+  if (!jDownloaderEnabled) {
+    return false;
+  }
+  if (sourceKind === 'elamigos') {
+    return sourcePreferences?.elamigos !== false;
+  }
+  if (sourceKind === 'steamrip') {
+    return sourcePreferences?.steamrip !== false;
+  }
   return false;
 }
 
 export function getDownloadAutomationWarning(params: {
   health: ConnectionHealthSummary | null;
+  jDownloaderEnabled?: boolean | null;
+  jDownloaderSourcePreferences?: JDownloaderSourcePreferences | null;
   rootLibraryPath: string | null | undefined;
   sourceKind: SupportedSourceKind | null | undefined;
 }): {
@@ -98,7 +112,13 @@ export function getDownloadAutomationWarning(params: {
     };
   }
 
-  if (!sourceRequiresMyJDownloader(sourceKind)) {
+  if (
+    !sourceRequiresMyJDownloader(
+      sourceKind,
+      params.jDownloaderEnabled,
+      params.jDownloaderSourcePreferences,
+    )
+  ) {
     return null;
   }
 
@@ -138,6 +158,8 @@ export function getDownloadAutomationWarning(params: {
 
 export function isSourceReadyForAutomation(params: {
   health: ConnectionHealthSummary | null;
+  jDownloaderEnabled?: boolean | null;
+  jDownloaderSourcePreferences?: JDownloaderSourcePreferences | null;
   rootLibraryPath: string | null | undefined;
   sourceKind: SupportedSourceKind | null | undefined;
 }): boolean {

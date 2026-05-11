@@ -246,6 +246,10 @@ function normalizeDevice(
   };
 }
 
+function deviceIsOnline(device: { status?: string | null }): boolean {
+  return device.status?.toUpperCase() === 'ONLINE';
+}
+
 function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
@@ -882,12 +886,15 @@ export class MyJDownloaderService {
     } catch (error) {
       throw normalizeMyJDownloaderError(error);
     }
+    const onlineDevices = devices.filter(deviceIsOnline);
+    const configuredDevice = params.selectedDeviceId
+      ? devices.find((device) => device.id === params.selectedDeviceId)
+      : null;
     const selectedDeviceId =
-      params.selectedDeviceId &&
-      devices.some((device) => device.id === params.selectedDeviceId)
-        ? params.selectedDeviceId
-        : devices.length === 1
-          ? (devices[0]?.id ?? null)
+      configuredDevice && deviceIsOnline(configuredDevice)
+        ? configuredDevice.id
+        : !params.selectedDeviceId && onlineDevices.length === 1
+          ? (onlineDevices[0]?.id ?? null)
           : null;
 
     return {
@@ -932,6 +939,31 @@ export class MyJDownloaderService {
           label: 'No devices',
           message:
             'Credentials are valid, but no JDownloader devices are available yet.',
+          selectedDeviceId: null,
+        };
+      }
+
+      const configuredDevice = credentials.deviceId
+        ? snapshot.devices.find((device) => device.id === credentials.deviceId)
+        : null;
+      if (configuredDevice && !deviceIsOnline(configuredDevice)) {
+        return {
+          color: 'yellow',
+          devices: snapshot.devices,
+          label: 'JDownloader offline',
+          message:
+            'Open JDownloader on the selected device, then refresh status.',
+          selectedDeviceId: null,
+        };
+      }
+
+      if (snapshot.devices.every((device) => !deviceIsOnline(device))) {
+        return {
+          color: 'yellow',
+          devices: snapshot.devices,
+          label: 'JDownloader offline',
+          message:
+            'Open JDownloader, then refresh status once MyJDownloader reports it online.',
           selectedDeviceId: null,
         };
       }
@@ -1055,6 +1087,22 @@ export class MyJDownloaderService {
       selectedDeviceId: credentials.deviceId || null,
     });
     if (!snapshot.selectedDeviceId) {
+      const configuredDevice = credentials.deviceId
+        ? snapshot.devices.find((device) => device.id === credentials.deviceId)
+        : null;
+      if (configuredDevice && !deviceIsOnline(configuredDevice)) {
+        throw new Error(
+          'JDownloader is not open on the selected device. Open JDownloader, wait for MyJDownloader to show it online, then try again.',
+        );
+      }
+      if (
+        snapshot.devices.length > 0 &&
+        snapshot.devices.every((device) => !deviceIsOnline(device))
+      ) {
+        throw new Error(
+          'JDownloader is not open. Open JDownloader, wait for MyJDownloader to show it online, then try again.',
+        );
+      }
       throw new Error(
         'Select a MyJDownloader device before queueing downloads',
       );

@@ -5,6 +5,7 @@ import type { MyJDownloaderService } from './services/myjdownloader.js';
 import {
   GameVaultService,
   type DirectHttpDownloadRunner,
+  type PlayniteIntegrationPaths,
   type SecureValueProvider,
 } from './services/gamevault-service.js';
 import type { GameVaultDatabase } from './services/database.js';
@@ -16,6 +17,7 @@ interface CreateGameVaultServiceParams {
   myJDownloader: MyJDownloaderService;
   notify: (event: 'debug' | 'error' | 'info' | 'warn', message: string) => void;
   pickDirectoryDialog: () => Promise<string | null>;
+  playnitePaths?: PlayniteIntegrationPaths;
   secrets: SecureValueProvider;
   showWindow: (trackedItemId?: string) => void;
   sourceFetch?: SourceFetch;
@@ -38,5 +40,6 @@ export function createGameVaultService(
     params.startDirectHttpDownload,
     extractSingleStagedZipArchive,
     params.steamFetch,
+    params.playnitePaths,
   );
 }

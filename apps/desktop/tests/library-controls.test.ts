@@ -185,6 +185,10 @@ describe('library controls', () => {
     const updateAvailable = makeItem('Update Available', {
       trackingStatus: TrackedItemTrackingStatus.UpdateAvailable,
     });
+    const queuedUpdate = makeItem('Queued Update', {
+      status: TrackedItemStatus.Queued,
+      trackingStatus: TrackedItemTrackingStatus.UpdateAvailable,
+    });
     const updateWithMissingPatch = makeItem('Update Needs Attention', {
       patchMetadataStatus: 'needs_attention',
       trackingStatus: TrackedItemTrackingStatus.UpdateAvailable,
@@ -198,6 +202,8 @@ describe('library controls', () => {
 
     expect(filterLibraryItem(updateAvailable, 'updates')).toBe(true);
     expect(matchesLibraryStatusFilter(updateAvailable, 'updates')).toBe(true);
+    expect(filterLibraryItem(queuedUpdate, 'updates')).toBe(false);
+    expect(matchesLibraryStatusFilter(queuedUpdate, 'updates')).toBe(false);
     expect(filterLibraryItem(updateWithMissingPatch, 'updates')).toBe(false);
     expect(matchesLibraryStatusFilter(updateWithMissingPatch, 'updates')).toBe(
       false,
@@ -333,6 +339,27 @@ describe('library controls', () => {
         sourceKind: 'steamrip',
       }),
     ).toBe(true);
+    expect(
+      canQueueSourceUpdate({
+        connectionHealth: {
+          desktop: {
+            color: 'green',
+            label: 'Desktop ready',
+            message: 'Desktop bridge is ready.',
+          },
+          devices: [],
+          myJDownloader: {
+            color: 'red',
+            label: 'MyJDownloader unavailable',
+            message: 'Connect MyJDownloader.',
+          },
+          selectedDeviceId: null,
+        },
+        jDownloaderEnabled: true,
+        rootLibraryPath: 'D:/Games',
+        sourceKind: 'steamrip',
+      }),
+    ).toBe(false);
   });
 
   it('does not warn when only optional MyJDownloader is offline', () => {

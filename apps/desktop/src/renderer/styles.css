@@ -70,6 +70,46 @@ body {
     var(--bg);
 }
 
+.app-fatal-error {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+.app-fatal-error > div {
+  width: min(560px, 100%);
+  display: grid;
+  gap: 14px;
+  padding: 24px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--card);
+  box-shadow: var(--shadow);
+}
+
+.app-fatal-error strong {
+  font-size: 20px;
+}
+
+.app-fatal-error p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.app-fatal-error code {
+  max-height: 160px;
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--card-muted);
+  color: var(--danger);
+  white-space: pre-wrap;
+}
+
 button,
 input,
 select {
@@ -236,6 +276,26 @@ select option {
 
 .navbar-automation-status .inline-spinner {
   flex: 0 0 auto;
+}
+
+.navbar-review-alert {
+  min-width: 38px;
+  height: 38px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 10px;
+  border: 1px solid color-mix(in srgb, var(--warning) 48%, var(--border));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--warning) 14%, var(--panel-soft));
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.navbar-review-alert:hover {
+  border-color: color-mix(in srgb, var(--warning) 70%, var(--border));
 }
 
 .utility-icon-button,
@@ -531,6 +591,165 @@ code {
   height: 34px;
   border-color: transparent;
   background: transparent;
+}
+
+.toggle-field {
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  align-self: end;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--panel-soft);
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.toggle-field input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
+.wishlist-status-message {
+  margin-top: 10px;
+}
+
+.wishlist-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.wishlist-row {
+  display: grid;
+  grid-template-columns: 172px minmax(0, 1fr);
+  min-height: 142px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--card);
+  box-shadow: 0 12px 26px rgba(0, 0, 0, 0.18);
+  overflow: hidden;
+}
+
+.wishlist-row__media {
+  min-height: 142px;
+  background: var(--card-muted);
+}
+
+.wishlist-row__cover {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
+.wishlist-row__cover.is-placeholder {
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.wishlist-row__body {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  padding: 14px;
+}
+
+.wishlist-row__heading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: start;
+}
+
+.wishlist-row h3 {
+  margin: 6px 0 3px;
+  color: var(--ink);
+  font-size: 20px;
+  font-weight: 500;
+  line-height: 1.18;
+  overflow-wrap: anywhere;
+}
+
+.wishlist-row__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.wishlist-remove-button:not(:disabled) {
+  color: var(--danger);
+}
+
+.wishlist-row__meta {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.wishlist-row__meta div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--panel-soft);
+}
+
+.wishlist-row__meta dt {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.wishlist-row__meta dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--muted-strong);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.wishlist-status-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: var(--panel-strong);
+  color: var(--muted-strong);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.wishlist-status-chip--not_in_library {
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 16%, var(--panel-strong));
+}
+
+.wishlist-status-chip--tracked {
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 16%, var(--panel-strong));
+}
+
+.wishlist-status-chip--installed {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, var(--panel-strong));
 }
 
 .game-card-grid {
@@ -2008,7 +2227,7 @@ code {
 
 .integration-status-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
   gap: 22px;
   margin-left: 52px;
 }
@@ -2052,6 +2271,11 @@ code {
 .integration-status-card p {
   color: var(--muted-strong);
   font-size: 13px;
+}
+
+.playnite-settings-panel {
+  display: grid;
+  gap: 16px;
 }
 
 .integration-account-panel {
@@ -2901,6 +3125,93 @@ code {
   width: min(720px, 100%);
 }
 
+.playnite-review-modal {
+  width: min(820px, 100%);
+}
+
+.playnite-review-modal__nav {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.playnite-review-modal__nav-button {
+  min-height: 38px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding-inline: 10px;
+}
+
+.playnite-review-modal__count {
+  min-width: 58px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-soft);
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 800;
+  text-align: center;
+}
+
+.playnite-candidate-list {
+  max-height: min(52vh, 520px);
+  display: grid;
+  gap: 10px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.playnite-candidate {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--panel-soft);
+  color: var(--ink);
+  text-align: left;
+}
+
+.playnite-candidate.is-selected {
+  border-color: color-mix(in srgb, var(--accent) 68%, var(--border));
+  background: color-mix(in srgb, var(--accent) 9%, var(--panel-soft));
+}
+
+.playnite-candidate.is-excluded {
+  opacity: 0.66;
+}
+
+.playnite-candidate__main,
+.playnite-candidate__meta,
+.playnite-candidate__reasons {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.playnite-candidate__main span {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.playnite-candidate__meta span,
+.playnite-candidate__reasons small {
+  padding: 3px 7px;
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  color: var(--muted-strong);
+  font-size: 11px;
+  font-weight: 800;
+}
+
 .manual-update-modal {
   width: min(760px, 100%);
 }
@@ -3564,6 +3875,9 @@ code {
   .detail-grid,
   .settings-grid,
   .metadata-grid,
+  .wishlist-row,
+  .wishlist-row__heading,
+  .wishlist-row__meta,
   .library-root-row,
   .ignored-row,
   .steam-search-row,

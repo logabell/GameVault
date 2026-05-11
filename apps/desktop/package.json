@@ -34,6 +34,7 @@
     "asar": true,
     "asarUnpack": [
       "dist/native-host/**/*",
+      "dist/playnite-plugin/**/*",
       "node_modules/7zip-bin-full/**/*"
     ],
     "directories": {

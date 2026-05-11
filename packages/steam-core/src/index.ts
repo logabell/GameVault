@@ -4,3 +4,4 @@ export * from './rss.js';
 export * from './search.js';
 export * from './steamdb-builds.js';
 export * from './watch.js';
+export * from './wishlist.js';

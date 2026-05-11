@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net462</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>GameVault.Playnite</AssemblyName>
+    <RootNamespace>GameVault.Playnite</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="PlayniteSDK" Version="6.16.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="extension.yaml" CopyToOutputDirectory="Always" />
+  </ItemGroup>
+</Project>

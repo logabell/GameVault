@@ -9,6 +9,7 @@ import {
   finalizeSteamRipExtraction,
   hasPortableArchiveContentFolder,
   normalizeDuplicateNestedFolder,
+  pathHasContent,
   pathExists,
   planLibraryPaths,
   planPortableArchiveExtractPathFromJob,
@@ -17,6 +18,30 @@ import {
   renameLibraryFolder,
   scanImportFolders,
 } from '../src/main/services/files.js';
+
+describe('pathHasContent', () => {
+  it('requires directories to contain at least one entry', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'gamevault-content-'));
+    try {
+      const emptyFolder = join(tempRoot, 'Schedule I');
+      const filledFolder = join(tempRoot, 'Hades');
+      const filePath = join(tempRoot, 'readme.txt');
+      await mkdir(emptyFolder, { recursive: true });
+      await mkdir(filledFolder, { recursive: true });
+      await writeFile(join(filledFolder, 'Hades.exe'), 'game');
+      await writeFile(filePath, 'file');
+
+      await expect(pathHasContent(emptyFolder)).resolves.toBe(false);
+      await expect(pathHasContent(filledFolder)).resolves.toBe(true);
+      await expect(pathHasContent(filePath)).resolves.toBe(true);
+      await expect(pathHasContent(join(tempRoot, 'missing'))).resolves.toBe(
+        false,
+      );
+    } finally {
+      await rm(tempRoot, { force: true, recursive: true });
+    }
+  });
+});
 
 describe('planLibraryPaths', () => {
   it('uses staging suffixes and extracts SteamRIP into a staging contents workspace', async () => {

@@ -1,5 +1,8 @@
 import {
+  Component,
   startTransition,
+  type ErrorInfo,
+  type ReactNode,
   type SyntheticEvent,
   useCallback,
   useEffect,
@@ -30,6 +33,7 @@ import {
   faFolderOpen,
   faGamepad,
   faGear,
+  faHeart,
   faList,
   faLink,
   faMagnifyingGlass,
@@ -73,7 +77,10 @@ import type {
   NativeHostRegistrationMetadata,
   NativeHostRegistrationResult,
   OnboardingState,
+  PlayniteExecutableSelectionRecord,
+  PlayniteIntegrationStatus,
   RegisterExtensionNativeHostPayload,
+  SavePlayniteExecutableSelectionPayload,
   RemoveTrackedItemMode,
   SaveImportBatchPayload,
   SaveImportBatchResult,
@@ -86,6 +93,8 @@ import type {
   SteamMatchResolutionPayload,
   SteamPatchCandidate,
   SteamPatchFeedResult,
+  SteamWishlistItemView,
+  SteamWishlistView,
   SourceKind,
   SupportedSourceKind,
   ThemeMode,
@@ -154,10 +163,23 @@ import {
   sortActivityIssues,
 } from './activity-report.js';
 
-type Section = 'library' | 'imports' | 'activity' | 'settings';
+type Section = 'library' | 'wishlist' | 'imports' | 'activity' | 'settings';
 type ActivityLogFilter = 'all' | 'error' | 'warn';
 type BrowserSetupTab = 'chromium' | 'firefox';
 type LibraryViewMode = 'cards' | 'list';
+type WishlistFilter =
+  | 'all'
+  | 'installed'
+  | 'in_library'
+  | 'not_in_library'
+  | 'ready_to_remove'
+  | 'tracked';
+type WishlistSortMode =
+  | 'dateAdded'
+  | 'libraryStatus'
+  | 'priority'
+  | 'releaseDate'
+  | 'title';
 type ImportSortKey = 'folder' | 'patchMetadata' | 'steamMatch';
 type SortDirection = 'asc' | 'desc';
 type ResolvedTheme = 'light' | 'dark';
@@ -261,6 +283,9 @@ type AppDialogOptions = {
   title?: string;
   variant?: AppDialogVariant;
 };
+type AppErrorBoundaryState = {
+  error: Error | null;
+};
 
 const DESKTOP_LIBRARY_VIEW_STORAGE_KEY = 'gamevault:desktop:library-view';
 const PATCH_EDITOR_BACKFILL_POLL_INTERVAL_MS = 750;
@@ -305,6 +330,9 @@ const DEFAULT_SETTINGS_DRAFT = {
     steamrip: true,
   },
   pollDailyHourLocal: '9',
+  playniteExtensionsPath: '',
+  playniteIntegrationEnabled: false,
+  playniteManifestPath: '',
   sourceWatchDurationDays: '5',
   sourceWatchIntervalHours: '8',
 };
@@ -350,7 +378,11 @@ declare global {
       getExtensionSetupInfo(): Promise<ExtensionSetupInfo>;
       getActivity(): Promise<ActivityView>;
       getLogs(): Promise<EventLogRecord[]>;
+      getPlayniteStatus(payload?: {
+        refresh?: boolean;
+      }): Promise<PlayniteIntegrationStatus>;
       getSettings(): Promise<SettingsView>;
+      getSteamWishlist(): Promise<SteamWishlistView>;
       listTrackedItems(): Promise<TrackedItemView[]>;
       markDownloadFailed(trackedItemId: string): Promise<TrackedItemView>;
       onActivityChange(
@@ -367,6 +399,11 @@ declare global {
         sourceKind: SupportedSourceKind;
         trackedItemId: string;
       }): Promise<TrackedItemView>;
+      requestSteamWishlistRefresh(): Promise<SteamWishlistView>;
+      requestSteamWishlistRemoval(payload: {
+        appId: number;
+        trackedItemId?: string | null;
+      }): Promise<SteamWishlistView>;
       refreshTrackedItem(trackedItemId: string): Promise<unknown>;
       removeTrackedItem(payload: {
         trackedItemId: string;
@@ -401,6 +438,9 @@ declare global {
         jDownloaderSourcePreferences?: SettingsView['jDownloaderSourcePreferences'];
         libraryRoots?: LibraryRootRecord[];
         pollDailyHourLocal?: number;
+        playniteExtensionsPath?: string | null;
+        playniteIntegrationEnabled?: boolean;
+        playniteManifestPath?: string | null;
         renameGameFoldersOnImport?: boolean;
         rootLibraryPath?: string | null;
         sourceWatchDurationDays?: number;
@@ -410,6 +450,9 @@ declare global {
       saveOnboardingState(
         payload: Partial<OnboardingState>,
       ): Promise<SettingsView>;
+      savePlayniteExecutableSelection(
+        payload: SavePlayniteExecutableSelectionPayload,
+      ): Promise<PlayniteIntegrationStatus>;
       scanImportCandidates(
         payload?: ImportScanPayload,
       ): Promise<ImportCandidate[]>;
@@ -417,6 +460,10 @@ declare global {
         folderName: string;
         rootPath: string;
       }): Promise<IgnoredImportFolderRecord[]>;
+      installPlaynitePlugin(payload: {
+        extensionsPath?: string | null;
+      }): Promise<PlayniteIntegrationStatus>;
+      refreshPlayniteIntegration(): Promise<PlayniteIntegrationStatus>;
       restoreImportFolder(payload: {
         id: string;
       }): Promise<IgnoredImportFolderRecord[]>;
@@ -464,6 +511,25 @@ function formatBytes(value: number | null | undefined): string {
     unitIndex += 1;
   }
   return `${size.toFixed(size >= 10 || unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
+function formatPlayniteConfidence(
+  selection: PlayniteExecutableSelectionRecord | null | undefined,
+): string {
+  if (!selection) return 'Not scanned';
+  if (selection.status === 'reviewed') return 'Reviewed';
+  if (selection.status === 'missing') return 'Missing';
+  return selection.confidence === 'high'
+    ? 'High confidence'
+    : selection.confidence === 'medium'
+      ? 'Medium confidence'
+      : 'Needs review';
+}
+
+function isReviewablePlayniteCandidate(
+  candidate: PlayniteExecutableSelectionRecord['candidates'][number],
+): boolean {
+  return !candidate.excluded && candidate.score > 0;
 }
 
 function progressPercent(item: TrackedItemView): number | null {
@@ -819,6 +885,9 @@ function createSettingsDraftFromSettings(loadedSettings: SettingsView): {
     SettingsView['jDownloaderSourcePreferences']
   >;
   pollDailyHourLocal: string;
+  playniteExtensionsPath: string;
+  playniteIntegrationEnabled: boolean;
+  playniteManifestPath: string;
   sourceWatchDurationDays: string;
   sourceWatchIntervalHours: string;
 } {
@@ -834,6 +903,10 @@ function createSettingsDraftFromSettings(loadedSettings: SettingsView): {
       loadedSettings.pollDailyHourLocal ??
         Number(DEFAULT_SETTINGS_DRAFT.pollDailyHourLocal),
     ),
+    playniteExtensionsPath: loadedSettings.playniteExtensionsPath ?? '',
+    playniteIntegrationEnabled:
+      loadedSettings.playniteIntegrationEnabled ?? false,
+    playniteManifestPath: loadedSettings.playniteManifestPath ?? '',
     sourceWatchDurationDays: String(
       loadedSettings.sourceWatchDurationDays ??
         Number(DEFAULT_SETTINGS_DRAFT.sourceWatchDurationDays),
@@ -1060,6 +1133,131 @@ function formatRelativeTime(value: string | null | undefined): string {
   if (hours < 48) return `${hours} hr ago`;
   const days = Math.floor(hours / 24);
   return `${days} days ago`;
+}
+
+function formatDateLabel(value: string | null | undefined): string {
+  if (!value) return 'Unknown';
+  const timestamp = new Date(value).getTime();
+  if (Number.isNaN(timestamp)) return 'Unknown';
+  return new Intl.DateTimeFormat(undefined, {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+  }).format(new Date(timestamp));
+}
+
+function getWishlistLibraryStatusLabel(item: SteamWishlistItemView): string {
+  if (item.library.status === 'not_in_library') return 'Not in GameVault';
+  if (item.library.status === 'installed') return 'Installed';
+  return 'Tracked';
+}
+
+function getWishlistFilterLabel(filter: WishlistFilter): string {
+  switch (filter) {
+    case 'all':
+      return 'All';
+    case 'in_library':
+      return 'In GameVault';
+    case 'installed':
+      return 'Installed';
+    case 'not_in_library':
+      return 'Not in GameVault';
+    case 'ready_to_remove':
+      return 'Ready to remove';
+    case 'tracked':
+      return 'Tracked';
+  }
+}
+
+function getDefaultWishlistSortDirection(
+  sort: WishlistSortMode,
+): SortDirection {
+  return sort === 'title' || sort === 'libraryStatus' ? 'asc' : 'desc';
+}
+
+function wishlistMatchesSearch(
+  item: SteamWishlistItemView,
+  search: string,
+): boolean {
+  const normalized = search.trim().toLowerCase();
+  if (!normalized) return true;
+  return [
+    item.title,
+    item.library.title,
+    item.appId.toString(),
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase()
+    .includes(normalized);
+}
+
+function wishlistMatchesFilter(
+  item: SteamWishlistItemView,
+  filter: WishlistFilter,
+  hideLibrary: boolean,
+): boolean {
+  if (hideLibrary && item.library.status !== 'not_in_library') {
+    return false;
+  }
+
+  switch (filter) {
+    case 'all':
+      return true;
+    case 'in_library':
+      return item.library.status !== 'not_in_library';
+    case 'installed':
+      return item.library.status === 'installed';
+    case 'not_in_library':
+      return item.library.status === 'not_in_library';
+    case 'ready_to_remove':
+      return item.canRemoveFromSteamWishlist;
+    case 'tracked':
+      return item.library.status === 'tracked';
+  }
+}
+
+function wishlistStatusRank(item: SteamWishlistItemView): number {
+  if (item.library.status === 'not_in_library') return 0;
+  if (item.library.status === 'tracked') return 1;
+  return 2;
+}
+
+function compareWishlistNullableTime(
+  left: string | null | undefined,
+  right: string | null | undefined,
+): number {
+  const leftTime = left ? new Date(left).getTime() : Number.NaN;
+  const rightTime = right ? new Date(right).getTime() : Number.NaN;
+  const normalizedLeft = Number.isNaN(leftTime) ? 0 : leftTime;
+  const normalizedRight = Number.isNaN(rightTime) ? 0 : rightTime;
+  return normalizedLeft - normalizedRight;
+}
+
+function sortWishlistItems(
+  items: SteamWishlistItemView[],
+  sort: WishlistSortMode,
+  direction: SortDirection,
+): SteamWishlistItemView[] {
+  const modifier = direction === 'asc' ? 1 : -1;
+  return [...items].sort((left, right) => {
+    let result = 0;
+    if (sort === 'dateAdded') {
+      result = compareWishlistNullableTime(left.dateAdded, right.dateAdded);
+    } else if (sort === 'releaseDate') {
+      result = compareWishlistNullableTime(left.releaseDate, right.releaseDate);
+    } else if (sort === 'libraryStatus') {
+      result = wishlistStatusRank(left) - wishlistStatusRank(right);
+    } else if (sort === 'priority') {
+      result = (left.priority ?? Number.MAX_SAFE_INTEGER) -
+        (right.priority ?? Number.MAX_SAFE_INTEGER);
+    } else {
+      result = left.title.localeCompare(right.title);
+    }
+    return result === 0
+      ? left.title.localeCompare(right.title)
+      : result * modifier;
+  });
 }
 
 function formatRelativeFuture(value: string | null | undefined): string {
@@ -1744,6 +1942,54 @@ function handleArtworkFallback(event: SyntheticEvent<HTMLImageElement>) {
   }
 }
 
+class AppErrorBoundary extends Component<
+  { children: ReactNode },
+  AppErrorBoundaryState
+> {
+  override state: AppErrorBoundaryState = { error: null };
+
+  static getDerivedStateFromError(error: Error): AppErrorBoundaryState {
+    return { error };
+  }
+
+  override componentDidCatch(error: Error, info: ErrorInfo): void {
+    console.error('Renderer render error', error, info.componentStack);
+  }
+
+  override render() {
+    if (this.state.error) {
+      return (
+        <main className="app-fatal-error" role="alert">
+          <div>
+            <strong>GameVault hit a renderer error.</strong>
+            <p>
+              The app stayed open so the error can be fixed instead of turning
+              into a blank screen.
+            </p>
+            <code>{this.state.error.message}</code>
+            <button
+              className="primary-button"
+              onClick={() => window.location.reload()}
+              type="button"
+            >
+              Reload App
+            </button>
+          </div>
+        </main>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+window.addEventListener('error', (event) => {
+  console.error('Renderer uncaught error', event.error ?? event.message);
+});
+
+window.addEventListener('unhandledrejection', (event) => {
+  console.error('Renderer unhandled rejection', event.reason);
+});
+
 function App() {
   const [section, setSection] = useState<Section>('library');
   const [libraryFilter, setLibraryFilter] = useState<LibraryFilter>('tracked');
@@ -1756,6 +2002,22 @@ function App() {
   const [libraryViewMode, setLibraryViewMode] = useState<LibraryViewMode>(() =>
     readStoredLibraryViewMode(DESKTOP_LIBRARY_VIEW_STORAGE_KEY),
   );
+  const [steamWishlist, setSteamWishlist] = useState<SteamWishlistView>({
+    items: [],
+    pendingActions: [],
+    source: 'cache',
+    totalCount: 0,
+  });
+  const [wishlistSearch, setWishlistSearch] = useState('');
+  const [wishlistFilter, setWishlistFilter] =
+    useState<WishlistFilter>('not_in_library');
+  const [wishlistHideLibrary, setWishlistHideLibrary] = useState(true);
+  const [wishlistSort, setWishlistSort] =
+    useState<WishlistSortMode>('dateAdded');
+  const [wishlistSortDirection, setWishlistSortDirection] =
+    useState<SortDirection>('desc');
+  const [wishlistBusy, setWishlistBusy] = useState(false);
+  const [wishlistMessage, setWishlistMessage] = useState<string | null>(null);
   const [detailsItemId, setDetailsItemId] = useState<string | null>(null);
   const [items, setItems] = useState<TrackedItemView[]>([]);
   const [activity, setActivity] = useState<ActivityView | null>(null);
@@ -1837,6 +2099,15 @@ function App() {
     useState(false);
   const [jDownloaderStatus, setJDownloaderStatus] =
     useState<JDownloaderInstallStatus | null>(null);
+  const [playniteStatus, setPlayniteStatus] =
+    useState<PlayniteIntegrationStatus | null>(null);
+  const [playniteBusy, setPlayniteBusy] = useState(false);
+  const [playniteMessage, setPlayniteMessage] = useState<string | null>(null);
+  const [playniteReview, setPlayniteReview] = useState<{
+    executablePath: string;
+    selection: PlayniteExecutableSelectionRecord;
+    title: string;
+  } | null>(null);
   const [browserExtensionStatus, setBrowserExtensionStatus] =
     useState<BrowserExtensionInstallStatus | null>(null);
   const [extensionSetupInfo, setExtensionSetupInfo] =
@@ -1915,6 +2186,43 @@ function App() {
       librarySort,
       librarySortDirection,
       libraryStatusFilter,
+    ],
+  );
+  const wishlistFilterCounts = useMemo(() => {
+    const base = steamWishlist.items;
+    return {
+      all: base.length,
+      in_library: base.filter(
+        (item) => item.library.status !== 'not_in_library',
+      ).length,
+      installed: base.filter((item) => item.library.status === 'installed')
+        .length,
+      not_in_library: base.filter(
+        (item) => item.library.status === 'not_in_library',
+      ).length,
+      ready_to_remove: base.filter((item) => item.canRemoveFromSteamWishlist)
+        .length,
+      tracked: base.filter((item) => item.library.status === 'tracked').length,
+    } satisfies Record<WishlistFilter, number>;
+  }, [steamWishlist.items]);
+  const visibleWishlistItems = useMemo(
+    () =>
+      sortWishlistItems(
+        steamWishlist.items.filter(
+          (item) =>
+            wishlistMatchesSearch(item, wishlistSearch) &&
+            wishlistMatchesFilter(item, wishlistFilter, wishlistHideLibrary),
+        ),
+        wishlistSort,
+        wishlistSortDirection,
+      ),
+    [
+      steamWishlist.items,
+      wishlistFilter,
+      wishlistHideLibrary,
+      wishlistSearch,
+      wishlistSort,
+      wishlistSortDirection,
     ],
   );
   const detailsItem = useMemo(
@@ -2113,13 +2421,15 @@ function App() {
   }, [appDialog, closeAppDialog]);
 
   async function refreshItems() {
-    const [trackedItems, loadedActivity] = await Promise.all([
+    const [trackedItems, loadedActivity, loadedWishlist] = await Promise.all([
       window.gameVaultApi.listTrackedItems(),
       window.gameVaultApi.getActivity(),
+      window.gameVaultApi.getSteamWishlist(),
     ]);
     startTransition(() => {
       setItems(trackedItems);
       setActivity(loadedActivity);
+      setSteamWishlist(loadedWishlist);
     });
   }
 
@@ -2200,6 +2510,161 @@ function App() {
       return nextConnectionHealth;
     } finally {
       setHealthRefreshBusy(false);
+    }
+  }
+
+  async function refreshPlayniteStatus(options?: { refresh?: boolean }) {
+    try {
+      const nextStatus = await window.gameVaultApi.getPlayniteStatus(options);
+      setPlayniteStatus(nextStatus);
+      return nextStatus;
+    } catch (error) {
+      setPlayniteMessage(
+        error instanceof Error
+          ? error.message
+          : 'Unable to refresh Playnite integration.',
+      );
+      return null;
+    }
+  }
+
+  async function installPlaynitePlugin() {
+    setPlayniteBusy(true);
+    setPlayniteMessage(null);
+    try {
+      const nextStatus = await window.gameVaultApi.installPlaynitePlugin({
+        extensionsPath: settingsDraft.playniteExtensionsPath.trim() || null,
+      });
+      setPlayniteStatus(nextStatus);
+      await refreshSettings();
+      setPlayniteMessage(
+        'Playnite plugin installed. Start or restart Playnite to load the GameVault integration.',
+      );
+    } catch (error) {
+      setPlayniteMessage(
+        error instanceof Error
+          ? error.message
+          : 'Unable to install the Playnite plugin.',
+      );
+    } finally {
+      setPlayniteBusy(false);
+    }
+  }
+
+  async function rescanPlayniteIntegration() {
+    setPlayniteBusy(true);
+    setPlayniteMessage(null);
+    try {
+      const nextStatus = await window.gameVaultApi.refreshPlayniteIntegration();
+      setPlayniteStatus(nextStatus);
+      setPlayniteMessage('Playnite manifest refreshed.');
+    } catch (error) {
+      setPlayniteMessage(
+        error instanceof Error
+          ? error.message
+          : 'Unable to refresh Playnite integration.',
+      );
+    } finally {
+      setPlayniteBusy(false);
+    }
+  }
+
+  async function savePlayniteReviewSelection() {
+    if (!playniteReview) return;
+    const currentReviewIndex =
+      playniteStatus?.pendingReviews.findIndex(
+        (review) =>
+          review.trackedItemId === playniteReview.selection.trackedItemId,
+      ) ?? -1;
+    setPlayniteBusy(true);
+    setPlayniteMessage(null);
+    try {
+      const nextStatus =
+        await window.gameVaultApi.savePlayniteExecutableSelection({
+          executablePath: playniteReview.executablePath,
+          trackedItemId: playniteReview.selection.trackedItemId,
+        });
+      setPlayniteStatus(nextStatus);
+      const nextReview =
+        nextStatus.pendingReviews[currentReviewIndex] ??
+        nextStatus.pendingReviews[currentReviewIndex - 1] ??
+        nextStatus.pendingReviews[0] ??
+        null;
+      setPlayniteReview(
+        nextReview ? createPlayniteReviewState(nextReview) : null,
+      );
+      setPlayniteMessage('Playnite launch executable saved.');
+    } catch (error) {
+      setPlayniteMessage(
+        error instanceof Error
+          ? error.message
+          : 'Unable to save Playnite executable selection.',
+      );
+    } finally {
+      setPlayniteBusy(false);
+    }
+  }
+
+  function createPlayniteReviewState(
+    review: PlayniteIntegrationStatus['pendingReviews'][number],
+  ): {
+    executablePath: string;
+    selection: PlayniteExecutableSelectionRecord;
+    title: string;
+  } {
+    const firstViable =
+      review.selection.candidates.find(isReviewablePlayniteCandidate) ??
+      null;
+    return {
+      executablePath:
+        review.selection.selectedExePath ?? firstViable?.fullPath ?? '',
+      selection: review.selection,
+      title: review.gameTitle,
+    };
+  }
+
+  function openPlayniteReview(
+    review = playniteStatus?.pendingReviews[0] ?? null,
+  ) {
+    if (!review) return;
+    setPlayniteMessage(null);
+    setPlayniteReview(createPlayniteReviewState(review));
+  }
+
+  function openPlayniteReviewAtIndex(index: number) {
+    const reviews = playniteStatus?.pendingReviews ?? [];
+    if (reviews.length === 0) return;
+    const normalizedIndex = ((index % reviews.length) + reviews.length) % reviews.length;
+    openPlayniteReview(reviews[normalizedIndex]);
+  }
+
+  function navigatePlayniteReview(offset: number) {
+    const reviews = playniteStatus?.pendingReviews ?? [];
+    if (!playniteReview || reviews.length === 0) return;
+    const currentIndex = reviews.findIndex(
+      (review) => review.trackedItemId === playniteReview.selection.trackedItemId,
+    );
+    openPlayniteReviewAtIndex((currentIndex >= 0 ? currentIndex : 0) + offset);
+  }
+
+  async function refreshSteamWishlist() {
+    setWishlistBusy(true);
+    setWishlistMessage(null);
+    try {
+      const nextWishlist =
+        await window.gameVaultApi.requestSteamWishlistRefresh();
+      setSteamWishlist(nextWishlist);
+      setWishlistMessage(
+        'Wishlist sync requested. Keep the browser extension enabled and signed in to Steam.',
+      );
+    } catch (error) {
+      setWishlistMessage(
+        error instanceof Error
+          ? error.message
+          : 'Unable to request Steam wishlist sync.',
+      );
+    } finally {
+      setWishlistBusy(false);
     }
   }
 
@@ -2554,29 +3019,47 @@ function App() {
 
   async function saveSettingsDraft() {
     setSettingsSaveStatus('saving');
+    setPlayniteMessage(null);
     try {
-      setSettings(
-        await window.gameVaultApi.saveSettings({
-          jDownloaderEnabled: settingsDraft.jDownloaderEnabled,
-          jDownloaderSourcePreferences:
-            settingsDraft.jDownloaderSourcePreferences,
-          libraryRoots: libraryRootsDraft,
-          pollDailyHourLocal: Number(settingsDraft.pollDailyHourLocal),
-          renameGameFoldersOnImport: renameOnImportDraft,
-          sourceWatchDurationDays: Number(
-            settingsDraft.sourceWatchDurationDays,
-          ),
-          sourceWatchIntervalHours: Number(
-            settingsDraft.sourceWatchIntervalHours,
-          ),
-          themeMode: settings.themeMode,
-        }),
-      );
+      const nextSettings = await window.gameVaultApi.saveSettings({
+        jDownloaderEnabled: settingsDraft.jDownloaderEnabled,
+        jDownloaderSourcePreferences:
+          settingsDraft.jDownloaderSourcePreferences,
+        libraryRoots: libraryRootsDraft,
+        pollDailyHourLocal: Number(settingsDraft.pollDailyHourLocal),
+        playniteExtensionsPath:
+          settingsDraft.playniteExtensionsPath.trim() || null,
+        playniteIntegrationEnabled:
+          settingsDraft.playniteIntegrationEnabled,
+        playniteManifestPath:
+          settingsDraft.playniteManifestPath.trim() || null,
+        renameGameFoldersOnImport: renameOnImportDraft,
+        sourceWatchDurationDays: Number(
+          settingsDraft.sourceWatchDurationDays,
+        ),
+        sourceWatchIntervalHours: Number(
+          settingsDraft.sourceWatchIntervalHours,
+        ),
+        themeMode: settings.themeMode,
+      });
+      setSettings(nextSettings);
       await refreshSettings();
+      const nextPlayniteStatus = await refreshPlayniteStatus();
+      if (
+        nextSettings.playniteIntegrationEnabled === true &&
+        nextPlayniteStatus &&
+        !nextPlayniteStatus.installed
+      ) {
+        setPlayniteMessage(
+          'Playnite export is enabled. Install the bundled plugin and GameVault will keep the Playnite manifest current.',
+        );
+      }
       setSettingsSaveStatus('saved');
     } catch (error) {
       setSettingsSaveStatus('idle');
-      throw error;
+      setPlayniteMessage(
+        error instanceof Error ? error.message : 'Unable to save settings.',
+      );
     }
   }
 
@@ -3712,19 +4195,43 @@ function App() {
   }, [detailsItemId]);
 
   useEffect(() => {
+    const playniteStatusRequest = window.gameVaultApi
+      .getPlayniteStatus()
+      .catch((error) => {
+        setPlayniteMessage(
+          error instanceof Error
+            ? error.message
+            : 'Unable to load Playnite integration status.',
+        );
+        return null;
+      });
     void Promise.all([
       window.gameVaultApi.listTrackedItems(),
       window.gameVaultApi.getSettings(),
       window.gameVaultApi.getActivity(),
       window.gameVaultApi.getConnectionHealth(),
       window.gameVaultApi.getDesktopHealth(),
+      playniteStatusRequest,
+      window.gameVaultApi.getSteamWishlist(),
     ]).then(
-      ([trackedItems, loadedSettings, loadedActivity, health, desktop]) => {
+      ([
+        trackedItems,
+        loadedSettings,
+        loadedActivity,
+        health,
+        desktop,
+        loadedPlayniteStatus,
+        loadedWishlist,
+      ]) => {
         setItems(trackedItems);
         setSettings(loadedSettings);
         setActivity(loadedActivity);
         setConnectionHealth(health);
         setDesktopHealth(desktop);
+        if (loadedPlayniteStatus) {
+          setPlayniteStatus(loadedPlayniteStatus);
+        }
+        setSteamWishlist(loadedWishlist);
         syncSettingsDrafts(loadedSettings);
         setAuthDraft({
           email: loadedSettings.myJDownloaderEmail ?? '',
@@ -3754,6 +4261,17 @@ function App() {
       setActivity(payload.activity);
     });
   }, []);
+
+  useEffect(() => {
+    if (steamWishlist.pendingActions.length === 0) return undefined;
+    const timer = window.setInterval(() => {
+      void window.gameVaultApi
+        .getSteamWishlist()
+        .then((nextWishlist) => setSteamWishlist(nextWishlist))
+        .catch(() => undefined);
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [steamWishlist.pendingActions.length]);
 
   useEffect(() => {
     if (!onboardingOpen) return;
@@ -4768,6 +5286,41 @@ function App() {
     }
   }
 
+  async function removeInstalledWishlistItem(item: SteamWishlistItemView) {
+    if (!item.library.trackedItemId) return;
+    const confirmed = await showConfirm(
+      `Remove ${item.title} from your Steam wishlist? GameVault has it marked as ${getWishlistLibraryStatusLabel(item).toLowerCase()}.`,
+      {
+        confirmLabel: 'Remove from Wishlist',
+        title: 'Remove Steam Wishlist Item',
+        variant: 'danger',
+      },
+    );
+    if (!confirmed) return;
+
+    setWishlistBusy(true);
+    setWishlistMessage(null);
+    try {
+      const nextWishlist =
+        await window.gameVaultApi.requestSteamWishlistRemoval({
+          appId: item.appId,
+          trackedItemId: item.library.trackedItemId,
+        });
+      setSteamWishlist(nextWishlist);
+      setWishlistMessage(
+        'Removal queued. The browser extension will finish it through your Steam session.',
+      );
+    } catch (error) {
+      await showAlert(
+        error instanceof Error
+          ? error.message
+          : 'Unable to queue Steam wishlist removal.',
+      );
+    } finally {
+      setWishlistBusy(false);
+    }
+  }
+
   function renderLibraryArtwork(
     item: TrackedItemView,
     className: string,
@@ -5555,6 +6108,9 @@ function App() {
                 const isRefreshing = sourceBusyKind === sourceKind;
                 const canDownloadSource = canQueueSourceUpdate({
                   connectionHealth,
+                  jDownloaderEnabled: settings.jDownloaderEnabled,
+                  jDownloaderSourcePreferences:
+                    settings.jDownloaderSourcePreferences,
                   rootLibraryPath: settings.rootLibraryPath,
                   sourceKind,
                 });
@@ -6129,6 +6685,280 @@ function App() {
     );
   }
 
+  function renderWishlistArtwork(item: SteamWishlistItemView) {
+    return item.coverUrl ? (
+      <img
+        alt={item.title}
+        className="wishlist-row__cover"
+        src={item.coverUrl}
+      />
+    ) : (
+      <div className="wishlist-row__cover is-placeholder">
+        <span>Steam</span>
+      </div>
+    );
+  }
+
+  function renderWishlistItem(item: SteamWishlistItemView) {
+    const pendingRemoval = item.removalPending?.status === 'pending';
+    return (
+      <article className="wishlist-row" key={item.appId}>
+        <div className="wishlist-row__media">{renderWishlistArtwork(item)}</div>
+        <div className="wishlist-row__body">
+          <div className="wishlist-row__heading">
+            <div>
+              <div className="chip-row">
+                <span
+                  className={`wishlist-status-chip wishlist-status-chip--${item.library.status}`}
+                >
+                  {getWishlistLibraryStatusLabel(item)}
+                </span>
+                {pendingRemoval ? (
+                  <span className="tracking-chip watching_source">
+                    Removal pending
+                  </span>
+                ) : null}
+              </div>
+              <h3>{item.title}</h3>
+              <p className="muted-text">Steam App {item.appId}</p>
+            </div>
+            <div className="wishlist-row__actions">
+              <button
+                aria-label={`Open ${item.title} on Steam`}
+                className="inline-icon-button"
+                onClick={() => void window.gameVaultApi.openExternal(item.storeUrl)}
+                title="Open Steam page"
+                type="button"
+              >
+                <FontAwesomeIcon aria-hidden="true" icon={faUpRightFromSquare} />
+              </button>
+              {item.library.trackedItemId ? (
+                <button
+                  aria-label={`Open GameVault details for ${item.title}`}
+                  className="inline-icon-button"
+                  onClick={() => setDetailsItemId(item.library.trackedItemId!)}
+                  title="Open GameVault details"
+                  type="button"
+                >
+                  <FontAwesomeIcon aria-hidden="true" icon={faCircleInfo} />
+                </button>
+              ) : null}
+              <button
+                aria-label={`Remove ${item.title} from Steam wishlist`}
+                className="inline-icon-button wishlist-remove-button"
+                disabled={
+                  wishlistBusy ||
+                  pendingRemoval ||
+                  !item.canRemoveFromSteamWishlist
+                }
+                onClick={() => void removeInstalledWishlistItem(item)}
+                title={
+                  item.canRemoveFromSteamWishlist
+                    ? 'Remove from Steam wishlist'
+                    : item.library.status === 'installed'
+                      ? 'Removal already pending'
+                      : 'Available after the matched GameVault item is installed'
+                }
+                type="button"
+              >
+                <FontAwesomeIcon aria-hidden="true" icon={faTrash} />
+              </button>
+            </div>
+          </div>
+          <dl className="wishlist-row__meta">
+            <div>
+              <dt>Added</dt>
+              <dd>{formatDateLabel(item.dateAdded)}</dd>
+            </div>
+            <div>
+              <dt>Release</dt>
+              <dd>{formatDateLabel(item.releaseDate)}</dd>
+            </div>
+            <div>
+              <dt>Priority</dt>
+              <dd>{item.priority ?? 'None'}</dd>
+            </div>
+            <div>
+              <dt>Price</dt>
+              <dd>{item.priceLabel ?? 'Unknown'}</dd>
+            </div>
+            <div>
+              <dt>Reviews</dt>
+              <dd>{item.reviewSummary ?? 'Unknown'}</dd>
+            </div>
+            <div>
+              <dt>GameVault</dt>
+              <dd>{item.library.title ?? getWishlistLibraryStatusLabel(item)}</dd>
+            </div>
+          </dl>
+        </div>
+      </article>
+    );
+  }
+
+  function renderSteamWishlistSection() {
+    const pendingSync = steamWishlist.pendingActions.some(
+      (action) => action.actionType === 'sync',
+    );
+    const statusText = steamWishlist.fetchedAt
+      ? `Synced ${formatRelativeTime(steamWishlist.fetchedAt)}`
+      : 'Not synced yet';
+
+    return (
+      <section className="library-surface wishlist-surface">
+        <div className="library-toolbar">
+          <div>
+            <p className="panel-title">Steam Wishlist</p>
+            <p className="muted-text">
+              {visibleWishlistItems.length} of {steamWishlist.totalCount} shown
+              {' | '}
+              {pendingSync ? 'Sync pending' : statusText}
+            </p>
+          </div>
+          <div className="library-toolbar__controls">
+            <label className="search-field">
+              <FontAwesomeIcon aria-hidden="true" icon={faMagnifyingGlass} />
+              <input
+                aria-label="Search Steam wishlist"
+                onChange={(event) => setWishlistSearch(event.currentTarget.value)}
+                placeholder="Search wishlist"
+                value={wishlistSearch}
+              />
+            </label>
+            <label className="toggle-field wishlist-hide-toggle">
+              <input
+                checked={wishlistHideLibrary}
+                onChange={(event) =>
+                  setWishlistHideLibrary(event.currentTarget.checked)
+                }
+                type="checkbox"
+              />
+              <span>Hide GameVault library</span>
+            </label>
+            <label className="select-field">
+              <span className="field-label">
+                <FontAwesomeIcon aria-hidden="true" icon={faFilter} />
+                Filter
+              </span>
+              <select
+                aria-label="Filter Steam wishlist"
+                onChange={(event) => {
+                  const nextFilter = event.currentTarget.value as WishlistFilter;
+                  setWishlistFilter(nextFilter);
+                  if (
+                    nextFilter !== 'all' &&
+                    nextFilter !== 'not_in_library'
+                  ) {
+                    setWishlistHideLibrary(false);
+                  }
+                }}
+                value={wishlistFilter}
+              >
+                {(
+                  [
+                    'not_in_library',
+                    'all',
+                    'in_library',
+                    'installed',
+                    'tracked',
+                    'ready_to_remove',
+                  ] satisfies WishlistFilter[]
+                ).map((filter) => (
+                  <option key={filter} value={filter}>
+                    {getWishlistFilterLabel(filter)} (
+                    {wishlistFilterCounts[filter]})
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="sort-control">
+              <label className="select-field">
+                <span className="field-label">
+                  <FontAwesomeIcon
+                    aria-hidden="true"
+                    icon={faArrowDownWideShort}
+                  />
+                  Sort
+                </span>
+                <select
+                  aria-label="Sort Steam wishlist"
+                  onChange={(event) => {
+                    const nextSort = event.currentTarget
+                      .value as WishlistSortMode;
+                    setWishlistSort(nextSort);
+                    setWishlistSortDirection(
+                      getDefaultWishlistSortDirection(nextSort),
+                    );
+                  }}
+                  value={wishlistSort}
+                >
+                  <option value="dateAdded">Date added</option>
+                  <option value="title">Title</option>
+                  <option value="libraryStatus">Library status</option>
+                  <option value="priority">Steam priority</option>
+                  <option value="releaseDate">Release date</option>
+                </select>
+              </label>
+              <button
+                aria-label={`Sort wishlist ${
+                  wishlistSortDirection === 'asc' ? 'ascending' : 'descending'
+                }`}
+                className="sort-direction-button"
+                onClick={() =>
+                  setWishlistSortDirection((current) =>
+                    current === 'asc' ? 'desc' : 'asc',
+                  )
+                }
+                title={
+                  wishlistSortDirection === 'asc' ? 'Ascending' : 'Descending'
+                }
+                type="button"
+              >
+                <FontAwesomeIcon
+                  aria-hidden="true"
+                  icon={wishlistSortDirection === 'asc' ? faSortUp : faSortDown}
+                />
+              </button>
+            </div>
+            <button
+              className="ghost-button settings-icon-text-button"
+              disabled={wishlistBusy}
+              onClick={() => void refreshSteamWishlist()}
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
+              <span>{wishlistBusy ? 'Syncing...' : 'Sync'}</span>
+            </button>
+          </div>
+        </div>
+        {wishlistMessage || steamWishlist.lastError ? (
+          <p className="wishlist-status-message muted-text">
+            {wishlistMessage ?? steamWishlist.lastError}
+          </p>
+        ) : null}
+        <div className="wishlist-list">
+          {visibleWishlistItems.length > 0 ? (
+            visibleWishlistItems.map((item) => renderWishlistItem(item))
+          ) : steamWishlist.totalCount === 0 ? (
+            <div className="empty-state">
+              <strong>No Steam wishlist items yet.</strong>
+              <p className="muted-text">
+                Sync from a browser where you are signed in to Steam.
+              </p>
+            </div>
+          ) : (
+            <div className="empty-state">
+              <strong>No wishlist games match this view.</strong>
+              <p className="muted-text">
+                Change the filter or show games already in GameVault.
+              </p>
+            </div>
+          )}
+        </div>
+      </section>
+    );
+  }
+
   function renderLibraryItem(item: TrackedItemView) {
     const progress = progressPercent(item);
     const activity = getItemActivity(item);
@@ -6673,6 +7503,161 @@ function App() {
             ) : null}
           </div>
         ) : null}
+      </div>
+    );
+  }
+
+  function renderPlayniteReviewModal() {
+    if (!playniteReview) return null;
+    const candidates = playniteReview.selection.candidates.filter(
+      isReviewablePlayniteCandidate,
+    );
+    const reviewCount = playniteStatus?.pendingReviews.length ?? 0;
+    const reviewIndex =
+      playniteStatus?.pendingReviews.findIndex(
+        (review) =>
+          review.trackedItemId === playniteReview.selection.trackedItemId,
+      ) ?? -1;
+    const reviewPosition = reviewIndex >= 0 ? reviewIndex + 1 : 1;
+    const canNavigateReviews = reviewCount > 1;
+    return (
+      <div className="modal-backdrop modal-backdrop--stacked" role="presentation">
+        <div
+          className="modal-panel playnite-review-modal"
+          role="dialog"
+          aria-modal="true"
+        >
+          <div className="panel-heading retry-modal__heading">
+            <div>
+              <p className="panel-title">Select Playnite Launch EXE</p>
+              <p className="muted-text">{playniteReview.title}</p>
+              <p className="muted-text">
+                {formatPlayniteConfidence(playniteReview.selection)}
+              </p>
+            </div>
+            <div className="playnite-review-modal__nav">
+              <button
+                aria-label="Previous Playnite executable review"
+                className="ghost-button playnite-review-modal__nav-button"
+                disabled={!canNavigateReviews}
+                onClick={() => navigatePlayniteReview(-1)}
+                type="button"
+              >
+                <FontAwesomeIcon aria-hidden="true" icon={faChevronLeft} />
+                Back
+              </button>
+              <span className="playnite-review-modal__count">
+                {reviewPosition} / {Math.max(reviewCount, 1)}
+              </span>
+              <button
+                aria-label="Next Playnite executable review"
+                className="ghost-button playnite-review-modal__nav-button"
+                disabled={!canNavigateReviews}
+                onClick={() => navigatePlayniteReview(1)}
+                type="button"
+              >
+                Next
+                <FontAwesomeIcon aria-hidden="true" icon={faChevronRight} />
+              </button>
+            </div>
+            <button
+              aria-label="Close Playnite executable review"
+              className="modal-close-button"
+              onClick={() => setPlayniteReview(null)}
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faXmark} />
+            </button>
+          </div>
+          <div className="playnite-candidate-list" role="listbox">
+            {candidates.length ? (
+              candidates.map((candidate) => {
+                const selected =
+                  candidate.fullPath === playniteReview.executablePath;
+                return (
+                  <button
+                    aria-selected={selected}
+                    className={`playnite-candidate ${
+                      selected ? 'is-selected' : ''
+                    } ${candidate.excluded ? 'is-excluded' : ''}`}
+                    key={candidate.fullPath}
+                    onClick={() =>
+                      setPlayniteReview((current) =>
+                        current
+                          ? { ...current, executablePath: candidate.fullPath }
+                          : current,
+                      )
+                    }
+                    role="option"
+                    type="button"
+                  >
+                    <span className="playnite-candidate__main">
+                      <strong>{candidate.fileName}</strong>
+                      <span>{candidate.relativePath}</span>
+                    </span>
+                    <span className="playnite-candidate__meta">
+                      <span>{formatBytes(candidate.sizeBytes)}</span>
+                      <span>Score {candidate.score}</span>
+                      <span>
+                        {candidate.excluded
+                          ? 'Excluded'
+                          : candidate.reasons[0] ?? 'Candidate'}
+                      </span>
+                    </span>
+                    <span className="playnite-candidate__reasons">
+                      {[...candidate.reasons, ...candidate.penalties]
+                        .slice(0, 4)
+                        .map((reason) => (
+                          <small key={reason}>{reason}</small>
+                        ))}
+                    </span>
+                  </button>
+                );
+              })
+            ) : (
+              <p className="muted-text">
+                No positive-scoring executable candidates were found in this
+                install folder.
+              </p>
+            )}
+          </div>
+          <label className="field">
+            <span className="field-label">Selected executable path</span>
+            <input
+              onChange={(event) => {
+                const executablePath = event.currentTarget.value;
+                setPlayniteReview((current) =>
+                  current
+                    ? { ...current, executablePath }
+                    : current,
+                );
+              }}
+              value={playniteReview.executablePath}
+            />
+          </label>
+          {playniteMessage ? (
+            <p className="integration-detection-note muted-text">
+              {playniteMessage}
+            </p>
+          ) : null}
+          <div className="action-row">
+            <button
+              className="ghost-button"
+              onClick={() => setPlayniteReview(null)}
+              type="button"
+            >
+              Cancel
+            </button>
+            <button
+              className="primary-button"
+              disabled={playniteBusy || !playniteReview.executablePath.trim()}
+              onClick={() => void savePlayniteReviewSelection()}
+              type="button"
+            >
+              {playniteBusy ? 'Saving...' : 'Use This EXE'}
+            </button>
+          </div>
+        </div>
       </div>
     );
   }
@@ -7435,6 +8420,15 @@ function App() {
               <span>{libraryTabCounts[filter]}</span>
             </button>
           ))}
+          <button
+            className={`top-nav__button ${section === 'wishlist' ? 'is-active' : ''}`}
+            onClick={() => setSection('wishlist')}
+            type="button"
+          >
+            <FontAwesomeIcon aria-hidden="true" icon={faHeart} />
+            Steam Wishlist
+            <span>{visibleWishlistItems.length}</span>
+          </button>
         </nav>
         {navbarAutomationStatus ? (
           <div
@@ -7453,6 +8447,21 @@ function App() {
           <div className="navbar-automation-status-slot" aria-hidden="true" />
         )}
         <div className="utility-row">
+          {playniteStatus?.pendingReviewCount ? (
+            <button
+              aria-label={`${playniteStatus.pendingReviewCount} Playnite launch executable review${playniteStatus.pendingReviewCount === 1 ? '' : 's'} pending`}
+              className="navbar-review-alert"
+              onClick={() => openPlayniteReview()}
+              title="Review Playnite launch executable"
+              type="button"
+            >
+              <FontAwesomeIcon
+                aria-hidden="true"
+                icon={faTriangleExclamation}
+              />
+              <span>{playniteStatus.pendingReviewCount}</span>
+            </button>
+          ) : null}
           {renderNavbarHealthMenu()}
           <button
             className={`utility-icon-button ${section === 'imports' ? 'is-active' : ''}`}
@@ -7702,6 +8711,8 @@ function App() {
             </div>
           </section>
         ) : null}
+
+        {section === 'wishlist' ? renderSteamWishlistSection() : null}
 
         {section === 'settings' ? (
           <section className="settings-page">
@@ -8112,6 +9123,242 @@ function App() {
                 </div>
               </div>
               {renderBrowserExtensionSetupPanel('settings')}
+            </section>
+
+            <section
+              aria-labelledby="settings-playnite-title"
+              className="settings-card settings-card--playnite"
+            >
+              <div className="settings-card__heading">
+                <span
+                  aria-hidden="true"
+                  className="settings-card__icon settings-card__icon--integrations"
+                >
+                  <FontAwesomeIcon icon={faGamepad} />
+                </span>
+                <div>
+                  <h2 id="settings-playnite-title">Playnite Integration</h2>
+                  <p>
+                    Export installed GameVault games into a local Playnite
+                    library.
+                  </p>
+                </div>
+              </div>
+              <div className="playnite-settings-panel">
+                <label className="settings-toggle-field download-behavior-global">
+                  <span className="settings-label-with-help">
+                    Enable Playnite export
+                    <span
+                      aria-label="Writes a local manifest for the bundled Playnite library plugin"
+                      className="settings-help-icon"
+                      role="img"
+                      title="Writes a local manifest for the bundled Playnite library plugin"
+                    >
+                      <FontAwesomeIcon
+                        aria-hidden="true"
+                        icon={faCircleQuestion}
+                      />
+                    </span>
+                  </span>
+                  <input
+                    checked={settingsDraft.playniteIntegrationEnabled}
+                    className="settings-toggle-input"
+                    onChange={(event) => {
+                      const playniteIntegrationEnabled =
+                        event.currentTarget.checked;
+                      setSettingsDraft((current) => ({
+                        ...current,
+                        playniteIntegrationEnabled,
+                      }));
+                      setSettingsSaveStatus('idle');
+                    }}
+                    type="checkbox"
+                  />
+                  <span aria-hidden="true" className="settings-toggle-track" />
+                  <small>
+                    High-confidence launch executables are selected
+                    automatically; uncertain games appear in the navbar.
+                  </small>
+                </label>
+                <div className="settings-grid integration-account-grid">
+                  <label className="field">
+                    <span className="field-label">
+                      Playnite extensions folder
+                    </span>
+                    <input
+                      onChange={(event) => {
+                        const playniteExtensionsPath =
+                          event.currentTarget.value;
+                        setSettingsDraft((current) => ({
+                          ...current,
+                          playniteExtensionsPath,
+                        }));
+                        setSettingsSaveStatus('idle');
+                      }}
+                      value={settingsDraft.playniteExtensionsPath}
+                    />
+                  </label>
+                  <label className="field">
+                    <span className="field-label">Manifest path</span>
+                    <input
+                      onChange={(event) => {
+                        const playniteManifestPath = event.currentTarget.value;
+                        setSettingsDraft((current) => ({
+                          ...current,
+                          playniteManifestPath,
+                        }));
+                        setSettingsSaveStatus('idle');
+                      }}
+                      value={settingsDraft.playniteManifestPath}
+                    />
+                  </label>
+                </div>
+                <div className="action-row integration-quick-actions">
+                  <button
+                    className="ghost-button settings-icon-text-button"
+                    disabled={playniteBusy}
+                    onClick={async () => {
+                      const picked = await window.gameVaultApi.pickDirectory();
+                      if (!picked) return;
+                      setSettingsDraft((current) => ({
+                        ...current,
+                        playniteExtensionsPath: picked,
+                      }));
+                      setSettingsSaveStatus('idle');
+                    }}
+                    type="button"
+                  >
+                    <FontAwesomeIcon aria-hidden="true" icon={faFolderOpen} />
+                    <span>Pick Folder</span>
+                  </button>
+                  <button
+                    className="ghost-button settings-icon-text-button"
+                    disabled={playniteBusy}
+                    onClick={() => void installPlaynitePlugin()}
+                    type="button"
+                  >
+                    <FontAwesomeIcon aria-hidden="true" icon={faPuzzlePiece} />
+                    <span>Install Plugin</span>
+                  </button>
+                  <button
+                    className="ghost-button settings-icon-text-button"
+                    disabled={playniteBusy}
+                    onClick={() => void rescanPlayniteIntegration()}
+                    type="button"
+                  >
+                    <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
+                    <span>Rescan Games</span>
+                  </button>
+                </div>
+                <div className="integration-status-grid">
+                  <div className="integration-status-card">
+                    <span
+                      className={`health-dot ${
+                        playniteStatus?.installed &&
+                        !playniteStatus.pluginUpdateAvailable
+                          ? 'green'
+                          : 'yellow'
+                      }`}
+                    />
+                    <FontAwesomeIcon
+                      aria-hidden="true"
+                      className="integration-status-card__icon"
+                      icon={faGamepad}
+                    />
+                    <div>
+                      <strong>
+                        {playniteStatus?.pluginUpdateAvailable
+                          ? 'Plugin update required'
+                          : playniteStatus?.installed
+                            ? 'Plugin files installed'
+                            : 'Plugin files not installed'}
+                      </strong>
+                      <p className="muted-text">
+                        {playniteStatus?.installed
+                          ? `Installed ${playniteStatus.installedPluginVersion ?? 'unknown'}; bundled ${playniteStatus.bundledPluginVersion} (SDK 6.x).`
+                          : (playniteStatus?.pluginInstallPath ??
+                            'Choose a Playnite Extensions folder, then install.')}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="integration-status-card">
+                    <span
+                      className={`health-dot ${
+                        playniteStatus?.pendingReviewCount ? 'yellow' : 'green'
+                      }`}
+                    />
+                    <FontAwesomeIcon
+                      aria-hidden="true"
+                      className="integration-status-card__icon"
+                      icon={faCheck}
+                    />
+                    <div>
+                      <strong>
+                        {playniteStatus?.exportableGames ?? 0} games exportable
+                      </strong>
+                      <p className="muted-text">
+                        {playniteStatus?.pendingReviewCount
+                          ? `${playniteStatus.pendingReviewCount} launch executable review${playniteStatus.pendingReviewCount === 1 ? '' : 's'} pending.`
+                          : playniteStatus?.manifestPath
+                            ? `Manifest: ${playniteStatus.manifestPath}`
+                            : 'Manifest will be generated after export is enabled.'}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="integration-status-card">
+                    <span
+                      className={`health-dot ${
+                        playniteStatus?.syncStatus.pluginSeen &&
+                        playniteStatus.syncStatus.current &&
+                        playniteStatus.syncStatus.syncedGames ===
+                          playniteStatus.syncStatus.exportableGames
+                          ? 'green'
+                          : 'yellow'
+                      }`}
+                    />
+                    <FontAwesomeIcon
+                      aria-hidden="true"
+                      className="integration-status-card__icon"
+                      icon={faRotateRight}
+                    />
+                    <div>
+                      <strong>
+                        {playniteStatus?.syncStatus.syncedGames ?? 0} /{' '}
+                        {playniteStatus?.syncStatus.exportableGames ?? 0} games synced
+                      </strong>
+                      <p className="muted-text">
+                        {!playniteStatus?.syncStatus.pluginSeen
+                          ? 'Close Playnite before installing. After install, start Playnite to load GameVault.'
+                          : playniteStatus.syncStatus.lastError
+                            ? `Plugin reported: ${playniteStatus.syncStatus.lastError}`
+                            : playniteStatus.syncStatus.current
+                              ? `Playnite checked in ${formatRelativeTime(playniteStatus.syncStatus.lastSyncedAt)}.`
+                              : `Waiting for Playnite's next automatic sync.`}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+                {playniteStatus?.pendingReviewCount ? (
+                  <div className="action-row integration-quick-actions">
+                    <button
+                      className="primary-button settings-icon-text-button"
+                      onClick={() => openPlayniteReview()}
+                      type="button"
+                    >
+                      <FontAwesomeIcon
+                        aria-hidden="true"
+                        icon={faTriangleExclamation}
+                      />
+                      <span>Review Launch EXE</span>
+                    </button>
+                  </div>
+                ) : null}
+                {playniteMessage ? (
+                  <p className="integration-detection-note muted-text">
+                    {playniteMessage}
+                  </p>
+                ) : null}
+              </div>
             </section>
 
             <section
@@ -9183,6 +10430,7 @@ function App() {
       {renderLibraryDetailsModal()}
       {renderSourcesModal()}
       {renderUpdateFlowModal()}
+      {renderPlayniteReviewModal()}
       {retrySelection
         ? (() => {
             const fullRows = retrySelection.item.downloadMirrors.filter(
@@ -9550,4 +10798,8 @@ function App() {
   );
 }
 
-createRoot(document.getElementById('root')!).render(<App />);
+createRoot(document.getElementById('root')!).render(
+  <AppErrorBoundary>
+    <App />
+  </AppErrorBoundary>,
+);

@@ -1354,12 +1354,16 @@ function App() {
     null;
   const warningState: WarningState | null = getDownloadAutomationWarning({
     health,
+    jDownloaderEnabled: settings.jDownloaderEnabled,
+    jDownloaderSourcePreferences: settings.jDownloaderSourcePreferences,
     rootLibraryPath: settings.rootLibraryPath,
     sourceKind: selectedDownloadSourceKind,
   });
   const navAlertSeverity = warningState ? resolveHealthSeverity(health) : null;
   const canFinishSelectedSourceDownload = isSourceReadyForAutomation({
     health,
+    jDownloaderEnabled: settings.jDownloaderEnabled,
+    jDownloaderSourcePreferences: settings.jDownloaderSourcePreferences,
     rootLibraryPath: settings.rootLibraryPath,
     sourceKind: selectedDownloadSourceKind,
   });

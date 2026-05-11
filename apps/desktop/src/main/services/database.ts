@@ -11,13 +11,22 @@ import type {
   LibraryRootRecord,
   OnboardingState,
   ParsedSourcePayload,
+  PlayniteExecutableCandidate,
+  PlayniteExecutableConfidence,
+  PlayniteExecutableSelectionRecord,
+  PlayniteExecutableStatus,
   SettingsRecord,
   SourceMatch,
   SourceKind,
   SourceSnapshot,
   SupportedSourceKind,
+  PendingSteamWishlistAction,
   SteamFeedCheckRecord,
   SourceWatch,
+  SteamWishlistActionStatus,
+  SteamWishlistActionType,
+  SteamWishlistCachedItem,
+  SteamWishlistRemovalRecord,
   SteamPatchEntry,
   SteamPatchCandidate,
   ThemeMode,
@@ -86,6 +95,9 @@ CREATE TABLE IF NOT EXISTS steam_matches (
   matched_at TEXT NOT NULL
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_steam_matches_app_id
+ON steam_matches (app_id);
+
 CREATE TABLE IF NOT EXISTS steam_patch_entries (
   id TEXT PRIMARY KEY,
   tracked_item_id TEXT NOT NULL,
@@ -119,6 +131,35 @@ CREATE TABLE IF NOT EXISTS steamdb_build_cache (
   expires_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS steam_wishlist_items (
+  app_id INTEGER PRIMARY KEY,
+  title TEXT NOT NULL,
+  normalized_title TEXT NOT NULL,
+  cover_url TEXT,
+  store_url TEXT NOT NULL,
+  release_date TEXT,
+  review_summary TEXT,
+  price_label TEXT,
+  priority INTEGER,
+  date_added TEXT,
+  last_seen_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS steam_wishlist_actions (
+  id TEXT PRIMARY KEY,
+  action_type TEXT NOT NULL,
+  app_id INTEGER,
+  tracked_item_id TEXT,
+  title TEXT,
+  status TEXT NOT NULL,
+  requested_at TEXT NOT NULL,
+  completed_at TEXT,
+  error_message TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_steam_wishlist_actions_pending
+ON steam_wishlist_actions (status, action_type, requested_at);
+
 CREATE TABLE IF NOT EXISTS install_records (
   tracked_item_id TEXT PRIMARY KEY,
   installed_version TEXT,
@@ -127,6 +168,17 @@ CREATE TABLE IF NOT EXISTS install_records (
   install_path TEXT,
   installed_source_kind TEXT,
   installed_source_url TEXT,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS playnite_executable_selections (
+  tracked_item_id TEXT PRIMARY KEY,
+  steam_app_id INTEGER,
+  selected_exe_path TEXT,
+  confidence TEXT NOT NULL,
+  status TEXT NOT NULL,
+  candidates_json TEXT NOT NULL,
+  reviewed_at TEXT,
   updated_at TEXT NOT NULL
 );
 
@@ -287,6 +339,54 @@ function normalizeThemeMode(
   value: string | null | undefined,
 ): Extract<ThemeMode, 'dark' | 'light'> {
   return value === 'light' ? 'light' : 'dark';
+}
+
+function normalizePlayniteExecutableConfidence(
+  value: string | null | undefined,
+): PlayniteExecutableConfidence {
+  return value === 'high' ||
+    value === 'medium' ||
+    value === 'low' ||
+    value === 'none'
+    ? value
+    : 'none';
+}
+
+function normalizePlayniteExecutableStatus(
+  value: string | null | undefined,
+): PlayniteExecutableStatus {
+  return value === 'auto_selected' ||
+    value === 'missing' ||
+    value === 'needs_review' ||
+    value === 'reviewed'
+    ? value
+    : 'needs_review';
+}
+
+function normalizePlayniteExecutableCandidates(
+  value: string | null | undefined,
+): PlayniteExecutableCandidate[] {
+  return parseJsonArray<Partial<PlayniteExecutableCandidate>>(value)
+    .filter(
+      (entry) =>
+        typeof entry.fullPath === 'string' &&
+        typeof entry.relativePath === 'string' &&
+        typeof entry.fileName === 'string',
+    )
+    .map((entry) => ({
+      excluded: Boolean(entry.excluded),
+      fileName: entry.fileName!,
+      fullPath: entry.fullPath!,
+      penalties: Array.isArray(entry.penalties)
+        ? entry.penalties.filter((reason): reason is string => typeof reason === 'string')
+        : [],
+      reasons: Array.isArray(entry.reasons)
+        ? entry.reasons.filter((reason): reason is string => typeof reason === 'string')
+        : [],
+      relativePath: entry.relativePath!,
+      score: typeof entry.score === 'number' ? entry.score : 0,
+      sizeBytes: typeof entry.sizeBytes === 'number' ? entry.sizeBytes : 0,
+    }));
 }
 
 function getDefaultJDownloaderEnabled(map: Map<string, string | null>): boolean {
@@ -1466,6 +1566,12 @@ export class GameVaultDatabase {
   }
 
   upsertSteamMatch(trackedItemId: string, match: ConfirmedSteamMatch): void {
+    const duplicate = this.findSteamMatchByAppId(match.appId);
+    if (duplicate && duplicate.trackedItemId !== trackedItemId) {
+      throw new Error(
+        `Steam app id ${match.appId} is already tracked by ${duplicate.trackedItemId}.`,
+      );
+    }
     this.exec(
       `INSERT INTO steam_matches (
          tracked_item_id, app_id, title, normalized_title, cover_url, matched_at
@@ -1622,6 +1728,181 @@ export class GameVaultDatabase {
     );
   }
 
+  listSteamWishlistItems(): SteamWishlistCachedItem[] {
+    return this.queryAll<{
+      app_id: number;
+      title: string;
+      normalized_title: string;
+      cover_url: string | null;
+      store_url: string;
+      release_date: string | null;
+      review_summary: string | null;
+      price_label: string | null;
+      priority: number | null;
+      date_added: string | null;
+      last_seen_at: string;
+    }>(
+      `SELECT *
+         FROM steam_wishlist_items
+        ORDER BY COALESCE(date_added, last_seen_at) DESC, title ASC`,
+    ).map((row) => ({
+      appId: Number(row.app_id),
+      coverUrl: row.cover_url,
+      dateAdded: row.date_added,
+      lastSeenAt: row.last_seen_at,
+      normalizedTitle: row.normalized_title,
+      priceLabel: row.price_label,
+      priority: row.priority,
+      releaseDate: row.release_date,
+      reviewSummary: row.review_summary,
+      storeUrl: row.store_url,
+      title: row.title,
+    }));
+  }
+
+  replaceSteamWishlistItems(items: SteamWishlistCachedItem[]): void {
+    this.db.run(`DELETE FROM steam_wishlist_items`);
+    for (const item of items) {
+      this.db.run(
+        `INSERT INTO steam_wishlist_items (
+           app_id, title, normalized_title, cover_url, store_url, release_date,
+           review_summary, price_label, priority, date_added, last_seen_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          item.appId,
+          item.title,
+          item.normalizedTitle,
+          item.coverUrl ?? null,
+          item.storeUrl,
+          item.releaseDate ?? null,
+          item.reviewSummary ?? null,
+          item.priceLabel ?? null,
+          item.priority ?? null,
+          item.dateAdded ?? null,
+          item.lastSeenAt,
+        ],
+      );
+    }
+    this.save();
+  }
+
+  deleteSteamWishlistItem(appId: number): void {
+    this.exec(`DELETE FROM steam_wishlist_items WHERE app_id = ?`, [appId]);
+  }
+
+  createSteamWishlistAction(record: {
+    actionType: SteamWishlistActionType;
+    appId?: number | null;
+    trackedItemId?: string | null;
+    title?: string | null;
+  }): SteamWishlistRemovalRecord {
+    const now = new Date().toISOString();
+    const id = randomId();
+    this.exec(
+      `INSERT INTO steam_wishlist_actions (
+         id, action_type, app_id, tracked_item_id, title, status, requested_at,
+         completed_at, error_message
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        record.actionType,
+        record.appId ?? null,
+        record.trackedItemId ?? null,
+        record.title ?? null,
+        'pending',
+        now,
+        null,
+        null,
+      ],
+    );
+    return this.findSteamWishlistActionById(id)!;
+  }
+
+  findPendingSteamWishlistRemoval(appId: number): SteamWishlistRemovalRecord | null {
+    return (
+      this.listSteamWishlistActions('pending').find(
+        (action) => action.actionType === 'remove' && action.appId === appId,
+      ) ?? null
+    );
+  }
+
+  findSteamWishlistActionById(id: string): SteamWishlistRemovalRecord | null {
+    return (
+      this.listSteamWishlistActions().find((action) => action.id === id) ??
+      null
+    );
+  }
+
+  listSteamWishlistActions(
+    status?: SteamWishlistActionStatus,
+  ): SteamWishlistRemovalRecord[] {
+    const where = status ? `WHERE status = ?` : '';
+    return this.queryAll<{
+      id: string;
+      action_type: SteamWishlistActionType;
+      app_id: number | null;
+      tracked_item_id: string | null;
+      title: string | null;
+      status: SteamWishlistActionStatus;
+      requested_at: string;
+      completed_at: string | null;
+      error_message: string | null;
+    }>(
+      `SELECT *
+         FROM steam_wishlist_actions
+         ${where}
+        ORDER BY requested_at DESC`,
+      status ? [status] : [],
+    ).map((row) => ({
+      actionType: row.action_type,
+      appId: row.app_id,
+      completedAt: row.completed_at,
+      errorMessage: row.error_message,
+      id: row.id,
+      requestedAt: row.requested_at,
+      status: row.status,
+      title: row.title,
+      trackedItemId: row.tracked_item_id,
+    }));
+  }
+
+  listPendingSteamWishlistActions(params: {
+    profileUrl?: string | null;
+    steamId?: string | null;
+  }): PendingSteamWishlistAction[] {
+    return this.listSteamWishlistActions('pending').map((action) => ({
+      actionType: action.actionType,
+      appId: action.appId,
+      id: action.id,
+      profileUrl: params.profileUrl ?? null,
+      requestedAt: action.requestedAt,
+      steamId: params.steamId ?? null,
+      title: action.title,
+      trackedItemId: action.trackedItemId,
+    }));
+  }
+
+  completeSteamWishlistAction(params: {
+    actionId: string;
+    errorMessage?: string | null;
+    status: Exclude<SteamWishlistActionStatus, 'pending'>;
+  }): SteamWishlistRemovalRecord {
+    const now = new Date().toISOString();
+    this.exec(
+      `UPDATE steam_wishlist_actions
+          SET status = ?,
+              completed_at = ?,
+              error_message = ?
+        WHERE id = ?`,
+      [params.status, now, params.errorMessage ?? null, params.actionId],
+    );
+    const action = this.findSteamWishlistActionById(params.actionId);
+    if (!action) {
+      throw new Error(`Steam wishlist action ${params.actionId} not found`);
+    }
+    return action;
+  }
+
   getSteamFeedCheck(trackedItemId: string): SteamFeedCheckRecord | null {
     const row = this.queryOne<{
       tracked_item_id: string;
@@ -1742,6 +2023,89 @@ export class GameVaultDatabase {
       trackedItemId: row.tracked_item_id,
       updatedAt: row.updated_at,
     }));
+  }
+
+  getPlayniteExecutableSelection(
+    trackedItemId: string,
+  ): PlayniteExecutableSelectionRecord | null {
+    const row = this.queryOne<{
+      candidates_json: string;
+      confidence: string;
+      reviewed_at: string | null;
+      selected_exe_path: string | null;
+      status: string;
+      steam_app_id: number | null;
+      tracked_item_id: string;
+      updated_at: string;
+    }>(
+      `SELECT * FROM playnite_executable_selections WHERE tracked_item_id = ?`,
+      [trackedItemId],
+    );
+    return row
+      ? {
+          candidates: normalizePlayniteExecutableCandidates(
+            row.candidates_json,
+          ),
+          confidence: normalizePlayniteExecutableConfidence(row.confidence),
+          reviewedAt: row.reviewed_at,
+          selectedExePath: row.selected_exe_path,
+          status: normalizePlayniteExecutableStatus(row.status),
+          steamAppId: row.steam_app_id,
+          trackedItemId: row.tracked_item_id,
+          updatedAt: row.updated_at,
+        }
+      : null;
+  }
+
+  listPlayniteExecutableSelections(): PlayniteExecutableSelectionRecord[] {
+    return this.queryAll<{
+      candidates_json: string;
+      confidence: string;
+      reviewed_at: string | null;
+      selected_exe_path: string | null;
+      status: string;
+      steam_app_id: number | null;
+      tracked_item_id: string;
+      updated_at: string;
+    }>(`SELECT * FROM playnite_executable_selections`).map((row) => ({
+      candidates: normalizePlayniteExecutableCandidates(row.candidates_json),
+      confidence: normalizePlayniteExecutableConfidence(row.confidence),
+      reviewedAt: row.reviewed_at,
+      selectedExePath: row.selected_exe_path,
+      status: normalizePlayniteExecutableStatus(row.status),
+      steamAppId: row.steam_app_id,
+      trackedItemId: row.tracked_item_id,
+      updatedAt: row.updated_at,
+    }));
+  }
+
+  upsertPlayniteExecutableSelection(
+    record: PlayniteExecutableSelectionRecord,
+  ): void {
+    this.exec(
+      `INSERT INTO playnite_executable_selections (
+         tracked_item_id, steam_app_id, selected_exe_path, confidence, status,
+         candidates_json, reviewed_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(tracked_item_id) DO UPDATE SET
+         steam_app_id = excluded.steam_app_id,
+         selected_exe_path = excluded.selected_exe_path,
+         confidence = excluded.confidence,
+         status = excluded.status,
+         candidates_json = excluded.candidates_json,
+         reviewed_at = excluded.reviewed_at,
+         updated_at = excluded.updated_at`,
+      [
+        record.trackedItemId,
+        record.steamAppId ?? null,
+        record.selectedExePath ?? null,
+        record.confidence,
+        record.status,
+        JSON.stringify(record.candidates),
+        record.reviewedAt ?? null,
+        record.updatedAt,
+      ],
+    );
   }
 
   getWatch(trackedItemId: string): SourceWatch | null {
@@ -2140,6 +2504,7 @@ export class GameVaultDatabase {
     const childTables = [
       'source_watches',
       'install_records',
+      'playnite_executable_selections',
       'source_matches',
       'source_snapshots',
       'steam_matches',
@@ -2198,6 +2563,14 @@ export class GameVaultDatabase {
         map.get('onboarding.state'),
       ),
       pollDailyHourLocal: Number(map.get('scheduler.pollDailyHourLocal') ?? 9),
+      playniteExtensionsPath:
+        map.get('playnite.extensionsPath')?.trim() || null,
+      playniteIntegrationEnabled:
+        map.get('playnite.integrationEnabled') === 'true',
+      playniteManifestPath: map.get('playnite.manifestPath')?.trim() || null,
+      playnitePluginInstalledAt:
+        map.get('playnite.pluginInstalledAt') ?? null,
+      playnitePluginVersion: map.get('playnite.pluginVersion') ?? null,
       renameGameFoldersOnImport:
         map.get('import.renameGameFoldersOnImport') !== 'false',
       rootLibraryPath: primaryRoot?.path ?? legacyRootPath,
@@ -2214,6 +2587,15 @@ export class GameVaultDatabase {
       `INSERT INTO settings (key, value) VALUES (?, ?)
        ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
       [key, value],
+    );
+  }
+
+  getSetting(key: string): string | null {
+    return (
+      this.queryOne<{ value: string | null }>(
+        `SELECT value FROM settings WHERE key = ?`,
+        [key],
+      )?.value ?? null
     );
   }
 

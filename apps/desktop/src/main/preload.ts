@@ -26,7 +26,10 @@ const api = {
     ipcRenderer.invoke('gamevault:getExtensionSetupInfo'),
   getActivity: () => ipcRenderer.invoke('gamevault:getActivity'),
   getLogs: () => ipcRenderer.invoke('gamevault:getLogs'),
+  getPlayniteStatus: (payload?: { refresh?: boolean }) =>
+    ipcRenderer.invoke('gamevault:getPlayniteStatus', payload ?? {}),
   getSettings: () => ipcRenderer.invoke('gamevault:getSettings'),
+  getSteamWishlist: () => ipcRenderer.invoke('gamevault:getSteamWishlist'),
   listTrackedItems: () => ipcRenderer.invoke('gamevault:listTrackedItems'),
   markDownloadFailed: (trackedItemId: string) =>
     ipcRenderer.invoke('gamevault:markDownloadFailed', trackedItemId),
@@ -61,6 +64,10 @@ const api = {
     ipcRenderer.invoke('gamevault:refreshTrackedItem', trackedItemId),
   refreshMatchedSource: (payload: unknown) =>
     ipcRenderer.invoke('gamevault:refreshMatchedSource', payload),
+  requestSteamWishlistRefresh: () =>
+    ipcRenderer.invoke('gamevault:requestSteamWishlistRefresh'),
+  requestSteamWishlistRemoval: (payload: unknown) =>
+    ipcRenderer.invoke('gamevault:requestSteamWishlistRemoval', payload),
   removeTrackedItem: (payload: unknown) =>
     ipcRenderer.invoke('gamevault:removeTrackedItem', payload),
   runActivityAction: (payload: unknown) =>
@@ -89,10 +96,16 @@ const api = {
     ipcRenderer.invoke('gamevault:scanImportCandidates', payload),
   ignoreImportFolder: (payload: unknown) =>
     ipcRenderer.invoke('gamevault:ignoreImportFolder', payload),
+  installPlaynitePlugin: (payload: unknown) =>
+    ipcRenderer.invoke('gamevault:installPlaynitePlugin', payload),
+  refreshPlayniteIntegration: () =>
+    ipcRenderer.invoke('gamevault:refreshPlayniteIntegration'),
   restoreImportFolder: (payload: unknown) =>
     ipcRenderer.invoke('gamevault:restoreImportFolder', payload),
   saveImportBatch: (payload: unknown) =>
     ipcRenderer.invoke('gamevault:saveImportBatch', payload),
+  savePlayniteExecutableSelection: (payload: unknown) =>
+    ipcRenderer.invoke('gamevault:savePlayniteExecutableSelection', payload),
   requestSteamDbBuildLookup: (appId: number) =>
     ipcRenderer.invoke('gamevault:requestSteamDbBuildLookup', appId),
   getSteamDbBuildLookup: (lookupId: string) =>

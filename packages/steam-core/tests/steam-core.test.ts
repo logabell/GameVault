@@ -16,6 +16,11 @@ import {
   parseSteamDbPatchFeed,
 } from '../src/rss.js';
 import { resolveSteamMatch, searchSteamStore } from '../src/search.js';
+import {
+  buildSteamWishlistProfileUrl,
+  fetchSteamWishlistApiItems,
+  fetchSteamWishlistMetadata,
+} from '../src/wishlist.js';
 import { compareSourceToUpstream, createWatchWindow } from '../src/watch.js';
 
 interface MockStoreSearchItem {
@@ -135,6 +140,99 @@ function createSteamSearchFetchMock(params: {
 }
 
 describe('steam matching', () => {
+  it('fetches wishlist API items with priorities and added dates', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      expect(url.pathname).toBe('/IWishlistService/GetWishlist/v1/');
+      expect(url.searchParams.get('steamid')).toBe('76561198086715287');
+      return new Response(
+        JSON.stringify({
+          response: {
+            items: [
+              { appid: 105600, date_added: 1751434604, priority: 2 },
+              { appid: '220200', date_added: 1751430884, priority: 0 },
+            ],
+          },
+        }),
+        { status: 200 },
+      );
+    });
+
+    await expect(
+      fetchSteamWishlistApiItems(
+        '76561198086715287',
+        fetchMock as typeof fetch,
+      ),
+    ).resolves.toEqual([
+      {
+        appId: 105600,
+        dateAdded: '2025-07-02T05:36:44.000Z',
+        priority: 2,
+      },
+      {
+        appId: 220200,
+        dateAdded: '2025-07-02T04:34:44.000Z',
+        priority: 0,
+      },
+    ]);
+  });
+
+  it('fetches wishlist metadata from Store Browse items', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      expect(url.pathname).toBe('/IStoreBrowseService/GetItems/v1/');
+      return new Response(
+        JSON.stringify({
+          response: {
+            store_items: [
+              {
+                appid: 105600,
+                assets: {
+                  asset_url_format: 'steam/apps/105600/${FILENAME}?t=123',
+                  library_hero: 'library_hero.jpg',
+                },
+                best_purchase_option: {
+                  formatted_final_price: '$9.99',
+                },
+                name: 'Terraria',
+                release: {
+                  steam_release_date: 1305568020,
+                },
+                reviews: {
+                  summary_filtered: {
+                    review_score_label: 'Overwhelmingly Positive',
+                  },
+                },
+              },
+            ],
+          },
+        }),
+        { status: 200 },
+      );
+    });
+
+    await expect(
+      fetchSteamWishlistMetadata([105600], fetchMock as typeof fetch),
+    ).resolves.toEqual([
+      {
+        appId: 105600,
+        coverUrl:
+          'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/105600/library_hero.jpg?t=123',
+        priceLabel: '$9.99',
+        releaseDate: '2011-05-16T17:47:00.000Z',
+        reviewSummary: 'Overwhelmingly Positive',
+        storeUrl: 'https://store.steampowered.com/app/105600/',
+        title: 'Terraria',
+      },
+    ]);
+  });
+
+  it('builds Steam wishlist profile URLs', () => {
+    expect(buildSteamWishlistProfileUrl('76561198086715287')).toBe(
+      'https://store.steampowered.com/wishlist/profiles/76561198086715287/',
+    );
+  });
+
   it('resolves Steam landscape artwork URLs from Store Browse assets', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = new URL(String(input));

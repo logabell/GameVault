@@ -325,6 +325,43 @@ describe('MyJDownloaderService authentication', () => {
 
     expect(client.listDeviceCalls).toHaveLength(2);
   });
+
+  it('reports an offline selected device before queueing links', async () => {
+    class OfflineClient extends FakeMyJDownloaderClient {
+      override async listDevices(
+        email: string,
+        password: string,
+      ): Promise<RawDeviceInfo[]> {
+        this.listDeviceCalls.push({ email, password });
+        return [{ id: 'device-1', name: 'JDownloader', status: 'OFFLINE' }];
+      }
+    }
+    const client = new OfflineClient();
+    const service = createService(client);
+
+    await expect(
+      service.getHealth({ forceRefresh: true }),
+    ).resolves.toMatchObject({
+      color: 'yellow',
+      label: 'JDownloader offline',
+      selectedDeviceId: null,
+    });
+
+    await expect(
+      service.queueLinks({
+        extractDirectory: 'C:\\Games\\_STAGING\\Mouse P.I. For Hire\\contents',
+        packageName: 'Mouse P.I. For Hire_1.0',
+        parsedSource,
+        selectedDownloads: {
+          fullUrl: 'https://example.invalid/full',
+          patchUrl: '',
+        },
+        sourceKind: 'steamrip',
+        targetDirectory: 'C:\\Games\\_STAGING\\Mouse P.I. For Hire_1.0',
+      }),
+    ).rejects.toThrow('JDownloader is not open');
+    expect(client.calls).toEqual([]);
+  });
 });
 
 describe('MyJDownloaderService queueLinks', () => {

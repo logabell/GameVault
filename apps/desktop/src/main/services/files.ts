@@ -57,6 +57,18 @@ export async function directoryHasEntries(target: string): Promise<boolean> {
   }
 }
 
+export async function pathHasContent(target: string): Promise<boolean> {
+  try {
+    const stats = await stat(target);
+    if (!stats.isDirectory()) {
+      return true;
+    }
+    return (await readdir(target)).length > 0;
+  } catch {
+    return false;
+  }
+}
+
 async function isDirectoryPath(target: string): Promise<boolean> {
   try {
     return (await stat(target)).isDirectory();

@@ -218,6 +218,36 @@ function createWindow(options?: { showOnReady?: boolean }) {
     width: 1280,
   });
   applyWindowShellDetails(mainWindow);
+  mainWindow.webContents.on('console-message', (event) => {
+    if (/download the react devtools/i.test(event.message)) {
+      return;
+    }
+    const location = event.sourceId
+      ? ` (${event.sourceId}:${event.lineNumber})`
+      : '';
+    const text = `[renderer:${event.level}] ${event.message}${location}`;
+    if (event.level === 'error' || event.level === 'warning') {
+      console.error(text);
+    } else {
+      console.info(text);
+    }
+  });
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    console.error(
+      `Renderer process gone: ${details.reason} (${details.exitCode})`,
+    );
+  });
+  mainWindow.webContents.on('unresponsive', () => {
+    console.error('Renderer became unresponsive');
+  });
+  mainWindow.webContents.on(
+    'did-fail-load',
+    (_event, errorCode, errorDescription, validatedUrl) => {
+      console.error(
+        `Renderer failed to load ${validatedUrl}: ${errorCode} ${errorDescription}`,
+      );
+    },
+  );
   void mainWindow.loadFile(getRendererUrl());
 
   mainWindow.on('close', (event) => {
@@ -617,6 +647,10 @@ async function bootstrap() {
       });
       return result.canceled ? null : (result.filePaths[0] ?? null);
     },
+    playnitePaths: {
+      appDataPath: userDataPath,
+      pluginBundlePath: join(__dirname, '..', 'playnite-plugin'),
+    },
     secrets: {
       decrypt(text) {
         return safeStorage.decryptString(Buffer.from(text, 'base64'));
@@ -705,6 +739,15 @@ async function bootstrap() {
   ipcMain.handle('gamevault:listTrackedItems', () =>
     service.listTrackedItems(),
   );
+  ipcMain.handle('gamevault:getSteamWishlist', () =>
+    service.getSteamWishlist(),
+  );
+  ipcMain.handle('gamevault:requestSteamWishlistRefresh', () =>
+    service.requestSteamWishlistRefresh(),
+  );
+  ipcMain.handle('gamevault:requestSteamWishlistRemoval', (_event, payload) =>
+    service.requestSteamWishlistRemoval(payload),
+  );
   ipcMain.handle('gamevault:detectBrowserExtension', () =>
     detectBrowserExtensionForSetup(),
   );
@@ -728,6 +771,18 @@ async function bootstrap() {
     service.getDesktopHealth(await getExtensionSetupInfo(), payload),
   );
   ipcMain.handle('gamevault:getSettings', () => service.getSettings());
+  ipcMain.handle('gamevault:getPlayniteStatus', (_event, payload) =>
+    service.getPlayniteStatus(payload),
+  );
+  ipcMain.handle('gamevault:installPlaynitePlugin', (_event, payload) =>
+    service.installPlaynitePlugin(payload),
+  );
+  ipcMain.handle('gamevault:refreshPlayniteIntegration', () =>
+    service.getPlayniteStatus({ refresh: true }),
+  );
+  ipcMain.handle('gamevault:savePlayniteExecutableSelection', (_event, payload) =>
+    service.savePlayniteExecutableSelection(payload),
+  );
   ipcMain.handle('gamevault:authenticateMyJDownloader', (_event, payload) =>
     service.authenticateMyJDownloader(payload.email, payload.password),
   );

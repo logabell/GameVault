@@ -2,8 +2,10 @@ import type {
   AddTrackedItemRequestPayload,
   CacheSteamDbBuildLookupPayload,
   CompleteSteamDbBuildLookupPayload,
+  CompleteSteamWishlistRemovalPayload,
   ConnectionHealthSummary,
   CreateMatchedDraftPayload,
+  PendingSteamWishlistAction,
   RemoveTrackedItemPayload,
   RemoveTrackedItemResult,
   QueueDraftDownloadPayload,
@@ -12,6 +14,9 @@ import type {
   SettingsView,
   SyncTrackedSteamPatchEntriesPayload,
   SteamDbBuildLookupState,
+  SteamWishlistRemovalRecord,
+  SteamWishlistSyncPayload,
+  SteamWishlistView,
   SteamPatchCandidate,
   SteamPatchEntry,
   SteamPatchFeedResult,
@@ -74,6 +79,18 @@ export type NativeMessageRequest =
   | {
       type: 'cacheSteamDbBuildLookup';
       payload: CacheSteamDbBuildLookupPayload;
+    }
+  | {
+      type: 'syncSteamWishlist';
+      payload: SteamWishlistSyncPayload;
+    }
+  | {
+      type: 'listPendingSteamWishlistActions';
+      payload: EmptyPayload;
+    }
+  | {
+      type: 'completeSteamWishlistRemoval';
+      payload: CompleteSteamWishlistRemovalPayload;
     }
   | {
       type: 'updateSteamDbBuildLookup';
@@ -186,6 +203,9 @@ export type NativeMessageRequest =
         libraryRoots?: SettingsView['libraryRoots'];
         renameGameFoldersOnImport?: boolean;
         pollDailyHourLocal?: number;
+        playniteExtensionsPath?: string | null;
+        playniteIntegrationEnabled?: boolean;
+        playniteManifestPath?: string | null;
         sourceWatchDurationDays?: number;
         sourceWatchIntervalHours?: number;
         themeMode?: ThemeMode | null;
@@ -252,6 +272,21 @@ export type NativeMessageResponse =
       ok: true;
       type: 'cacheSteamDbBuildLookup';
       payload: SteamDbBuildLookupState;
+    }
+  | {
+      ok: true;
+      type: 'syncSteamWishlist';
+      payload: SteamWishlistView;
+    }
+  | {
+      ok: true;
+      type: 'listPendingSteamWishlistActions';
+      payload: PendingSteamWishlistAction[];
+    }
+  | {
+      ok: true;
+      type: 'completeSteamWishlistRemoval';
+      payload: SteamWishlistRemovalRecord;
     }
   | {
       ok: true;

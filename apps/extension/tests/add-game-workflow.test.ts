@@ -11,7 +11,10 @@ import type {
   SupportedSourceKind,
   TrackedItemView,
 } from '@gamevault/shared-types';
-import { TrackedItemTrackingStatus } from '@gamevault/shared-types';
+import {
+  TrackedItemStatus,
+  TrackedItemTrackingStatus,
+} from '@gamevault/shared-types';
 
 import {
   buildCreateMatchedDraftMessage,
@@ -300,6 +303,14 @@ describe('extension add-game workflow helpers', () => {
         }),
       ),
     ).toBe(true);
+    expect(
+      hasActionableSourceUpdate(
+        trackedItem({
+          status: TrackedItemStatus.Queued,
+          trackingStatus: TrackedItemTrackingStatus.UpdateAvailable,
+        }),
+      ),
+    ).toBe(false);
     expect(
       hasActionableSourceUpdate(
         trackedItem({
@@ -715,7 +726,7 @@ describe('extension add-game workflow helpers', () => {
     );
   });
 
-  it('allows SteamRIP and ElAmigos to use direct downloads when MyJDownloader is not ready', () => {
+  it('allows SteamRIP and ElAmigos when JDownloader automation is not enabled', () => {
     expect(
       isSourceReadyForAutomation({
         health: healthyDesktopOnly,
@@ -736,6 +747,37 @@ describe('extension add-game workflow helpers', () => {
     expect(getDownloadQueueSuccessMessage('steamrip', 'jdownloader')).toBe(
       'Queued in MyJDownloader.',
     );
+  });
+
+  it('requires MyJDownloader readiness when JDownloader automation is enabled', () => {
+    expect(
+      isSourceReadyForAutomation({
+        health: healthyDesktopOnly,
+        jDownloaderEnabled: true,
+        rootLibraryPath: 'D:/Games',
+        sourceKind: 'steamrip',
+      }),
+    ).toBe(false);
+    expect(
+      getDownloadAutomationWarning({
+        health: healthyDesktopOnly,
+        jDownloaderEnabled: true,
+        rootLibraryPath: 'D:/Games',
+        sourceKind: 'elamigos',
+      }),
+    ).toMatchObject({
+      actionLabel: 'Login to MyJDownloader',
+      title: 'MyJDownloader unavailable',
+    });
+    expect(
+      isSourceReadyForAutomation({
+        health: healthyDesktopOnly,
+        jDownloaderEnabled: true,
+        jDownloaderSourcePreferences: { elamigos: true, steamrip: false },
+        rootLibraryPath: 'D:/Games',
+        sourceKind: 'steamrip',
+      }),
+    ).toBe(true);
   });
 
   it('requires a root library path before any automated download can start', () => {

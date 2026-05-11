@@ -171,6 +171,26 @@ export class NativeBridgeServer {
             payload: this.service.cacheSteamDbBuildLookup(request.payload),
             type: request.type,
           };
+        case 'syncSteamWishlist':
+          return {
+            ok: true,
+            payload: await this.service.syncSteamWishlist(request.payload),
+            type: request.type,
+          };
+        case 'listPendingSteamWishlistActions':
+          return {
+            ok: true,
+            payload: this.service.listPendingSteamWishlistActions(),
+            type: request.type,
+          };
+        case 'completeSteamWishlistRemoval':
+          return {
+            ok: true,
+            payload: this.service.completeSteamWishlistRemoval(
+              request.payload,
+            ),
+            type: request.type,
+          };
         case 'updateSteamDbBuildLookup':
           return {
             ok: true,

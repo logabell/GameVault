@@ -193,6 +193,95 @@ export interface InstallRecord {
   updatedAt: string;
 }
 
+export type PlayniteExecutableConfidence = 'high' | 'medium' | 'low' | 'none';
+
+export type PlayniteExecutableStatus =
+  | 'auto_selected'
+  | 'missing'
+  | 'needs_review'
+  | 'reviewed';
+
+export interface PlayniteExecutableCandidate {
+  excluded: boolean;
+  fileName: string;
+  fullPath: string;
+  penalties: string[];
+  reasons: string[];
+  relativePath: string;
+  score: number;
+  sizeBytes: number;
+}
+
+export interface PlayniteExecutableSelectionRecord {
+  candidates: PlayniteExecutableCandidate[];
+  confidence: PlayniteExecutableConfidence;
+  reviewedAt?: string | null;
+  selectedExePath?: string | null;
+  status: PlayniteExecutableStatus;
+  steamAppId?: number | null;
+  trackedItemId: string;
+  updatedAt: string;
+}
+
+export interface PlayniteManifestGame {
+  executablePath: string;
+  executableRelativePath: string;
+  installPath: string;
+  source: 'GameVault';
+  steamAppId: number;
+  steamStoreUrl: string;
+  steamTitle?: string | null;
+  title: string;
+  trackedItemId: string;
+  version?: string | null;
+}
+
+export interface PlayniteManifest {
+  generatedAt: string;
+  games: PlayniteManifestGame[];
+  library: 'GameVault';
+  version: 1;
+}
+
+export interface PlayniteSyncStatus {
+  current: boolean;
+  exportableGames: number;
+  importableGames: number;
+  lastError?: string | null;
+  lastSyncedAt?: string | null;
+  manifestGeneratedAt?: string | null;
+  pluginSeen: boolean;
+  statusPath: string;
+  syncedGames: number;
+}
+
+export interface PlayniteIntegrationStatus {
+  bundledPluginVersion: string;
+  enabled: boolean;
+  exportableGames: number;
+  installed: boolean;
+  installedPluginVersion?: string | null;
+  manifestPath: string;
+  pendingReviewCount: number;
+  pendingReviews: Array<{
+    gameTitle: string;
+    selection: PlayniteExecutableSelectionRecord;
+    steamAppId?: number | null;
+    trackedItemId: string;
+  }>;
+  pluginInstallPath?: string | null;
+  pluginInstalledAt?: string | null;
+  pluginUpdateAvailable: boolean;
+  pluginVersion?: string | null;
+  playniteExtensionsPath?: string | null;
+  syncStatus: PlayniteSyncStatus;
+}
+
+export interface SavePlayniteExecutableSelectionPayload {
+  executablePath: string;
+  trackedItemId: string;
+}
+
 export interface SourceSnapshot {
   trackedItemId: string;
   sourceKind: SourceKind;
@@ -429,6 +518,11 @@ export interface SettingsRecord {
   onboarding?: OnboardingState | null;
   lastExtensionActivityAt?: string | null;
   pollDailyHourLocal?: number;
+  playniteExtensionsPath?: string | null;
+  playniteIntegrationEnabled?: boolean;
+  playniteManifestPath?: string | null;
+  playnitePluginInstalledAt?: string | null;
+  playnitePluginVersion?: string | null;
   sourceWatchDurationDays?: number;
   sourceWatchIntervalHours?: number;
   themeMode?: ThemeMode | null;
@@ -620,6 +714,106 @@ export interface SteamMatchResolutionPayload {
   candidates: SteamCandidate[];
   autoSelected: boolean;
   searchQueries?: string[];
+}
+
+export type SteamWishlistSource =
+  | 'cache'
+  | 'extension_session'
+  | 'public_api';
+
+export type SteamWishlistLibraryStatus =
+  | 'installed'
+  | 'not_in_library'
+  | 'tracked';
+
+export type SteamWishlistActionType = 'remove' | 'sync';
+export type SteamWishlistActionStatus = 'complete' | 'failed' | 'pending';
+
+export interface SteamWishlistMetadata {
+  appId: number;
+  coverUrl?: string | null;
+  priceLabel?: string | null;
+  releaseDate?: string | null;
+  reviewSummary?: string | null;
+  storeUrl: string;
+  title: string;
+}
+
+export interface SteamWishlistSyncItem {
+  appId: number;
+  dateAdded?: string | null;
+  priority?: number | null;
+}
+
+export interface SteamWishlistSyncPayload {
+  fetchedAt?: string | null;
+  items: SteamWishlistSyncItem[];
+  profileUrl?: string | null;
+  source?: SteamWishlistSource | null;
+  steamId?: string | null;
+}
+
+export interface SteamWishlistCachedItem
+  extends SteamWishlistMetadata,
+    SteamWishlistSyncItem {
+  lastSeenAt: string;
+  normalizedTitle: string;
+}
+
+export interface SteamWishlistLibraryMatch {
+  finalPath?: string | null;
+  finalPathExists: boolean;
+  status: SteamWishlistLibraryStatus;
+  trackedItemId?: string | null;
+  trackedStatus?: TrackedItemStatus | null;
+  title?: string | null;
+}
+
+export interface SteamWishlistRemovalRecord {
+  actionType: SteamWishlistActionType;
+  appId?: number | null;
+  completedAt?: string | null;
+  errorMessage?: string | null;
+  id: string;
+  requestedAt: string;
+  status: SteamWishlistActionStatus;
+  title?: string | null;
+  trackedItemId?: string | null;
+}
+
+export interface PendingSteamWishlistAction {
+  actionType: SteamWishlistActionType;
+  appId?: number | null;
+  id: string;
+  profileUrl?: string | null;
+  requestedAt: string;
+  steamId?: string | null;
+  title?: string | null;
+  trackedItemId?: string | null;
+}
+
+export interface CompleteSteamWishlistRemovalPayload {
+  actionId: string;
+  appId: number;
+  errorMessage?: string | null;
+  success: boolean;
+}
+
+export interface SteamWishlistItemView extends SteamWishlistCachedItem {
+  canRemoveFromSteamWishlist: boolean;
+  library: SteamWishlistLibraryMatch;
+  removalPending?: SteamWishlistRemovalRecord | null;
+}
+
+export interface SteamWishlistView {
+  fetchedAt?: string | null;
+  items: SteamWishlistItemView[];
+  lastError?: string | null;
+  pendingActions: PendingSteamWishlistAction[];
+  profileUrl?: string | null;
+  source: SteamWishlistSource;
+  steamId?: string | null;
+  totalCount: number;
 }
 
 export interface ImportCandidateDuplicate {

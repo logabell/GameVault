@@ -4,6 +4,7 @@ import type { SteamPatchEntry, TrackedItemView } from '../src/index.js';
 import {
   canDeleteTrackedItemFiles,
   getScopedLibraryStatusFilterCounts,
+  hasActionableSourceUpdate,
   matchesLibrarySearch,
   matchesLibraryStatusFilter,
   sortLibraryItems,
@@ -270,6 +271,20 @@ describe('shared library controls', () => {
       sourceBehind: 1,
       updates: 0,
     });
+  });
+
+  it('only treats installed games as actionable source updates', () => {
+    const installedUpdate = makeItem('Installed Update', {
+      trackingStatus: TrackedItemTrackingStatus.UpdateAvailable,
+    });
+    const queuedUpdate = makeItem('Queued Update', {
+      status: TrackedItemStatus.Queued,
+      trackingStatus: TrackedItemTrackingStatus.UpdateAvailable,
+    });
+
+    expect(hasActionableSourceUpdate(installedUpdate)).toBe(true);
+    expect(hasActionableSourceUpdate(queuedUpdate)).toBe(false);
+    expect(matchesLibraryStatusFilter(queuedUpdate, 'updates')).toBe(false);
   });
 
   it('only offers file deletion for local lifecycle states', () => {

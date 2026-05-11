@@ -3,6 +3,7 @@ import type {
   ConnectionHealthSummary,
   NativeMessageRequest,
   NativeMessageResponse,
+  PendingSteamWishlistAction,
   ParsedSourcePayload,
   SelectedDownloads,
   SettingsView,
@@ -12,6 +13,8 @@ import type {
   SteamDbBuildLookupState,
   SteamMatchResolutionPayload,
   SteamPatchCandidate,
+  SteamWishlistSyncItem,
+  SteamWishlistSyncPayload,
   SupportedSourceKind,
   ThemeMode,
   TrackedItemView,
@@ -45,12 +48,16 @@ const STEAMDB_SELECTION_CONTEXT_PREFIX = 'steamDbSelectionContext';
 const STEAMDB_BACKFILL_STATE_PREFIX = 'steamDbBackfill';
 const STEAMDB_PENDING_CONFIRMATION_KEY = 'steamDbPendingConfirmation';
 const DESKTOP_STEAMDB_LOOKUP_ALARM = 'desktopSteamDbBuildLookups';
+const DESKTOP_STEAM_WISHLIST_ALARM = 'desktopSteamWishlist';
 const STEAMDB_SELECTION_TTL_MS = 30 * 60 * 1000;
 const STEAMDB_BACKFILL_TIMEOUT_MS = 22000;
 const STEAMDB_MANUAL_BACKFILL_TIMEOUT_MS = 5 * 60 * 1000;
 const STEAMDB_BACKFILL_TTL_MS = 30 * 60 * 1000;
 const DESKTOP_STEAMDB_LOOKUP_FAST_POLL_MS = 2500;
 const STEAMDB_RETRY_AFTER_HINT_TTL_MS = 10 * 60 * 1000;
+const STEAM_WISHLIST_SYNC_MIN_INTERVAL_MS = 5 * 60 * 1000;
+const STEAM_WISHLIST_PROFILE_URL_RE =
+  /\/wishlist\/profiles\/(?<steamId>\d{17})\/?/i;
 
 interface CachedParsedPage {
   canonicalUrl: string;
@@ -156,6 +163,8 @@ let lastKnownHealthSnapshot: {
 } | null = null;
 let desktopSteamDbLookupPollInFlight = false;
 let desktopSteamDbLookupPollTimer: ReturnType<typeof setTimeout> | null = null;
+let desktopSteamWishlistPollInFlight = false;
+let lastSteamWishlistSessionSyncAttemptAt = 0;
 const steamDbRetryAfterHints = new Map<
   number,
   { capturedAt: number; retryAfterMs: number }
@@ -1001,6 +1010,231 @@ async function sendDesktopRequest(
   }
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object'
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function numberOrNull(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseSteamWishlistProfileUrl(value: string): {
+  profileUrl: string;
+  steamId: string;
+} | null {
+  const match = value.match(STEAM_WISHLIST_PROFILE_URL_RE);
+  const steamId = match?.groups?.steamId;
+  if (!steamId) return null;
+  return {
+    profileUrl: `https://store.steampowered.com/wishlist/profiles/${steamId}/`,
+    steamId,
+  };
+}
+
+async function fetchSteamWishlistProfile(): Promise<{
+  html: string;
+  profileUrl: string;
+  sessionId: string | null;
+  steamId: string;
+}> {
+  const response = await fetch(
+    'https://store.steampowered.com/wishlist/profiles/my/',
+    {
+      credentials: 'include',
+      headers: {
+        Accept: 'text/html, */*;q=0.8',
+      },
+      redirect: 'follow',
+    },
+  );
+  if (!response.ok) {
+    throw new Error(`Steam wishlist page returned ${response.status}.`);
+  }
+
+  const profile = parseSteamWishlistProfileUrl(response.url);
+  const html = await response.text();
+  if (!profile) {
+    throw new Error('Sign in to Steam in this browser to sync your wishlist.');
+  }
+
+  const sessionId =
+    html.match(/g_sessionID\s*=\s*"(?<sessionId>[^"]+)"/)?.groups
+      ?.sessionId ??
+    html.match(/"sessionid"\s*:\s*"(?<sessionId>[^"]+)"/)?.groups
+      ?.sessionId ??
+    null;
+  return {
+    html,
+    profileUrl: profile.profileUrl,
+    sessionId,
+    steamId: profile.steamId,
+  };
+}
+
+async function readSteamWishlistSessionItems(): Promise<SteamWishlistSyncPayload> {
+  const profile = await fetchSteamWishlistProfile();
+  const response = await fetch('https://store.steampowered.com/dynamicstore/userdata/', {
+    credentials: 'include',
+    headers: {
+      Accept: 'application/json',
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`Steam wishlist session lookup returned ${response.status}.`);
+  }
+
+  const payload = asRecord(await response.json());
+  const wishlist = Array.isArray(payload?.rgWishlist)
+    ? payload.rgWishlist
+    : [];
+  const items: SteamWishlistSyncItem[] = wishlist.flatMap((value) => {
+    const appId = numberOrNull(value);
+    return appId ? [{ appId }] : [];
+  });
+
+  return {
+    fetchedAt: new Date().toISOString(),
+    items,
+    profileUrl: profile.profileUrl,
+    source: 'extension_session',
+    steamId: profile.steamId,
+  };
+}
+
+async function syncSteamWishlistSession(): Promise<void> {
+  const payload = await readSteamWishlistSessionItems();
+  const response = await sendDesktopRequest(
+    {
+      payload,
+      type: 'syncSteamWishlist',
+    },
+    { bridgeTimeoutMs: 1000, retryBridgeTimeoutMs: 5000 },
+  );
+  if (!response.ok) {
+    throw new Error(response.error.message);
+  }
+}
+
+async function listPendingSteamWishlistActions(): Promise<
+  PendingSteamWishlistAction[]
+> {
+  try {
+    const response = await sendDesktopRequest(
+      {
+        payload: {},
+        type: 'listPendingSteamWishlistActions',
+      },
+      { bridgeTimeoutMs: 1000, retryBridgeTimeoutMs: 2500 },
+    );
+    if (!response.ok || response.type !== 'listPendingSteamWishlistActions') {
+      return [];
+    }
+    return response.payload;
+  } catch {
+    return [];
+  }
+}
+
+async function removeSteamWishlistItem(
+  action: PendingSteamWishlistAction,
+): Promise<void> {
+  if (!action.appId) {
+    throw new Error('Wishlist removal action is missing a Steam AppID.');
+  }
+  const profile = await fetchSteamWishlistProfile();
+  if (!profile.sessionId) {
+    throw new Error('Steam session id was unavailable. Open Steam and sign in.');
+  }
+  const profileUrl = action.profileUrl ?? profile.profileUrl;
+  const removeUrl = new URL('remove/', profileUrl).toString();
+  const body = new URLSearchParams({
+    appid: String(action.appId),
+    sessionid: profile.sessionId,
+  });
+  const response = await fetch(removeUrl, {
+    body,
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      'X-Requested-With': 'XMLHttpRequest',
+    },
+    method: 'POST',
+  });
+  if (!response.ok) {
+    throw new Error(`Steam wishlist removal returned ${response.status}.`);
+  }
+}
+
+async function completeSteamWishlistRemovalAction(
+  action: PendingSteamWishlistAction,
+  result: { errorMessage?: string | null; success: boolean },
+): Promise<void> {
+  if (!action.appId) return;
+  await sendDesktopRequest(
+    {
+      payload: {
+        actionId: action.id,
+        appId: action.appId,
+        errorMessage: result.errorMessage ?? null,
+        success: result.success,
+      },
+      type: 'completeSteamWishlistRemoval',
+    },
+    { bridgeTimeoutMs: 1000, retryBridgeTimeoutMs: 2500 },
+  );
+}
+
+async function pollDesktopSteamWishlistActions(): Promise<void> {
+  if (desktopSteamWishlistPollInFlight) {
+    return;
+  }
+
+  desktopSteamWishlistPollInFlight = true;
+  try {
+    const actions = await listPendingSteamWishlistActions();
+    const syncAction = actions.find((action) => action.actionType === 'sync');
+    const syncRequestedAt = syncAction
+      ? new Date(syncAction.requestedAt).getTime()
+      : 0;
+    if (
+      syncAction &&
+      (syncRequestedAt > lastSteamWishlistSessionSyncAttemptAt ||
+        Date.now() - lastSteamWishlistSessionSyncAttemptAt >
+          STEAM_WISHLIST_SYNC_MIN_INTERVAL_MS)
+    ) {
+      lastSteamWishlistSessionSyncAttemptAt = Date.now();
+      await syncSteamWishlistSession().catch(() => {
+        // Leave the sync action pending so a later signed-in browser session can retry.
+      });
+    }
+
+    for (const action of actions.filter(
+      (candidate) => candidate.actionType === 'remove',
+    )) {
+      try {
+        await removeSteamWishlistItem(action);
+        await completeSteamWishlistRemovalAction(action, { success: true });
+        await syncSteamWishlistSession().catch(() => undefined);
+      } catch (error) {
+        await completeSteamWishlistRemovalAction(action, {
+          errorMessage:
+            error instanceof Error
+              ? error.message
+              : 'Unable to remove Steam wishlist item.',
+          success: false,
+        }).catch(() => undefined);
+      }
+    }
+  } finally {
+    desktopSteamWishlistPollInFlight = false;
+  }
+}
+
 async function resolveSteamCandidates(
   parsedSource: ParsedSourcePayload,
   queryTitle?: string | null,
@@ -1431,6 +1665,12 @@ async function pollDesktopSteamDbBuildLookups(): Promise<void> {
 
 async function ensureDesktopSteamDbLookupAlarm(): Promise<void> {
   await chrome.alarms.create(DESKTOP_STEAMDB_LOOKUP_ALARM, {
+    periodInMinutes: 1,
+  });
+}
+
+async function ensureDesktopSteamWishlistAlarm(): Promise<void> {
+  await chrome.alarms.create(DESKTOP_STEAM_WISHLIST_ALARM, {
     periodInMinutes: 1,
   });
 }
@@ -3106,11 +3346,14 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name !== DESKTOP_STEAMDB_LOOKUP_ALARM) {
+  if (alarm.name === DESKTOP_STEAMDB_LOOKUP_ALARM) {
+    void pollDesktopSteamDbBuildLookups().catch(() => undefined);
     return;
   }
 
-  void pollDesktopSteamDbBuildLookups().catch(() => undefined);
+  if (alarm.name === DESKTOP_STEAM_WISHLIST_ALARM) {
+    void pollDesktopSteamWishlistActions().catch(() => undefined);
+  }
 });
 
 chrome.webRequest.onHeadersReceived.addListener(
@@ -3121,15 +3364,21 @@ chrome.webRequest.onHeadersReceived.addListener(
 
 chrome.runtime.onInstalled.addListener(() => {
   void ensureDesktopSteamDbLookupAlarm().catch(() => undefined);
+  void ensureDesktopSteamWishlistAlarm().catch(() => undefined);
   void pollDesktopSteamDbBuildLookups().catch(() => undefined);
+  void pollDesktopSteamWishlistActions().catch(() => undefined);
   void primeCurrentTab().catch(() => undefined);
 });
 
 chrome.runtime.onStartup.addListener(() => {
   void ensureDesktopSteamDbLookupAlarm().catch(() => undefined);
+  void ensureDesktopSteamWishlistAlarm().catch(() => undefined);
   void pollDesktopSteamDbBuildLookups().catch(() => undefined);
+  void pollDesktopSteamWishlistActions().catch(() => undefined);
 });
 
 void ensureDesktopSteamDbLookupAlarm().catch(() => undefined);
+void ensureDesktopSteamWishlistAlarm().catch(() => undefined);
 void pollDesktopSteamDbBuildLookups().catch(() => undefined);
+void pollDesktopSteamWishlistActions().catch(() => undefined);
 void primeCurrentTab().catch(() => undefined);

@@ -6,6 +6,8 @@ import { basename, dirname, join } from 'node:path';
 
 import type {
   ConfirmedSteamMatch,
+  ConnectionHealthSummary,
+  DownloadJobRecord,
   ExtensionSetupInfo,
   ParsedSourcePayload,
   SteamPatchCandidate,
@@ -21,6 +23,7 @@ import {
   GameVaultService,
   type DirectHttpDownloadProgressSnapshot,
   type DirectHttpDownloadRunner,
+  type PlayniteIntegrationPaths,
 } from '../src/main/services/gamevault-service.js';
 import type { extractSingleStagedZipArchive } from '../src/main/services/files.js';
 
@@ -279,6 +282,65 @@ function mockSteamNetwork(
 
     return new Response('', { status: 404 });
   });
+}
+
+function mockSteamWishlistNetwork(params: {
+  metadata: Record<number, { title: string; releaseDate?: number }>;
+  wishlistItems?: Array<{ appid: number; date_added?: number; priority?: number }>;
+}) {
+  return vi.fn(async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    if (
+      url.hostname === 'api.steampowered.com' &&
+      url.pathname === '/IWishlistService/GetWishlist/v1/'
+    ) {
+      return new Response(
+        JSON.stringify({
+          response: {
+            items: params.wishlistItems ?? [],
+          },
+        }),
+        { status: 200 },
+      );
+    }
+
+    if (
+      url.hostname === 'api.steampowered.com' &&
+      url.pathname === '/IStoreBrowseService/GetItems/v1/'
+    ) {
+      const inputJson = JSON.parse(url.searchParams.get('input_json') ?? '{}');
+      const appIds: number[] = (inputJson.ids ?? []).map(
+        (entry: { appid: number }) => Number(entry.appid),
+      );
+      return new Response(
+        JSON.stringify({
+          response: {
+            store_items: appIds
+              .map((appId) => {
+                const metadata = params.metadata[appId];
+                return metadata
+                  ? {
+                      appid: appId,
+                      assets: {
+                        asset_url_format: `steam/apps/${appId}/\${FILENAME}?t=123`,
+                        library_hero: 'library_hero.jpg',
+                      },
+                      name: metadata.title,
+                      release: metadata.releaseDate
+                        ? { steam_release_date: metadata.releaseDate }
+                        : undefined,
+                    }
+                  : null;
+              })
+              .filter(Boolean),
+          },
+        }),
+        { status: 200 },
+      );
+    }
+
+    return new Response('', { status: 404 });
+  }) as typeof fetch;
 }
 
 function steamRipSourceHtml(params: {
@@ -663,19 +725,23 @@ function createService(
     ),
   })),
   jDownloaderEnabled = true,
+  notify: (
+    event: 'debug' | 'error' | 'info' | 'warn',
+    message: string,
+  ) => void = () => undefined,
+  jDownloaderHealth: ConnectionHealthSummary['myJDownloader'] = {
+    color: 'green',
+    label: 'Ready',
+    message: 'Ready',
+  },
+  playnitePaths: PlayniteIntegrationPaths = {},
 ): GameVaultService {
   database.setSetting(
     'download.jdownloader.enabled',
     jDownloaderEnabled ? 'true' : 'false',
   );
   const myJDownloader = {
-    getHealth: async () => ({
-      color: 'green',
-      devices: [],
-      label: 'Ready',
-      message: 'Ready',
-      selectedDeviceId: null,
-    }),
+    getHealth: async () => jDownloaderHealth,
     getPackageProgress,
     queueLinks,
     removePackage,
@@ -689,13 +755,15 @@ function createService(
       decrypt: (text) => text,
       encrypt: (text) => text,
     },
-    () => undefined,
+    notify,
     () => undefined,
     async () => null,
     dismountIsoUnderPath,
     sourceFetch,
     startDirectHttpDownload,
     extractStagedZipArchive,
+    (input, init) => fetch(input, init),
+    playnitePaths,
   );
 }
 
@@ -739,6 +807,126 @@ async function waitForCondition(
 
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+describe('GameVaultService Steam wishlist workflow', () => {
+  it('syncs wishlist items and marks exact Steam AppID library matches', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const tracked = database.upsertTrackedItem({
+        coverUrl: null,
+        normalizedTitle: 'terraria',
+        sourceKind: 'manual',
+        title: 'Terraria',
+      });
+      database.upsertSteamMatch(tracked.id, {
+        appId: 105600,
+        coverUrl:
+          'https://cdn.cloudflare.steamstatic.com/steam/apps/105600/library_hero.jpg',
+        matchedAt: new Date().toISOString(),
+        normalizedTitle: 'terraria',
+        title: 'Terraria',
+      });
+
+      vi.stubGlobal(
+        'fetch',
+        mockSteamWishlistNetwork({
+          metadata: {
+            105600: { title: 'Terraria' },
+            220200: { title: 'Kerbal Space Program' },
+          },
+          wishlistItems: [
+            { appid: 105600, date_added: 1751434604, priority: 0 },
+            { appid: 220200, date_added: 1751430884, priority: 1 },
+          ],
+        }),
+      );
+
+      const service = createService(database);
+      const view = await service.syncSteamWishlist({
+        fetchedAt: '2026-05-10T12:00:00.000Z',
+        items: [{ appId: 105600 }, { appId: 220200 }],
+        profileUrl:
+          'https://store.steampowered.com/wishlist/profiles/76561198086715287/',
+        source: 'extension_session',
+        steamId: '76561198086715287',
+      });
+
+      expect(view.items).toHaveLength(2);
+      expect(
+        view.items.find((item) => item.appId === 105600)?.library.status,
+      ).toBe('tracked');
+      expect(
+        view.items.find((item) => item.appId === 220200)?.library.status,
+      ).toBe('not_in_library');
+      expect(view.steamId).toBe('76561198086715287');
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('queues removal only for installed matched wishlist games', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const installRoot = join(tempRoot, 'Terraria');
+      await mkdir(installRoot);
+      const tracked = database.upsertTrackedItem({
+        coverUrl: null,
+        normalizedTitle: 'terraria',
+        sourceKind: 'manual',
+        title: 'Terraria',
+      });
+      database.upsertSteamMatch(tracked.id, {
+        appId: 105600,
+        coverUrl:
+          'https://cdn.cloudflare.steamstatic.com/steam/apps/105600/library_hero.jpg',
+        matchedAt: new Date().toISOString(),
+        normalizedTitle: 'terraria',
+        title: 'Terraria',
+      });
+      database.upsertInstallRecord({
+        installPath: installRoot,
+        installedAt: '2026-05-10T12:00:00.000Z',
+        trackedItemId: tracked.id,
+        updatedAt: '2026-05-10T12:00:00.000Z',
+      });
+
+      vi.stubGlobal(
+        'fetch',
+        mockSteamWishlistNetwork({
+          metadata: {
+            105600: { title: 'Terraria' },
+          },
+          wishlistItems: [{ appid: 105600 }],
+        }),
+      );
+
+      const service = createService(database);
+      await service.syncSteamWishlist({
+        items: [{ appId: 105600 }],
+        source: 'extension_session',
+      });
+      const view = await service.requestSteamWishlistRemoval({
+        appId: 105600,
+        trackedItemId: tracked.id,
+      });
+      const item = view.items.find((entry) => entry.appId === 105600);
+
+      expect(item?.library.status).toBe('installed');
+      expect(item?.removalPending?.status).toBe('pending');
+      expect(service.listPendingSteamWishlistActions()).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            actionType: 'remove',
+            appId: 105600,
+            trackedItemId: tracked.id,
+          }),
+        ]),
+      );
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
 });
 
 describe('GameVaultService import workflow', () => {
@@ -1395,6 +1583,7 @@ describe('GameVaultService import workflow', () => {
       const rootPath = join(tempRoot, 'Library');
       const folderPath = join(rootPath, 'Snapshotless');
       await mkdir(folderPath, { recursive: true });
+      await writeFile(join(folderPath, 'Snapshotless.exe'), 'game');
       vi.stubGlobal(
         'fetch',
         vi.fn(async (input: RequestInfo | URL) => {
@@ -1951,6 +2140,51 @@ describe('GameVaultService SteamDB patch workflow', () => {
     }
   });
 
+  it('does not mark an empty install folder as installed', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootLibraryPath = join(tempRoot, 'Library');
+      const installPath = join(rootLibraryPath, 'Schedule I');
+      database.setSetting('library.rootPath', rootLibraryPath);
+      await mkdir(installPath, { recursive: true });
+
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'schedule i',
+        sourceKind: 'steamrip',
+        sourceUrl: 'https://steamrip.com/schedule-i-free-download/',
+        title: 'Schedule I',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 3164500,
+        coverUrl: null,
+        matchedAt: '2026-05-10T12:00:00.000Z',
+        normalizedTitle: 'schedule i',
+        title: 'Schedule I',
+      });
+      database.upsertInstallRecord({
+        installedAt: '05/10/2026',
+        installedBuildId: null,
+        installedSourceKind: 'steamrip',
+        installedSourceUrl: 'https://steamrip.com/schedule-i-free-download/',
+        installedVersion: null,
+        installPath,
+        trackedItemId: item.id,
+        updatedAt: '2026-05-10T12:00:00.000Z',
+      });
+
+      const [view] = await createService(database).listTrackedItems();
+
+      expect(view?.fileState).toMatchObject({
+        finalPath: installPath,
+        finalPathExists: false,
+      });
+      expect(view?.status).toBe('folder_missing');
+      expect(view?.patchMetadataStatus).not.toBe('behind');
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('does not mark an installed SteamRIP source as updateable when only SteamDB is newer', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -2054,6 +2288,10 @@ describe('GameVaultService SteamDB patch workflow', () => {
       await mkdir(join(tempRoot, 'Library', 'Alina of the Arena'), {
         recursive: true,
       });
+      await writeFile(
+        join(tempRoot, 'Library', 'Alina of the Arena', 'Alina.exe'),
+        'game',
+      );
 
       const [view] = await createService(database).listTrackedItems();
       const steamrip = view?.sourceMatches.find(
@@ -2278,6 +2516,10 @@ describe('GameVaultService SteamDB patch workflow', () => {
       await mkdir(join(tempRoot, 'Library', 'Ziggurat 2'), {
         recursive: true,
       });
+      await writeFile(
+        join(tempRoot, 'Library', 'Ziggurat 2', 'Ziggurat2.exe'),
+        'game',
+      );
 
       const [view] = await createService(database).listTrackedItems();
       const elamigos = view?.sourceMatches.find(
@@ -3025,6 +3267,150 @@ describe('GameVaultService SteamDB patch workflow', () => {
     }
   });
 
+  it('persists resolved installed patch metadata for non-manual installs after reload', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const libraryRoot = join(tempRoot, 'Library');
+      const installPath = join(libraryRoot, 'MOUSE P.I. For Hire');
+      await mkdir(installPath, { recursive: true });
+      await writeFile(join(installPath, 'Mouse.exe'), 'game');
+      database.setSetting('library.rootPath', libraryRoot);
+
+      const item = database.upsertTrackedItem({
+        normalizedTitle: parsedSource.normalizedTitle,
+        sourceKind: parsedSource.sourceKind,
+        sourceUrl: parsedSource.sourceUrl,
+        title: parsedSource.title,
+      });
+      database.upsertSteamMatch(item.id, steamMatch);
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-20T12:00:00.000Z',
+        fingerprint: parsedSource.fingerprint,
+        observedBuildId: null,
+        observedPatchDate: parsedSource.latestSourceRelease.patchDate,
+        observedPatchLink: null,
+        observedPatchTitle: null,
+        observedVersion: parsedSource.latestSourceRelease.version,
+        patchSelectionSource: null,
+        sourceKind: parsedSource.sourceKind,
+        sourceUrl: parsedSource.sourceUrl,
+        trackedItemId: item.id,
+      });
+      database.setRawParsedSourcePayload(item.id, parsedSource);
+      database.upsertInstallRecord({
+        installedAt: null,
+        installedBuildId: null,
+        installedSourceKind: parsedSource.sourceKind,
+        installedSourceUrl: parsedSource.sourceUrl,
+        installedVersion: null,
+        installPath,
+        trackedItemId: item.id,
+        updatedAt: '2026-04-20T12:00:00.000Z',
+      });
+      const newerPatch: SteamPatchCandidate = {
+        ...selectedPatch,
+        buildId: '22899999',
+        link: 'https://steamdb.info/patchnotes/22899999/',
+        patchDate: '04/20/2026',
+        patchTitle: 'MOUSE: P.I. For Hire update for 20 April 2026',
+        publishedAt: '2026-04-20T07:13:32.000Z',
+        title: 'MOUSE: P.I. For Hire update for 20 April 2026',
+      };
+
+      const service = createService(database);
+      const [initial] = await service.listTrackedItems();
+      expect(initial?.patchMetadataStatus).toBe('needs_attention');
+
+      const updated = await service.updateSourcePatch({
+        selectedSteamPatch: selectedPatch,
+        steamPatchEntries: [newerPatch, selectedPatch],
+        trackedItemId: item.id,
+      });
+
+      expect(updated.installRecord).toMatchObject({
+        installedBuildId: selectedPatch.buildId,
+        installedVersion: selectedPatch.patchTitle,
+      });
+      expect(updated.selectedPatch).toMatchObject({
+        buildId: selectedPatch.buildId,
+      });
+      expect(updated.patchMetadataStatus).toBe('behind');
+
+      const reopened = await GameVaultDatabase.open(
+        join(tempRoot, 'gamevault.sqlite'),
+        resolveSqlWasmPath(),
+      );
+      const [reopenedView] = await createService(reopened).listTrackedItems();
+
+      expect(reopened.getSourceSnapshot(item.id, 'steamrip')).toMatchObject({
+        observedBuildId: null,
+        patchSelectionSource: null,
+      });
+      expect(reopenedView?.installRecord).toMatchObject({
+        installedBuildId: selectedPatch.buildId,
+        installedVersion: selectedPatch.patchTitle,
+      });
+      expect(reopenedView?.selectedPatch).toMatchObject({
+        buildId: selectedPatch.buildId,
+      });
+      expect(reopenedView?.patchMetadataStatus).toBe('behind');
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('fails JDownloader queueing when the selected device is offline', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response(rss([selectedPatch]), { status: 200 })),
+      );
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9001,
+        packageName: 'queued-package',
+      }));
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        undefined,
+        undefined,
+        fetch,
+        undefined,
+        undefined,
+        undefined,
+        createEmbeddedBrowserRunner(),
+        true,
+        undefined,
+        {
+          color: 'yellow',
+          label: 'JDownloader offline',
+          message:
+            'Open JDownloader on the selected device, then refresh status.',
+        },
+      );
+
+      await expect(
+        service.addTrackedItem({
+          parsedSource,
+          queueDownload: true,
+          selectedDownloads: { fullUrl: 'https://gofile.io/d/full' },
+          selectedSteamPatch: selectedPatch,
+          steamMatch,
+        }),
+      ).rejects.toThrow('Open JDownloader');
+
+      expect(queueLinks).not.toHaveBeenCalled();
+      const trackedItem = database.listTrackedItems()[0];
+      expect(trackedItem).toBeDefined();
+      expect(database.getDownloadJob(trackedItem!.id)).toBeNull();
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('updates imported patch metadata without overwriting matched source snapshots', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -3366,6 +3752,106 @@ describe('GameVaultService SteamDB patch workflow', () => {
         },
         status: 'failed',
       });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('deletes library files without notifying when stale JDownloader cleanup fails', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootLibraryPath = join(tempRoot, 'Library');
+      const installPath = join(rootLibraryPath, 'Old Game');
+      const stagePath = join(rootLibraryPath, '_STAGING', 'Old Game');
+      await mkdir(installPath, { recursive: true });
+      await mkdir(stagePath, { recursive: true });
+      await writeFile(join(installPath, 'OldGame.exe'), 'game');
+      await writeFile(join(stagePath, 'archive.part1.rar'), 'stage');
+      database.setSetting('library.rootPath', rootLibraryPath);
+      const item = database.upsertTrackedItem({
+        id: 'old-game',
+        normalizedTitle: 'old game',
+        sourceKind: 'manual',
+        title: 'Old Game',
+      });
+      database.upsertInstallRecord({
+        installPath,
+        installedAt: '2026-05-10T12:00:00.000Z',
+        installedBuildId: null,
+        installedSourceKind: 'manual',
+        installedSourceUrl: null,
+        installedVersion: '1.0',
+        trackedItemId: item.id,
+        updatedAt: '2026-05-10T12:00:00.000Z',
+      });
+      const now = '2026-05-10T12:00:00.000Z';
+      const job: DownloadJobRecord = {
+        bytesLoaded: null,
+        bytesTotal: null,
+        completedParts: null,
+        createdAt: now,
+        errorMessage: null,
+        etaSeconds: null,
+        finalPath: installPath,
+        id: 'old-job',
+        packageId: 123,
+        packageName: 'Old Game',
+        parts: [],
+        provider: 'jdownloader',
+        selectedMirrorUrl: null,
+        selectedPatchMirrorUrl: null,
+        sourceKind: null,
+        speed: null,
+        stage: 'complete',
+        stagePath,
+        statusMessage: null,
+        totalParts: null,
+        trackedItemId: item.id,
+        updatedAt: now,
+      };
+      database.upsertDownloadJob(job);
+      const removePackage = vi.fn(async () => {
+        throw new Error('Package no longer exists in JDownloader.');
+      });
+      const notify = vi.fn();
+      const service = createService(
+        database,
+        undefined,
+        removePackage,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        true,
+        notify,
+      );
+
+      await service.removeTrackedItem({
+        mode: 'delete_files',
+        trackedItemId: item.id,
+      });
+
+      expect(removePackage).toHaveBeenCalledOnce();
+      expect(existsSync(installPath)).toBe(false);
+      expect(notify).not.toHaveBeenCalledWith(
+        'warn',
+        'Unable to remove JDownloader package during cleanup',
+      );
+      expect(database.listEvents()).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            level: 'warn',
+            message: 'Unable to remove JDownloader package during cleanup',
+          }),
+          expect.objectContaining({
+            level: 'info',
+            message: 'Deleted tracked item files',
+          }),
+        ]),
+      );
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
@@ -4290,6 +4776,92 @@ describe('GameVaultService SteamDB patch workflow', () => {
           url: ankergamesProxyUrl,
         }),
       ]);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('logs unresolved Ankergames direct-ready mirrors during source refresh without notifying', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response(rss([]), { status: 200 })),
+      );
+      const warningMessage =
+        'Unable to resolve Ankergames direct-ready mirror during source refresh';
+      const notify = vi.fn();
+      const sourceFetch = vi.fn(async (input: string, init?: RequestInit) => {
+        if (input === 'https://ankergames.net/game/shape-of-dreams') {
+          return new Response(ankergamesSourceHtml(), { status: 200 });
+        }
+        if (input === 'https://ankergames.net/csrf-token') {
+          return new Response(JSON.stringify({ token: 'csrf-token' }), {
+            status: 200,
+          });
+        }
+        if (input === 'https://ankergames.net/generate-download-url/2557') {
+          expect(init?.method).toBe('POST');
+          return new Response(
+            JSON.stringify({
+              download_url: 'https://ankergames.net/download/signed',
+              success: true,
+            }),
+            { status: 200 },
+          );
+        }
+        expect(input).toBe('https://ankergames.net/download/signed');
+        return new Response('<html><body>Countdown</body></html>', {
+          status: 200,
+        });
+      });
+      const service = createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        true,
+        notify,
+      );
+
+      const draft = await service.createMatchedDraft({
+        parsedSource: ankergamesDirectReadySource,
+        steamMatch: {
+          ...steamMatch,
+          appId: 2444750,
+          normalizedTitle: 'shape of dreams',
+          title: 'Shape of Dreams',
+        },
+      });
+
+      notify.mockClear();
+      await service.refreshMatchedSource(draft.item.id, 'ankergames');
+
+      expect(
+        database
+          .listEvents()
+          .filter((event) => event.message === warningMessage),
+      ).toEqual([
+        expect.objectContaining({
+          context: expect.objectContaining({
+            trackedItemId: draft.item.id,
+            url: 'https://ankergames.net/generate-download-url/2557',
+          }),
+          level: 'warn',
+          message: warningMessage,
+        }),
+      ]);
+      expect(notify).not.toHaveBeenCalledWith('warn', warningMessage);
+      expect(notify).toHaveBeenCalledWith(
+        'info',
+        'Refreshed ankergames source',
+      );
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
@@ -5240,6 +5812,7 @@ describe('GameVaultService SteamDB patch workflow', () => {
       await writeFile(join(updateStagePath, 'update.exe'), 'update');
       const installedPath = join(tempRoot, 'Library', 'Frostpunk 2');
       await mkdir(installedPath, { recursive: true });
+      await writeFile(join(installedPath, 'Frostpunk2.exe'), 'game');
 
       const completed = await service.completeStagedInstall(view.item.id);
 
@@ -5883,6 +6456,131 @@ describe('GameVaultService SteamDB patch workflow', () => {
         stage: 'complete',
         statusMessage: 'Downloaded and installed',
       });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('refreshes the Playnite manifest after a direct download installs', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootLibraryPath = join(tempRoot, 'Library');
+      const playniteAppDataPath = join(tempRoot, 'PlayniteAppData');
+      const manifestPath = join(playniteAppDataPath, 'playnite-library.json');
+      database.setSetting('library.rootPath', rootLibraryPath);
+      database.setSetting('playnite.integrationEnabled', 'true');
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const downloadCompletion = createDeferred<{
+        fileName: string;
+        savePath: string;
+      }>();
+      const extractStagedZipArchive = vi.fn(
+        async (params: { extractPath: string }) => {
+          const gamePath = join(params.extractPath, 'A Little to the Left');
+          await mkdir(gamePath, { recursive: true });
+          await writeFile(
+            join(gamePath, 'A Little To The Left.exe'),
+            'game',
+          );
+          await mkdir(join(gamePath, 'A Little To The Left_Data'), {
+            recursive: true,
+          });
+          return join(params.extractPath, 'A-Little-To-The-Left.zip');
+        },
+      );
+      const startEmbeddedBrowserDownload = createEmbeddedBrowserRunner({
+        completion: downloadCompletion.promise,
+      });
+      const service = createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        fetch,
+        undefined,
+        undefined,
+        extractStagedZipArchive,
+        startEmbeddedBrowserDownload,
+        true,
+        undefined,
+        undefined,
+        { appDataPath: playniteAppDataPath },
+      );
+      const aLittleSource: ParsedSourcePayload = {
+        ...ankergamesDirectReadySource,
+        fingerprint: 'ankergames-a-little-to-the-left',
+        latestSourceRelease: {
+          buildId: '1629520',
+          isPatch: false,
+          label: 'Version 1.0',
+          version: '1.0',
+        },
+        normalizedTitle: 'a little to the left',
+        sourceUrl: 'https://ankergames.net/game/a-little-to-the-left',
+        title: 'A Little to the Left',
+      };
+      const aLittlePatch: SteamPatchCandidate = {
+        ...selectedPatch,
+        appId: 1629520,
+        buildId: '1629520',
+        patchTitle: 'A Little to the Left launch build',
+        title: 'A Little to the Left launch build',
+        version: '1.0',
+      };
+
+      const queued = await service.addTrackedItem({
+        parsedSource: aLittleSource,
+        queueDownload: true,
+        selectedDownloads: {
+          fullUrl: 'https://ankergames.net/generate-download-url/2557',
+        },
+        selectedSteamPatch: aLittlePatch,
+        steamMatch: {
+          ...steamMatch,
+          appId: 1629520,
+          normalizedTitle: 'a little to the left',
+          title: 'A Little to the Left',
+        },
+      });
+      const stagePath = queued.currentDownload?.stagePath;
+      expect(stagePath).toEqual(expect.any(String));
+      await writeFile(join(stagePath!, 'A-Little-To-The-Left.zip'), 'zip');
+
+      downloadCompletion.resolve({
+        fileName: 'A-Little-To-The-Left.zip',
+        savePath: join(stagePath!, 'A-Little-To-The-Left.zip'),
+      });
+      await downloadCompletion.promise;
+      await waitForCondition(
+        () =>
+          database.getDownloadJob(queued.item.id)?.stage === 'complete' &&
+          existsSync(manifestPath),
+      );
+
+      const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as {
+        games: Array<{
+          executablePath: string;
+          installPath: string;
+          steamAppId: number;
+          title: string;
+        }>;
+      };
+      expect(manifest.games).toEqual([
+        expect.objectContaining({
+          executablePath: join(
+            rootLibraryPath,
+            'A Little to the Left',
+            'A Little To The Left.exe',
+          ),
+          installPath: join(rootLibraryPath, 'A Little to the Left'),
+          steamAppId: 1629520,
+          title: 'A Little to the Left',
+        }),
+      ]);
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }

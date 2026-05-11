@@ -40,6 +40,39 @@ async function removeTempRootAfterPendingSave(tempRoot: string): Promise<void> {
 }
 
 describe('GameVaultDatabase cleanup metadata', () => {
+  it('rejects duplicate Steam app ids', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const first = database.upsertTrackedItem({
+        normalizedTitle: 'barony',
+        sourceKind: 'manual',
+        title: 'Barony',
+      });
+      const second = database.upsertTrackedItem({
+        normalizedTitle: 'barony duplicate',
+        sourceKind: 'manual',
+        title: 'Barony Duplicate',
+      });
+      database.upsertSteamMatch(first.id, {
+        appId: 371970,
+        matchedAt: '2026-05-10T12:00:00.000Z',
+        normalizedTitle: 'barony',
+        title: 'Barony',
+      });
+
+      expect(() =>
+        database.upsertSteamMatch(second.id, {
+          appId: 371970,
+          matchedAt: '2026-05-10T12:00:00.000Z',
+          normalizedTitle: 'barony',
+          title: 'Barony',
+        }),
+      ).toThrow(/already tracked/);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('caches SteamDB build-table history until expiry', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {

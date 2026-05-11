@@ -74,6 +74,7 @@ export function needsPatchMetadataAttention(item: TrackedItemView): boolean {
 
 export function hasActionableSourceUpdate(item: TrackedItemView): boolean {
   return (
+    item.status === TrackedItemStatus.Installed &&
     !needsPatchMetadataAttention(item) &&
     getTrackingStatus(item) === TrackedItemTrackingStatus.UpdateAvailable
   );

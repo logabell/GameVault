@@ -1,4 +1,5 @@
 import {
+  access,
   copyFile,
   mkdir,
   readdir,
@@ -43,6 +44,28 @@ async function buildAndCopyExtension() {
   const bundledExtensionDir = join(distDir, 'extension');
   await rm(bundledExtensionDir, { force: true, recursive: true });
   await copyDirectory(extensionDistDir, bundledExtensionDir);
+}
+
+async function pathExists(path) {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function copyPlaynitePlugin() {
+  const pluginProjectDir = resolve(rootDir, '..', 'playnite-plugin');
+  await import(pathToFileURL(join(pluginProjectDir, 'scripts', 'build.mjs')).href);
+  const pluginBuildDir = join(pluginProjectDir, 'bin', 'Release', 'net462');
+  const builtDllPath = join(pluginBuildDir, 'GameVault.Playnite.dll');
+  const bundledPluginDir = join(distDir, 'playnite-plugin');
+  const sourceDir = (await pathExists(builtDllPath))
+    ? pluginBuildDir
+    : pluginProjectDir;
+  await rm(bundledPluginDir, { force: true, recursive: true });
+  await copyDirectory(sourceDir, bundledPluginDir);
 }
 
 await Promise.all([
@@ -97,6 +120,7 @@ await copyFile(
 );
 await copyDirectory(join(srcDir, 'assets'), join(distDir, 'assets'));
 await buildAndCopyExtension();
+await copyPlaynitePlugin();
 await copyFile(
   resolve(rootDir, '../../node_modules/sql.js/dist/sql-wasm.wasm'),
   join(distDir, 'main', 'sql-wasm.wasm'),
