@@ -4121,6 +4121,121 @@ describe('GameVaultService SteamDB patch workflow', () => {
     }
   });
 
+  it('queues repeated ElAmigos full/update mirrors as one full package', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const sharedFileCryptUrl =
+        'https://www.filecrypt.cc/Container/4A5B64741B.html';
+      const elamigosSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fullDownloadUrls: [
+          {
+            kind: 'full',
+            label: 'DDOWNLOAD FileCrypt',
+            url: sharedFileCryptUrl,
+          },
+        ],
+        latestSourceRelease: {
+          isPatch: true,
+          label: 'update 1.0.1 - 1.0.5',
+          patchDate: '04/21/2026',
+          version: '1.0.5',
+        },
+        patchDownloadUrls: [
+          {
+            kind: 'patch',
+            label: 'DDOWNLOAD FileCrypt',
+            url: 'https://filecrypt.cc/Container/4A5B64741B.html',
+          },
+        ],
+        sourceKind: 'elamigos',
+        sourceUrl: 'https://elamigos.site/data/Shared_FileCrypt.html',
+        title: 'MOUSE P.I. For Hire',
+      };
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9003,
+        packageName: 'MOUSE P.I. For Hire_22852168',
+        parts: [
+          {
+            mirrorUrl: sharedFileCryptUrl,
+            packageId: 9003,
+            packageName: 'MOUSE P.I. For Hire_22852168',
+            role: 'full' as const,
+          },
+        ],
+      }));
+      const service = createService(database, queueLinks);
+      const item = database.upsertTrackedItem({
+        normalizedTitle: elamigosSource.normalizedTitle,
+        sourceKind: 'elamigos',
+        sourceUrl: elamigosSource.sourceUrl,
+        title: elamigosSource.title,
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-23T12:00:00.000Z',
+        fingerprint: elamigosSource.fingerprint,
+        observedBuildId: selectedPatch.buildId ?? null,
+        observedPatchDate: selectedPatch.patchDate,
+        observedPatchLink: selectedPatch.link,
+        observedPatchTitle: selectedPatch.patchTitle,
+        observedVersion: '1.0.5',
+        patchSelectionSource: selectedPatch.selectionSource ?? 'rss',
+        sourceKind: 'elamigos',
+        sourceUrl: elamigosSource.sourceUrl,
+        trackedItemId: item.id,
+      });
+      database.setRawParsedSourcePayload(item.id, elamigosSource);
+      database.syncDownloadMirrors(item.id, 'elamigos', [
+        {
+          kind: 'full',
+          label: 'DDOWNLOAD FileCrypt',
+          url: sharedFileCryptUrl,
+        },
+        {
+          kind: 'patch',
+          label: 'DDOWNLOAD FileCrypt',
+          url: 'https://filecrypt.cc/Container/4A5B64741B.html',
+        },
+      ]);
+      database.upsertInstallRecord({
+        installedAt: '04/19/2026',
+        installedBuildId: '22800000',
+        installedSourceKind: 'elamigos',
+        installedSourceUrl: elamigosSource.sourceUrl,
+        installedVersion: '1.0.1',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-23T12:00:00.000Z',
+      });
+
+      await service.queueUpdateFromSource({
+        sourceKind: 'elamigos',
+        trackedItemId: item.id,
+      });
+
+      expect(queueLinks).toHaveBeenCalledWith(
+        expect.objectContaining({
+          selectedDownloads: {
+            fullUrl: sharedFileCryptUrl,
+            patchUrl: null,
+            sourceKind: 'elamigos',
+          },
+        }),
+      );
+      expect(database.getDownloadJob(item.id)).toMatchObject({
+        packageName: 'MOUSE P.I. For Hire_22852168',
+        selectedMirrorUrl: sharedFileCryptUrl,
+        selectedPatchMirrorUrl: null,
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('queues full-only ElAmigos updates in manual mode when ElAmigos JDownloader is disabled', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -6027,6 +6142,426 @@ describe('GameVaultService SteamDB patch workflow', () => {
         installedSourceKind: 'elamigos',
         installPath: installedPath,
       });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('renames completed manual ElAmigos folders to the Steam title', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootLibraryPath = join(tempRoot, 'Library');
+      database.setSetting('library.rootPath', rootLibraryPath);
+      database.setSetting(
+        'download.jdownloader.sources',
+        JSON.stringify({ elamigos: false, steamrip: true }),
+      );
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const elamigosSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fullDownloadUrls: [
+          { kind: 'full', label: 'FULL', url: 'https://filecrypt.cc/bg3' },
+        ],
+        latestSourceRelease: {
+          buildId: '22517190',
+          isPatch: false,
+          label: 'Hotfix #36',
+          patchDate: '03/26/2026',
+          version: '7209685',
+        },
+        normalizedTitle: 'baldurs gate 3 deluxe edition',
+        patchDownloadUrls: [],
+        sourceKind: 'elamigos',
+        sourceUrl:
+          'https://elamigos.site/data/Baldurs_Gate_3_Deluxe_Edition_MULTi13_-_ElAmigos.html',
+        title: "Baldur's Gate III / Baldurs Gate 3 Deluxe Edition",
+      };
+      const bg3SteamMatch: ConfirmedSteamMatch = {
+        appId: 1086940,
+        coverUrl: null,
+        matchedAt: '2026-04-20T12:00:00.000Z',
+        normalizedTitle: 'baldurs gate 3',
+        title: "Baldur's Gate 3",
+      };
+      const bg3Patch: SteamPatchCandidate = {
+        ...selectedPatch,
+        appId: 1086940,
+        buildId: '22517190',
+        patchDate: '03/26/2026',
+        patchTitle: 'Hotfix #36 Now Live!',
+        title: 'Hotfix #36 Now Live!',
+        version: '7209685',
+      };
+      const queueLinks = vi.fn();
+      const startDirectHttpDownload = createEmbeddedBrowserRunner();
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        undefined,
+        undefined,
+        fetch,
+        undefined,
+        undefined,
+        undefined,
+        startDirectHttpDownload,
+      );
+      const queued = await service.addTrackedItem({
+        parsedSource: elamigosSource,
+        queueDownload: true,
+        selectedDownloads: { fullUrl: 'https://filecrypt.cc/bg3' },
+        selectedSteamPatch: bg3Patch,
+        steamMatch: bg3SteamMatch,
+      });
+      expect(queued.item.title).toBe("Baldur's Gate 3");
+      const stagePath = queued.currentDownload!.stagePath;
+      await mkdir(stagePath, { recursive: true });
+      await writeFile(join(stagePath, 'setup.iso'), 'iso');
+
+      await service.confirmManualDownloadReady(queued.item.id);
+
+      const installerChosenPath = join(rootLibraryPath, 'Baldurs Gate 3');
+      const expectedPath = join(rootLibraryPath, "Baldur's Gate 3");
+      await mkdir(installerChosenPath, { recursive: true });
+      await writeFile(join(installerChosenPath, 'bg3.exe'), 'game');
+
+      const completed = await service.completeStagedInstall(queued.item.id);
+
+      expect(queueLinks).not.toHaveBeenCalled();
+      expect(startDirectHttpDownload).not.toHaveBeenCalled();
+      expect(existsSync(installerChosenPath)).toBe(false);
+      expect(existsSync(join(expectedPath, 'bg3.exe'))).toBe(true);
+      expect(existsSync(stagePath)).toBe(false);
+      expect(completed).toMatchObject({
+        fileState: {
+          finalPath: expectedPath,
+          finalPathExists: true,
+        },
+        item: {
+          steamTitle: "Baldur's Gate 3",
+          title: "Baldur's Gate 3",
+        },
+        status: 'installed',
+      });
+      expect(completed.installRecord).toMatchObject({
+        installedSourceKind: 'elamigos',
+        installPath: expectedPath,
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('repairs completed ElAmigos install paths when rebuilding status', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootLibraryPath = join(tempRoot, 'Library');
+      database.setSetting('library.rootPath', rootLibraryPath);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const elamigosSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fullDownloadUrls: [
+          { kind: 'full', label: 'FULL', url: 'https://filecrypt.cc/bg3' },
+        ],
+        latestSourceRelease: {
+          buildId: '22517190',
+          isPatch: false,
+          label: 'Hotfix #36',
+          patchDate: '03/26/2026',
+          version: '7209685',
+        },
+        normalizedTitle: 'baldurs gate 3 deluxe edition',
+        patchDownloadUrls: [],
+        sourceKind: 'elamigos',
+        sourceUrl:
+          'https://elamigos.site/data/Baldurs_Gate_3_Deluxe_Edition_MULTi13_-_ElAmigos.html',
+        title: "Baldur's Gate III / Baldurs Gate 3 Deluxe Edition",
+      };
+      const bg3SteamMatch: ConfirmedSteamMatch = {
+        appId: 1086940,
+        coverUrl: null,
+        matchedAt: '2026-04-20T12:00:00.000Z',
+        normalizedTitle: 'baldurs gate 3',
+        title: "Baldur's Gate 3",
+      };
+      const bg3Patch: SteamPatchCandidate = {
+        ...selectedPatch,
+        appId: 1086940,
+        buildId: '22517190',
+        patchDate: '03/26/2026',
+        patchTitle: 'Hotfix #36 Now Live!',
+        title: 'Hotfix #36 Now Live!',
+        version: '7209685',
+      };
+      const service = createService(database);
+      const added = await service.addTrackedItem({
+        parsedSource: elamigosSource,
+        queueDownload: false,
+        selectedDownloads: { fullUrl: 'https://filecrypt.cc/bg3' },
+        selectedSteamPatch: bg3Patch,
+        steamMatch: bg3SteamMatch,
+      });
+      const installerChosenPath = join(rootLibraryPath, 'Baldurs Gate 3');
+      const expectedPath = join(rootLibraryPath, "Baldur's Gate 3");
+      await mkdir(installerChosenPath, { recursive: true });
+      await writeFile(join(installerChosenPath, 'bg3.exe'), 'game');
+      database.upsertInstallRecord({
+        installedAt: '03/26/2026',
+        installedBuildId: '22517190',
+        installedSourceKind: 'elamigos',
+        installedSourceUrl: elamigosSource.sourceUrl,
+        installedVersion: '7209685',
+        installPath: expectedPath,
+        trackedItemId: added.item.id,
+        updatedAt: '2026-04-20T12:00:00.000Z',
+      });
+
+      const [view] = await service.listTrackedItems();
+
+      expect(existsSync(installerChosenPath)).toBe(false);
+      expect(existsSync(join(expectedPath, 'bg3.exe'))).toBe(true);
+      expect(view).toMatchObject({
+        fileState: {
+          finalPath: expectedPath,
+          finalPathExists: true,
+        },
+        item: {
+          steamTitle: "Baldur's Gate 3",
+          title: "Baldur's Gate 3",
+        },
+        status: 'installed',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('repairs ElAmigos folder names before a failing source refresh', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootLibraryPath = join(tempRoot, 'Library');
+      database.setSetting('library.rootPath', rootLibraryPath);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response(rss([selectedPatch]), { status: 200 })),
+      );
+      const elamigosSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fullDownloadUrls: [
+          { kind: 'full', label: 'FULL', url: 'https://filecrypt.cc/bg3' },
+        ],
+        latestSourceRelease: {
+          buildId: '22517190',
+          isPatch: false,
+          label: 'Hotfix #36',
+          patchDate: '03/26/2026',
+          version: '7209685',
+        },
+        normalizedTitle: 'baldurs gate 3 deluxe edition',
+        patchDownloadUrls: [],
+        sourceKind: 'elamigos',
+        sourceUrl:
+          'https://elamigos.site/data/Baldurs_Gate_3_Deluxe_Edition_MULTi13_-_ElAmigos.html',
+        title: "Baldur's Gate III / Baldurs Gate 3 Deluxe Edition",
+      };
+      const bg3SteamMatch: ConfirmedSteamMatch = {
+        appId: 1086940,
+        coverUrl: null,
+        matchedAt: '2026-04-20T12:00:00.000Z',
+        normalizedTitle: 'baldurs gate 3',
+        title: "Baldur's Gate 3",
+      };
+      const bg3Patch: SteamPatchCandidate = {
+        ...selectedPatch,
+        appId: 1086940,
+        buildId: '22517190',
+        patchDate: '03/26/2026',
+        patchTitle: 'Hotfix #36 Now Live!',
+        title: 'Hotfix #36 Now Live!',
+        version: '7209685',
+      };
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9001,
+        packageName: "Baldur's Gate 3_22517190",
+      }));
+      const removePackage = vi.fn(async () => undefined);
+      const failingSourceFetch: SourceFetch = vi.fn(
+        async () => new Response('', { status: 503 }),
+      );
+      const service = createService(
+        database,
+        queueLinks,
+        removePackage,
+        undefined,
+        undefined,
+        failingSourceFetch,
+      );
+      const added = await service.addTrackedItem({
+        parsedSource: elamigosSource,
+        queueDownload: true,
+        selectedDownloads: { fullUrl: 'https://filecrypt.cc/bg3' },
+        selectedSteamPatch: bg3Patch,
+        steamMatch: bg3SteamMatch,
+      });
+      const installerChosenPath = join(rootLibraryPath, 'Baldurs Gate 3');
+      const expectedPath = join(rootLibraryPath, "Baldur's Gate 3");
+      await mkdir(installerChosenPath, { recursive: true });
+      await writeFile(join(installerChosenPath, 'bg3.exe'), 'game');
+      database.upsertInstallRecord({
+        installedAt: '03/26/2026',
+        installedBuildId: '22517190',
+        installedSourceKind: 'elamigos',
+        installedSourceUrl: elamigosSource.sourceUrl,
+        installedVersion: '7209685',
+        installPath: expectedPath,
+        trackedItemId: added.item.id,
+        updatedAt: '2026-04-20T12:00:00.000Z',
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-05-11T12:00:00.000Z',
+        fingerprint: elamigosSource.fingerprint,
+        observedBuildId: null,
+        observedPatchDate: '03/26/2026',
+        observedPatchLink: null,
+        observedPatchTitle: null,
+        observedVersion: '7209685',
+        patchSelectionSource: null,
+        sourceKind: 'elamigos',
+        sourceUrl: elamigosSource.sourceUrl,
+        trackedItemId: added.item.id,
+      });
+
+      await expect(service.refreshTrackedItem(added.item.id)).rejects.toThrow(
+        'Source refresh failed with 503',
+      );
+
+      expect(existsSync(installerChosenPath)).toBe(false);
+      expect(existsSync(join(expectedPath, 'bg3.exe'))).toBe(true);
+      expect(database.findTrackedItemById(added.item.id)).toMatchObject({
+        normalizedTitle: 'baldurs gate 3',
+        title: "Baldur's Gate 3",
+      });
+      expect(database.getDownloadJob(added.item.id)).toMatchObject({
+        finalPath: expectedPath,
+        stage: 'complete',
+      });
+      expect(database.getInstallRecord(added.item.id)).toMatchObject({
+        installedAt: '03/26/2026',
+        installedBuildId: '22517190',
+        installedVersion: '7209685',
+      });
+      expect(removePackage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          packageId: 9001,
+        }),
+      );
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('does not show an update when the installed SteamDB build is latest but ElAmigos lacks a build id', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootLibraryPath = join(tempRoot, 'Library');
+      const installPath = join(rootLibraryPath, "Baldur's Gate 3");
+      database.setSetting('library.rootPath', rootLibraryPath);
+      await mkdir(installPath, { recursive: true });
+      await writeFile(join(installPath, 'bg3.exe'), 'game');
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'baldurs gate 3',
+        sourceKind: 'elamigos',
+        sourceUrl:
+          'https://elamigos.site/data/Baldurs_Gate_3_Deluxe_Edition_MULTi13_-_ElAmigos.html',
+        title: "Baldur's Gate 3",
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 1086940,
+        coverUrl: null,
+        matchedAt: '2026-05-11T12:00:00.000Z',
+        normalizedTitle: 'baldurs gate 3',
+        title: "Baldur's Gate 3",
+      });
+      database.upsertPatchEntries([
+        {
+          appId: 1086940,
+          buildId: '22517190',
+          link: 'https://steamdb.info/patchnotes/22517190/',
+          patchDate: '03/26/2026',
+          patchTitle: 'Hotfix #36 Now Live!',
+          publishedAt: '2026-03-26T14:08:29.000Z',
+          selectionSource: 'rss',
+          title: 'Hotfix #36 Now Live!',
+          trackedItemId: item.id,
+        },
+        {
+          appId: 1086940,
+          buildId: '22517175',
+          link: 'https://steamdb.info/patchnotes/22517175/',
+          patchDate: '03/26/2026',
+          patchTitle: "Baldur's Gate 3 update for 26 March 2026",
+          publishedAt: '2026-03-26T14:07:46.000Z',
+          selectionSource: 'rss',
+          title: "Baldur's Gate 3 update for 26 March 2026",
+          trackedItemId: item.id,
+        },
+      ]);
+      database.upsertInstallRecord({
+        installedAt: '03/26/2026',
+        installedBuildId: '22517190',
+        installedSourceKind: 'elamigos',
+        installedSourceUrl: item.sourceUrl,
+        installedVersion: '7209685',
+        installPath,
+        trackedItemId: item.id,
+        updatedAt: '2026-05-11T12:00:00.000Z',
+      });
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-05-11T12:00:00.000Z',
+        isPrimary: true,
+        lastCheckedAt: '2026-05-11T12:00:00.000Z',
+        lastError: null,
+        method: 'primary_source',
+        normalizedTitle: 'baldurs gate 3 baldurs gate 3 deluxe',
+        score: 1,
+        sourceKind: 'elamigos',
+        sourceTitle: "Baldur's Gate III / Baldurs Gate 3 Deluxe Edition",
+        sourceUrl: item.sourceUrl,
+        status: 'verified',
+        trackedItemId: item.id,
+        updatedAt: '2026-05-11T12:00:00.000Z',
+        usable: true,
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-05-11T12:00:00.000Z',
+        fingerprint: 'elamigos-bg3',
+        observedBuildId: null,
+        observedPatchDate: '03/26/2026',
+        observedPatchLink: null,
+        observedPatchTitle: null,
+        observedVersion: '7209685',
+        patchSelectionSource: null,
+        sourceKind: 'elamigos',
+        sourceUrl: item.sourceUrl!,
+        trackedItemId: item.id,
+      });
+
+      const [view] = await createService(database).listTrackedItems();
+      const elamigos = view?.sourceMatches.find(
+        (source) => source.match.sourceKind === 'elamigos',
+      );
+
+      expect(view?.patchMetadataStatus).toBe('latest');
+      expect(view?.trackingStatus).toBe('up_to_date');
+      expect(elamigos?.isUpdateSource).toBe(false);
+      expect(elamigos?.updateStatus).toBe('same_as_installed');
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }

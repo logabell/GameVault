@@ -141,6 +141,22 @@ function normalizeHref(href: string, baseUrl: string): string | null {
   }
 }
 
+function normalizeMirrorUrlKey(url: string): string {
+  const value = url.trim();
+  if (!value) {
+    return '';
+  }
+
+  try {
+    const parsedUrl = new URL(value);
+    parsedUrl.hash = '';
+    parsedUrl.hostname = parsedUrl.hostname.replace(/^www\./i, '');
+    return parsedUrl.toString().replace(/\/$/, '').toLowerCase();
+  } catch {
+    return value.replace(/\/$/, '').toLowerCase();
+  }
+}
+
 function getMirrorHostLabel(url: string): string | null {
   const hostname = new URL(url).hostname.replace(/^www\./i, '').toLowerCase();
   for (const [hostSuffix, label] of MIRROR_HOST_LABELS) {
@@ -250,9 +266,15 @@ function findDownloadAnchors($: ReturnType<typeof load>, baseUrl: string): {
       }
     });
 
+  const fullUrlKeys = new Set(
+    fullDownloadUrls.map((entry) => normalizeMirrorUrlKey(entry.url)),
+  );
+
   return {
     fullDownloadUrls,
-    patchDownloadUrls,
+    patchDownloadUrls: patchDownloadUrls.filter(
+      (entry) => !fullUrlKeys.has(normalizeMirrorUrlKey(entry.url)),
+    ),
   };
 }
 

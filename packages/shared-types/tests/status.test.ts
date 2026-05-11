@@ -226,6 +226,76 @@ describe('deriveTrackedItemStatus', () => {
     ).toBe(TrackedItemTrackingStatus.UpdateAvailable);
   });
 
+  it('keeps installed latest when source metadata lacks the Steam build id', () => {
+    const latestPatch = {
+      appId: 1086940,
+      buildId: '22517190',
+      link: 'https://steamdb.info/patchnotes/22517190/',
+      patchDate: '03/26/2026',
+      patchTitle: 'Hotfix #36 Now Live!',
+      publishedAt: '2026-03-26T14:08:29.000Z',
+      trackedItemId: 'item',
+      title: 'Hotfix #36 Now Live!',
+    };
+
+    expect(
+      deriveTrackedItemTrackingStatus({
+        finalPathExists: true,
+        hasSteamMatch: true,
+        installRecord: {
+          installedAt: '03/26/2026',
+          installedBuildId: '22517190',
+          installedVersion: '7209685',
+          trackedItemId: 'item',
+          updatedAt: '2026-05-11T12:00:00.000Z',
+        },
+        latestPatch,
+        selectedPatch: latestPatch,
+        sourceMatches: [
+          {
+            downloadMirrors: [],
+            isUpdateSource: true,
+            match: {
+              confidence: 1,
+              createdAt: '2026-05-11T12:00:00.000Z',
+              isPrimary: true,
+              method: 'primary_source',
+              normalizedTitle: 'baldurs gate 3',
+              score: 1,
+              sourceKind: 'elamigos',
+              status: 'verified',
+              trackedItemId: 'item',
+              updatedAt: '2026-05-11T12:00:00.000Z',
+              usable: true,
+            },
+            snapshot: {
+              checkedAt: '2026-05-11T12:00:00.000Z',
+              fingerprint: '',
+              observedBuildId: null,
+              observedPatchDate: '03/26/2026',
+              observedVersion: '7209685',
+              sourceKind: 'elamigos',
+              sourceUrl: 'https://elamigos.example.test/bg3',
+              trackedItemId: 'item',
+            },
+            updateStatus: 'newer_than_installed',
+          },
+        ],
+        sourceSnapshot: {
+          checkedAt: '2026-05-11T12:00:00.000Z',
+          fingerprint: '',
+          observedBuildId: null,
+          observedPatchDate: '03/26/2026',
+          observedVersion: '7209685',
+          sourceKind: 'elamigos',
+          sourceUrl: 'https://elamigos.example.test/bg3',
+          trackedItemId: 'item',
+        },
+        versionsBehindLatest: 0,
+      }),
+    ).toBe(TrackedItemTrackingStatus.UpToDate);
+  });
+
   it('does not let a stale expired watch hide an available source update', () => {
     expect(
       deriveTrackedItemTrackingStatus({

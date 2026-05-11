@@ -119,6 +119,19 @@ function selectedPatchIsLatest(input: StatusComputationInput): boolean {
   return patchIdentityMatches(input.selectedPatch, input.latestPatch);
 }
 
+function installedPatchIsLatest(input: StatusComputationInput): boolean {
+  const installedBuildId = input.installRecord?.installedBuildId?.trim();
+  if (
+    installedBuildId &&
+    input.latestPatch?.buildId &&
+    installedBuildId === input.latestPatch.buildId
+  ) {
+    return true;
+  }
+
+  return selectedPatchIsLatest(input);
+}
+
 function isDiscoveredDraft(input: StatusComputationInput): boolean {
   return Boolean(
     input.hasSteamMatch &&
@@ -343,9 +356,8 @@ export function deriveTrackedItemTrackingStatus(
   }
 
   if (
-    selectedPatchIsLatest(input) &&
-    (!input.installRecord || installedMatchesSource) &&
-    (!matchedSourceUpdate || installedMatchesSource)
+    installedPatchIsLatest(input) &&
+    (!input.installRecord || installedMatchesSource || input.finalPathExists)
   ) {
     return TrackedItemTrackingStatus.UpToDate;
   }

@@ -636,7 +636,7 @@ describe('MyJDownloaderService queueLinks', () => {
     ).toEqual([]);
   });
 
-  it('crawls a shared ElAmigos mirror once and splits child files by role', async () => {
+  it('queues a repeated ElAmigos full/update mirror as one full package', async () => {
     const client = new FakeMyJDownloaderClient();
     client.crawledLinksByJob.set(9001, [
       {
@@ -662,18 +662,10 @@ describe('MyJDownloaderService queueLinks', () => {
     client.downloadPackages = [
       {
         finished: false,
-        name: 'REPLACED_2283087_full',
+        name: 'REPLACED_2283087',
         running: false,
-        saveTo: 'C:\\Games\\_STAGING\\REPLACED_2283087\\REPLACED_2283087_full',
+        saveTo: 'C:\\Games\\_STAGING\\REPLACED_2283087',
         uuid: 301,
-      },
-      {
-        finished: false,
-        name: 'REPLACED_2283087_update',
-        running: false,
-        saveTo:
-          'C:\\Games\\_STAGING\\REPLACED_2283087\\REPLACED_2283087_update',
-        uuid: 302,
       },
     ];
     client.downloadLinks = [
@@ -684,7 +676,7 @@ describe('MyJDownloaderService queueLinks', () => {
       },
       {
         name: 'Repl1ac4e-Update1.0.1097-elamigos.rar',
-        packageUUID: 302,
+        packageUUID: 301,
         uuid: 502,
       },
     ];
@@ -713,6 +705,11 @@ describe('MyJDownloaderService queueLinks', () => {
     });
 
     expect(client.findAll('/linkgrabberv2/addLinks')).toHaveLength(1);
+    expect(client.find('/linkgrabberv2/addLinks').params).toMatchObject({
+      destinationFolder: 'C:\\Games\\_STAGING\\REPLACED_2283087',
+      links: 'https://gofile.io/d/shared',
+      packageName: 'REPLACED_2283087',
+    });
     expect(
       client
         .findAll('/linkgrabberv2/queryLinks')
@@ -726,54 +723,40 @@ describe('MyJDownloaderService queueLinks', () => {
         .map((call) => call.params),
     ).toEqual([
       [
-        [100],
-        [],
-        'REPLACED_2283087_full',
-        'C:\\Games\\_STAGING\\REPLACED_2283087\\REPLACED_2283087_full',
-      ],
-      [
-        [101],
-        [],
-        'REPLACED_2283087_update',
-        'C:\\Games\\_STAGING\\REPLACED_2283087\\REPLACED_2283087_update',
+        [100, 101],
+        [200],
+        'REPLACED_2283087',
+        'C:\\Games\\_STAGING\\REPLACED_2283087',
       ],
     ]);
-    expect(client.findAll('/linkgrabberv2/setDownloadDirectory')).toHaveLength(
-      0,
-    );
+    expect(client.find('/linkgrabberv2/setDownloadDirectory').params).toEqual([
+      'C:\\Games\\_STAGING\\REPLACED_2283087',
+      [200],
+    ]);
     expect(
       client.findAll('/linkgrabberv2/setEnabled').map((call) => call.params),
     ).toEqual([
-      [true, [100], []],
-      [true, [101], []],
+      [true, [100, 101], [200]],
     ]);
     expect(
       client
         .findAll('/linkgrabberv2/moveToDownloadlist')
         .map((call) => call.params),
     ).toEqual([
-      [[100], []],
-      [[101], []],
+      [[100, 101], [200]],
     ]);
     expect(result.parts).toEqual([
       {
         mirrorUrl: 'https://gofile.io/d/shared',
         packageId: 301,
-        packageName: 'REPLACED_2283087_full',
+        packageName: 'REPLACED_2283087',
         role: 'full',
-      },
-      {
-        mirrorUrl: 'https://gofile.io/d/shared',
-        packageId: 302,
-        packageName: 'REPLACED_2283087_update',
-        role: 'patch',
       },
     ]);
     expect(
       client.findAll('/extraction/getArchiveInfo').map((call) => call.params),
     ).toEqual([
-      [[501], []],
-      [[502], []],
+      [[501, 502], []],
     ]);
     expect(
       client

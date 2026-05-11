@@ -274,6 +274,7 @@ function normalizeQueueUrl(input: string | null | undefined): string {
   try {
     const url = new URL(value);
     url.hash = '';
+    url.hostname = url.hostname.replace(/^www\./i, '');
     return url.toString().replace(/\/$/, '').toLowerCase();
   } catch {
     return value.replace(/\/$/, '').toLowerCase();
@@ -294,22 +295,30 @@ function buildLinkQueueRequests(
     );
   }
 
+  const fullUrl = selectedDownloads.fullUrl.trim();
+  const patchUrl = selectedDownloads.patchUrl?.trim() ?? '';
+  const sharedElamigosContainer = Boolean(
+    sourceKind === 'elamigos' &&
+      fullUrl &&
+      patchUrl &&
+      normalizeQueueUrl(fullUrl) === normalizeQueueUrl(patchUrl),
+  );
   const splitElamigosPackages = Boolean(
-    sourceKind === 'elamigos' && selectedDownloads.patchUrl?.trim(),
+    sourceKind === 'elamigos' && patchUrl && !sharedElamigosContainer,
   );
 
   return [
     {
       packageName: splitElamigosPackages ? `${packageName}_full` : packageName,
       role: 'full' as const,
-      url: selectedDownloads.fullUrl,
+      url: fullUrl,
     },
     {
       packageName: splitElamigosPackages
         ? `${packageName}_update`
         : packageName,
       role: 'patch' as const,
-      url: selectedDownloads.patchUrl ?? '',
+      url: sharedElamigosContainer ? '' : patchUrl,
     },
   ].filter(
     (entry): entry is LinkQueueRequest =>

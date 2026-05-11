@@ -4398,10 +4398,10 @@ function App() {
     setBusyAction(actionKind);
     try {
       await action();
-      await refreshItems();
     } catch (error) {
       await showAlert(actionErrorMessage(error));
     } finally {
+      await refreshItems().catch(() => undefined);
       setBusyId(null);
       setBusyAction(null);
     }

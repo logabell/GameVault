@@ -1264,28 +1264,37 @@ describe('source parsers', () => {
         url: 'https://www.keeplinks.org/p16/69e128dd8e720',
       },
     ]);
-    expect(parsed.patchDownloadUrls).toEqual([
+    expect(parsed.patchDownloadUrls).toEqual([]);
+  });
+
+  it('collapses ElAmigos update sections that repeat full mirror URLs', () => {
+    const parsed = parseSupportedPage(
+      'https://elamigos.site/data/Shared_FileCrypt_-_ElAmigos.html',
+      `
+        <html><body>
+          <h2>Shared FileCrypt (2026), 42GB</h2>
+          <h3>ElAmigos release. Updated to version 1.0.0 (01.05.2026).</h3>
+          <h2>DDOWNLOAD</h2>
+          <a href="https://www.filecrypt.cc/Container/4A5B64741B.html">FileCrypt</a>
+          <h2>Shared FileCrypt update 1.0.0 - 1.1.0 (02.05.2026)</h2>
+          <h2>DDOWNLOAD</h2>
+          <a href="https://filecrypt.cc/Container/4A5B64741B.html">FileCrypt</a>
+        </body></html>
+      `,
+    );
+
+    expect(parsed.fullDownloadUrls).toEqual([
       {
-        kind: 'patch',
-        label: 'DDOWNLOAD FileCrypt',
-        url: 'https://filecrypt.cc/Container/D2B56114B1.html',
-      },
-      {
-        kind: 'patch',
-        label: 'DDOWNLOAD Keeplinks',
-        url: 'https://www.keeplinks.org/p16/69e128e4cab1f',
-      },
-      {
-        kind: 'patch',
-        label: 'RAPIDGATOR FileCrypt',
-        url: 'https://filecrypt.cc/Container/3D6E4EDE5A.html',
-      },
-      {
-        kind: 'patch',
-        label: 'RAPIDGATOR Keeplinks',
-        url: 'https://www.keeplinks.org/p16/69e128dd8e720',
+        kind: 'full',
+        label: 'FileCrypt',
+        url: 'https://www.filecrypt.cc/Container/4A5B64741B.html',
       },
     ]);
+    expect(parsed.patchDownloadUrls).toEqual([]);
+    expect(parsed.latestSourceRelease).toMatchObject({
+      isPatch: true,
+      version: '1.1.0',
+    });
   });
 
   it('parses ElAmigos full-release header dates when no update blocks exist', () => {

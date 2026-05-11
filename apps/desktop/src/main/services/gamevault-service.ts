@@ -763,20 +763,28 @@ function buildDownloadJobParts(params: {
   trackedItemId: string;
   now: string;
 }): DownloadJobPartRecord[] {
-  const splitElamigosPackages = Boolean(
+  const fullUrl = params.selectedDownloads.fullUrl?.trim() ?? '';
+  const patchUrl = params.selectedDownloads.patchUrl?.trim() ?? '';
+  const sharedElamigosContainer = Boolean(
     params.sourceKind === 'elamigos' &&
-    params.selectedDownloads.patchUrl?.trim(),
+      fullUrl &&
+      patchUrl &&
+      mirrorUrlsShareIdentity(fullUrl, patchUrl),
+  );
+  const effectivePatchUrl = sharedElamigosContainer ? '' : patchUrl;
+  const splitElamigosPackages = Boolean(
+    params.sourceKind === 'elamigos' && effectivePatchUrl,
   );
   const entries = [
     {
-      mirrorUrl: params.selectedDownloads.fullUrl,
+      mirrorUrl: fullUrl,
       packageName: splitElamigosPackages
         ? `${params.packageName}_full`
         : params.packageName,
       role: 'full' as const,
     },
     {
-      mirrorUrl: params.selectedDownloads.patchUrl ?? '',
+      mirrorUrl: effectivePatchUrl,
       packageName: splitElamigosPackages
         ? `${params.packageName}_update`
         : params.packageName,
@@ -908,11 +916,156 @@ function mirrorUrlMatches(
   return (left ?? '').trim() === right;
 }
 
+function normalizeMirrorUrlKey(value: string | null | undefined): string {
+  const trimmed = value?.trim() ?? '';
+  if (!trimmed) {
+    return '';
+  }
+
+  try {
+    const url = new URL(trimmed);
+    url.hash = '';
+    url.hostname = url.hostname.replace(/^www\./i, '');
+    return url.toString().replace(/\/$/, '').toLowerCase();
+  } catch {
+    return trimmed.replace(/\/$/, '').toLowerCase();
+  }
+}
+
+function mirrorUrlsShareIdentity(
+  left: string | null | undefined,
+  right: string | null | undefined,
+): boolean {
+  const normalizedLeft = normalizeMirrorUrlKey(left);
+  const normalizedRight = normalizeMirrorUrlKey(right);
+  return Boolean(
+    normalizedLeft &&
+      normalizedRight &&
+      normalizedLeft === normalizedRight,
+  );
+}
+
+function findElamigosFullMirrorForPatchUrl(
+  parsedSource: ParsedSourcePayload,
+  patchUrl: string | null | undefined,
+): DownloadDescriptor | null {
+  if (parsedSource.sourceKind !== 'elamigos' || !patchUrl?.trim()) {
+    return null;
+  }
+
+  return (
+    parsedSource.fullDownloadUrls.find((mirror) =>
+      mirrorUrlsShareIdentity(mirror.url, patchUrl),
+    ) ?? null
+  );
+}
+
+function elamigosPatchMirrorHasFullMirror(
+  parsedSource: ParsedSourcePayload,
+  patchUrl: string,
+): boolean {
+  return findElamigosFullMirrorForPatchUrl(parsedSource, patchUrl) != null;
+}
+
+function collapseSharedElamigosSelectedDownloads(
+  parsedSource: ParsedSourcePayload,
+  selectedDownloads: SelectedDownloads,
+): SelectedDownloads {
+  if (parsedSource.sourceKind !== 'elamigos') {
+    return selectedDownloads;
+  }
+
+  const fullUrl = selectedDownloads.fullUrl?.trim() ?? '';
+  const patchUrl = selectedDownloads.patchUrl?.trim() ?? '';
+  if (!patchUrl) {
+    return {
+      ...selectedDownloads,
+      fullUrl,
+      patchUrl: null,
+      sourceKind: 'elamigos',
+    };
+  }
+
+  if (fullUrl && mirrorUrlsShareIdentity(fullUrl, patchUrl)) {
+    return {
+      ...selectedDownloads,
+      fullUrl,
+      patchUrl: null,
+      sourceKind: 'elamigos',
+    };
+  }
+
+  const matchingFullMirror = findElamigosFullMirrorForPatchUrl(
+    parsedSource,
+    patchUrl,
+  );
+  if (matchingFullMirror) {
+    return {
+      ...selectedDownloads,
+      fullUrl: getStoredMirrorUrl(parsedSource.sourceKind, matchingFullMirror),
+      patchUrl: null,
+      sourceKind: 'elamigos',
+    };
+  }
+
+  return {
+    ...selectedDownloads,
+    fullUrl,
+    patchUrl,
+    sourceKind: 'elamigos',
+  };
+}
+
+function getCurrentParsedDownloadMirrors(
+  parsedSource: ParsedSourcePayload,
+): DownloadDescriptor[] {
+  if (parsedSource.sourceKind !== 'elamigos') {
+    return [
+      ...parsedSource.fullDownloadUrls,
+      ...parsedSource.patchDownloadUrls,
+    ];
+  }
+
+  return [
+    ...parsedSource.fullDownloadUrls,
+    ...parsedSource.patchDownloadUrls.filter(
+      (mirror) => !elamigosPatchMirrorHasFullMirror(parsedSource, mirror.url),
+    ),
+  ];
+}
+
 function pathIsInsideOrEqual(parentPath: string, targetPath: string): boolean {
   const relativePath = relative(resolve(parentPath), resolve(targetPath));
   return (
     relativePath === '' ||
     (!relativePath.startsWith('..') && !isAbsolute(relativePath))
+  );
+}
+
+function sourceSnapshotMatchesInstallRecord(
+  sourceSnapshot: SourceSnapshot,
+  installRecord: InstallRecord,
+): boolean {
+  if (
+    sourceSnapshot.sourceKind &&
+    installRecord.installedSourceKind &&
+    sourceSnapshot.sourceKind !== installRecord.installedSourceKind
+  ) {
+    return false;
+  }
+
+  const snapshotBuildId = sourceSnapshot.observedBuildId?.trim() ?? '';
+  const installedBuildId = installRecord.installedBuildId?.trim() ?? '';
+  if (snapshotBuildId && installedBuildId) {
+    return snapshotBuildId === installedBuildId;
+  }
+
+  const snapshotVersion = sourceSnapshot.observedVersion?.trim() ?? '';
+  const installedVersion = installRecord.installedVersion?.trim() ?? '';
+  return Boolean(
+    snapshotVersion &&
+      installedVersion &&
+      snapshotVersion === installedVersion,
   );
 }
 
@@ -3127,18 +3280,96 @@ export class GameVaultService {
     );
   }
 
+  private syncTrackedItemSteamIdentity(
+    item: TrackedItemRecord,
+    steamMatch: ConfirmedSteamMatch | null,
+  ): TrackedItemRecord {
+    if (!steamMatch) {
+      return item;
+    }
+
+    const coverUrl = steamMatch.coverUrl ?? item.coverUrl ?? null;
+    if (
+      item.title === steamMatch.title &&
+      item.normalizedTitle === steamMatch.normalizedTitle &&
+      item.coverUrl === coverUrl
+    ) {
+      return item;
+    }
+
+    return this.database.upsertTrackedItem({
+      coverUrl,
+      id: item.id,
+      normalizedTitle: steamMatch.normalizedTitle,
+      sourceKind: item.sourceKind ?? null,
+      sourceUrl: item.sourceUrl ?? null,
+      title: steamMatch.title,
+    });
+  }
+
   private async buildTrackedItemView(
     trackedItemId: string,
   ): Promise<TrackedItemView> {
-    const item = this.database.findTrackedItemById(trackedItemId);
+    let item = this.database.findTrackedItemById(trackedItemId);
     if (!item) {
       throw new Error(`Tracked item ${trackedItemId} not found`);
     }
 
     const settings = this.database.getSettings();
     const steamMatch = this.database.getSteamMatch(trackedItemId);
-    const installRecord = this.database.getInstallRecord(trackedItemId);
-    const storedDownload = this.database.getDownloadJob(trackedItemId);
+    item = this.syncTrackedItemSteamIdentity(item, steamMatch);
+    let installRecord = this.database.getInstallRecord(trackedItemId);
+    let storedDownload = this.database.getDownloadJob(trackedItemId);
+    if (
+      settings.rootLibraryPath &&
+      (installRecord?.installedSourceKind === 'elamigos' ||
+        (storedDownload?.sourceKind === 'elamigos' &&
+          storedDownload.stage === 'complete'))
+    ) {
+      const canonicalizedPath = await this
+        .canonicalizeCompletedElamigosInstallPath({
+          item,
+          requireCompleted: false,
+          rootLibraryPath: settings.rootLibraryPath,
+          seedPaths: [installRecord?.installPath, storedDownload?.finalPath],
+        })
+        .catch((error) => {
+          this.appendEvent(
+            'warn',
+            'Unable to canonicalize ElAmigos install folder',
+            {
+              error:
+                error instanceof Error
+                  ? error.message
+                  : 'Unknown ElAmigos install folder error',
+              trackedItemId,
+            },
+          );
+          return null;
+        });
+      if (canonicalizedPath) {
+        const updatedAt = new Date().toISOString();
+        if (installRecord && installRecord.installPath !== canonicalizedPath) {
+          installRecord = {
+            ...installRecord,
+            installPath: canonicalizedPath,
+            updatedAt,
+          };
+          this.database.upsertInstallRecord(installRecord);
+        }
+        if (
+          storedDownload?.stage === 'complete' &&
+          storedDownload.finalPath !== canonicalizedPath
+        ) {
+          storedDownload = {
+            ...storedDownload,
+            finalPath: canonicalizedPath,
+            updatedAt,
+          };
+          this.upsertDownloadJob(storedDownload);
+        }
+      }
+    }
     const preferredSnapshotSourceKind =
       storedDownload?.sourceKind ?? installRecord?.installedSourceKind ?? null;
     let sourceSnapshot = this.getItemSourceSnapshot(
@@ -3356,8 +3587,10 @@ export class GameVaultService {
       item: {
         ...item,
         coverUrl: steamMatch?.coverUrl ?? item.coverUrl,
+        normalizedTitle: steamMatch?.normalizedTitle ?? item.normalizedTitle,
         steamAppId: steamMatch?.appId ?? null,
         steamTitle: steamMatch?.title ?? null,
+        title: steamMatch?.title ?? item.title,
       },
       latestPatch,
       patchMetadataStatus,
@@ -4788,7 +5021,7 @@ export class GameVaultService {
     parsedSource: ParsedSourcePayload,
     selectedDownloads: SelectedDownloads,
   ): SelectedDownloads {
-    return {
+    return collapseSharedElamigosSelectedDownloads(parsedSource, {
       ...selectedDownloads,
       fullUrl: this.getStoredMirrorUrlForSelection({
         kind: 'full',
@@ -4802,7 +5035,7 @@ export class GameVaultService {
             requestedUrl: selectedDownloads.patchUrl,
           })
         : null,
-    };
+    });
   }
 
   private planUpdateSelectedDownloads(params: {
@@ -4817,13 +5050,20 @@ export class GameVaultService {
       };
     }
 
+    const selectedDownloads = collapseSharedElamigosSelectedDownloads(
+      params.parsedSource,
+      params.selectedDownloads,
+    );
     const installedSourceKind =
       this.database.getInstallRecord(params.trackedItemId)
         ?.installedSourceKind ?? null;
-    const hasPatchDownloads = params.parsedSource.patchDownloadUrls.length > 0;
+    const hasPatchDownloads = params.parsedSource.patchDownloadUrls.some(
+      (mirror) =>
+        !elamigosPatchMirrorHasFullMirror(params.parsedSource, mirror.url),
+    );
 
     if (!hasPatchDownloads) {
-      const selectedFullUrl = params.selectedDownloads.fullUrl?.trim() ?? '';
+      const selectedFullUrl = selectedDownloads.fullUrl?.trim() ?? '';
       if (!selectedFullUrl) {
         throw new Error(
           'Select an ElAmigos full mirror before queueing this update.',
@@ -4831,14 +5071,14 @@ export class GameVaultService {
       }
 
       return {
-        ...params.selectedDownloads,
+        ...selectedDownloads,
         fullUrl: selectedFullUrl,
         patchUrl: null,
         sourceKind: 'elamigos',
       };
     }
 
-    const selectedPatchUrl = params.selectedDownloads.patchUrl?.trim() ?? '';
+    const selectedPatchUrl = selectedDownloads.patchUrl?.trim() ?? '';
     if (!selectedPatchUrl) {
       throw new Error(
         'Select an ElAmigos update mirror before queueing this update.',
@@ -4847,14 +5087,14 @@ export class GameVaultService {
 
     if (installedSourceKind === 'elamigos') {
       return {
-        ...params.selectedDownloads,
+        ...selectedDownloads,
         fullUrl: '',
         patchUrl: selectedPatchUrl,
         sourceKind: 'elamigos',
       };
     }
 
-    const selectedFullUrl = params.selectedDownloads.fullUrl?.trim() ?? '';
+    const selectedFullUrl = selectedDownloads.fullUrl?.trim() ?? '';
     if (!selectedFullUrl) {
       throw new Error(
         'Select an ElAmigos full mirror before queueing this update.',
@@ -4862,7 +5102,7 @@ export class GameVaultService {
     }
 
     return {
-      ...params.selectedDownloads,
+      ...selectedDownloads,
       fullUrl: selectedFullUrl,
       patchUrl: selectedPatchUrl,
       sourceKind: 'elamigos',
@@ -5185,12 +5425,13 @@ export class GameVaultService {
     trackedItemId: string,
     options: SourceDiscoveryOptions = {},
   ): Promise<TrackedItemView> {
-    const item = this.database.findTrackedItemById(trackedItemId);
+    let item = this.database.findTrackedItemById(trackedItemId);
     if (!item) {
       throw new Error(`Tracked item ${trackedItemId} not found`);
     }
 
     const steamMatch = this.database.getSteamMatch(trackedItemId);
+    item = this.syncTrackedItemSteamIdentity(item, steamMatch);
     for (const sourceKind of SUPPORTED_SOURCE_KINDS) {
       const existing = this.database.getSourceMatch(trackedItemId, sourceKind);
       if (existing?.isPrimary || existing?.method === 'manual') {
@@ -5283,29 +5524,46 @@ export class GameVaultService {
     parsedSource: ParsedSourcePayload,
     previousParsedSource?: ParsedSourcePayload | null,
   ): void {
-    const mirrors = [
-      ...parsedSource.fullDownloadUrls,
-      ...parsedSource.patchDownloadUrls,
-    ].map((mirror) => {
-      const storedUrl = getStoredMirrorUrl(parsedSource.sourceKind, mirror);
-      if (
-        parsedSource.sourceKind === 'ankergames' &&
-        /^direct$/i.test(mirror.label.trim()) &&
-        (isAnkerGamesGeneratedDownloadUrl(mirror.url) ||
-          isAnkerGamesDirectDownloadUrl(storedUrl) ||
-          isAnkerGamesProxyDownloadUrl(storedUrl))
-      ) {
-        return { ...mirror, label: 'DataNodes', url: storedUrl };
-      }
+    const mirrors = getCurrentParsedDownloadMirrors(parsedSource).map(
+      (mirror) => {
+        const storedUrl = getStoredMirrorUrl(parsedSource.sourceKind, mirror);
+        if (
+          parsedSource.sourceKind === 'ankergames' &&
+          /^direct$/i.test(mirror.label.trim()) &&
+          (isAnkerGamesGeneratedDownloadUrl(mirror.url) ||
+            isAnkerGamesDirectDownloadUrl(storedUrl) ||
+            isAnkerGamesProxyDownloadUrl(storedUrl))
+        ) {
+          return { ...mirror, label: 'DataNodes', url: storedUrl };
+        }
 
-      return { ...mirror, url: storedUrl };
-    });
+        return { ...mirror, url: storedUrl };
+      },
+    );
 
     this.database.syncDownloadMirrors(
       trackedItemId,
       parsedSource.sourceKind,
       mirrors,
     );
+    if (parsedSource.sourceKind === 'elamigos') {
+      this.database.deleteDownloadMirrorsByKindExceptUrls({
+        kind: 'full',
+        sourceKind: parsedSource.sourceKind,
+        trackedItemId,
+        urls: mirrors
+          .filter((mirror) => mirror.kind === 'full')
+          .map((mirror) => mirror.url),
+      });
+      this.database.deleteDownloadMirrorsByKindExceptUrls({
+        kind: 'patch',
+        sourceKind: parsedSource.sourceKind,
+        trackedItemId,
+        urls: mirrors
+          .filter((mirror) => mirror.kind === 'patch')
+          .map((mirror) => mirror.url),
+      });
+    }
 
     if (parsedSource.sourceKind !== 'ankergames') {
       return;
@@ -5406,6 +5664,11 @@ export class GameVaultService {
     snapshot?: SourceSnapshot | null;
   }): TrackedItemView['sourceMatches'][number]['updateStatus'] {
     const { installRecord, latestPatch, match, snapshot } = params;
+    const installedBuildMatchesLatest = Boolean(
+      installRecord?.installedBuildId &&
+        latestPatch?.buildId &&
+        installRecord.installedBuildId === latestPatch.buildId,
+    );
     if (match.status === 'blocked') {
       return 'blocked';
     }
@@ -5465,6 +5728,15 @@ export class GameVaultService {
       return match.method === 'recent_updates'
         ? 'possible_update'
         : 'newer_than_installed';
+    }
+
+    if (
+      installedBuildMatchesLatest &&
+      !snapshot.observedBuildId &&
+      latestPatch?.patchDate &&
+      snapshot.observedPatchDate === latestPatch.patchDate
+    ) {
+      return 'same_as_installed';
     }
 
     const installIdentity = installRecord?.installedBuildId
@@ -5750,11 +6022,11 @@ export class GameVaultService {
     );
 
     this.database.updateTrackedItemPrimarySource(payload.trackedItemId, {
-      coverUrl: parsedSource.coverUrl ?? null,
-      normalizedTitle: parsedSource.normalizedTitle,
+      coverUrl: steamMatch.coverUrl ?? parsedSource.coverUrl ?? null,
+      normalizedTitle: steamMatch.normalizedTitle,
       sourceKind: parsedSource.sourceKind,
       sourceUrl: parsedSource.sourceUrl,
-      title: parsedSource.title,
+      title: steamMatch.title,
     });
     this.persistParsedSource(
       payload.trackedItemId,
@@ -6250,7 +6522,10 @@ export class GameVaultService {
         params.selectedDownloads.sourceKind ?? params.parsedSource.sourceKind,
     };
     if (params.parsedSource.sourceKind !== 'ankergames') {
-      return selectedDownloads;
+      return collapseSharedElamigosSelectedDownloads(
+        params.parsedSource,
+        selectedDownloads,
+      );
     }
 
     let fullUrl = selectedDownloads.fullUrl;
@@ -6691,11 +6966,12 @@ export class GameVaultService {
       : null;
 
     const item = this.database.upsertTrackedItem({
-      coverUrl: payload.parsedSource.coverUrl ?? null,
-      normalizedTitle: payload.parsedSource.normalizedTitle,
+      coverUrl: steamMatch?.coverUrl ?? payload.parsedSource.coverUrl ?? null,
+      normalizedTitle:
+        steamMatch?.normalizedTitle ?? payload.parsedSource.normalizedTitle,
       sourceKind: payload.parsedSource.sourceKind,
       sourceUrl: payload.parsedSource.sourceUrl,
-      title: payload.parsedSource.title,
+      title: steamMatch?.title ?? payload.parsedSource.title,
     });
     const previousParsedSource = this.database.getRawParsedSourcePayload(
       item.id,
@@ -6780,12 +7056,14 @@ export class GameVaultService {
   }
 
   async refreshTrackedItem(trackedItemId: string): Promise<RefreshResult> {
-    const item = this.database.findTrackedItemById(trackedItemId);
+    let item = this.database.findTrackedItemById(trackedItemId);
     if (!item) {
       throw new Error(`Tracked item ${trackedItemId} not found`);
     }
 
     const steamMatch = this.database.getSteamMatch(trackedItemId);
+    item = this.syncTrackedItemSteamIdentity(item, steamMatch);
+    await this.reconcileLocalInstallAfterRefresh(trackedItemId);
     if (!item?.sourceUrl || item.sourceKind === 'manual' || !item.sourceKind) {
       const snapshot = this.getItemSourceSnapshot(item);
 
@@ -6806,8 +7084,6 @@ export class GameVaultService {
           },
         );
       }
-
-      await this.reconcileLocalInstallAfterRefresh(trackedItemId);
 
       const latestPatch = this.getLatestPatch(trackedItemId);
       const view = await this.buildTrackedItemView(trackedItemId);
@@ -6880,8 +7156,6 @@ export class GameVaultService {
         this.reconcileSteamPatchWatch(trackedItemId);
       }
     }
-
-    await this.reconcileLocalInstallAfterRefresh(trackedItemId);
 
     const latestPatch = this.getLatestPatch(trackedItemId);
     const view = await this.buildTrackedItemView(trackedItemId);
@@ -7134,34 +7408,29 @@ export class GameVaultService {
       params.trackedItemId,
       params.sourceKind,
     );
-    const selectedFull =
-      (params.selectedDownloads
-        ? this.getSelectedDownloadsForPersistence(
-            parsedSource,
-            params.selectedDownloads,
-          ).fullUrl
-        : null) ??
-      mirrors.find((mirror) => mirror.kind === 'full' && mirror.selectedAt)
-        ?.url ??
-      mirrors.find((mirror) => mirror.kind === 'full')?.url;
+    const explicitSelectedDownloads = params.selectedDownloads
+      ? this.getSelectedDownloadsForPersistence(
+          parsedSource,
+          params.selectedDownloads,
+        )
+      : null;
+    const selectedFull = explicitSelectedDownloads
+      ? explicitSelectedDownloads.fullUrl
+      : (mirrors.find((mirror) => mirror.kind === 'full' && mirror.selectedAt)
+          ?.url ?? mirrors.find((mirror) => mirror.kind === 'full')?.url);
     if (!selectedFull && params.sourceKind !== 'elamigos') {
       throw new Error(
         'Select a full download mirror before queueing this update.',
       );
     }
-    const selectedPatch =
-      (params.selectedDownloads
-        ? this.getSelectedDownloadsForPersistence(
-            parsedSource,
-            params.selectedDownloads,
-          ).patchUrl
-        : null) ??
-      mirrors.find((mirror) => mirror.kind === 'patch' && mirror.selectedAt)
-        ?.url ??
-      (params.sourceKind === 'elamigos'
-        ? mirrors.find((mirror) => mirror.kind === 'patch')?.url
-        : null) ??
-      null;
+    const selectedPatch = explicitSelectedDownloads
+      ? explicitSelectedDownloads.patchUrl
+      : (mirrors.find((mirror) => mirror.kind === 'patch' && mirror.selectedAt)
+          ?.url ??
+        (params.sourceKind === 'elamigos'
+          ? mirrors.find((mirror) => mirror.kind === 'patch')?.url
+          : null) ??
+        null);
 
     const plannedDownloads = this.planUpdateSelectedDownloads({
       parsedSource,
@@ -7275,13 +7544,6 @@ export class GameVaultService {
     item: TrackedItemRecord,
     rootLibraryPath: string,
   ): string {
-    const installPath = this.database
-      .getInstallRecord(item.id)
-      ?.installPath?.trim();
-    if (installPath) {
-      return resolve(installPath);
-    }
-
     const steamMatch = this.database.getSteamMatch(item.id);
     return resolve(
       join(
@@ -7289,6 +7551,110 @@ export class GameVaultService {
         sanitizePathSegment(steamMatch?.title ?? item.title),
       ),
     );
+  }
+
+  private async findCompletedElamigosInstallCandidate(params: {
+    expectedPath: string;
+    expectedTitle: string;
+    rootLibraryPath: string;
+    seedPaths?: Array<string | null | undefined>;
+  }): Promise<string | null> {
+    const rootLibraryPath = resolve(params.rootLibraryPath);
+    const expectedPath = resolve(params.expectedPath);
+    const expectedTitleKey = normalizeSteamTitle(params.expectedTitle);
+    const candidates = new Set<string>();
+
+    for (const seedPath of params.seedPaths ?? []) {
+      const resolvedSeedPath = seedPath?.trim() ? resolve(seedPath) : null;
+      if (
+        !resolvedSeedPath ||
+        !pathIsInsideOrEqual(rootLibraryPath, resolvedSeedPath)
+      ) {
+        continue;
+      }
+      if (normalizeSteamTitle(basename(resolvedSeedPath)) === expectedTitleKey) {
+        candidates.add(resolvedSeedPath);
+      }
+    }
+
+    const entries = await readdir(rootLibraryPath, {
+      withFileTypes: true,
+    }).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name === '_STAGING') {
+        continue;
+      }
+      if (normalizeSteamTitle(entry.name) !== expectedTitleKey) {
+        continue;
+      }
+      candidates.add(resolve(join(rootLibraryPath, entry.name)));
+    }
+
+    const matches: string[] = [];
+    for (const candidate of candidates) {
+      if (
+        pathKey(candidate) === pathKey(expectedPath) ||
+        !(await directoryHasEntries(candidate))
+      ) {
+        continue;
+      }
+      matches.push(candidate);
+    }
+
+    if (matches.length === 0) {
+      return null;
+    }
+    if (matches.length > 1) {
+      throw new Error(
+        `Found multiple completed ElAmigos install folders matching ${params.expectedTitle}: ${matches.join(', ')}`,
+      );
+    }
+
+    return matches[0] ?? null;
+  }
+
+  private async canonicalizeCompletedElamigosInstallPath(params: {
+    item: TrackedItemRecord;
+    requireCompleted: boolean;
+    rootLibraryPath: string;
+    seedPaths?: Array<string | null | undefined>;
+  }): Promise<string | null> {
+    const steamMatch = this.database.getSteamMatch(params.item.id);
+    const expectedTitle = steamMatch?.title ?? params.item.title;
+    const expectedPath = this.getExpectedElamigosInstallPath(
+      params.item,
+      params.rootLibraryPath,
+    );
+    if (await directoryHasEntries(expectedPath)) {
+      return expectedPath;
+    }
+
+    const candidatePath = await this.findCompletedElamigosInstallCandidate({
+      expectedPath,
+      expectedTitle,
+      rootLibraryPath: params.rootLibraryPath,
+      seedPaths: params.seedPaths,
+    });
+    if (!candidatePath) {
+      if (params.requireCompleted) {
+        throw new Error(
+          `No completed ElAmigos install was found at ${expectedPath}. Finish the manual installer there and try again.`,
+        );
+      }
+      return null;
+    }
+
+    const renamedPath = await renameLibraryFolder({
+      currentPath: candidatePath,
+      rootLibraryPath: params.rootLibraryPath,
+      targetPath: expectedPath,
+    });
+    this.appendEvent('info', 'Renamed ElAmigos install folder to Steam title', {
+      from: candidatePath,
+      to: renamedPath,
+      trackedItemId: params.item.id,
+    });
+    return renamedPath;
   }
 
   private async deleteExistingElamigosFullReplacementInstallFolder(params: {
@@ -7356,15 +7722,18 @@ export class GameVaultService {
     trackedItemId: string,
     sourceSnapshot: SourceSnapshot,
     now: Date,
+    installPath?: string | null,
   ): void {
     this.database.upsertInstallRecord({
       installedAt: sourceSnapshot.observedPatchDate ?? dateStamp(),
       installedBuildId: sourceSnapshot.observedBuildId ?? null,
-      installPath: this.database.findTrackedItemById(trackedItemId)
-        ? this.getExpectedFinalInstallPath(
-            this.database.findTrackedItemById(trackedItemId)!,
-          )
-        : null,
+      installPath:
+        installPath ??
+        (this.database.findTrackedItemById(trackedItemId)
+          ? this.getExpectedFinalInstallPath(
+              this.database.findTrackedItemById(trackedItemId)!,
+            )
+          : null),
       installedSourceKind: sourceSnapshot.sourceKind,
       installedSourceUrl: sourceSnapshot.sourceUrl,
       installedVersion: sourceSnapshot.observedVersion,
@@ -7481,31 +7850,66 @@ export class GameVaultService {
   private async reconcileLocalInstallAfterRefresh(
     trackedItemId: string,
   ): Promise<void> {
-    const item = this.database.findTrackedItemById(trackedItemId);
+    let item = this.database.findTrackedItemById(trackedItemId);
     if (!item) {
       return;
     }
+    item = this.syncTrackedItemSteamIdentity(
+      item,
+      this.database.getSteamMatch(trackedItemId),
+    );
     const sourceSnapshot = this.getItemSourceSnapshot(item);
     if (!sourceSnapshot) {
       return;
     }
 
-    const finalPath = this.getExpectedFinalInstallPath(item);
+    const settings = this.database.getSettings();
+    const job = this.database.getDownloadJob(trackedItemId);
+    const installRecord = this.database.getInstallRecord(trackedItemId);
+    let finalPath = this.getExpectedFinalInstallPath(item);
+    if (
+      sourceSnapshot.sourceKind === 'elamigos' &&
+      settings.rootLibraryPath
+    ) {
+      finalPath =
+        (await this.canonicalizeCompletedElamigosInstallPath({
+          item,
+          requireCompleted: false,
+          rootLibraryPath: settings.rootLibraryPath,
+          seedPaths: [finalPath, installRecord?.installPath, job?.finalPath],
+        })) ?? finalPath;
+    }
     if (!finalPath || !(await directoryHasEntries(finalPath))) {
       return;
     }
 
-    const job = this.database.getDownloadJob(trackedItemId);
     const shouldCompleteStaleJob = Boolean(
-      job && ['failed', 'staged'].includes(job.stage),
+      job &&
+        (['failed', 'staged'].includes(job.stage) ||
+          (installRecord &&
+            sourceSnapshotMatchesInstallRecord(sourceSnapshot, installRecord))),
     );
-    const installRecord = this.database.getInstallRecord(trackedItemId);
-    if (!shouldCompleteStaleJob && installRecord) {
-      return;
+    const now = new Date();
+    if (installRecord) {
+      if (installRecord.installPath !== finalPath) {
+        this.database.upsertInstallRecord({
+          ...installRecord,
+          installPath: finalPath,
+          updatedAt: now.toISOString(),
+        });
+      }
+      if (!shouldCompleteStaleJob) {
+        return;
+      }
+    } else {
+      this.upsertInstallRecordFromSnapshot(
+        trackedItemId,
+        sourceSnapshot,
+        now,
+        finalPath,
+      );
     }
 
-    const now = new Date();
-    this.upsertInstallRecordFromSnapshot(trackedItemId, sourceSnapshot, now);
     this.clearFailedStateForSelectedMirrors(trackedItemId);
 
     if (job && shouldCompleteStaleJob) {
@@ -9142,7 +9546,7 @@ export class GameVaultService {
       throw new Error('No staged source snapshot is available for this item.');
     }
     const settings = this.database.getSettings();
-    const installedFinalPath =
+    let installedFinalPath =
       sourceSnapshot.sourceKind === 'elamigos' && settings.rootLibraryPath
         ? this.getExpectedElamigosInstallPath(item, settings.rootLibraryPath)
         : null;
@@ -9210,15 +9614,30 @@ export class GameVaultService {
     }
 
     if (
+      sourceSnapshot.sourceKind === 'elamigos' &&
+      settings.rootLibraryPath &&
+      currentJob
+    ) {
+      installedFinalPath = await this.canonicalizeCompletedElamigosInstallPath({
+        item,
+        requireCompleted: true,
+        rootLibraryPath: settings.rootLibraryPath,
+        seedPaths: [
+          installedFinalPath,
+          currentJob.finalPath,
+          this.database.getInstallRecord(trackedItemId)?.installPath,
+        ],
+      });
+    }
+
+    if (
       currentJob &&
       isManualProvider(currentJob.provider) &&
       sourceSnapshot.sourceKind === 'elamigos' &&
-      (!installedFinalPath || !(await directoryHasEntries(installedFinalPath)))
+      !installedFinalPath
     ) {
       throw new Error(
-        `No completed ElAmigos install was found at ${
-          installedFinalPath ?? 'the expected library folder'
-        }. Finish the manual installer there and try again.`,
+        'No completed ElAmigos install was found at the expected library folder. Finish the manual installer there and try again.',
       );
     }
 
