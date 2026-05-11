@@ -112,15 +112,19 @@ const extensionRegistration = {
 function createCredentialBackedService(params: {
   database: GameVaultDatabase;
   decrypt: (text: string) => string;
+  listDevices?: MyJDownloaderClient['listDevices'];
 }): GameVaultService {
   const client: MyJDownloaderClient = {
     async callDevice<T>(): Promise<T> {
       throw new Error('Unexpected device call');
     },
     async disconnect(): Promise<void> {},
-    async listDevices() {
+    async listDevices(email, password) {
+      if (params.listDevices) {
+        return params.listDevices(email, password);
+      }
       return [
-      { id: 'device-1', name: 'JDownloader', status: 'ONLINE' },
+        { id: 'device-1', name: 'JDownloader', status: 'ONLINE' },
       ];
     },
   };
@@ -1016,6 +1020,37 @@ describe('GameVaultService import workflow', () => {
       expect(health.myJDownloader).toMatchObject({
         color: 'red',
         label: 'Reconnect MyJDownloader',
+      });
+      expect(database.getSettings()).toMatchObject({
+        encryptedPassword: null,
+        myJDownloaderDeviceId: null,
+        myJDownloaderEmail: 'logan@example.test',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('clears rejected saved MyJDownloader credentials and prompts reconnect', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('myjd.email', 'logan@example.test');
+      database.setSetting('myjd.password', 'encrypted-secret');
+      database.setSetting('myjd.deviceId', 'device-1');
+      const service = createCredentialBackedService({
+        database,
+        decrypt: () => 'bad-password',
+        listDevices: async () => {
+          throw new Error('403: Forbidden');
+        },
+      });
+
+      const health = await service.getConnectionHealth({ forceRefresh: true });
+
+      expect(health.myJDownloader).toMatchObject({
+        color: 'red',
+        label: 'Reconnect MyJDownloader',
+        message: expect.stringContaining('login was rejected'),
       });
       expect(database.getSettings()).toMatchObject({
         encryptedPassword: null,
@@ -2816,6 +2851,159 @@ describe('GameVaultService SteamDB patch workflow', () => {
         selectedMirrorUrl: ankerMirrorUrl,
         stage: 'queued',
       });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('queues SteamRIP bzzhr.to mirrors through the direct HTTP browser resolver', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response(rss([selectedPatch]), { status: 200 })),
+      );
+      const queueLinks = vi.fn();
+      const startDirectHttpDownload = createEmbeddedBrowserRunner();
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        undefined,
+        undefined,
+        fetch,
+        undefined,
+        undefined,
+        undefined,
+        startDirectHttpDownload,
+      );
+      const bzzhrSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fingerprint: 'steamrip-bzzhr-source',
+        fullDownloadUrls: [
+          {
+            kind: 'full',
+            label: 'Buzzheavier',
+            url: 'https://bzzhr.to/u33dxmmaozb6',
+          },
+        ],
+      };
+
+      const view = await service.addTrackedItem({
+        parsedSource: bzzhrSource,
+        queueDownload: true,
+        selectedDownloads: { fullUrl: 'https://bzzhr.to/u33dxmmaozb6' },
+        selectedSteamPatch: selectedPatch,
+        steamMatch,
+      });
+
+      expect(queueLinks).not.toHaveBeenCalled();
+      expect(startDirectHttpDownload).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sourceKind: 'steamrip',
+          sourceUrl: bzzhrSource.sourceUrl,
+          url: 'https://bzzhr.to/u33dxmmaozb6',
+        }),
+      );
+      expect(view.currentDownload).toMatchObject({
+        provider: 'direct_http',
+        selectedMirrorUrl: 'https://bzzhr.to/u33dxmmaozb6',
+        stage: 'queued',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('retries SteamRIP with the refreshed parsed mirror instead of a stale selected mirror', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response(rss([selectedPatch]), { status: 200 })),
+      );
+      const queueLinks = vi.fn();
+      const startDirectHttpDownload = createEmbeddedBrowserRunner();
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        undefined,
+        undefined,
+        fetch,
+        undefined,
+        undefined,
+        undefined,
+        startDirectHttpDownload,
+      );
+      const staleMirrorUrl = 'https://bzzhr.to/i1vc25zpcfc3';
+      const refreshedMirrorUrl = 'https://bzzhr.to/u33dxmmaozb6';
+      const staleSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fingerprint: 'steamrip-stale-bzzhr-source',
+        fullDownloadUrls: [
+          {
+            kind: 'full',
+            label: 'Buzzheavier',
+            url: staleMirrorUrl,
+          },
+        ],
+      };
+      const refreshedSource: ParsedSourcePayload = {
+        ...staleSource,
+        fingerprint: 'steamrip-refreshed-bzzhr-source',
+        fullDownloadUrls: [
+          {
+            kind: 'full',
+            label: 'Buzzheavier',
+            url: refreshedMirrorUrl,
+          },
+        ],
+      };
+
+      const view = await service.addTrackedItem({
+        parsedSource: staleSource,
+        queueDownload: true,
+        selectedDownloads: { fullUrl: staleMirrorUrl },
+        selectedSteamPatch: selectedPatch,
+        steamMatch,
+      });
+      await service.markDownloadFailed(view.item.id);
+      database.setRawParsedSourcePayload(view.item.id, refreshedSource);
+      database.syncDownloadMirrors(
+        view.item.id,
+        'steamrip',
+        refreshedSource.fullDownloadUrls,
+      );
+      database.selectDownloadMirror(
+        view.item.id,
+        staleMirrorUrl,
+        'full',
+        'steamrip',
+      );
+
+      await service.retryDownload(view.item.id);
+
+      expect(queueLinks).not.toHaveBeenCalled();
+      expect(startDirectHttpDownload).toHaveBeenCalledTimes(2);
+      expect(startDirectHttpDownload).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          sourceKind: 'steamrip',
+          url: refreshedMirrorUrl,
+        }),
+      );
+      expect(database.getDownloadJob(view.item.id)).toMatchObject({
+        provider: 'direct_http',
+        selectedMirrorUrl: refreshedMirrorUrl,
+        stage: 'queued',
+      });
+      expect(
+        database
+          .listDownloadMirrors(view.item.id, 'steamrip')
+          .find((mirror) => mirror.url === refreshedMirrorUrl)?.selectedAt,
+      ).toEqual(expect.any(String));
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
@@ -6968,6 +7156,62 @@ describe('GameVaultService SteamDB patch workflow', () => {
     }
   });
 
+  it('removes leftover completed SteamRIP staging folders during later polling', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootLibraryPath = join(tempRoot, 'Library');
+      database.setSetting('library.rootPath', rootLibraryPath);
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'cyberpunk 2077',
+        sourceKind: 'steamrip',
+        sourceUrl: 'https://steamrip.com/cryberpunk-2k77-d7/',
+        title: 'Cyberpunk 2077',
+      });
+      const finalPath = join(rootLibraryPath, 'Cyberpunk 2077');
+      const stagePath = join(
+        rootLibraryPath,
+        '_STAGING',
+        'Cyberpunk 2077_19939064',
+      );
+      await mkdir(join(finalPath, 'bin', 'x64'), { recursive: true });
+      await writeFile(
+        join(finalPath, 'bin', 'x64', 'Cyberpunk2077.exe'),
+        'game',
+      );
+      await mkdir(stagePath, { recursive: true });
+      await writeFile(
+        join(stagePath, 'Cbpunk-2ksvenseven-SteamRIP.com.rar'),
+        'archive',
+      );
+      database.upsertDownloadJob({
+        createdAt: '2026-05-11T12:00:00.000Z',
+        errorMessage: null,
+        finalPath,
+        id: 'cyberpunk-steamrip-download',
+        packageName: 'Cyberpunk 2077_19939064',
+        provider: 'direct_http',
+        sourceKind: 'steamrip',
+        stage: 'complete',
+        stagePath,
+        statusMessage: 'Downloaded and installed',
+        trackedItemId: item.id,
+        updatedAt: '2026-05-11T12:10:00.000Z',
+      });
+
+      await createService(database).pollDownloadJobs();
+
+      expect(existsSync(join(finalPath, 'bin', 'x64', 'Cyberpunk2077.exe')))
+        .toBe(true);
+      expect(existsSync(stagePath)).toBe(false);
+      expect(database.getDownloadJob(item.id)).toMatchObject({
+        stage: 'complete',
+        statusMessage: 'Downloaded and installed',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('completes Ankergames curl downloads after the staged ZIP finishes saving', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -7690,6 +7934,212 @@ describe('GameVaultService SteamDB patch workflow', () => {
         ],
         stage: 'staged',
         totalParts: 1,
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('does not keep polling staged ElAmigos installers into a failed state', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const elamigosSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fullDownloadUrls: [
+          {
+            kind: 'full',
+            label: 'FULL',
+            url: 'https://gofile.io/d/full',
+          },
+        ],
+        latestSourceRelease: {
+          isPatch: false,
+          label: 'Patch 1.9.8',
+          patchDate: '03/30/2026',
+          version: '1.9.8',
+        },
+        normalizedTitle: 'against the storm',
+        patchDownloadUrls: [],
+        sourceKind: 'elamigos',
+        title: 'Against the Storm',
+      };
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9001,
+        packageName: 'Against the Storm_22900000',
+        parts: [
+          {
+            mirrorUrl: 'https://gofile.io/d/full',
+            packageId: 9001,
+            packageName: 'Against the Storm_22900000',
+            role: 'full' as const,
+          },
+        ],
+      }));
+      const getPackageProgress = vi.fn(async () => ({
+        bytesLoaded: 100,
+        bytesTotal: 100,
+        etaSeconds: 0,
+        packageId: 9001,
+        speed: null,
+        stage: 'staged' as const,
+        statusMessage: null,
+      }));
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        getPackageProgress,
+      );
+      const view = await service.addTrackedItem({
+        parsedSource: elamigosSource,
+        queueDownload: true,
+        selectedDownloads: {
+          fullUrl: 'https://gofile.io/d/full',
+        },
+        selectedSteamPatch: {
+          ...selectedPatch,
+          buildId: '22900000',
+          patchDate: '03/30/2026',
+        },
+        steamMatch: {
+          ...steamMatch,
+          normalizedTitle: 'against the storm',
+          title: 'Against the Storm',
+        },
+      });
+      const stagePath = view.currentDownload?.stagePath;
+      expect(stagePath).toEqual(expect.any(String));
+      await writeFile(join(stagePath!, 'AgainstTheStorm.iso'), 'iso');
+
+      await service.pollDownloadJobs();
+      expect(database.getDownloadJob(view.item.id)).toMatchObject({
+        stage: 'staged',
+      });
+
+      getPackageProgress.mockRejectedValue(
+        new Error('JDownloader package is no longer available'),
+      );
+      await service.pollDownloadJobs();
+
+      expect(getPackageProgress).toHaveBeenCalledTimes(1);
+      expect(database.getDownloadJob(view.item.id)).toMatchObject({
+        errorMessage: null,
+        stage: 'staged',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('completes a failed ElAmigos staged job after the installer creates the game folder', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootLibraryPath = join(tempRoot, 'Library');
+      database.setSetting('library.rootPath', rootLibraryPath);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const elamigosSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fullDownloadUrls: [
+          {
+            kind: 'full',
+            label: 'FULL',
+            url: 'https://gofile.io/d/full',
+          },
+        ],
+        latestSourceRelease: {
+          isPatch: false,
+          label: 'Patch 1.9.8',
+          patchDate: '03/30/2026',
+          version: '1.9.8',
+        },
+        normalizedTitle: 'against the storm',
+        patchDownloadUrls: [],
+        sourceKind: 'elamigos',
+        title: 'Against the Storm',
+      };
+      const queueLinks = vi.fn(async () => ({
+        packageId: 9001,
+        packageName: 'Against the Storm_22900000',
+        parts: [
+          {
+            mirrorUrl: 'https://gofile.io/d/full',
+            packageId: 9001,
+            packageName: 'Against the Storm_22900000',
+            role: 'full' as const,
+          },
+        ],
+      }));
+      const getPackageProgress = vi.fn(async () => ({
+        bytesLoaded: 100,
+        bytesTotal: 100,
+        etaSeconds: 0,
+        packageId: 9001,
+        speed: null,
+        stage: 'staged' as const,
+        statusMessage: null,
+      }));
+      const service = createService(
+        database,
+        queueLinks,
+        undefined,
+        getPackageProgress,
+      );
+      const view = await service.addTrackedItem({
+        parsedSource: elamigosSource,
+        queueDownload: true,
+        selectedDownloads: {
+          fullUrl: 'https://gofile.io/d/full',
+        },
+        selectedSteamPatch: {
+          ...selectedPatch,
+          buildId: '22900000',
+          patchDate: '03/30/2026',
+        },
+        steamMatch: {
+          ...steamMatch,
+          normalizedTitle: 'against the storm',
+          title: 'Against the Storm',
+        },
+      });
+      const stagePath = view.currentDownload?.stagePath;
+      expect(stagePath).toEqual(expect.any(String));
+      await writeFile(join(stagePath!, 'AgainstTheStorm.iso'), 'iso');
+      await service.pollDownloadJobs();
+
+      const stagedJob = database.getDownloadJob(view.item.id)!;
+      database.upsertDownloadJob({
+        ...stagedJob,
+        errorMessage: 'JDownloader package is no longer available',
+        stage: 'failed',
+        statusMessage: 'JDownloader package is no longer available',
+        updatedAt: new Date().toISOString(),
+      });
+      const installedPath = join(rootLibraryPath, 'Against the Storm');
+      await mkdir(installedPath, { recursive: true });
+      await writeFile(join(installedPath, 'AgainstTheStorm.exe'), 'game');
+
+      const completed = await service.completeStagedInstall(view.item.id);
+
+      expect(completed.status).toBe(TrackedItemStatus.Installed);
+      expect(completed.fileState.finalPath).toBe(installedPath);
+      expect(completed.playniteExecutableSelection?.selectedExePath).toBe(
+        join(installedPath, 'AgainstTheStorm.exe'),
+      );
+      expect(database.getDownloadJob(view.item.id)).toMatchObject({
+        finalPath: installedPath,
+        stage: 'complete',
+      });
+      expect(database.getInstallRecord(view.item.id)).toMatchObject({
+        installPath: installedPath,
+        installedSourceKind: 'elamigos',
       });
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);

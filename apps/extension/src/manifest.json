@@ -56,8 +56,8 @@
         "https://www.ankergames.net/game/*",
         "https://elamigos.site/data/*.html",
         "https://www.elamigos.site/data/*.html",
-        "https://steamrip.com/*-free-download*",
-        "https://www.steamrip.com/*-free-download*"
+        "https://steamrip.com/*",
+        "https://www.steamrip.com/*"
       ],
       "js": ["content.js"],
       "run_at": "document_idle"

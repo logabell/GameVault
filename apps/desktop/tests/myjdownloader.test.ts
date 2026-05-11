@@ -362,6 +362,67 @@ describe('MyJDownloaderService authentication', () => {
     ).rejects.toThrow('JDownloader is not open');
     expect(client.calls).toEqual([]);
   });
+
+  it('probes an UNKNOWN selected device before marking it offline', async () => {
+    class UnknownStatusClient extends FakeMyJDownloaderClient {
+      override async listDevices(
+        email: string,
+        password: string,
+      ): Promise<RawDeviceInfo[]> {
+        this.listDeviceCalls.push({ email, password });
+        return [{ id: 'device-1', name: 'JDownloader', status: 'UNKNOWN' }];
+      }
+    }
+    const client = new UnknownStatusClient();
+    const service = createService(client);
+
+    await expect(
+      service.getHealth({ forceRefresh: true }),
+    ).resolves.toMatchObject({
+      color: 'green',
+      devices: [{ id: 'device-1', selected: true, status: 'UNKNOWN' }],
+      label: 'JDownloader',
+      selectedDeviceId: 'device-1',
+    });
+    expect(client.findAll('/downloadsV2/queryPackages')).toHaveLength(1);
+  });
+
+  it('keeps an UNKNOWN selected device offline when the probe fails', async () => {
+    class UnreachableUnknownStatusClient extends FakeMyJDownloaderClient {
+      override async listDevices(
+        email: string,
+        password: string,
+      ): Promise<RawDeviceInfo[]> {
+        this.listDeviceCalls.push({ email, password });
+        return [{ id: 'device-1', name: 'JDownloader', status: 'UNKNOWN' }];
+      }
+
+      override async callDevice<T>(
+        email: string,
+        password: string,
+        deviceId: string,
+        path: string,
+        params?: unknown,
+      ): Promise<T> {
+        if (path === '/downloadsV2/queryPackages') {
+          this.calls.push({ params, path });
+          throw new Error('Device is not reachable');
+        }
+        return super.callDevice<T>(email, password, deviceId, path, params);
+      }
+    }
+    const client = new UnreachableUnknownStatusClient();
+    const service = createService(client);
+
+    await expect(
+      service.getHealth({ forceRefresh: true }),
+    ).resolves.toMatchObject({
+      color: 'yellow',
+      label: 'JDownloader offline',
+      selectedDeviceId: null,
+    });
+    expect(client.findAll('/downloadsV2/queryPackages')).toHaveLength(1);
+  });
 });
 
 describe('MyJDownloaderService queueLinks', () => {

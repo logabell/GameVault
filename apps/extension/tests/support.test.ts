@@ -42,11 +42,14 @@ describe('supported detail pages', () => {
       'https://steamrip.com/mouse-p-i-for-hire-free-download/',
       'https://steamrip.com/ziggurat-2-free-download-1r/',
       'https://www.steamrip.com/example-game-free-download-alt-release/?ref=homepage',
+      'https://steamrip.com/cryberpunk-2k77-d7/',
     ]) {
       expect(isSupportedDetailPage(url)).toBe(true);
     }
 
     expect(isSupportedDetailPage('https://steamrip.com/updated-games/')).toBe(false);
+    expect(isSupportedDetailPage('https://steamrip.com/top-games/')).toBe(false);
+    expect(isSupportedDetailPage('https://steamrip.com/request-games/')).toBe(false);
     expect(isSupportedDetailPage('https://steamrip.com/category/action/')).toBe(false);
     expect(
       isSupportedDetailPage(

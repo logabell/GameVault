@@ -8,6 +8,11 @@ import type {
   ExtensionSetupInfo,
   RegisterExtensionNativeHostPayload,
 } from '@gamevault/shared-types';
+import type {
+  DownloadItem,
+  Event as ElectronEvent,
+  WebContents,
+} from 'electron';
 import { FIREFOX_EXTENSION_ID } from '@gamevault/shared-types';
 import {
   app,
@@ -267,6 +272,278 @@ function createWindow(options?: { showOnReady?: boolean }) {
   return mainWindow;
 }
 
+const BROWSER_RESOLVED_DOWNLOAD_HOSTS = new Set([
+  'buzzheavier.com',
+  'bzzhr.to',
+]);
+const BROWSER_DOWNLOAD_RESOLVE_TIMEOUT_MS = 30000;
+let browserDownloadPartitionCounter = 0;
+
+const BROWSER_DOWNLOAD_TRIGGER_SCRIPT = `
+(async () => {
+  const toAbsoluteUrl = (value) => {
+    try {
+      return new URL(value, window.location.href).toString();
+    } catch {
+      return null;
+    }
+  };
+  const textOf = (element) => (element?.textContent ?? '').trim();
+  const directTriggers = Array.from(document.querySelectorAll('li'))
+    .filter((item) => {
+      const label = textOf(item.querySelector('strong')).replace(/:$/, '').toLowerCase();
+      return label === 'direct';
+    })
+    .flatMap((item) => Array.from(item.querySelectorAll('a, button')))
+    .filter((element) => {
+      const label = textOf(element).toLowerCase();
+      return label.includes('download') && !label.includes('alternative');
+    });
+  const selectors = [
+    'a[hx-get*="/download"]',
+    'button[hx-get*="/download"]',
+    'a[data-hx-get*="/download"]',
+    'button[data-hx-get*="/download"]',
+    'a[href*="/download"]',
+    'button[data-download-url]',
+    'a[data-download-url]',
+  ];
+  const trigger = directTriggers[0] ?? selectors
+    .map((selector) => document.querySelector(selector))
+    .find(Boolean);
+  if (!trigger) {
+    return null;
+  }
+
+  const hxGet =
+    trigger.getAttribute('hx-get') ?? trigger.getAttribute('data-hx-get');
+  if (hxGet) {
+    const endpoint = toAbsoluteUrl(hxGet);
+    if (endpoint) {
+      const response = await fetch(endpoint, {
+        credentials: 'include',
+        headers: {
+          'HX-Current-URL': window.location.href,
+          'HX-Request': 'true',
+        },
+      });
+      const redirect =
+        response.headers.get('HX-Redirect') ?? response.headers.get('Location');
+      const resolved = redirect ? toAbsoluteUrl(redirect) : null;
+      if (resolved) {
+        return resolved;
+      }
+      return null;
+    }
+  }
+
+  const dataDownloadUrl = trigger.getAttribute('data-download-url');
+  const resolvedDataDownloadUrl = dataDownloadUrl
+    ? toAbsoluteUrl(dataDownloadUrl)
+    : null;
+  if (resolvedDataDownloadUrl) {
+    return resolvedDataDownloadUrl;
+  }
+
+  if (trigger instanceof HTMLElement) {
+    trigger.click();
+  }
+  return null;
+})()
+`;
+
+function getBrowserDownloadPartition(): string {
+  browserDownloadPartitionCounter += 1;
+  return `gamevault-download-${Date.now().toString(36)}-${browserDownloadPartitionCounter.toString(36)}`;
+}
+
+function shouldResolveDownloadUrlInBrowser(params: {
+  sourceKind: StartDirectHttpDownloadParams['sourceKind'];
+  url: string;
+}): boolean {
+  if (params.sourceKind !== 'steamrip') {
+    return false;
+  }
+
+  try {
+    const hostname = new URL(params.url).hostname
+      .replace(/^www\./i, '')
+      .toLowerCase();
+    return BROWSER_RESOLVED_DOWNLOAD_HOSTS.has(hostname);
+  } catch {
+    return false;
+  }
+}
+
+function getDownloadItemUrl(item: DownloadItem): string {
+  const chain = item.getURLChain();
+  return chain.at(-1) ?? item.getURL();
+}
+
+function resolveBrowserDownloadUrl(candidate: string): Promise<string> {
+  return new Promise((resolveDownloadUrl, rejectDownloadUrl) => {
+    const sourceUrl = candidate.trim();
+    let settled = false;
+    let fallbackResolvedUrlTimer: NodeJS.Timeout | null = null;
+    let triggerTimer: NodeJS.Timeout | null = null;
+    let timeout: NodeJS.Timeout | null = null;
+    let handleWillDownload: ((
+      event: ElectronEvent,
+      item: DownloadItem,
+      webContents: WebContents,
+    ) => void) | null = null;
+    const downloadWindow = new BrowserWindow({
+      height: 720,
+      show: false,
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        partition: getBrowserDownloadPartition(),
+        sandbox: true,
+      },
+      width: 960,
+    });
+    const downloadSession = downloadWindow.webContents.session;
+
+    const finish = (error: Error | null, resolvedUrl?: string) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (triggerTimer) {
+        clearTimeout(triggerTimer);
+        triggerTimer = null;
+      }
+      if (fallbackResolvedUrlTimer) {
+        clearTimeout(fallbackResolvedUrlTimer);
+        fallbackResolvedUrlTimer = null;
+      }
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      if (handleWillDownload) {
+        downloadSession.off('will-download', handleWillDownload);
+      }
+      if (!downloadWindow.isDestroyed()) {
+        downloadWindow.destroy();
+      }
+      if (error) {
+        rejectDownloadUrl(error);
+        return;
+      }
+      if (resolvedUrl) {
+        resolveDownloadUrl(resolvedUrl);
+        return;
+      }
+      rejectDownloadUrl(
+        new Error('Browser download resolver ended without a direct URL.'),
+      );
+    };
+
+    handleWillDownload = (event, item, webContents) => {
+      if (webContents.id !== downloadWindow.webContents.id) {
+        return;
+      }
+      const resolvedUrl = getDownloadItemUrl(item);
+      event.preventDefault();
+      finish(null, resolvedUrl);
+    };
+
+    const triggerDownload = async () => {
+      if (settled || downloadWindow.isDestroyed()) {
+        return;
+      }
+      try {
+        const resolvedUrl = await downloadWindow.webContents.executeJavaScript(
+          BROWSER_DOWNLOAD_TRIGGER_SCRIPT,
+          true,
+        );
+        if (typeof resolvedUrl === 'string' && resolvedUrl.trim()) {
+          const absoluteResolvedUrl = new URL(resolvedUrl, sourceUrl).toString();
+          downloadWindow.webContents.downloadURL(absoluteResolvedUrl, {
+            headers: {
+              Referer: sourceUrl,
+            },
+          });
+          if (fallbackResolvedUrlTimer) {
+            clearTimeout(fallbackResolvedUrlTimer);
+          }
+          fallbackResolvedUrlTimer = setTimeout(() => {
+            finish(null, absoluteResolvedUrl);
+          }, 10000);
+        }
+      } catch {
+        // If the page script is blocked or the markup changed, the timeout
+        // below turns this into a normal queue failure.
+      }
+    };
+
+    const scheduleTrigger = () => {
+      if (settled || downloadWindow.isDestroyed()) {
+        return;
+      }
+      if (triggerTimer) {
+        clearTimeout(triggerTimer);
+      }
+      triggerTimer = setTimeout(() => {
+        void triggerDownload();
+      }, 250);
+    };
+
+    timeout = setTimeout(() => {
+      finish(
+        new Error(
+          'Timed out while resolving the browser download URL for this SteamRIP mirror.',
+        ),
+      );
+    }, BROWSER_DOWNLOAD_RESOLVE_TIMEOUT_MS);
+
+    downloadSession.on('will-download', handleWillDownload);
+    downloadWindow.once('closed', () => {
+      finish(
+        new Error(
+          'Browser download resolver closed before a direct URL was captured.',
+        ),
+      );
+    });
+    downloadWindow.webContents.setWindowOpenHandler(({ url }) => {
+      void downloadWindow.loadURL(url).catch((error) => {
+        finish(
+          error instanceof Error
+            ? error
+            : new Error('Browser download resolver could not open a popup URL.'),
+        );
+      });
+      return { action: 'deny' };
+    });
+    downloadWindow.webContents.on('did-finish-load', scheduleTrigger);
+    downloadWindow.webContents.on('did-stop-loading', scheduleTrigger);
+    downloadWindow.webContents.on(
+      'did-fail-load',
+      (_event, errorCode, errorDescription, validatedUrl, isMainFrame) => {
+        if (!isMainFrame || errorCode === -3) {
+          return;
+        }
+        finish(
+          new Error(
+            `Browser download resolver failed to load ${validatedUrl}: ${errorDescription}`,
+          ),
+        );
+      },
+    );
+    void downloadWindow
+      .loadURL(sourceUrl)
+      .then(scheduleTrigger)
+      .catch((error) => {
+        finish(
+          error instanceof Error
+            ? error
+            : new Error('Browser download resolver could not open the mirror.'),
+        );
+      });
+  });
+}
+
 function parseCurlProbeHeaders(rawHeaders: string): {
   contentDisposition: string | null;
   contentLength: number | null;
@@ -308,23 +585,30 @@ function parseCurlProbeHeaders(rawHeaders: string): {
   };
 }
 
-function probeCurlDownload(candidate: string): Promise<{
+function probeCurlDownload(
+  candidate: string,
+  options: { referer?: string | null } = {},
+): Promise<{
   contentDisposition: string | null;
   contentLength: number | null;
 }> {
   return new Promise((resolve, reject) => {
+    const args = [
+      '-sS',
+      '-I',
+      '-L',
+      '--connect-timeout',
+      '15',
+      '--max-time',
+      '40',
+    ];
+    if (options.referer) {
+      args.push('--referer', options.referer);
+    }
+    args.push(candidate);
     const probe = spawn(
       'curl.exe',
-      [
-        '-sS',
-        '-I',
-        '-L',
-        '--connect-timeout',
-        '15',
-        '--max-time',
-        '40',
-        candidate,
-      ],
+      args,
       {
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
@@ -426,15 +710,28 @@ function startDirectHttpDownload(params: StartDirectHttpDownloadParams) {
       };
 
       const start = async () => {
-        const normalized = params.url.trim();
+        const sourceDownloadUrl = params.url.trim();
+        let normalized = sourceDownloadUrl;
+        let referer: string | null = null;
 
         emitProgress('queued', 'Starting download');
+        if (
+          shouldResolveDownloadUrlInBrowser({
+            sourceKind: params.sourceKind,
+            url: sourceDownloadUrl,
+          })
+        ) {
+          emitProgress('queued', 'Resolving download URL');
+          normalized = await resolveBrowserDownloadUrl(sourceDownloadUrl);
+          referer = sourceDownloadUrl;
+        }
+
         let probeResult: {
           contentDisposition: string | null;
           contentLength: number | null;
         } | null = null;
         try {
-          probeResult = await probeCurlDownload(normalized);
+          probeResult = await probeCurlDownload(normalized, { referer });
         } catch {
           probeResult = null;
         }
@@ -461,37 +758,59 @@ function startDirectHttpDownload(params: StartDirectHttpDownloadParams) {
                 fileName: derivedFileName,
                 stagePath: params.stagePath,
               });
-        await rm(savePath, { force: true }).catch(() => undefined);
+        const existingBytesLoaded = await stat(savePath)
+          .then((details) => details.size)
+          .catch(() => 0);
         activeSavePath = savePath;
-        activeBytesLoaded = 0;
+        activeBytesLoaded = existingBytesLoaded;
         activeBytesTotal = probeResult?.contentLength ?? null;
         activeDownloadSpeed = null;
         lastProgressSample = {
-          bytesLoaded: 0,
+          bytesLoaded: existingBytesLoaded,
           recordedAt: Date.now(),
         };
-        emitProgress('downloading', 'Downloading');
-
-        const curl = spawn(
-          'curl.exe',
-          [
-            '-L',
-            '--fail',
-            '--output',
-            savePath,
-            '--connect-timeout',
-            '15',
-            '--retry',
-            '2',
-            '--retry-delay',
-            '2',
-            normalized,
-          ],
-          {
-            stdio: ['ignore', 'ignore', 'pipe'],
-            windowsHide: true,
-          },
+        if (
+          activeBytesTotal != null &&
+          existingBytesLoaded >= activeBytesTotal
+        ) {
+          emitProgress('downloading', 'Download already staged');
+          settleDownload(null, { fileName, savePath });
+          return;
+        }
+        emitProgress(
+          'downloading',
+          existingBytesLoaded > 0 ? 'Resuming download' : 'Downloading',
         );
+
+        const curlArgs = [
+          '-sS',
+          '-L',
+          '--fail',
+          '--continue-at',
+          '-',
+          '--output',
+          savePath,
+          '--connect-timeout',
+          '15',
+          '--retry',
+          '12',
+          '--retry-delay',
+          '5',
+          '--retry-all-errors',
+          '--retry-connrefused',
+          '--speed-time',
+          '120',
+          '--speed-limit',
+          '1024',
+        ];
+        if (referer) {
+          curlArgs.push('--referer', referer);
+        }
+        curlArgs.push(normalized);
+        const curl = spawn('curl.exe', curlArgs, {
+          stdio: ['ignore', 'ignore', 'pipe'],
+          windowsHide: true,
+        });
         activeCurlProcess = curl;
         let stderr = '';
 
@@ -530,6 +849,9 @@ function startDirectHttpDownload(params: StartDirectHttpDownloadParams) {
 
         curl.stderr.on('data', (chunk) => {
           stderr += chunk.toString();
+          if (stderr.length > 8000) {
+            stderr = stderr.slice(-8000);
+          }
         });
         curl.once('error', async (error) => {
           if (activeCurlProgressTimer) {
@@ -537,7 +859,7 @@ function startDirectHttpDownload(params: StartDirectHttpDownloadParams) {
             activeCurlProgressTimer = null;
           }
           activeCurlProcess = null;
-          await rm(savePath, { force: true }).catch(() => undefined);
+          await updateFileProgress();
           settleDownload(error);
         });
         curl.once('close', async (code) => {
@@ -551,7 +873,6 @@ function startDirectHttpDownload(params: StartDirectHttpDownloadParams) {
             settleDownload(null, { fileName, savePath });
             return;
           }
-          await rm(savePath, { force: true }).catch(() => undefined);
           settleDownload(
             new Error(
               stderr.trim() ||

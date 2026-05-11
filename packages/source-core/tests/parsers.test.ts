@@ -1503,12 +1503,17 @@ describe('source parsers', () => {
       'https://steamrip.com/mouse-p-i-for-hire-free-download/',
       'https://steamrip.com/ziggurat-2-free-download-1r/',
       'https://www.steamrip.com/example-game-free-download-alt-release/?ref=homepage',
+      'https://steamrip.com/cryberpunk-2k77-d7/',
     ]) {
       expect(getAdapterForUrl(url, '')?.kind).toBe('steamrip');
     }
 
     expect(
       getAdapterForUrl('https://steamrip.com/updated-games/', ''),
+    ).toBeNull();
+    expect(getAdapterForUrl('https://steamrip.com/top-games/', '')).toBeNull();
+    expect(
+      getAdapterForUrl('https://steamrip.com/request-games/', ''),
     ).toBeNull();
     expect(
       getAdapterForUrl(
@@ -1559,6 +1564,43 @@ describe('source parsers', () => {
         kind: 'full',
         label: 'MegaDB',
         url: 'https://megadb.net/example',
+      },
+    ]);
+    expect(parsed.patchDownloadUrls).toEqual([]);
+  });
+
+  it('ignores SteamRIP links under the languages section', () => {
+    const html = `
+      <html>
+        <body>
+          <h1>MOUSE: P.I. For Hire</h1>
+          <div class="entry-content">
+            <p>Version: v1.0.3.8157</p>
+            <p><strong>GOFILE</strong><br /><a href="https://gofile.io/d/full">DOWNLOAD HERE</a></p>
+            <h4>Languages</h4>
+            <p><strong>Buzzheavier</strong><br /><a href="https://bzzhr.to/language-pack">DOWNLOAD HERE</a></p>
+            <h4>Download Links</h4>
+            <p><strong>Buzzheavier</strong><br /><a href="https://bzzhr.to/full-archive">DOWNLOAD HERE</a></p>
+          </div>
+        </body>
+      </html>
+    `;
+
+    const parsed = parseSupportedPage(
+      'https://steamrip.com/mouse-p-i-for-hire-free-download/',
+      html,
+    );
+
+    expect(parsed.fullDownloadUrls).toEqual([
+      {
+        kind: 'full',
+        label: 'GOFILE',
+        url: 'https://gofile.io/d/full',
+      },
+      {
+        kind: 'full',
+        label: 'Buzzheavier',
+        url: 'https://bzzhr.to/full-archive',
       },
     ]);
     expect(parsed.patchDownloadUrls).toEqual([]);

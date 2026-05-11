@@ -1,11 +1,25 @@
 import { load } from 'cheerio';
+import type { AnyNode } from 'domhandler';
 import type { ParsedSourcePayload, SourceSnapshot } from '@gamevault/shared-types';
 
 import type { RefreshTrackedItemInput, SourceAdapter } from '../types.js';
 import { buildFingerprint, compactText, normalizeSlashDate, normalizeTitle } from '../utils.js';
 
 const STEAMRIP_DETAIL_SLUG_RE =
-  /^[a-z0-9][a-z0-9-]*-free-download(?:-[a-z0-9][a-z0-9-]*)?$/i;
+  /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i;
+const STEAMRIP_NON_DETAIL_PATHS = new Set([
+  'about',
+  'contact-us',
+  'faq',
+  'games-list',
+  'games-list-page',
+  'privacy-policy',
+  'recent-updates',
+  'request-games',
+  'terms-conditions',
+  'top-games',
+  'updated-games',
+]);
 const VERSION_RE = /version[:\s]+(?<version>[0-9a-z.-]+)/i;
 const BUILD_RE = /build[:\s#]+(?<build>[0-9a-z.-]+)/i;
 const HOST_LABELS = new Map<string, string>([
@@ -17,17 +31,62 @@ const HOST_LABELS = new Map<string, string>([
   ['megadb.net', 'MegaDB'],
   ['pixeldrain.com', 'PixelDrain'],
 ]);
+const HEADING_SELECTOR = 'h1, h2, h3, h4, h5, h6';
+const SECTION_MARKER_SELECTOR = `${HEADING_SELECTOR}, p, li`;
+const SECTION_MARKER_WITH_ANCHORS_SELECTOR = `${SECTION_MARKER_SELECTOR}, a[href]`;
+
+function stripAnchorText(
+  $: ReturnType<typeof load>,
+  element: AnyNode,
+): string {
+  const clone = $(element).clone();
+  clone.find('a[href]').remove();
+  return compactText(clone.text());
+}
+
+function normalizedSectionLabel(text: string): string {
+  return compactText(text)
+    .replace(/[:-]+$/g, '')
+    .trim()
+    .toLowerCase();
+}
+
+function isLanguagesSectionLabel(text: string): boolean {
+  const label = normalizedSectionLabel(text);
+  return label === 'language' || label === 'languages';
+}
+
+function isDownloadSectionLabel(text: string): boolean {
+  const label = normalizedSectionLabel(text);
+  if (!label) {
+    return false;
+  }
+
+  return (
+    Array.from(HOST_LABELS.values()).some(
+      (hostLabel) => label === hostLabel.toLowerCase(),
+    ) || /^(?:download|downloads|download links?|mirrors?)$/i.test(label)
+  );
+}
+
+function isExplicitDownloadSectionLabel(text: string): boolean {
+  return /^(?:download|downloads|download links?|mirrors?)$/i.test(
+    normalizedSectionLabel(text),
+  );
+}
 
 function isSteamRipDetailPage(url: string): boolean {
   try {
     const parsedUrl = new URL(url);
     const hostname = parsedUrl.hostname.replace(/^www\./i, '').toLowerCase();
     const pathSegments = parsedUrl.pathname.split('/').filter(Boolean);
+    const slug = pathSegments[0]?.toLowerCase() ?? '';
     return (
       /^https?:$/.test(parsedUrl.protocol) &&
       hostname === 'steamrip.com' &&
       pathSegments.length === 1 &&
-      STEAMRIP_DETAIL_SLUG_RE.test(pathSegments[0] ?? '')
+      !STEAMRIP_NON_DETAIL_PATHS.has(slug) &&
+      STEAMRIP_DETAIL_SLUG_RE.test(slug)
     );
   } catch {
     return false;
@@ -101,7 +160,29 @@ function collectDownloadAnchors(
 ): ParsedSourcePayload['fullDownloadUrls'] {
   const downloadUrls: ParsedSourcePayload['fullDownloadUrls'] = [];
   const seenUrls = new Set<string>();
-  $('a[href]').each((_, element) => {
+  let currentSection: 'download' | 'languages' | null = null;
+  const contentRoot = $('.entry-content, .post-entry').first();
+  const candidates =
+    contentRoot.length > 0
+      ? contentRoot.find(SECTION_MARKER_WITH_ANCHORS_SELECTOR)
+      : $(SECTION_MARKER_WITH_ANCHORS_SELECTOR);
+
+  candidates.each((_, element) => {
+    if (!$(element).is('a[href]')) {
+      const markerText = stripAnchorText($, element);
+      if (isLanguagesSectionLabel(markerText)) {
+        currentSection = 'languages';
+      } else if (
+        isDownloadSectionLabel(markerText) &&
+        (currentSection !== 'languages' ||
+          $(element).is(HEADING_SELECTOR) ||
+          isExplicitDownloadSectionLabel(markerText))
+      ) {
+        currentSection = 'download';
+      }
+      return;
+    }
+
     const href = $(element).attr('href');
     if (!href || href.startsWith('#')) {
       return;
@@ -113,6 +194,10 @@ function collectDownloadAnchors(
     }
 
     const label = compactText($(element).text());
+    if (currentSection === 'languages' || isLanguagesSectionLabel(label)) {
+      return;
+    }
+
     const hostname = new URL(absoluteUrl).hostname.replace(/^www\./i, '').toLowerCase();
     const inferredLabel =
       /^download here$/i.test(label) || !label

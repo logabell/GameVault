@@ -1349,6 +1349,7 @@ function canConfirmElamigosStagedInstall(item: TrackedItemView): boolean {
     item.currentDownload?.sourceKind === 'elamigos' &&
     item.currentDownload.provider !== 'manual' &&
     (item.currentDownload.stage === 'staged' ||
+      item.currentDownload.stage === 'failed' ||
       (item.currentDownload.stage === 'extracting' &&
         item.currentDownload.statusMessage ===
           'Waiting for JDownloader extraction to finish')),

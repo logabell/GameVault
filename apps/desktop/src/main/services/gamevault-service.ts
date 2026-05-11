@@ -133,6 +133,7 @@ import {
   directoryHasEntries,
   dismountIsoImagesUnderPath,
   ensureDirectory,
+  extractDirectHttpArchive,
   extractDirectHttpArchives,
   extractSingleStagedZipArchive,
   finalizePortableArchiveExtraction,
@@ -188,6 +189,8 @@ const ACTIVITY_STALE_DOWNLOAD_MS = 2 * 60 * 60 * 1000;
 const ACTIVITY_STALE_GRACE_MS = 5 * 60 * 1000;
 const STEAMDB_BACKOFF_EVENT_INTERVAL_MS = 30 * 60 * 1000;
 const EXTENSION_ACTIVITY_RECENT_MS = 30 * 60 * 1000;
+const FILE_CLEANUP_RETRY_ATTEMPTS = IS_TEST_ENV ? 2 : 8;
+const FILE_CLEANUP_RETRY_DELAY_MS = IS_TEST_ENV ? 1 : 1000;
 const EXTENSION_ACTIVITY_SETTING_KEY = 'extension.lastNativeMessageAt';
 const PLAYNITE_PLUGIN_FOLDER_NAME = 'GameVault';
 const PLAYNITE_PLUGIN_VERSION = '0.1.9';
@@ -246,6 +249,40 @@ class SourceCatalogUnavailableError extends Error {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
+}
+
+function isTransientFileCleanupError(error: unknown): boolean {
+  const code =
+    error && typeof error === 'object' && 'code' in error
+      ? String((error as { code?: unknown }).code ?? '')
+      : '';
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  return /^(?:EBUSY|ENOTEMPTY|EPERM)$/i.test(code) ||
+    /\b(?:EBUSY|ENOTEMPTY|EPERM)\b/i.test(message);
+}
+
+async function retryTransientFileCleanup<T>(
+  operation: () => Promise<T>,
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < FILE_CLEANUP_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (
+        !isTransientFileCleanupError(error) ||
+        attempt === FILE_CLEANUP_RETRY_ATTEMPTS - 1
+      ) {
+        throw error;
+      }
+      await sleep(FILE_CLEANUP_RETRY_DELAY_MS * (attempt + 1));
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('File cleanup failed.');
 }
 
 function retryAfterMs(response: Response, defaultMs: number): number {
@@ -719,6 +756,40 @@ function sourceSupportsJDownloader(
   sourceKind: ParsedSourcePayload['sourceKind'],
 ): sourceKind is 'elamigos' | 'steamrip' {
   return sourceKind === 'elamigos' || sourceKind === 'steamrip';
+}
+
+const STEAMRIP_BROWSER_RESOLVED_DOWNLOAD_HOSTS = new Set([
+  'buzzheavier.com',
+  'bzzhr.to',
+]);
+
+function isSteamRipBuzzheavierMirrorUrl(
+  value: string | null | undefined,
+): boolean {
+  const url = value?.trim();
+  if (!url) {
+    return false;
+  }
+
+  try {
+    const hostname = new URL(url).hostname
+      .replace(/^www\./i, '')
+      .toLowerCase();
+    return STEAMRIP_BROWSER_RESOLVED_DOWNLOAD_HOSTS.has(hostname);
+  } catch {
+    return false;
+  }
+}
+
+function selectedDownloadRequiresBrowserResolvedDirectHttp(params: {
+  selectedDownloads: SelectedDownloads;
+  sourceKind: ParsedSourcePayload['sourceKind'];
+}): boolean {
+  return (
+    params.sourceKind === 'steamrip' &&
+    (isSteamRipBuzzheavierMirrorUrl(params.selectedDownloads.fullUrl) ||
+      isSteamRipBuzzheavierMirrorUrl(params.selectedDownloads.patchUrl))
+  );
 }
 
 function isDirectHttpProvider(
@@ -1553,6 +1624,7 @@ export class GameVaultService {
   private downloadProgressFlushTimer: NodeJS.Timeout | null = null;
   private downloadProgressBatchDepth = 0;
   private downloadJobPollPromise: Promise<void> | null = null;
+  private readonly completedStagingCleanupFailures = new Set<string>();
   private lastSteamDbBackoffEventAt = 0;
   private steamFeedPollPromise: Promise<void> | null = null;
   private steamLibraryCoverBackfillPromise: Promise<number> | null = null;
@@ -1661,6 +1733,7 @@ export class GameVaultService {
         (job) =>
           job.stage !== 'failed' &&
           job.stage !== 'complete' &&
+          !(job.sourceKind === 'elamigos' && job.stage === 'staged') &&
           !isManualProvider(job.provider),
       );
   }
@@ -1888,11 +1961,25 @@ export class GameVaultService {
   }
 
   private async resolveDownloadProvider(params: {
+    selectedDownloads: SelectedDownloads;
     settings: ReturnType<GameVaultDatabase['getSettings']>;
     sourceKind: ParsedSourcePayload['sourceKind'];
     trackedItemId: string;
   }): Promise<DownloadProvider> {
     if (!sourceSupportsJDownloader(params.sourceKind)) {
+      return 'direct_http';
+    }
+
+    if (selectedDownloadRequiresBrowserResolvedDirectHttp(params)) {
+      this.appendEvent(
+        'info',
+        'Selected SteamRIP mirror will be resolved in the browser for curl download',
+        {
+          sourceKind: params.sourceKind,
+          trackedItemId: params.trackedItemId,
+        },
+        { notify: false },
+      );
       return 'direct_http';
     }
 
@@ -2149,10 +2236,12 @@ export class GameVaultService {
 
     const settings = this.database.getSettings();
     if (settings.rootLibraryPath) {
-      await removeKnownLibraryPaths({
-        rootLibraryPath: settings.rootLibraryPath,
-        stagePath: params.job.stagePath,
-      })
+      await retryTransientFileCleanup(() =>
+        removeKnownLibraryPaths({
+          rootLibraryPath: settings.rootLibraryPath!,
+          stagePath: params.job.stagePath,
+        }),
+      )
         .then((deletedPaths) => {
           this.appendEvent('info', 'Deleted staged archive files', {
             deletedPaths,
@@ -2392,7 +2481,9 @@ export class GameVaultService {
 
     if (!hasExtractedGameFolder) {
       const label = sourceKind === 'ankergames' ? 'AnkerGames' : 'SteamRIP';
-      const message = `${label} download did not finish cleanly. Retry the download to continue.`;
+      const message = recoveredFromArchive
+        ? `${label} archive extracted, but no installable game folder was found. The selected mirror may point to extras or language content instead of the full game.`
+        : `${label} download did not finish cleanly. Retry the download to continue.`;
       this.markDownloadJobFailed({
         job,
         markMirrorsFailed: false,
@@ -2503,8 +2594,9 @@ export class GameVaultService {
       this.activeDirectHttpDownloads.set(params.trackedItemId, handle);
       notifyStarted?.();
       notifyStarted = undefined;
+      let completedDownload: { fileName: string; savePath: string };
       try {
-        await handle.completion;
+        completedDownload = await handle.completion;
       } finally {
         if (
           this.activeDirectHttpDownloads.get(params.trackedItemId) === handle
@@ -2578,11 +2670,15 @@ export class GameVaultService {
           sourceKind: 'steamrip',
           stagePath: job.stagePath,
         });
-        const extractedArchives = await extractDirectHttpArchives({
+        await rm(extractPath, { force: true, recursive: true }).catch(
+          () => undefined,
+        );
+        const extractedArchive = await extractDirectHttpArchive({
+          archivePath: completedDownload.savePath,
           archiveRootPath: targetPath,
           destinationPath: extractPath,
         });
-        if (extractedArchives.length === 0) {
+        if (!extractedArchive) {
           throw new Error(
             'SteamRIP download completed, but no extractable archive was found.',
           );
@@ -5082,9 +5178,21 @@ export class GameVaultService {
           requestedUrl,
         ),
     );
-    return matchingDescriptor
-      ? getStoredMirrorUrl(params.parsedSource.sourceKind, matchingDescriptor)
-      : requestedUrl;
+    if (matchingDescriptor) {
+      return getStoredMirrorUrl(
+        params.parsedSource.sourceKind,
+        matchingDescriptor,
+      );
+    }
+
+    if (params.parsedSource.sourceKind === 'steamrip') {
+      const fallbackDescriptor = descriptors[0] ?? null;
+      return fallbackDescriptor
+        ? getStoredMirrorUrl(params.parsedSource.sourceKind, fallbackDescriptor)
+        : requestedUrl;
+    }
+
+    return requestedUrl;
   }
 
   private getSelectedDownloadsForPersistence(
@@ -5616,7 +5724,10 @@ export class GameVaultService {
       parsedSource.sourceKind,
       mirrors,
     );
-    if (parsedSource.sourceKind === 'elamigos') {
+    if (
+      parsedSource.sourceKind === 'elamigos' ||
+      parsedSource.sourceKind === 'steamrip'
+    ) {
       this.database.deleteDownloadMirrorsByKindExceptUrls({
         kind: 'full',
         sourceKind: parsedSource.sourceKind,
@@ -5876,6 +5987,21 @@ export class GameVaultService {
       },
       selectedDeviceId: myJDownloader.selectedDeviceId,
     };
+  }
+
+  private clearRejectedMyJDownloaderCredentials(errorMessage: string): void {
+    const settings = this.database.getSettings();
+    if (!settings.encryptedPassword && !settings.myJDownloaderDeviceId) {
+      return;
+    }
+
+    this.database.setSetting('myjd.password', null);
+    this.database.setSetting('myjd.deviceId', null);
+    this.appendEvent(
+      'warn',
+      'Cleared rejected MyJDownloader credentials',
+      { error: errorMessage },
+    );
   }
 
   private buildDesktopHealthSummary(params: {
@@ -6591,6 +6717,37 @@ export class GameVaultService {
       sourceKind:
         params.selectedDownloads.sourceKind ?? params.parsedSource.sourceKind,
     };
+    if (params.parsedSource.sourceKind === 'steamrip') {
+      if (
+        selectedDownloads.fullUrl &&
+        !mirrorUrlMatches(
+          selectedDownloads.fullUrl,
+          params.selectedDownloads.fullUrl,
+        )
+      ) {
+        this.database.selectDownloadMirror(
+          params.trackedItemId,
+          selectedDownloads.fullUrl,
+          'full',
+          'steamrip',
+        );
+        this.appendEvent(
+          'info',
+          'Using refreshed SteamRIP mirror instead of stale saved mirror',
+          {
+            refreshedUrl: selectedDownloads.fullUrl,
+            requestedUrl: params.selectedDownloads.fullUrl,
+            trackedItemId: params.trackedItemId,
+          },
+        );
+      }
+
+      return {
+        ...selectedDownloads,
+        patchUrl: null,
+      };
+    }
+
     if (params.parsedSource.sourceKind !== 'ankergames') {
       return collapseSharedElamigosSelectedDownloads(
         params.parsedSource,
@@ -6712,6 +6869,7 @@ export class GameVaultService {
       `${canonicalTitle}_${releaseSuffix}`,
     );
     const provider = await this.resolveDownloadProvider({
+      selectedDownloads: queueSelectedDownloads,
       settings,
       sourceKind: parsedSource.sourceKind,
       trackedItemId,
@@ -8142,9 +8300,64 @@ export class GameVaultService {
     return this.downloadJobPollPromise;
   }
 
+  private async cleanupCompletedPortableArchiveStaging(): Promise<void> {
+    const settings = this.database.getSettings();
+    if (!settings.rootLibraryPath) {
+      return;
+    }
+
+    for (const job of this.database.listDownloadJobs()) {
+      if (
+        job.stage !== 'complete' ||
+        !isPortableArchiveSourceKind(job.sourceKind) ||
+        !job.stagePath ||
+        !(await pathExists(job.stagePath))
+      ) {
+        continue;
+      }
+
+      if (!(await directoryHasEntries(job.finalPath).catch(() => false))) {
+        continue;
+      }
+
+      await retryTransientFileCleanup(() =>
+        removeKnownLibraryPaths({
+          rootLibraryPath: settings.rootLibraryPath!,
+          stagePath: job.stagePath,
+        }),
+      )
+        .then((deletedPaths) => {
+          this.completedStagingCleanupFailures.delete(job.id);
+          this.appendEvent('info', 'Deleted completed download staging files', {
+            deletedPaths,
+            trackedItemId: job.trackedItemId,
+          });
+        })
+        .catch((error) => {
+          if (this.completedStagingCleanupFailures.has(job.id)) {
+            return;
+          }
+          this.completedStagingCleanupFailures.add(job.id);
+          this.appendEvent(
+            'warn',
+            'Unable to delete completed download staging files',
+            {
+              error:
+                error instanceof Error
+                  ? error.message
+                  : 'Unknown archive cleanup error',
+              trackedItemId: job.trackedItemId,
+            },
+          );
+        });
+    }
+  }
+
   private async pollDownloadJobsInternal(
     options: PollDownloadJobsOptions,
   ): Promise<void> {
+    await this.cleanupCompletedPortableArchiveStaging();
+
     const activeJobs = this.listActiveDownloadJobs();
     if (activeJobs.length === 0) {
       return;
@@ -8929,11 +9142,24 @@ export class GameVaultService {
   async getConnectionHealth(options?: {
     forceRefresh?: boolean;
   }): Promise<ConnectionHealthSummary> {
-    return this.buildConnectionHealthSummary(
-      await this.myJDownloader.getHealth({
-        forceRefresh: options?.forceRefresh ?? false,
-      }),
-    );
+    const myJDownloader = await this.myJDownloader.getHealth({
+      forceRefresh: options?.forceRefresh ?? false,
+    });
+
+    if (myJDownloader.failureKind === 'authentication-rejected') {
+      this.clearRejectedMyJDownloaderCredentials(myJDownloader.message);
+      await this.myJDownloader.disconnect();
+      return this.buildConnectionHealthSummary({
+        ...myJDownloader,
+        devices: [],
+        label: 'Reconnect MyJDownloader',
+        message:
+          'Saved MyJDownloader login was rejected. Re-enter your MyJDownloader email and password in Settings.',
+        selectedDeviceId: null,
+      });
+    }
+
+    return this.buildConnectionHealthSummary(myJDownloader);
   }
 
   async getDesktopHealth(

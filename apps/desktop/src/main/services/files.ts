@@ -373,6 +373,25 @@ export async function extractDirectHttpArchives(params: {
   return archivePaths;
 }
 
+export async function extractDirectHttpArchive(params: {
+  archivePath: string;
+  archiveRootPath: string;
+  destinationPath: string;
+  runExtract?: (archivePath: string, destinationPath: string) => Promise<void>;
+}): Promise<string | null> {
+  const archiveRootPath = resolve(params.archiveRootPath);
+  const archivePath = resolve(params.archivePath);
+  const destinationPath = resolve(params.destinationPath);
+  if (!isDirectHttpExtractableArchive(basename(archivePath))) {
+    return null;
+  }
+
+  assertPathInside(archiveRootPath, archivePath);
+  await ensureDirectory(destinationPath);
+  await (params.runExtract ?? extractZipArchive)(archivePath, destinationPath);
+  return archivePath;
+}
+
 function isPortableArchiveExtraFolder(folderName: string): boolean {
   return ['_commonredist', '__macosx'].includes(folderName.toLowerCase());
 }

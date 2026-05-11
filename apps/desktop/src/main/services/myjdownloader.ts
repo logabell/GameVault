@@ -170,6 +170,7 @@ const PACKAGE_RESOLVE_POLL_MS = 500;
 
 type MyJDownloaderHealthSnapshot = ConnectionHealthSummary['myJDownloader'] & {
   devices: MyJDownloaderDeviceSummary[];
+  failureKind?: 'authentication-rejected' | 'credentials-unreadable';
   selectedDeviceId: string | null;
 };
 
@@ -213,6 +214,14 @@ function normalizeMyJDownloaderError(error: unknown): Error {
   return error instanceof Error ? error : new Error(message);
 }
 
+function isMyJDownloaderAuthenticationRejected(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    /^403:\s*Forbidden$/i.test(message) ||
+    /MyJDownloader rejected the email or password/i.test(message)
+  );
+}
+
 function buildNotConnectedHealth(): MyJDownloaderHealthSnapshot {
   return {
     color: 'red',
@@ -227,6 +236,7 @@ function buildReconnectHealth(): MyJDownloaderHealthSnapshot {
   return {
     color: 'red',
     devices: [],
+    failureKind: 'credentials-unreadable',
     label: 'Reconnect MyJDownloader',
     message:
       'Saved MyJDownloader credentials could not be read. Reconnect your account in Settings.',
@@ -248,6 +258,10 @@ function normalizeDevice(
 
 function deviceIsOnline(device: { status?: string | null }): boolean {
   return device.status?.toUpperCase() === 'ONLINE';
+}
+
+function deviceIsOffline(device: { status?: string | null }): boolean {
+  return device.status?.toUpperCase() === 'OFFLINE';
 }
 
 function sleep(milliseconds: number): Promise<void> {
@@ -628,7 +642,11 @@ async function createSignature(
 
 class MyJDownloaderRawClient implements MyJDownloaderClient {
   private cachedSession: RawSession | null = null;
-  private sessionPromise: Promise<RawSession> | null = null;
+  private sessionGeneration = 0;
+  private sessionPromise: {
+    key: string;
+    promise: Promise<RawSession>;
+  } | null = null;
 
   private buildSessionKey(email: string, password: string): string {
     return `${normalizeMyJDownloaderEmail(email)}\n${password}`;
@@ -641,6 +659,8 @@ class MyJDownloaderRawClient implements MyJDownloaderClient {
 
   private clearSession(): void {
     this.cachedSession = null;
+    this.sessionPromise = null;
+    this.sessionGeneration += 1;
   }
 
   private async callServer<T>(
@@ -736,40 +756,54 @@ class MyJDownloaderRawClient implements MyJDownloaderClient {
       return this.cachedSession;
     }
 
-    if (this.sessionPromise) {
-      return this.sessionPromise;
+    if (this.sessionPromise?.key === key) {
+      return this.sessionPromise.promise;
     }
 
-    this.sessionPromise = this.connect(email, password)
+    const generation = this.sessionGeneration;
+    const sessionRequest: {
+      key: string;
+      promise: Promise<RawSession>;
+    } = {
+      key,
+      promise: undefined as unknown as Promise<RawSession>,
+    };
+    const promise = this.connect(email, password)
       .then((session) => {
-        this.cachedSession = session;
+        if (
+          this.sessionGeneration === generation &&
+          this.sessionPromise === sessionRequest
+        ) {
+          this.cachedSession = session;
+        }
         return session;
       })
       .finally(() => {
-        this.sessionPromise = null;
+        if (this.sessionPromise === sessionRequest) {
+          this.sessionPromise = null;
+        }
       });
+    sessionRequest.promise = promise;
+    this.sessionPromise = sessionRequest;
 
-    return this.sessionPromise;
+    return promise;
   }
 
   async disconnect(): Promise<void> {
     const session = this.cachedSession;
+    this.clearSession();
     if (!session) {
       return;
     }
 
-    try {
-      await this.callServer(
-        session,
-        '/my/disconnect',
-        session.serverEncryptionToken,
-        {
-          sessiontoken: session.sessionToken,
-        },
-      );
-    } finally {
-      this.clearSession();
-    }
+    await this.callServer(
+      session,
+      '/my/disconnect',
+      session.serverEncryptionToken,
+      {
+        sessiontoken: session.sessionToken,
+      },
+    );
   }
 
   async listDevices(email: string, password: string): Promise<RawDeviceInfo[]> {
@@ -899,12 +933,33 @@ export class MyJDownloaderService {
     const configuredDevice = params.selectedDeviceId
       ? devices.find((device) => device.id === params.selectedDeviceId)
       : null;
-    const selectedDeviceId =
+    let selectedDeviceId =
       configuredDevice && deviceIsOnline(configuredDevice)
         ? configuredDevice.id
         : !params.selectedDeviceId && onlineDevices.length === 1
           ? (onlineDevices[0]?.id ?? null)
           : null;
+    const onlyDevice = devices.length === 1 ? (devices[0] ?? null) : null;
+    const probeCandidate =
+      selectedDeviceId != null
+        ? null
+        : configuredDevice && !deviceIsOffline(configuredDevice)
+          ? configuredDevice
+          : !params.selectedDeviceId &&
+              onlyDevice &&
+              !deviceIsOffline(onlyDevice)
+            ? onlyDevice
+            : null;
+    if (
+      probeCandidate &&
+      (await this.probeDeviceReachable({
+        deviceId: probeCandidate.id,
+        email,
+        password: params.password,
+      }))
+    ) {
+      selectedDeviceId = probeCandidate.id;
+    }
 
     return {
       devices: devices.map((device) =>
@@ -912,6 +967,28 @@ export class MyJDownloaderService {
       ),
       selectedDeviceId,
     };
+  }
+
+  private async probeDeviceReachable(params: {
+    deviceId: string;
+    email: string;
+    password: string;
+  }): Promise<boolean> {
+    try {
+      await this.rawClient.callDevice<RawDeviceQueryPackage[]>(
+        params.email,
+        params.password,
+        params.deviceId,
+        '/downloadsV2/queryPackages',
+        {
+          maxResults: 1,
+          name: true,
+        },
+      );
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async authenticate(params: {
@@ -955,7 +1032,11 @@ export class MyJDownloaderService {
       const configuredDevice = credentials.deviceId
         ? snapshot.devices.find((device) => device.id === credentials.deviceId)
         : null;
-      if (configuredDevice && !deviceIsOnline(configuredDevice)) {
+      if (
+        configuredDevice &&
+        !deviceIsOnline(configuredDevice) &&
+        !configuredDevice.selected
+      ) {
         return {
           color: 'yellow',
           devices: snapshot.devices,
@@ -966,7 +1047,10 @@ export class MyJDownloaderService {
         };
       }
 
-      if (snapshot.devices.every((device) => !deviceIsOnline(device))) {
+      if (
+        !snapshot.selectedDeviceId &&
+        snapshot.devices.every((device) => !deviceIsOnline(device))
+      ) {
         return {
           color: 'yellow',
           devices: snapshot.devices,
@@ -997,14 +1081,22 @@ export class MyJDownloaderService {
         selectedDeviceId: snapshot.selectedDeviceId,
       };
     } catch (error) {
+      const normalizedError = normalizeMyJDownloaderError(error);
+      if (isMyJDownloaderAuthenticationRejected(normalizedError)) {
+        return {
+          color: 'red',
+          devices: [],
+          failureKind: 'authentication-rejected',
+          label: 'Authentication failed',
+          message: normalizedError.message,
+          selectedDeviceId: null,
+        };
+      }
       return {
         color: 'red',
         devices: [],
         label: 'Authentication failed',
-        message:
-          error instanceof Error
-            ? error.message
-            : 'Unable to connect to MyJDownloader.',
+        message: normalizedError.message,
         selectedDeviceId: null,
       };
     }
