@@ -5385,6 +5385,24 @@ function App() {
       'Source patch unavailable';
     const latestPatchTitle =
       item.latestPatch?.patchTitle ?? 'Latest SteamDB patch unavailable';
+    const executableSelection = item.playniteExecutableSelection ?? null;
+    const launchExecutablePath = executableSelection?.selectedExePath ?? null;
+    const launchExecutableStatus = executableSelection
+      ? launchExecutablePath
+        ? formatPlayniteConfidence(executableSelection)
+        : executableSelection.status === 'missing'
+          ? 'No EXE found'
+          : formatPlayniteConfidence(executableSelection)
+      : fileState.finalPathExists
+        ? 'Not scanned'
+        : fileState.finalPath
+          ? 'Folder not found'
+          : 'Unknown';
+    const launchExecutablePathLabel =
+      launchExecutablePath ??
+      (fileState.finalPath
+        ? `Install folder: ${fileState.finalPath}`
+        : 'Root path not set');
     return (
       <div
         className={`detail-grid game-details__grid ${
@@ -5426,15 +5444,9 @@ function App() {
           <span>{formatNextSourceScan(item)}</span>
         </div>
         <div>
-          <strong>Game Folder</strong>
-          <span>
-            {fileState.finalPathExists
-              ? 'Found'
-              : fileState.finalPath
-                ? 'Not found'
-                : 'Unknown'}
-          </span>
-          <span>{fileState.finalPath ?? 'Root path not set'}</span>
+          <strong>Launch EXE</strong>
+          <span>{launchExecutableStatus}</span>
+          <span>{launchExecutablePathLabel}</span>
         </div>
       </div>
     );

@@ -190,7 +190,7 @@ const STEAMDB_BACKOFF_EVENT_INTERVAL_MS = 30 * 60 * 1000;
 const EXTENSION_ACTIVITY_RECENT_MS = 30 * 60 * 1000;
 const EXTENSION_ACTIVITY_SETTING_KEY = 'extension.lastNativeMessageAt';
 const PLAYNITE_PLUGIN_FOLDER_NAME = 'GameVault';
-const PLAYNITE_PLUGIN_VERSION = '0.1.6';
+const PLAYNITE_PLUGIN_VERSION = '0.1.9';
 
 const SOURCE_CATALOG_URLS: Record<SupportedSourceKind, string[]> = {
   ankergames: [
@@ -2187,6 +2187,24 @@ export class GameVaultService {
     trackedItemId: string,
   ): Promise<void> {
     if (!this.database.getSettings().playniteIntegrationEnabled) {
+      try {
+        await this.refreshPlayniteExecutableSelectionForTrackedItem(
+          trackedItemId,
+        );
+      } catch (error) {
+        this.appendEvent(
+          'warn',
+          'Unable to refresh launch executable after install',
+          {
+            error:
+              error instanceof Error
+                ? error.message
+                : 'Unknown executable scan error',
+            trackedItemId,
+          },
+          { notify: false },
+        );
+      }
       return;
     }
 
@@ -2196,6 +2214,31 @@ export class GameVaultService {
       this.appendEvent(
         'warn',
         'Unable to refresh Playnite manifest after install',
+        {
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Unknown Playnite manifest export error',
+          trackedItemId,
+        },
+        { notify: false },
+      );
+    }
+  }
+
+  private async exportPlayniteManifestAfterRemoval(
+    trackedItemId: string,
+  ): Promise<void> {
+    if (!this.database.getSettings().playniteIntegrationEnabled) {
+      return;
+    }
+
+    try {
+      await this.exportPlayniteManifest({ rescan: false });
+    } catch (error) {
+      this.appendEvent(
+        'warn',
+        'Unable to refresh Playnite manifest after library removal',
         {
           error:
             error instanceof Error
@@ -3578,12 +3621,20 @@ export class GameVaultService {
       versionsBehindLatestIsLowerBound:
         patchLag.versionsBehindLatestIsLowerBound,
     });
+    const storedPlayniteExecutableSelection =
+      this.database.getPlayniteExecutableSelection(trackedItemId);
+    const playniteExecutableSelection = storedPlayniteExecutableSelection
+      ? (this.normalizePlayniteExecutableSelections([
+          storedPlayniteExecutableSelection,
+        ])[0] ?? storedPlayniteExecutableSelection)
+      : null;
 
     return {
       currentDownload,
       downloadMirrors,
       currentWatch,
       installRecord,
+      playniteExecutableSelection,
       item: {
         ...item,
         coverUrl: steamMatch?.coverUrl ?? item.coverUrl,
@@ -3718,29 +3769,48 @@ export class GameVaultService {
     return this.refreshPlayniteExecutableSelectionsForViews(views);
   }
 
+  private async refreshPlayniteExecutableSelectionForView(
+    view: TrackedItemView,
+  ): Promise<PlayniteExecutableSelectionRecord | null> {
+    const installPath =
+      view.installRecord?.installPath ?? view.fileState.finalPath ?? null;
+    if (!installPath) {
+      return null;
+    }
+
+    const previous = this.database.getPlayniteExecutableSelection(
+      view.item.id,
+    );
+    const selection = await scanPlayniteExecutableSelection({
+      installPath,
+      previousSelection: previous,
+      steamAppId: view.item.steamAppId,
+      steamTitle: view.item.steamTitle,
+      title: view.item.title,
+      trackedItemId: view.item.id,
+    });
+    this.database.upsertPlayniteExecutableSelection(selection);
+    return this.normalizePlayniteExecutableSelections([selection])[0] ?? null;
+  }
+
+  private async refreshPlayniteExecutableSelectionForTrackedItem(
+    trackedItemId: string,
+  ): Promise<PlayniteExecutableSelectionRecord | null> {
+    const view = await this.buildTrackedItemView(trackedItemId);
+    return this.refreshPlayniteExecutableSelectionForView(view);
+  }
+
   private async refreshPlayniteExecutableSelectionsForViews(
     views: TrackedItemView[],
   ): Promise<PlayniteExecutableSelectionRecord[]> {
     const selections: PlayniteExecutableSelectionRecord[] = [];
     for (const view of views) {
-      const installPath =
-        view.installRecord?.installPath ?? view.fileState.finalPath ?? null;
-      if (!installPath) {
-        continue;
-      }
-      const previous = this.database.getPlayniteExecutableSelection(
-        view.item.id,
+      const selection = await this.refreshPlayniteExecutableSelectionForView(
+        view,
       );
-      const selection = await scanPlayniteExecutableSelection({
-        installPath,
-        previousSelection: previous,
-        steamAppId: view.item.steamAppId,
-        steamTitle: view.item.steamTitle,
-        title: view.item.title,
-        trackedItemId: view.item.id,
-      });
-      this.database.upsertPlayniteExecutableSelection(selection);
-      selections.push(selection);
+      if (selection) {
+        selections.push(selection);
+      }
     }
     return this.normalizePlayniteExecutableSelections(selections);
   }
@@ -9290,6 +9360,7 @@ export class GameVaultService {
           },
         );
       });
+      await this.exportPlayniteManifestAfterInstall(item.id);
       imported.push(await this.buildTrackedItemView(item.id));
     }
 
@@ -9774,6 +9845,7 @@ export class GameVaultService {
     }
 
     this.database.deleteTrackedItemCascade(payload.trackedItemId);
+    await this.exportPlayniteManifestAfterRemoval(payload.trackedItemId);
     this.appendEvent(
       'info',
       payload.mode === 'delete_files'

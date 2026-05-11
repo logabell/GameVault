@@ -1,10 +1,12 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
+using System.Threading;
 using Playnite.SDK;
 using Playnite.SDK.Events;
 using Playnite.SDK.Models;
@@ -16,8 +18,14 @@ namespace GameVault.Playnite
     public class GameVaultLibraryPlugin : LibraryPlugin
     {
         private const string LibraryName = "GameVault";
-        private const string PluginVersion = "0.1.6";
+        private const string PluginVersion = "0.1.9";
+        private const int ManifestSyncDebounceMs = 1500;
+        private readonly object manifestSyncLock = new object();
         private readonly IPlayniteAPI playniteApi;
+        private FileSystemWatcher manifestWatcher;
+        private Timer manifestSyncTimer;
+        private SynchronizationContext playniteSynchronizationContext;
+        private string watchedManifestPath;
 
         public override Guid Id
         {
@@ -63,12 +71,19 @@ namespace GameVault.Playnite
 
         public override void OnApplicationStarted(OnApplicationStartedEventArgs args)
         {
-            WriteCurrentSyncStatus();
+            playniteSynchronizationContext = SynchronizationContext.Current;
+            EnsureManifestWatcher();
+            QueueManifestSync();
         }
 
         public override void OnLibraryUpdated(OnLibraryUpdatedEventArgs args)
         {
             WriteCurrentSyncStatus();
+        }
+
+        public override void OnApplicationStopped(OnApplicationStoppedEventArgs args)
+        {
+            DisposeManifestWatcher();
         }
 
         private static bool IsImportable(GameVaultManifestGame game)
@@ -170,7 +185,6 @@ namespace GameVault.Playnite
                     int appId;
                     GameVaultManifestGame manifestGame;
                     if (game.PluginId == Id &&
-                        ShouldReplaceGameIcon(game.Icon, manifestGame: null) &&
                         !string.IsNullOrWhiteSpace(game.GameId) &&
                         int.TryParse(game.GameId, out appId) &&
                         gamesById.TryGetValue(appId, out manifestGame) &&
@@ -178,7 +192,7 @@ namespace GameVault.Playnite
                     {
                         var iconPath = GetExecutableIconPath(manifestGame);
                         if (!string.IsNullOrWhiteSpace(iconPath) &&
-                            ShouldReplaceGameIcon(game.Icon, manifestGame))
+                            !string.Equals(game.Icon, iconPath, StringComparison.OrdinalIgnoreCase))
                         {
                             game.Icon = iconPath;
                             playniteApi.Database.Games.Update(game);
@@ -212,7 +226,7 @@ namespace GameVault.Playnite
 
                 var iconDirectory = GetIconDirectory();
                 Directory.CreateDirectory(iconDirectory);
-                var iconPath = Path.Combine(iconDirectory, game.SteamAppId + ".png");
+                var iconPath = Path.Combine(iconDirectory, GetExecutableIconFileName(game));
                 var executableWriteTime = File.GetLastWriteTimeUtc(game.ExecutablePath);
                 if (File.Exists(iconPath) &&
                     File.GetLastWriteTimeUtc(iconPath) >= executableWriteTime)
@@ -241,23 +255,321 @@ namespace GameVault.Playnite
             }
         }
 
-        private static bool ShouldReplaceGameIcon(string currentIcon, GameVaultManifestGame manifestGame)
+        private static string GetExecutableIconFileName(GameVaultManifestGame game)
         {
-            if (string.IsNullOrWhiteSpace(currentIcon))
+            var executableName = Path.GetFileNameWithoutExtension(game.ExecutablePath);
+            var safeName = new string(
+                (executableName ?? "exe")
+                    .Select(character => char.IsLetterOrDigit(character) ? character : '-')
+                    .ToArray())
+                .Trim('-');
+            if (string.IsNullOrWhiteSpace(safeName))
             {
+                safeName = "exe";
+            }
+
+            if (safeName.Length > 40)
+            {
+                safeName = safeName.Substring(0, 40);
+            }
+
+            return game.SteamAppId + "-" + safeName + "-" + StablePathHash(game.ExecutablePath) + ".png";
+        }
+
+        private static string StablePathHash(string value)
+        {
+            unchecked
+            {
+                var hash = 2166136261u;
+                foreach (var character in (value ?? string.Empty).ToLowerInvariant())
+                {
+                    hash ^= character;
+                    hash *= 16777619u;
+                }
+
+                return hash.ToString("x8");
+            }
+        }
+
+        private void EnsureManifestWatcher()
+        {
+            try
+            {
+                var manifestPath = GetManifestPath();
+                var manifestDirectory = Path.GetDirectoryName(manifestPath);
+                if (string.IsNullOrWhiteSpace(manifestDirectory))
+                {
+                    return;
+                }
+
+                if (manifestWatcher != null &&
+                    string.Equals(watchedManifestPath, manifestPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+
+                DisposeManifestWatcher();
+                Directory.CreateDirectory(manifestDirectory);
+
+                manifestWatcher = new FileSystemWatcher(manifestDirectory, Path.GetFileName(manifestPath))
+                {
+                    NotifyFilter = NotifyFilters.CreationTime |
+                        NotifyFilters.FileName |
+                        NotifyFilters.LastWrite |
+                        NotifyFilters.Size
+                };
+                manifestWatcher.Changed += OnManifestFileChanged;
+                manifestWatcher.Created += OnManifestFileChanged;
+                manifestWatcher.Renamed += OnManifestFileRenamed;
+                manifestWatcher.EnableRaisingEvents = true;
+                watchedManifestPath = manifestPath;
+            }
+            catch
+            {
+                // Manifest watching is a convenience; manual Playnite library updates still work.
+            }
+        }
+
+        private void DisposeManifestWatcher()
+        {
+            try
+            {
+                if (manifestWatcher != null)
+                {
+                    manifestWatcher.Dispose();
+                    manifestWatcher = null;
+                }
+
+                if (manifestSyncTimer != null)
+                {
+                    manifestSyncTimer.Dispose();
+                    manifestSyncTimer = null;
+                }
+
+                watchedManifestPath = null;
+            }
+            catch
+            {
+                // Shutdown cleanup should never block Playnite.
+            }
+        }
+
+        private void OnManifestFileChanged(object sender, FileSystemEventArgs args)
+        {
+            QueueManifestSync();
+        }
+
+        private void OnManifestFileRenamed(object sender, RenamedEventArgs args)
+        {
+            QueueManifestSync();
+        }
+
+        private void QueueManifestSync()
+        {
+            try
+            {
+                EnsureManifestWatcher();
+                if (manifestSyncTimer == null)
+                {
+                    manifestSyncTimer = new Timer(_ => RunManifestSyncOnUiThread(), null, Timeout.Infinite, Timeout.Infinite);
+                }
+
+                manifestSyncTimer.Change(ManifestSyncDebounceMs, Timeout.Infinite);
+            }
+            catch
+            {
+                // Sync status will be refreshed the next time Playnite asks for library games.
+            }
+        }
+
+        private void RunManifestSyncOnUiThread()
+        {
+            try
+            {
+                if (playniteSynchronizationContext != null)
+                {
+                    playniteSynchronizationContext.Post(_ => SyncManifestIntoPlaynite(), null);
+                    return;
+                }
+
+                SyncManifestIntoPlaynite();
+            }
+            catch
+            {
+                // File watcher callbacks should never bubble into Playnite.
+            }
+        }
+
+        private void SyncManifestIntoPlaynite()
+        {
+            lock (manifestSyncLock)
+            {
+                string error;
+                var manifest = ReadManifest(out error);
+                if (manifest == null || manifest.Games == null)
+                {
+                    WriteSyncStatus(manifest, 0, error);
+                    return;
+                }
+
+                var importableGames = manifest.Games
+                    .Where(game => IsImportable(game))
+                    .ToList();
+
+                ClearManifestImportExclusions(importableGames);
+                RemoveMissingManifestGames(importableGames);
+                ImportOrUpdateManifestGames(importableGames);
+                ApplyExecutableIcons(importableGames);
+                WriteSyncStatus(manifest, importableGames.Count, error);
+            }
+        }
+
+        private void RemoveMissingManifestGames(List<GameVaultManifestGame> importableGames)
+        {
+            try
+            {
+                var manifestIds = new HashSet<string>(
+                    importableGames
+                        .Where(game => game.SteamAppId > 0)
+                        .Select(game => game.SteamAppId.ToString()));
+                var missingGames = playniteApi.Database.Games
+                    .Where(game =>
+                        game.PluginId == Id &&
+                        !string.IsNullOrWhiteSpace(game.GameId) &&
+                        !manifestIds.Contains(game.GameId))
+                    .ToList();
+
+                if (missingGames.Count > 0)
+                {
+                    playniteApi.Database.Games.Remove(missingGames);
+                }
+            }
+            catch
+            {
+                // Removing stale library entries should not prevent fresh entries from syncing.
+            }
+        }
+
+        private void ImportOrUpdateManifestGames(List<GameVaultManifestGame> importableGames)
+        {
+            try
+            {
+                var existingGamesById = playniteApi.Database.Games
+                    .Where(game => game.PluginId == Id && !string.IsNullOrWhiteSpace(game.GameId))
+                    .GroupBy(game => game.GameId)
+                    .ToDictionary(group => group.Key, group => group.First());
+
+                foreach (var manifestGame in importableGames)
+                {
+                    var gameId = manifestGame.SteamAppId.ToString();
+                    Game existingGame;
+                    if (!existingGamesById.TryGetValue(gameId, out existingGame))
+                    {
+                        var imported = playniteApi.Database.ImportGame(ToGameMetadata(manifestGame), this);
+                        if (imported != null && !string.IsNullOrWhiteSpace(imported.GameId))
+                        {
+                            existingGamesById[imported.GameId] = imported;
+                        }
+                        continue;
+                    }
+
+                    if (ApplyManifestMetadata(existingGame, manifestGame))
+                    {
+                        playniteApi.Database.Games.Update(existingGame);
+                    }
+                }
+            }
+            catch
+            {
+                // Playnite can still import through the regular library update path.
+            }
+        }
+
+        private static bool ApplyManifestMetadata(Game game, GameVaultManifestGame manifestGame)
+        {
+            var changed = false;
+            if (!string.Equals(game.InstallDirectory, manifestGame.InstallPath, StringComparison.OrdinalIgnoreCase))
+            {
+                game.InstallDirectory = manifestGame.InstallPath;
+                changed = true;
+            }
+
+            if (!game.IsInstalled)
+            {
+                game.IsInstalled = true;
+                changed = true;
+            }
+
+            if (!string.Equals(game.Version, manifestGame.Version, StringComparison.Ordinal))
+            {
+                game.Version = manifestGame.Version;
+                changed = true;
+            }
+
+            var iconPath = GetExecutableIconPath(manifestGame);
+            if (!string.IsNullOrWhiteSpace(iconPath) &&
+                !string.Equals(game.Icon, iconPath, StringComparison.OrdinalIgnoreCase))
+            {
+                game.Icon = iconPath;
+                changed = true;
+            }
+
+            return ApplyManifestPlayAction(game, manifestGame) || changed;
+        }
+
+        private static bool ApplyManifestPlayAction(Game game, GameVaultManifestGame manifestGame)
+        {
+            var changed = false;
+            if (game.GameActions == null)
+            {
+                game.GameActions = new ObservableCollection<GameAction>();
+                changed = true;
+            }
+
+            var playAction = game.GameActions.FirstOrDefault(action => action != null && action.IsPlayAction);
+            if (playAction == null)
+            {
+                game.GameActions.Add(CreatePlayAction(manifestGame));
                 return true;
             }
 
-            if (manifestGame != null &&
-                string.Equals(
-                    currentIcon,
-                    manifestGame.ExecutablePath,
-                    StringComparison.OrdinalIgnoreCase))
+            if (playAction.Type != GameActionType.File)
             {
-                return true;
+                playAction.Type = GameActionType.File;
+                changed = true;
             }
 
-            return currentIcon.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
+            if (!string.Equals(playAction.Path, manifestGame.ExecutablePath, StringComparison.OrdinalIgnoreCase))
+            {
+                playAction.Path = manifestGame.ExecutablePath;
+                changed = true;
+            }
+
+            var workingDirectory = Path.GetDirectoryName(manifestGame.ExecutablePath);
+            if (!string.Equals(playAction.WorkingDir, workingDirectory, StringComparison.OrdinalIgnoreCase))
+            {
+                playAction.WorkingDir = workingDirectory;
+                changed = true;
+            }
+
+            if (!playAction.IsPlayAction)
+            {
+                playAction.IsPlayAction = true;
+                changed = true;
+            }
+
+            return changed;
+        }
+
+        private static GameAction CreatePlayAction(GameVaultManifestGame game)
+        {
+            return new GameAction
+            {
+                Type = GameActionType.File,
+                Path = game.ExecutablePath,
+                WorkingDir = Path.GetDirectoryName(game.ExecutablePath),
+                IsPlayAction = true
+            };
         }
 
         private void WriteSyncStatus(GameVaultManifest manifest, int importableGames, string error)

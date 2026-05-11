@@ -657,6 +657,7 @@ export interface TrackedItemView {
   sourceSnapshot?: SourceSnapshot | null;
   sourceMatches: MatchedSourceView[];
   installRecord?: InstallRecord | null;
+  playniteExecutableSelection?: PlayniteExecutableSelectionRecord | null;
   currentWatch?: SourceWatch | null;
   latestPatch?: SteamPatchEntry | null;
   patchMetadataStatus?: PatchMetadataStatus;

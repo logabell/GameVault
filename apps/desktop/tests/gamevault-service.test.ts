@@ -13,6 +13,7 @@ import type {
   SteamPatchCandidate,
   SupportedSourceKind,
 } from '@gamevault/shared-types';
+import { TrackedItemStatus } from '@gamevault/shared-types';
 import type { SourceFetch } from '@gamevault/source-core';
 import {
   MyJDownloaderService,
@@ -1321,6 +1322,13 @@ describe('GameVaultService import workflow', () => {
         installedSourceUrl: `manual:import:${imported.item.id}`,
         installedVersion: '1.2.3',
       });
+      expect(imported.playniteExecutableSelection?.selectedExePath).toBe(
+        join(finalPath, 'game.exe'),
+      );
+      expect(
+        database.getPlayniteExecutableSelection(imported.item.id)
+          ?.selectedExePath,
+      ).toBe(join(finalPath, 'game.exe'));
       expect(database.listPatchEntries(imported.item.id)).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
@@ -1386,6 +1394,63 @@ describe('GameVaultService import workflow', () => {
         installPath: folderPath,
         installedSourceKind: 'steamrip',
         installedSourceUrl: null,
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('keeps imported folders installed when no launch executable is detected', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootPath = join(tempRoot, 'Library');
+      const folderPath = join(rootPath, 'No Exe Game');
+      await mkdir(folderPath, { recursive: true });
+      await writeFile(join(folderPath, 'readme.txt'), 'installed files');
+      vi.stubGlobal('fetch', mockSteamNetwork([]));
+      const service = createService(database);
+      const patch: SteamPatchCandidate = {
+        appId: 337,
+        buildId: '337999',
+        link: 'manual:patch',
+        patchDate: '2026-04-23',
+        patchTitle: 'Version 1.0',
+        publishedAt: '2026-04-23T00:00:00.000Z',
+        selectionSource: 'manual',
+        title: 'No Exe Game patch',
+        version: '1.0',
+      };
+
+      const result = await service.saveImportBatch({
+        rows: [
+          {
+            folderName: 'No Exe Game',
+            folderPath,
+            renameFolder: false,
+            rootPath,
+            selectedSteamPatch: patch,
+            steamMatch: {
+              appId: 337,
+              coverUrl: null,
+              matchedAt: '2026-04-23T00:00:00.000Z',
+              normalizedTitle: 'no exe game',
+              title: 'No Exe Game',
+            },
+            steamPatchEntries: [patch],
+          },
+        ],
+      });
+
+      const imported = result.imported[0]!;
+      expect(imported.status).toBe(TrackedItemStatus.Installed);
+      expect(imported.fileState.finalPathExists).toBe(true);
+      expect(imported.playniteExecutableSelection).toMatchObject({
+        selectedExePath: null,
+        status: 'missing',
+      });
+      expect(database.getPlayniteExecutableSelection(imported.item.id)).toMatchObject({
+        selectedExePath: null,
+        status: 'missing',
       });
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
