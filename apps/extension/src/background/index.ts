@@ -106,7 +106,7 @@ interface DraftStatusContext {
   trackedStatusPending: boolean;
 }
 
-type SteamDbSelectionMode = 'select' | 'backfill';
+type SteamDbSelectionMode = 'select' | 'backfill' | 'view';
 type SteamDbBackfillStatus = 'pending' | 'complete' | 'failed';
 
 interface SteamDbSelectionContext {
@@ -2584,10 +2584,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         typeof message.selectedDownloads?.fullUrl === 'string'
           ? String(message.selectedDownloads.fullUrl)
           : '';
-      if (!appId || !fullUrl) {
+      if (!appId) {
         sendResponse({
-          message:
-            'Choose a Steam app and download mirror before opening SteamDB.',
+          message: 'Choose a Steam app before opening SteamDB.',
           ok: false,
         });
         return;
@@ -2630,7 +2629,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           message.selectedSteamCandidate !== null
             ? (message.selectedSteamCandidate as SteamCandidate)
             : null,
-        selectionMode: 'select',
+        selectionMode: fullUrl ? 'select' : 'view',
         sourceUrl: draftTarget.url ?? draftSourceUrl,
         tabId: draftTarget.tabId ?? sourceTabId,
       };
@@ -2680,7 +2679,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (
         !appId ||
         !isFreshSteamDbContext(context) ||
-        context?.selectionMode === 'backfill' ||
+        context?.selectionMode !== 'select' ||
         !context?.selectedDownloads?.fullUrl
       ) {
         sendResponse({

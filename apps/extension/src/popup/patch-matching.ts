@@ -9,6 +9,10 @@ export interface SteamPatchSuggestion {
   score: number;
 }
 
+interface ScoredSteamPatchSuggestion extends SteamPatchSuggestion {
+  patch: SteamPatchCandidate;
+}
+
 export function getSteamPatchKey(patch: SteamPatchCandidate): string {
   const source = patch.selectionSource ?? 'rss';
   return `${source}:${
@@ -44,10 +48,52 @@ function normalizePatchSignal(value: string | null | undefined): string {
   return (value ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
+function patchTimestamp(patch: SteamPatchCandidate): number {
+  const published = new Date(patch.publishedAt).getTime();
+  if (!Number.isNaN(published)) {
+    return published;
+  }
+
+  const dated = new Date(patch.patchDate).getTime();
+  return Number.isNaN(dated) ? 0 : dated;
+}
+
+function numericPatchBuildId(value: string | null | undefined): bigint | null {
+  const trimmed = value?.trim();
+  return trimmed && /^\d+$/.test(trimmed) ? BigInt(trimmed) : null;
+}
+
+function comparePatchesByRecency(
+  left: SteamPatchCandidate,
+  right: SteamPatchCandidate,
+): number {
+  const timestampDelta = patchTimestamp(right) - patchTimestamp(left);
+  if (timestampDelta !== 0) {
+    return timestampDelta;
+  }
+
+  const leftBuildId = numericPatchBuildId(left.buildId);
+  const rightBuildId = numericPatchBuildId(right.buildId);
+  if (
+    leftBuildId != null &&
+    rightBuildId != null &&
+    leftBuildId !== rightBuildId
+  ) {
+    return leftBuildId > rightBuildId ? -1 : 1;
+  }
+  if (leftBuildId != null) {
+    return -1;
+  }
+  if (rightBuildId != null) {
+    return 1;
+  }
+  return 0;
+}
+
 function scoreSteamPatchCandidate(
   parsedSource: ParsedSourcePayload,
   patch: SteamPatchCandidate,
-): SteamPatchSuggestion | null {
+): ScoredSteamPatchSuggestion | null {
   const sourceRelease = parsedSource.latestSourceRelease;
   const sourceDateKey = normalizePatchDateKey(sourceRelease.patchDate);
   const patchDateKey =
@@ -90,6 +136,7 @@ function scoreSteamPatchCandidate(
   return {
     key: getSteamPatchKey(patch),
     label: `Likely match: ${reasons.join(', ')}`,
+    patch,
     score,
   };
 }
@@ -99,10 +146,23 @@ export function findLikelySteamPatch(
   patches: SteamPatchCandidate[],
 ): SteamPatchSuggestion | null {
   if (!parsedSource || patches.length === 0) return null;
-  return (
+  const best =
     patches
       .map((patch) => scoreSteamPatchCandidate(parsedSource, patch))
-      .filter((entry): entry is SteamPatchSuggestion => entry != null)
-      .sort((left, right) => right.score - left.score)[0] ?? null
-  );
+      .filter((entry): entry is ScoredSteamPatchSuggestion => entry != null)
+      .sort(
+        (left, right) =>
+          right.score - left.score ||
+          comparePatchesByRecency(left.patch, right.patch),
+      )[0] ?? null;
+
+  if (!best) {
+    return null;
+  }
+
+  return {
+    key: best.key,
+    label: best.label,
+    score: best.score,
+  };
 }

@@ -184,7 +184,9 @@ export function findSteamPatchByDateAndVersion(
   if (!dateKey) return null;
 
   const sameDatePatches = uniquePatchesByIdentity(
-    patches.filter((patch) => normalizePatchDateKey(patch.patchDate) === dateKey),
+    patches.filter(
+      (patch) => normalizePatchDateKey(patch.patchDate) === dateKey,
+    ),
   );
   if (sameDatePatches.length <= 1) {
     return sameDatePatches[0] ?? null;
@@ -194,8 +196,8 @@ export function findSteamPatchByDateAndVersion(
   const versionMatches = sameDatePatches.filter((patch) =>
     steamPatchTitleMatchesSourceVersion(patch, normalizedVersion),
   );
-  if (versionMatches.length === 1) {
-    return versionMatches[0]!;
+  if (versionMatches.length > 0) {
+    return findMostRecentSteamPatch(versionMatches);
   }
 
   const untitledPatches = sameDatePatches.filter(
@@ -215,9 +217,11 @@ export function findSteamPatchByDateAndVersion(
       (patchVersion) => patchVersion && patchVersion !== normalizedVersion,
     );
 
-  return untitledPatches.length === 1 && titledVersionsAreKnownAndDifferent
-    ? untitledPatches[0]!
-    : null;
+  if (untitledPatches.length === 1 && titledVersionsAreKnownAndDifferent) {
+    return untitledPatches[0]!;
+  }
+
+  return findMostRecentSteamPatch(sameDatePatches);
 }
 
 export function getSteamPatchIdentityKey(patch: SteamPatchEntry): string {
@@ -236,6 +240,54 @@ function uniquePatchesByIdentity(
     uniquePatches.set(getSteamPatchIdentityKey(patch), patch);
   }
   return Array.from(uniquePatches.values());
+}
+
+function patchTimestamp(patch: SteamPatchEntry): number {
+  const published = new Date(patch.publishedAt).getTime();
+  if (!Number.isNaN(published)) {
+    return published;
+  }
+
+  const dated = new Date(patch.patchDate).getTime();
+  return Number.isNaN(dated) ? 0 : dated;
+}
+
+function numericPatchBuildId(value: string | null | undefined): bigint | null {
+  const trimmed = value?.trim();
+  return trimmed && /^\d+$/.test(trimmed) ? BigInt(trimmed) : null;
+}
+
+function compareSteamPatchesByRecency(
+  left: SteamPatchEntry,
+  right: SteamPatchEntry,
+): number {
+  const timestampDelta = patchTimestamp(right) - patchTimestamp(left);
+  if (timestampDelta !== 0) {
+    return timestampDelta;
+  }
+
+  const leftBuildId = numericPatchBuildId(left.buildId);
+  const rightBuildId = numericPatchBuildId(right.buildId);
+  if (
+    leftBuildId != null &&
+    rightBuildId != null &&
+    leftBuildId !== rightBuildId
+  ) {
+    return leftBuildId > rightBuildId ? -1 : 1;
+  }
+  if (leftBuildId != null) {
+    return -1;
+  }
+  if (rightBuildId != null) {
+    return 1;
+  }
+  return 0;
+}
+
+function findMostRecentSteamPatch(
+  patches: SteamPatchEntry[],
+): SteamPatchEntry | null {
+  return [...patches].sort(compareSteamPatchesByRecency)[0] ?? null;
 }
 
 export function findUniqueSteamPatchByTitleVersion(

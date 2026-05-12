@@ -278,6 +278,69 @@ describe('finalizeSteamRipExtraction', () => {
     }
   });
 
+  it('promotes an AnkerGames payload folder beside Redist even when its name differs from the title', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'gamevault-anker-redist-'));
+    const rootLibraryPath = join(tempRoot, 'High Seas');
+    const stageRootPath = join(rootLibraryPath, '_STAGING');
+    const extractPath = join(stageRootPath, 'MOUSE P.I. For Hire_22923861');
+    const gameFolderPath = join(extractPath, 'MOUSE');
+    const finalPath = join(rootLibraryPath, 'MOUSE P.I. For Hire');
+
+    try {
+      await mkdir(join(gameFolderPath, 'MOUSE_Data'), { recursive: true });
+      await mkdir(join(extractPath, 'Redist', 'DirectX'), { recursive: true });
+      await writeFile(join(gameFolderPath, 'MOUSE.exe'), 'game');
+      await writeFile(join(gameFolderPath, 'MOUSE_Data', 'data.unity3d'), 'data');
+      await writeFile(
+        join(extractPath, 'Redist', 'DXWebSetup.exe'),
+        'redist',
+      );
+      await writeFile(join(extractPath, 'Read Me.txt'), 'readme');
+      await writeFile(
+        join(extractPath, 'AnkerGames - Free Pre-installed PC Games.url'),
+        'url',
+      );
+      await writeFile(join(extractPath, 'Run Me!.bat'), 'bat');
+      await writeFile(
+        join(extractPath, 'Mouse-P-I-For-Hire-AnkerGames.zip'),
+        'zip',
+      );
+
+      await expect(
+        hasPortableArchiveContentFolder({
+          canonicalTitle: 'MOUSE P.I. For Hire',
+          extractPath,
+          sourceKind: 'ankergames',
+        }),
+      ).resolves.toBe(true);
+
+      await finalizePortableArchiveExtraction({
+        canonicalTitle: 'MOUSE P.I. For Hire',
+        extractPath,
+        finalPath,
+        sourceKind: 'ankergames',
+        stageRootPath,
+      });
+
+      await expect(readFile(join(finalPath, 'MOUSE.exe'), 'utf8')).resolves.toBe(
+        'game',
+      );
+      await expect(
+        readFile(join(finalPath, 'MOUSE_Data', 'data.unity3d'), 'utf8'),
+      ).resolves.toBe('data');
+      await expect(readFile(join(finalPath, 'Run Me!.bat'), 'utf8')).resolves.toBe(
+        'bat',
+      );
+      await expect(pathExists(join(finalPath, 'Redist'))).resolves.toBe(false);
+      await expect(pathExists(join(finalPath, 'Read Me.txt'))).resolves.toBe(
+        false,
+      );
+      await expect(pathExists(extractPath)).resolves.toBe(false);
+    } finally {
+      await rm(tempRoot, { force: true, recursive: true });
+    }
+  });
+
   it('does not treat an empty AnkerGames game folder as extracted content', async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), 'gamevault-empty-anker-'));
     const rootLibraryPath = join(tempRoot, 'High Seas');

@@ -127,7 +127,7 @@ describe('shared library controls', () => {
     ).toEqual(['Newest', 'Middle', 'Oldest']);
   });
 
-  it('pins active downloads above the selected sort order', () => {
+  it('pins active downloads above the selected sort order in download creation order', () => {
     const items = [
       makeItem('Alpha Installed'),
       makeItem('Omega Complete', {
@@ -144,20 +144,20 @@ describe('shared library controls', () => {
       }),
       makeItem('Zulu Downloading', {
         currentDownload: {
-          createdAt: '2026-04-01T00:00:00.000Z',
+          createdAt: '2026-04-20T00:00:00.000Z',
           finalPath: 'D:/Games/Zulu Downloading',
           id: 'job-downloading',
           packageName: 'Zulu Downloading',
           stage: 'downloading',
           stagePath: 'D:/Games/_STAGING/Zulu Downloading',
           trackedItemId: 'zulu-downloading',
-          updatedAt: '2026-04-20T00:00:00.000Z',
+          updatedAt: '2026-04-22T00:00:00.000Z',
         },
         status: TrackedItemStatus.Downloading,
       }),
       makeItem('Yankee Queued', {
         currentDownload: {
-          createdAt: '2026-04-01T00:00:00.000Z',
+          createdAt: '2026-04-21T00:00:00.000Z',
           finalPath: 'D:/Games/Yankee Queued',
           id: 'job-queued',
           packageName: 'Yankee Queued',
@@ -178,6 +178,58 @@ describe('shared library controls', () => {
       'Alpha Installed',
       'Omega Complete',
     ]);
+  });
+
+  it('keeps active download order stable when progress timestamps change', () => {
+    const alphaDownloading = makeItem('Alpha Downloading', {
+      currentDownload: {
+        createdAt: '2026-04-20T00:00:00.000Z',
+        finalPath: 'D:/Games/Alpha Downloading',
+        id: 'job-alpha',
+        packageName: 'Alpha Downloading',
+        stage: 'downloading',
+        stagePath: 'D:/Games/_STAGING/Alpha Downloading',
+        trackedItemId: 'alpha-downloading',
+        updatedAt: '2026-04-23T00:00:00.000Z',
+      },
+      status: TrackedItemStatus.Downloading,
+    });
+    const bravoDownloading = makeItem('Bravo Downloading', {
+      currentDownload: {
+        createdAt: '2026-04-21T00:00:00.000Z',
+        finalPath: 'D:/Games/Bravo Downloading',
+        id: 'job-bravo',
+        packageName: 'Bravo Downloading',
+        stage: 'downloading',
+        stagePath: 'D:/Games/_STAGING/Bravo Downloading',
+        trackedItemId: 'bravo-downloading',
+        updatedAt: '2026-04-22T00:00:00.000Z',
+      },
+      status: TrackedItemStatus.Downloading,
+    });
+    const alphaProgressUpdate: TrackedItemView = {
+      ...alphaDownloading,
+      currentDownload: {
+        ...alphaDownloading.currentDownload!,
+        bytesLoaded: 1024,
+        updatedAt: '2026-04-24T00:00:00.000Z',
+      },
+    };
+
+    expect(
+      sortLibraryItems(
+        [alphaDownloading, bravoDownloading],
+        'name',
+        'asc',
+      ).map((item) => item.item.title),
+    ).toEqual(['Bravo Downloading', 'Alpha Downloading']);
+    expect(
+      sortLibraryItems(
+        [alphaProgressUpdate, bravoDownloading],
+        'name',
+        'asc',
+      ).map((item) => item.item.title),
+    ).toEqual(['Bravo Downloading', 'Alpha Downloading']);
   });
 
   it('sorts by patches behind and leaves unknown lag last', () => {

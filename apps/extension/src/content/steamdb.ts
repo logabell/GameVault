@@ -76,7 +76,13 @@ async function getSteamDbContextMode(
     return null;
   }
 
-  return response.payload.mode === 'backfill' ? 'backfill' : 'select';
+  if (response.payload.mode === 'backfill') {
+    return 'backfill';
+  }
+  if (response.payload.mode === 'select') {
+    return 'select';
+  }
+  return null;
 }
 
 function ensureActionHeader(row: HTMLTableRowElement): void {

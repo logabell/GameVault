@@ -241,10 +241,10 @@ function compareActiveDownloadPinned(
     return 0;
   }
 
-  const updatedCompare =
-    getDateTimestamp(right.currentDownload?.updatedAt ?? right.item.updatedAt) -
-    getDateTimestamp(left.currentDownload?.updatedAt ?? left.item.updatedAt);
-  return updatedCompare || compareTitle(left, right);
+  const createdCompare =
+    getActiveDownloadCreatedTimestamp(right) -
+    getActiveDownloadCreatedTimestamp(left);
+  return createdCompare || compareTitle(left, right);
 }
 
 export function getLibraryStatusSortRank(item: TrackedItemView): number {
@@ -285,6 +285,12 @@ function getDateTimestamp(value: string | null | undefined): number {
   if (!value) return 0;
   const timestamp = new Date(value).getTime();
   return Number.isNaN(timestamp) ? 0 : timestamp;
+}
+
+function getActiveDownloadCreatedTimestamp(item: TrackedItemView): number {
+  return getDateTimestamp(
+    item.currentDownload?.createdAt ?? item.item.createdAt,
+  );
 }
 
 function getLibraryRecentlyUpdatedTimestamp(item: TrackedItemView): number {

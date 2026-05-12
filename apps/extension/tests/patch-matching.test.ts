@@ -80,6 +80,7 @@ function patchCandidate(
   patchTitle: string,
   patchDate: string,
   buildId: string,
+  publishedAt?: string,
 ): SteamPatchCandidate {
   const [month = '01', day = '01', year = '1970'] = patchDate.split('/');
   return {
@@ -88,7 +89,9 @@ function patchCandidate(
     link: `https://steamdb.info/patchnotes/${buildId}/`,
     patchDate,
     patchTitle,
-    publishedAt: `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T00:00:00.000Z`,
+    publishedAt:
+      publishedAt ??
+      `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T00:00:00.000Z`,
     title: patchTitle,
   };
 }
@@ -119,6 +122,37 @@ describe('SteamDB patch matching', () => {
 
     expect(suggestion?.key).toBe(getSteamPatchKey(matchingUpdatePatch));
     expect(suggestion?.label).toContain('source date');
+  });
+
+  it('uses the most recent SteamDB row when ElAmigos only matches a same-day date', () => {
+    const olderSameDayPatch = patchCandidate(
+      'No Man Sky hotfix for 21 April 2026',
+      '04/21/2026',
+      '22880000',
+      '2026-04-21T09:00:00.000Z',
+    );
+    const matchingSameDayPatch = patchCandidate(
+      'No Man Sky update for 21 April 2026',
+      '04/21/2026',
+      '22885608',
+      '2026-04-21T22:00:00.000Z',
+    );
+    const suggestion = findLikelySteamPatch(
+      {
+        ...frostpunkSource,
+        latestSourceRelease: {
+          isPatch: true,
+          label: 'No Man Sky update (21.04.2026)',
+          patchDate: '21.04.2026',
+          version: 'unknown',
+        },
+        patchDownloadUrls: [],
+        title: "No Man's Sky",
+      },
+      [olderSameDayPatch, matchingSameDayPatch],
+    );
+
+    expect(suggestion?.key).toBe(getSteamPatchKey(matchingSameDayPatch));
   });
 
   it('does not suggest a row without date, build, or version signal overlap', () => {

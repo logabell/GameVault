@@ -190,7 +190,7 @@ describe('source comparison inference', () => {
     });
   });
 
-  it('leaves ambiguous ElAmigos date-only rows unresolved without a peer patch', () => {
+  it('uses the latest same-day SteamDB build when ElAmigos has only a patch date', () => {
     const latestPatch = patch(
       '22517190',
       'Hotfix #36 Now Live!',
@@ -214,13 +214,60 @@ describe('source comparison inference', () => {
     ]);
 
     expect(rows[0]).toMatchObject({
-      matchedPatch: null,
-      snapshot: {
-        observedBuildId: null,
-        observedPatchDate: '03/26/2026',
+      matchedPatch: {
+        buildId: latestPatch.buildId,
+        patchTitle: latestPatch.patchTitle,
       },
-      updateStatus: 'unknown',
-      versionsBehindLatest: null,
+      snapshot: {
+        observedBuildId: latestPatch.buildId,
+        observedPatchDate: latestPatch.patchDate,
+        observedPatchTitle: latestPatch.patchTitle,
+      },
+      updateStatus: 'matches_upstream',
+      versionsBehindLatest: 0,
+    });
+  });
+
+  it('matches ElAmigos dotted patch dates to the latest SteamDB build on that day', () => {
+    const latestPatch = patch(
+      '23076725',
+      "No Man's Sky update for 4 May 2026",
+      '05/04/2026',
+      '2026-05-04T14:00:00.000Z',
+    );
+    const matchingSameDayPatch = patch(
+      '22885608',
+      "No Man's Sky update for 21 April 2026",
+      '04/21/2026',
+      '2026-04-21T22:00:00.000Z',
+    );
+    const olderSameDayPatch = patch(
+      '22880000',
+      "No Man's Sky hotfix for 21 April 2026",
+      '04/21/2026',
+      '2026-04-21T09:00:00.000Z',
+    );
+    const elamigos = sourceView('elamigos', {
+      observedPatchDate: '21.04.2026',
+      observedVersion: 'unknown',
+    });
+
+    const rows = inferSourceComparisonRows(trackedItem([elamigos]), [
+      latestPatch,
+      olderSameDayPatch,
+      matchingSameDayPatch,
+    ]);
+
+    expect(rows[0]).toMatchObject({
+      matchedPatch: {
+        buildId: matchingSameDayPatch.buildId,
+      },
+      snapshot: {
+        observedBuildId: matchingSameDayPatch.buildId,
+        observedPatchDate: matchingSameDayPatch.patchDate,
+      },
+      updateStatus: 'source_behind_upstream',
+      versionsBehindLatest: 1,
     });
   });
 

@@ -393,7 +393,9 @@ export async function extractDirectHttpArchive(params: {
 }
 
 function isPortableArchiveExtraFolder(folderName: string): boolean {
-  return ['_commonredist', '__macosx'].includes(folderName.toLowerCase());
+  return ['_commonredist', '__macosx', 'redist'].includes(
+    folderName.toLowerCase(),
+  );
 }
 
 function isPortableArchiveExtraFile(fileName: string): boolean {

@@ -7572,6 +7572,27 @@ export class GameVaultService {
       }
     }
 
+    if (
+      !hasExplicitSelection &&
+      existingJob?.stage === 'failed' &&
+      isDirectHttpProvider(existingJob.provider) &&
+      isPortableArchiveSourceKind(parsedSource.sourceKind)
+    ) {
+      const item = this.database.findTrackedItemById(trackedItemId);
+      if (item) {
+        const recoveredJob = await this.recoverDirectHttpDownloadJob(
+          item,
+          existingJob,
+          parsedSource.sourceKind,
+        );
+        this.upsertDownloadJob(recoveredJob);
+        if (recoveredJob.stage === 'complete') {
+          await this.exportPlayniteManifestAfterInstall(trackedItemId);
+          return this.buildTrackedItemView(trackedItemId);
+        }
+      }
+    }
+
     const mirrors = this.database.listDownloadMirrors(
       trackedItemId,
       parsedSource.sourceKind,
@@ -8117,6 +8138,27 @@ export class GameVaultService {
           (installRecord &&
             sourceSnapshotMatchesInstallRecord(sourceSnapshot, installRecord))),
     );
+    const shouldValidatePortableArchiveInstall = Boolean(
+      job &&
+        ['failed', 'staged'].includes(job.stage) &&
+        isDirectHttpProvider(job.provider) &&
+        isPortableArchiveSourceKind(job.sourceKind ?? item.sourceKind),
+    );
+    if (
+      shouldValidatePortableArchiveInstall &&
+      !(await this.detectsLaunchExecutable({ finalPath, item }))
+    ) {
+      this.appendEvent(
+        'warn',
+        'Skipped local install reconciliation without a launch executable',
+        {
+          finalPath,
+          trackedItemId,
+        },
+      );
+      return;
+    }
+
     const now = new Date();
     if (installRecord) {
       if (installRecord.installPath !== finalPath) {
@@ -8320,6 +8362,17 @@ export class GameVaultService {
         continue;
       }
 
+      const item = this.database.findTrackedItemById(job.trackedItemId);
+      if (
+        item &&
+        !(await this.detectsLaunchExecutable({
+          finalPath: job.finalPath,
+          item,
+        }))
+      ) {
+        continue;
+      }
+
       await retryTransientFileCleanup(() =>
         removeKnownLibraryPaths({
           rootLibraryPath: settings.rootLibraryPath!,
@@ -8351,6 +8404,20 @@ export class GameVaultService {
           );
         });
     }
+  }
+
+  private async detectsLaunchExecutable(params: {
+    finalPath: string;
+    item: TrackedItemRecord;
+  }): Promise<boolean> {
+    const selection = await scanPlayniteExecutableSelection({
+      installPath: params.finalPath,
+      steamAppId: params.item.steamAppId ?? null,
+      steamTitle: params.item.steamTitle ?? null,
+      title: params.item.title,
+      trackedItemId: params.item.id,
+    });
+    return Boolean(selection.selectedExePath);
   }
 
   private async pollDownloadJobsInternal(

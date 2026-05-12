@@ -2955,18 +2955,10 @@ function App() {
       setMessage('Choose a Steam app before opening SteamDB.');
       return;
     }
-    if (!selectedFullMirrorUrl) {
-      setMessage('Choose a full download mirror before opening SteamDB.');
-      return;
-    }
     const effectivePatchMirrorUrl = getEffectivePatchMirrorUrl(
       selectedFullMirrorUrl,
       selectedPatchMirrorUrl,
     );
-    if (requiresSourcePatchMirror && !effectivePatchMirrorUrl) {
-      setMessage('Choose an update mirror before opening SteamDB.');
-      return;
-    }
 
     setBusy(true);
     setMessage(null);
@@ -2975,7 +2967,7 @@ function App() {
         appId: selectedAppId,
         mode,
         selectedDownloads: {
-          fullUrl: selectedFullMirrorUrl,
+          fullUrl: selectedFullMirrorUrl ?? '',
           patchUrl: effectivePatchMirrorUrl,
         },
         selectedSteamCandidate,

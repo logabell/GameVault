@@ -5812,6 +5812,103 @@ describe('GameVaultService SteamDB patch workflow', () => {
     }
   });
 
+  it('keeps a failed Ankergames curl item failed when the final folder only has a backup executable', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootLibraryPath = join(tempRoot, 'Library');
+      database.setSetting('library.rootPath', rootLibraryPath);
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'shape of dreams',
+        sourceKind: 'ankergames',
+        sourceUrl: ankergamesSource.sourceUrl,
+        title: 'Shape of Dreams',
+      });
+      const finalPath = join(rootLibraryPath, 'Shape of Dreams');
+      const stagePath = join(
+        rootLibraryPath,
+        '_STAGING',
+        'Shape of Dreams_22630308',
+      );
+      database.upsertDownloadJob({
+        createdAt: '2026-05-12T02:50:33.080Z',
+        errorMessage:
+          'AnkerGames download did not finish cleanly. Retry the download to continue.',
+        finalPath,
+        id: 'failed-anker-backup-exe',
+        packageName: 'Shape of Dreams_22630308',
+        provider: 'direct_http',
+        selectedMirrorUrl: ankergamesProxyUrl,
+        sourceKind: 'ankergames',
+        stage: 'failed',
+        stagePath,
+        statusMessage:
+          'AnkerGames download did not finish cleanly. Retry the download to continue.',
+        trackedItemId: item.id,
+        updatedAt: '2026-05-12T02:54:49.361Z',
+      });
+      await mkdir(finalPath, { recursive: true });
+      await writeFile(join(finalPath, 'ShapeOfDreams.exe.bak'), 'backup');
+      await writeFile(join(finalPath, 'UnityCrashHandler64.exe'), 'helper');
+      await mkdir(stagePath, { recursive: true });
+      await writeFile(join(stagePath, 'Shape-of-Dreams-AnkerGames.zip'), 'zip');
+
+      const sourceFetch = vi.fn(async (input: string, init?: RequestInit) => {
+        if (input === ankergamesSource.sourceUrl) {
+          return new Response(ankergamesSourceHtml(), { status: 200 });
+        }
+
+        if (input === 'https://ankergames.net/csrf-token') {
+          return new Response(JSON.stringify({ token: 'csrf-token' }), {
+            status: 200,
+          });
+        }
+
+        expect(input).toBe('https://ankergames.net/livewire/update');
+        expect(init?.method).toBe('POST');
+        return new Response(
+          JSON.stringify({
+            components: [
+              {
+                snapshot: JSON.stringify({
+                  data: {
+                    versionData: [
+                      {
+                        current_build: '22630308',
+                        current_version: 'V 1.2.1.7',
+                        latest_build: '22630308',
+                      },
+                      { s: 'arr' },
+                    ],
+                  },
+                }),
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      });
+      const service = createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      );
+
+      const refreshed = await service.refreshTrackedItem(item.id);
+
+      expect(refreshed.status).toBe('failed');
+      expect(existsSync(stagePath)).toBe(true);
+      expect(database.getInstallRecord(item.id)).toBeNull();
+      expect(database.getDownloadJob(item.id)).toMatchObject({
+        stage: 'failed',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('keeps a failed SteamRIP item failed when refresh cannot find the final folder', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -7574,6 +7671,124 @@ describe('GameVaultService SteamDB patch workflow', () => {
         provider: 'direct_http',
         stage: 'complete',
         statusMessage: 'Recovered from staged ZIP',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('recovers a failed Ankergames curl download from extracted Redist staging on retry', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootLibraryPath = join(tempRoot, 'Library');
+      const stagePath = join(
+        rootLibraryPath,
+        '_STAGING',
+        'MOUSE P.I. For Hire_22923861',
+      );
+      const finalPath = join(rootLibraryPath, 'MOUSE P.I. For Hire');
+      database.setSetting('library.rootPath', rootLibraryPath);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'mouse p i for hire',
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.net/game/mouse-p-i-for-hire',
+        title: 'MOUSE: P.I. For Hire',
+      });
+      const mouseSource: ParsedSourcePayload = {
+        ...ankergamesDirectReadySource,
+        fingerprint: 'ankergames-mouse-redist',
+        latestSourceRelease: {
+          buildId: '22923861',
+          isPatch: false,
+          label: 'Version V 1.0.6.8170',
+          version: 'V 1.0.6.8170',
+        },
+        normalizedTitle: 'mouse p i for hire',
+        sourceUrl: 'https://ankergames.net/game/mouse-p-i-for-hire',
+        title: 'MOUSE: P.I. For Hire',
+      };
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-05-12T02:50:33.080Z',
+        fingerprint: mouseSource.fingerprint,
+        observedBuildId: '22923861',
+        observedPatchDate: '05/11/2026',
+        observedPatchLink: null,
+        observedPatchTitle: null,
+        observedVersion: 'V 1.0.6.8170',
+        patchSelectionSource: selectedPatch.selectionSource ?? 'rss',
+        sourceKind: 'ankergames',
+        sourceUrl: mouseSource.sourceUrl,
+        trackedItemId: item.id,
+      });
+      database.setRawParsedSourcePayload(item.id, mouseSource);
+      database.upsertDownloadJob({
+        createdAt: '2026-05-12T02:50:33.080Z',
+        errorMessage:
+          'AnkerGames download did not finish cleanly. Retry the download to continue.',
+        finalPath,
+        id: 'failed-anker-redist',
+        packageName: 'MOUSE P.I. For Hire_22923861',
+        provider: 'direct_http',
+        selectedMirrorUrl: ankergamesProxyUrl,
+        sourceKind: 'ankergames',
+        stage: 'failed',
+        stagePath,
+        statusMessage:
+          'AnkerGames download did not finish cleanly. Retry the download to continue.',
+        trackedItemId: item.id,
+        updatedAt: '2026-05-12T02:54:49.361Z',
+      });
+      await mkdir(join(stagePath, 'MOUSE', 'MOUSE_Data'), {
+        recursive: true,
+      });
+      await mkdir(join(stagePath, 'Redist', 'DirectX'), { recursive: true });
+      await writeFile(join(stagePath, 'MOUSE', 'MOUSE.exe'), 'game');
+      await writeFile(
+        join(stagePath, 'MOUSE', 'MOUSE_Data', 'data.unity3d'),
+        'data',
+      );
+      await writeFile(join(stagePath, 'Redist', 'DXWebSetup.exe'), 'redist');
+      await writeFile(join(stagePath, 'Read Me.txt'), 'readme');
+      await writeFile(join(stagePath, 'Run Me!.bat'), 'bat');
+      await writeFile(
+        join(stagePath, 'Mouse-P-I-For-Hire-AnkerGames.zip'),
+        'zip',
+      );
+
+      const startDirectHttpDownload = createEmbeddedBrowserRunner();
+      const service = createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        fetch,
+        undefined,
+        undefined,
+        undefined,
+        startDirectHttpDownload,
+      );
+
+      await service.retryDownload(item.id);
+
+      expect(startDirectHttpDownload).not.toHaveBeenCalled();
+      await expect(readFile(join(finalPath, 'MOUSE.exe'), 'utf8')).resolves.toBe(
+        'game',
+      );
+      await expect(readFile(join(finalPath, 'Run Me!.bat'), 'utf8')).resolves.toBe(
+        'bat',
+      );
+      expect(existsSync(join(finalPath, 'Redist'))).toBe(false);
+      expect(existsSync(stagePath)).toBe(false);
+      expect(database.getDownloadJob(item.id)).toMatchObject({
+        provider: 'direct_http',
+        stage: 'complete',
+        statusMessage: 'Recovered extracted game files',
       });
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
