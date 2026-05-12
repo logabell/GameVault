@@ -137,6 +137,7 @@ import {
 import {
   canConfirmJDownloaderStep,
   canConfirmMyJDownloaderStep,
+  canConfirmSteamWishlistStep,
   getDesktopHealthMenuTitle,
   getEmptyLibraryState,
   isValidExtensionSetupId,
@@ -167,17 +168,10 @@ type Section = 'library' | 'wishlist' | 'imports' | 'activity' | 'settings';
 type ActivityLogFilter = 'all' | 'error' | 'warn';
 type BrowserSetupTab = 'chromium' | 'firefox';
 type LibraryViewMode = 'cards' | 'list';
-type WishlistFilter =
-  | 'all'
-  | 'installed'
-  | 'in_library'
-  | 'not_in_library'
-  | 'ready_to_remove'
-  | 'tracked';
+type WishlistFilter = 'all' | 'installed' | 'ready_to_remove' | 'tracked';
 type WishlistSortMode =
   | 'dateAdded'
   | 'libraryStatus'
-  | 'priority'
   | 'releaseDate'
   | 'title';
 type ImportSortKey = 'folder' | 'patchMetadata' | 'steamMatch';
@@ -295,6 +289,7 @@ const STEAM_LEGACY_APP_ART_BASE =
 const JDOWNLOADER_DOWNLOAD_URL = 'https://jdownloader.org/download/index';
 const MYJDOWNLOADER_SIGNUP_URL =
   'https://my.jdownloader.org/login.html#register';
+const STEAM_WISHLIST_SIGN_IN_URL = 'https://store.steampowered.com/wishlist/';
 const SOURCE_HOME_LINKS = [
   { label: 'AnkerGames', url: 'https://ankergames.net' },
   { label: 'ElAmigos', url: 'https://elamigos.site' },
@@ -365,6 +360,9 @@ declare global {
       confirmManualDownloadReady(
         trackedItemId: string,
       ): Promise<TrackedItemView>;
+      configureSteamWishlistProfile(payload: {
+        profileUrl: string;
+      }): Promise<SteamWishlistView>;
       completeStagedInstall(trackedItemId: string): Promise<TrackedItemView>;
       disconnectMyJDownloader(): Promise<ConnectionHealthSummary>;
       detectBrowserExtension(): Promise<BrowserExtensionInstallStatus>;
@@ -1156,12 +1154,8 @@ function getWishlistFilterLabel(filter: WishlistFilter): string {
   switch (filter) {
     case 'all':
       return 'All';
-    case 'in_library':
-      return 'In GameVault';
     case 'installed':
       return 'Installed';
-    case 'not_in_library':
-      return 'Not in GameVault';
     case 'ready_to_remove':
       return 'Ready to remove';
     case 'tracked':
@@ -1204,12 +1198,8 @@ function wishlistMatchesFilter(
   switch (filter) {
     case 'all':
       return true;
-    case 'in_library':
-      return item.library.status !== 'not_in_library';
     case 'installed':
       return item.library.status === 'installed';
-    case 'not_in_library':
-      return item.library.status === 'not_in_library';
     case 'ready_to_remove':
       return item.canRemoveFromSteamWishlist;
     case 'tracked':
@@ -1218,7 +1208,7 @@ function wishlistMatchesFilter(
 }
 
 function wishlistStatusRank(item: SteamWishlistItemView): number {
-  if (item.library.status === 'not_in_library') return 0;
+  if (item.library.status === 'installed') return 0;
   if (item.library.status === 'tracked') return 1;
   return 2;
 }
@@ -1248,9 +1238,6 @@ function sortWishlistItems(
       result = compareWishlistNullableTime(left.releaseDate, right.releaseDate);
     } else if (sort === 'libraryStatus') {
       result = wishlistStatusRank(left) - wishlistStatusRank(right);
-    } else if (sort === 'priority') {
-      result = (left.priority ?? Number.MAX_SAFE_INTEGER) -
-        (right.priority ?? Number.MAX_SAFE_INTEGER);
     } else {
       result = left.title.localeCompare(right.title);
     }
@@ -1918,12 +1905,34 @@ function resolveTheme(themeMode: ThemeMode | null | undefined): ResolvedTheme {
   return 'dark';
 }
 
-function getSteamPortraitCoverUrl(item: TrackedItemView): string | null {
-  return item.item.steamAppId
+function getSteamAppPortraitCoverUrl(appId: number | null | undefined): string | null {
+  return appId
     ? `${STEAM_LEGACY_APP_ART_BASE}/${encodeURIComponent(
-        String(item.item.steamAppId),
+        String(appId),
       )}/library_600x900.jpg`
     : null;
+}
+
+function isSteamLandscapeArtworkUrl(url: string | null | undefined): boolean {
+  if (!url) {
+    return false;
+  }
+
+  try {
+    const parsed = new URL(url);
+    return (
+      /(^|\.)steamstatic\.com$/i.test(parsed.hostname) &&
+      /\/(?:library_hero(?:_2x)?|hero_capsule(?:_2x)?|capsule_\d+x\d+(?:_2x)?|header(?:_2x)?|main_capsule(?:_2x)?)\.jpg$/i.test(
+        parsed.pathname,
+      )
+    );
+  } catch {
+    return false;
+  }
+}
+
+function getSteamPortraitCoverUrl(item: TrackedItemView): string | null {
+  return getSteamAppPortraitCoverUrl(item.item.steamAppId);
 }
 
 function getLibraryArtworkUrl(
@@ -2010,13 +2019,13 @@ function App() {
     totalCount: 0,
   });
   const [wishlistSearch, setWishlistSearch] = useState('');
-  const [wishlistFilter, setWishlistFilter] =
-    useState<WishlistFilter>('not_in_library');
+  const [wishlistFilter, setWishlistFilter] = useState<WishlistFilter>('all');
   const [wishlistHideLibrary, setWishlistHideLibrary] = useState(true);
   const [wishlistSort, setWishlistSort] =
     useState<WishlistSortMode>('dateAdded');
   const [wishlistSortDirection, setWishlistSortDirection] =
     useState<SortDirection>('desc');
+  const [wishlistProfileUrlDraft, setWishlistProfileUrlDraft] = useState('');
   const [wishlistBusy, setWishlistBusy] = useState(false);
   const [wishlistMessage, setWishlistMessage] = useState<string | null>(null);
   const [detailsItemId, setDetailsItemId] = useState<string | null>(null);
@@ -2152,6 +2161,7 @@ function App() {
   const setupCopiedTimerRef = useRef<number | null>(null);
   const patchEditorRequestIdRef = useRef(0);
   const appDialogRequestIdRef = useRef(0);
+  const wishlistSyncWasPendingRef = useRef(false);
   const appDialogResolverRef = useRef<((confirmed: boolean) => void) | null>(
     null,
   );
@@ -2190,22 +2200,22 @@ function App() {
     ],
   );
   const wishlistFilterCounts = useMemo(() => {
-    const base = steamWishlist.items;
+    const base = steamWishlist.items.filter((item) =>
+      wishlistMatchesSearch(item, wishlistSearch),
+    );
     return {
       all: base.length,
-      in_library: base.filter(
-        (item) => item.library.status !== 'not_in_library',
-      ).length,
       installed: base.filter((item) => item.library.status === 'installed')
         .length,
-      not_in_library: base.filter(
-        (item) => item.library.status === 'not_in_library',
-      ).length,
       ready_to_remove: base.filter((item) => item.canRemoveFromSteamWishlist)
         .length,
       tracked: base.filter((item) => item.library.status === 'tracked').length,
     } satisfies Record<WishlistFilter, number>;
-  }, [steamWishlist.items]);
+  }, [steamWishlist.items, wishlistSearch]);
+  const trackedItemsById = useMemo(
+    () => new Map(items.map((item) => [item.item.id, item] as const)),
+    [items],
+  );
   const visibleWishlistItems = useMemo(
     () =>
       sortWishlistItems(
@@ -2287,6 +2297,18 @@ function App() {
     canConfirmJDownloaderStep(jDownloaderStatus);
   const myJDownloaderReadyForOnboarding =
     canConfirmMyJDownloaderStep(connectionHealth);
+  const extensionRegisteredForWishlist =
+    hasAnySavedExtensionRegistration(settings.onboarding);
+  const extensionConnectedForWishlist =
+    extensionRegisteredForWishlist && desktopHealth?.extension.color === 'green';
+  const steamWishlistReadyForOnboarding =
+    canConfirmSteamWishlistStep(steamWishlist);
+  const steamWishlistNeedsSetup = !steamWishlistReadyForOnboarding;
+  const wishlistPendingSyncAction =
+    steamWishlist.pendingActions.find(
+      (action) => action.actionType === 'sync',
+    ) ?? null;
+  const wishlistSyncPending = Boolean(wishlistPendingSyncAction);
   const firefoxSetupExtensionId =
     extensionSetupInfo?.firefoxExtensionId ?? FIREFOX_EXTENSION_ID;
   const activeBrowserSetupExtensionId =
@@ -2431,6 +2453,7 @@ function App() {
       setItems(trackedItems);
       setActivity(loadedActivity);
       setSteamWishlist(loadedWishlist);
+      setWishlistProfileUrlDraft(loadedWishlist.profileUrl ?? '');
     });
   }
 
@@ -2655,8 +2678,9 @@ function App() {
       const nextWishlist =
         await window.gameVaultApi.requestSteamWishlistRefresh();
       setSteamWishlist(nextWishlist);
+      setWishlistProfileUrlDraft(nextWishlist.profileUrl ?? '');
       setWishlistMessage(
-        'Wishlist sync requested. Keep the browser extension enabled and signed in to Steam.',
+        'Sync queued. Waiting for the browser extension to read Steam and report back.',
       );
     } catch (error) {
       setWishlistMessage(
@@ -2664,6 +2688,31 @@ function App() {
           ? error.message
           : 'Unable to request Steam wishlist sync.',
       );
+    } finally {
+      setWishlistBusy(false);
+    }
+  }
+
+  async function saveSteamWishlistProfile() {
+    setWishlistBusy(true);
+    setWishlistMessage(null);
+    setOnboardingMessage(null);
+    try {
+      const nextWishlist =
+        await window.gameVaultApi.configureSteamWishlistProfile({
+          profileUrl: wishlistProfileUrlDraft,
+        });
+      setSteamWishlist(nextWishlist);
+      setWishlistProfileUrlDraft(nextWishlist.profileUrl ?? '');
+      setWishlistMessage('Steam wishlist URL saved.');
+      setOnboardingMessage('Steam wishlist URL saved. You can sync now.');
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : 'Unable to save Steam wishlist URL.';
+      setWishlistMessage(message);
+      setOnboardingMessage(message);
     } finally {
       setWishlistBusy(false);
     }
@@ -2712,6 +2761,18 @@ function App() {
         refreshExtensionSetupInfo(),
         refreshBrowserExtensionStatus(),
         refreshDesktopHealth({ forceRefresh: true }),
+      ]);
+    }
+    if (step === 'wishlist') {
+      setWishlistProfileUrlDraft(steamWishlist.profileUrl ?? '');
+      void Promise.allSettled([
+        refreshExtensionSetupInfo(),
+        refreshBrowserExtensionStatus(),
+        refreshDesktopHealth({ forceRefresh: true }),
+        window.gameVaultApi.getSteamWishlist().then((nextWishlist) => {
+          setSteamWishlist(nextWishlist);
+          setWishlistProfileUrlDraft(nextWishlist.profileUrl ?? '');
+        }),
       ]);
     }
   }
@@ -2930,12 +2991,47 @@ function App() {
     }
   }
 
-  async function finishOnboarding() {
+  async function continueFromExtensionSetup() {
+    setOnboardingMessage(null);
+    setOnboardingStep('wishlist');
+  }
+
+  async function skipExtensionSetup() {
     setOnboardingBusy(true);
     try {
       await saveOnboardingPatch({
+        extensionSkippedAt: timestampNow(),
+      });
+      setOnboardingStep('wishlist');
+    } finally {
+      setOnboardingBusy(false);
+    }
+  }
+
+  async function finishSteamWishlistSetup() {
+    setOnboardingBusy(true);
+    setOnboardingMessage(null);
+    try {
+      const draft = wishlistProfileUrlDraft.trim();
+      const nextWishlist =
+        draft && draft !== (steamWishlist.profileUrl ?? '')
+          ? await window.gameVaultApi.configureSteamWishlistProfile({
+              profileUrl: draft,
+            })
+          : await window.gameVaultApi.getSteamWishlist();
+      setSteamWishlist(nextWishlist);
+      setWishlistProfileUrlDraft(nextWishlist.profileUrl ?? '');
+      if (!canConfirmSteamWishlistStep(nextWishlist)) {
+        setOnboardingMessage(
+          'Save your exact Steam wishlist URL, sign in to Steam in the browser with the GameVault extension, then sync the wishlist.',
+        );
+        return;
+      }
+      await saveOnboardingPatch({
         completedAt: timestampNow(),
         skippedAt: null,
+        steamWishlistConfirmedAt: timestampNow(),
+        steamWishlistSkippedAt: null,
       });
       setOnboardingOpen(false);
     } finally {
@@ -2943,12 +3039,13 @@ function App() {
     }
   }
 
-  async function skipExtensionAndCloseOnboarding() {
+  async function skipSteamWishlistAndFinishOnboarding() {
     setOnboardingBusy(true);
     try {
       await saveOnboardingPatch({
-        extensionSkippedAt: timestampNow(),
-        skippedAt: timestampNow(),
+        completedAt: timestampNow(),
+        skippedAt: null,
+        steamWishlistSkippedAt: timestampNow(),
       });
       setOnboardingOpen(false);
     } finally {
@@ -4233,6 +4330,7 @@ function App() {
           setPlayniteStatus(loadedPlayniteStatus);
         }
         setSteamWishlist(loadedWishlist);
+        setWishlistProfileUrlDraft(loadedWishlist.profileUrl ?? '');
         syncSettingsDrafts(loadedSettings);
         setAuthDraft({
           email: loadedSettings.myJDownloaderEmail ?? '',
@@ -4268,11 +4366,30 @@ function App() {
     const timer = window.setInterval(() => {
       void window.gameVaultApi
         .getSteamWishlist()
-        .then((nextWishlist) => setSteamWishlist(nextWishlist))
+        .then((nextWishlist) => {
+          setSteamWishlist(nextWishlist);
+          setWishlistProfileUrlDraft(nextWishlist.profileUrl ?? '');
+        })
         .catch(() => undefined);
     }, 3000);
     return () => window.clearInterval(timer);
   }, [steamWishlist.pendingActions.length]);
+
+  useEffect(() => {
+    if (wishlistSyncPending) {
+      wishlistSyncWasPendingRef.current = true;
+      return;
+    }
+    if (!wishlistSyncWasPendingRef.current) {
+      return;
+    }
+    wishlistSyncWasPendingRef.current = false;
+    if (steamWishlist.fetchedAt && !steamWishlist.lastError) {
+      setWishlistMessage(
+        `Wishlist synced ${formatRelativeTime(steamWishlist.fetchedAt)}.`,
+      );
+    }
+  }, [steamWishlist.fetchedAt, steamWishlist.lastError, wishlistSyncPending]);
 
   useEffect(() => {
     if (!onboardingOpen) return;
@@ -4286,7 +4403,10 @@ function App() {
   }, [onboardingOpen]);
 
   useEffect(() => {
-    if (!onboardingOpen || onboardingStep !== 'extension') {
+    if (
+      !onboardingOpen ||
+      (onboardingStep !== 'extension' && onboardingStep !== 'wishlist')
+    ) {
       return;
     }
     void refreshBrowserExtensionStatus().catch(() => undefined);
@@ -4772,10 +4892,11 @@ function App() {
     }
   }
 
-  async function startSourceUpdate(sourceKind: SupportedSourceKind) {
-    if (!sourcesModal) return;
-
-    const source = sourcesModal.item.sourceMatches.find(
+  async function startSourceUpdateForItem(
+    item: TrackedItemView,
+    sourceKind: SupportedSourceKind,
+  ) {
+    const source = item.sourceMatches.find(
       (entry) => entry.match.sourceKind === sourceKind,
     );
     if (!source) {
@@ -4786,7 +4907,7 @@ function App() {
     }
 
     const mirrorPlan = planUpdateMirrorSelection({
-      installedSourceKind: getInstalledSourceKind(sourcesModal.item),
+      installedSourceKind: getInstalledSourceKind(item),
       mirrors: source.downloadMirrors,
       sourceKind,
     });
@@ -4796,7 +4917,7 @@ function App() {
     }
 
     const flow = buildUpdateFlowState({
-      item: sourcesModal.item,
+      item,
       mirrorPlan,
       phase:
         mirrorPlan.showFullRows || mirrorPlan.showPatchRows
@@ -4812,6 +4933,11 @@ function App() {
     }
 
     await loadUpdatePatchChoices(flow);
+  }
+
+  async function startSourceUpdate(sourceKind: SupportedSourceKind) {
+    if (!sourcesModal) return;
+    await startSourceUpdateForItem(sourcesModal.item, sourceKind);
   }
 
   async function queueUpdateFlowDownload(flow: UpdateFlowState) {
@@ -5284,41 +5410,6 @@ function App() {
     } finally {
       setBusyId(null);
       setBusyAction(null);
-    }
-  }
-
-  async function removeInstalledWishlistItem(item: SteamWishlistItemView) {
-    if (!item.library.trackedItemId) return;
-    const confirmed = await showConfirm(
-      `Remove ${item.title} from your Steam wishlist? GameVault has it marked as ${getWishlistLibraryStatusLabel(item).toLowerCase()}.`,
-      {
-        confirmLabel: 'Remove from Wishlist',
-        title: 'Remove Steam Wishlist Item',
-        variant: 'danger',
-      },
-    );
-    if (!confirmed) return;
-
-    setWishlistBusy(true);
-    setWishlistMessage(null);
-    try {
-      const nextWishlist =
-        await window.gameVaultApi.requestSteamWishlistRemoval({
-          appId: item.appId,
-          trackedItemId: item.library.trackedItemId,
-        });
-      setSteamWishlist(nextWishlist);
-      setWishlistMessage(
-        'Removal queued. The browser extension will finish it through your Steam session.',
-      );
-    } catch (error) {
-      await showAlert(
-        error instanceof Error
-          ? error.message
-          : 'Unable to queue Steam wishlist removal.',
-      );
-    } finally {
-      setWishlistBusy(false);
     }
   }
 
@@ -6699,11 +6790,21 @@ function App() {
   }
 
   function renderWishlistArtwork(item: SteamWishlistItemView) {
-    return item.coverUrl ? (
+    const portraitCover = getSteamAppPortraitCoverUrl(item.appId);
+    const fallbackCover =
+      portraitCover &&
+      item.coverUrl &&
+      portraitCover !== item.coverUrl &&
+      !isSteamLandscapeArtworkUrl(item.coverUrl)
+        ? (item.coverUrl ?? undefined)
+        : undefined;
+    return portraitCover || fallbackCover ? (
       <img
         alt={item.title}
         className="wishlist-row__cover"
-        src={item.coverUrl}
+        data-fallback-src={fallbackCover}
+        onError={fallbackCover ? handleArtworkFallback : undefined}
+        src={portraitCover ?? fallbackCover}
       />
     ) : (
       <div className="wishlist-row__cover is-placeholder">
@@ -6712,8 +6813,53 @@ function App() {
     );
   }
 
+  function getWishlistTrackedItem(
+    item: SteamWishlistItemView,
+  ): TrackedItemView | null {
+    return item.library.trackedItemId
+      ? (trackedItemsById.get(item.library.trackedItemId) ?? null)
+      : null;
+  }
+
+  function getWishlistUpdateSource(
+    item: TrackedItemView | null,
+  ): MatchedSourceView | null {
+    if (!item || !hasActionableSourceUpdate(item)) return null;
+    return (
+      item.sourceMatches.find(
+        (source) =>
+          source.isUpdateSource &&
+          source.downloadMirrors.some(
+            (mirror) => mirror.kind === 'full' || mirror.kind === 'patch',
+          ),
+      ) ?? null
+    );
+  }
+
+  async function startWishlistUpdate(item: SteamWishlistItemView) {
+    const tracked = getWishlistTrackedItem(item);
+    const source = getWishlistUpdateSource(tracked);
+    if (!tracked || !source) {
+      if (tracked) {
+        await openSourcesForItem(tracked);
+      }
+      return;
+    }
+    await startSourceUpdateForItem(tracked, source.match.sourceKind);
+  }
+
   function renderWishlistItem(item: SteamWishlistItemView) {
     const pendingRemoval = item.removalPending?.status === 'pending';
+    const tracked = getWishlistTrackedItem(item);
+    const trackingStatus = tracked ? getTrackingStatus(tracked) : null;
+    const updateSource = getWishlistUpdateSource(tracked);
+    const canDownloadSource = canQueueSourceUpdate({
+      connectionHealth,
+      jDownloaderEnabled: settings.jDownloaderEnabled,
+      jDownloaderSourcePreferences: settings.jDownloaderSourcePreferences,
+      rootLibraryPath: settings.rootLibraryPath,
+      sourceKind: updateSource?.match.sourceKind,
+    });
     return (
       <article className="wishlist-row" key={item.appId}>
         <div className="wishlist-row__media">{renderWishlistArtwork(item)}</div>
@@ -6731,11 +6877,33 @@ function App() {
                     Removal pending
                   </span>
                 ) : null}
+                {trackingStatus ? (
+                  <span className={`tracking-chip ${trackingStatus}`}>
+                    {formatLabel(trackingStatus)}
+                  </span>
+                ) : null}
               </div>
               <h3>{item.title}</h3>
-              <p className="muted-text">Steam App {item.appId}</p>
             </div>
             <div className="wishlist-row__actions">
+              {updateSource ? (
+                <button
+                  className="primary-button wishlist-update-button"
+                  disabled={
+                    busyId === tracked?.item.id || !canDownloadSource
+                  }
+                  onClick={() => void startWishlistUpdate(item)}
+                  type="button"
+                >
+                  <FontAwesomeIcon
+                    aria-hidden="true"
+                    icon={faArrowDownWideShort}
+                  />
+                  <span>
+                    {busyId === tracked?.item.id ? 'Preparing...' : 'Update Now'}
+                  </span>
+                </button>
+              ) : null}
               <button
                 aria-label={`Open ${item.title} on Steam`}
                 className="inline-icon-button"
@@ -6756,26 +6924,6 @@ function App() {
                   <FontAwesomeIcon aria-hidden="true" icon={faCircleInfo} />
                 </button>
               ) : null}
-              <button
-                aria-label={`Remove ${item.title} from Steam wishlist`}
-                className="inline-icon-button wishlist-remove-button"
-                disabled={
-                  wishlistBusy ||
-                  pendingRemoval ||
-                  !item.canRemoveFromSteamWishlist
-                }
-                onClick={() => void removeInstalledWishlistItem(item)}
-                title={
-                  item.canRemoveFromSteamWishlist
-                    ? 'Remove from Steam wishlist'
-                    : item.library.status === 'installed'
-                      ? 'Removal already pending'
-                      : 'Available after the matched GameVault item is installed'
-                }
-                type="button"
-              >
-                <FontAwesomeIcon aria-hidden="true" icon={faTrash} />
-              </button>
             </div>
           </div>
           <dl className="wishlist-row__meta">
@@ -6788,10 +6936,6 @@ function App() {
               <dd>{formatDateLabel(item.releaseDate)}</dd>
             </div>
             <div>
-              <dt>Priority</dt>
-              <dd>{item.priority ?? 'None'}</dd>
-            </div>
-            <div>
               <dt>Price</dt>
               <dd>{item.priceLabel ?? 'Unknown'}</dd>
             </div>
@@ -6800,8 +6944,8 @@ function App() {
               <dd>{item.reviewSummary ?? 'Unknown'}</dd>
             </div>
             <div>
-              <dt>GameVault</dt>
-              <dd>{item.library.title ?? getWishlistLibraryStatusLabel(item)}</dd>
+              <dt>Steam App</dt>
+              <dd>{item.appId}</dd>
             </div>
           </dl>
         </div>
@@ -6810,25 +6954,32 @@ function App() {
   }
 
   function renderSteamWishlistSection() {
-    const pendingSync = steamWishlist.pendingActions.some(
-      (action) => action.actionType === 'sync',
-    );
     const statusText = steamWishlist.fetchedAt
       ? `Synced ${formatRelativeTime(steamWishlist.fetchedAt)}`
       : 'Not synced yet';
+    const syncDetailText = wishlistSyncPending
+      ? `Sync queued ${formatRelativeTime(
+          wishlistPendingSyncAction?.requestedAt ?? '',
+        )}; waiting for browser extension`
+      : steamWishlist.lastError
+        ? `Sync failed: ${steamWishlist.lastError}`
+        : statusText;
 
     return (
       <section className="library-surface wishlist-surface">
-        <div className="library-toolbar">
-          <div>
+        <div className="library-toolbar wishlist-toolbar">
+          <div className="wishlist-toolbar__heading">
             <p className="panel-title">Steam Wishlist</p>
-            <p className="muted-text">
-              {visibleWishlistItems.length} of {steamWishlist.totalCount} shown
-              {' | '}
-              {pendingSync ? 'Sync pending' : statusText}
+            <p className="muted-text wishlist-toolbar__status">
+              <span>
+                {visibleWishlistItems.length} of {steamWishlist.totalCount}{' '}
+                shown
+              </span>
+              <span aria-hidden="true" className="wishlist-toolbar__divider" />
+              <span>{syncDetailText}</span>
             </p>
           </div>
-          <div className="library-toolbar__controls">
+          <div className="library-toolbar__controls wishlist-toolbar__controls">
             <label className="search-field">
               <FontAwesomeIcon aria-hidden="true" icon={faMagnifyingGlass} />
               <input
@@ -6851,31 +7002,22 @@ function App() {
             <label className="select-field">
               <span className="field-label">
                 <FontAwesomeIcon aria-hidden="true" icon={faFilter} />
-                Filter
+                Status
               </span>
               <select
                 aria-label="Filter Steam wishlist"
                 onChange={(event) => {
                   const nextFilter = event.currentTarget.value as WishlistFilter;
                   setWishlistFilter(nextFilter);
-                  if (
-                    nextFilter !== 'all' &&
-                    nextFilter !== 'not_in_library'
-                  ) {
+                  if (nextFilter !== 'all') {
                     setWishlistHideLibrary(false);
                   }
                 }}
                 value={wishlistFilter}
               >
                 {(
-                  [
-                    'not_in_library',
-                    'all',
-                    'in_library',
-                    'installed',
-                    'tracked',
-                    'ready_to_remove',
-                  ] satisfies WishlistFilter[]
+                  ['all', 'installed', 'tracked', 'ready_to_remove'] satisfies
+                    WishlistFilter[]
                 ).map((filter) => (
                   <option key={filter} value={filter}>
                     {getWishlistFilterLabel(filter)} (
@@ -6908,7 +7050,6 @@ function App() {
                   <option value="dateAdded">Date added</option>
                   <option value="title">Title</option>
                   <option value="libraryStatus">Library status</option>
-                  <option value="priority">Steam priority</option>
                   <option value="releaseDate">Release date</option>
                 </select>
               </label>
@@ -6933,37 +7074,76 @@ function App() {
                 />
               </button>
             </div>
+            <span className="wishlist-sync-summary">
+              Last sync:{' '}
+              {steamWishlist.fetchedAt
+                ? `${formatRelativeTime(steamWishlist.fetchedAt)}`
+                : 'Never'}
+            </span>
             <button
               className="ghost-button settings-icon-text-button"
-              disabled={wishlistBusy}
+              disabled={wishlistBusy || wishlistSyncPending}
               onClick={() => void refreshSteamWishlist()}
               type="button"
             >
               <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
-              <span>{wishlistBusy ? 'Syncing...' : 'Sync'}</span>
+              <span>
+                {wishlistBusy
+                  ? 'Syncing...'
+                  : wishlistSyncPending
+                    ? 'Sync Pending'
+                    : 'Sync'}
+              </span>
             </button>
           </div>
         </div>
+        {steamWishlistNeedsSetup ? (
+          <div className="wishlist-setup-callout">
+            <div>
+              <strong>Steam wishlist sync needs browser setup.</strong>
+              <p className="muted-text">
+                GameVault gathers wishlist AppIDs through the browser extension
+                while you are signed in to Steam. Cookies and session IDs stay
+                in the browser.
+              </p>
+            </div>
+          </div>
+        ) : null}
         {wishlistMessage || steamWishlist.lastError ? (
           <p className="wishlist-status-message muted-text">
-            {wishlistMessage ?? steamWishlist.lastError}
+            {wishlistMessage ??
+              (steamWishlist.lastError
+                ? `Sync failed: ${steamWishlist.lastError}`
+                : null)}
           </p>
         ) : null}
         <div className="wishlist-list">
           {visibleWishlistItems.length > 0 ? (
             visibleWishlistItems.map((item) => renderWishlistItem(item))
           ) : steamWishlist.totalCount === 0 ? (
-            <div className="empty-state">
+            <div className="empty-state wishlist-empty-state">
               <strong>No Steam wishlist items yet.</strong>
               <p className="muted-text">
-                Sync from a browser where you are signed in to Steam.
+                {steamWishlistNeedsSetup
+                  ? 'Set up the browser extension and sign in to Steam to start syncing.'
+                  : 'Sync from a browser where you are signed in to Steam.'}
               </p>
+              {steamWishlistNeedsSetup ? (
+                <button
+                  className="primary-button settings-icon-text-button"
+                  onClick={() => openOnboardingGuide('wishlist')}
+                  type="button"
+                >
+                  <FontAwesomeIcon aria-hidden="true" icon={faCircleInfo} />
+                  <span>Setup Instructions</span>
+                </button>
+              ) : null}
             </div>
           ) : (
             <div className="empty-state">
               <strong>No wishlist games match this view.</strong>
               <p className="muted-text">
-                Change the filter or show games already in GameVault.
+                Change the status filter or show games already in GameVault.
               </p>
             </div>
           )}
@@ -7520,6 +7700,183 @@ function App() {
     );
   }
 
+  function renderSteamWishlistSetupPanel() {
+    const statusColor = steamWishlistReadyForOnboarding
+      ? 'green'
+      : extensionConnectedForWishlist
+        ? 'yellow'
+        : 'red';
+    const statusTitle = steamWishlistReadyForOnboarding
+      ? 'Steam wishlist connected'
+      : wishlistSyncPending
+        ? 'Sync queued'
+      : !extensionRegisteredForWishlist
+        ? 'Browser extension setup required'
+        : !extensionConnectedForWishlist
+          ? 'Waiting for browser extension'
+          : 'Steam sign-in needed';
+    const statusMessage = steamWishlistReadyForOnboarding
+      ? `GameVault synced this Steam wishlist ${formatRelativeTime(
+          steamWishlist.fetchedAt ?? '',
+        )}.`
+      : wishlistSyncPending
+        ? `GameVault is waiting for the browser extension to pick up this sync request. Queued ${formatRelativeTime(
+            wishlistPendingSyncAction?.requestedAt,
+          )}.`
+      : !extensionRegisteredForWishlist
+        ? 'Register the GameVault browser extension first. Wishlist sync uses that extension to read your signed-in Steam session.'
+        : !extensionConnectedForWishlist
+          ? 'Reload or open the GameVault browser extension once so it can reach the desktop bridge.'
+          : 'Open your Steam wishlist, sign in, copy the final profile wishlist URL, then sync from GameVault.';
+
+    return (
+      <div className="onboarding-panel steam-wishlist-setup-panel">
+        <div className="onboarding-status-card">
+          <span className={`health-dot ${statusColor}`} aria-hidden="true" />
+          <div>
+            <strong className="onboarding-status-title">
+              <FontAwesomeIcon aria-hidden="true" icon={faHeart} />
+              <span>{statusTitle}</span>
+            </strong>
+            <p className="muted-text">{statusMessage}</p>
+            <p className="muted-text steam-wishlist-setup-panel__privacy">
+              GameVault stores wishlist AppIDs, game metadata, local settings,
+              and removal audit results. Steam cookies and session IDs stay in
+              your browser.
+            </p>
+          </div>
+        </div>
+
+        <div className="steam-wishlist-profile-card">
+          <label className="field">
+            <span className="field-label">Steam wishlist URL</span>
+            <input
+              onChange={(event) =>
+                setWishlistProfileUrlDraft(event.currentTarget.value)
+              }
+              placeholder="https://store.steampowered.com/wishlist/profiles/76561198086715287/"
+              value={wishlistProfileUrlDraft}
+            />
+          </label>
+          <div className="action-row steam-wishlist-profile-card__actions">
+            <button
+              className="ghost-button settings-icon-text-button"
+              disabled={wishlistBusy || !wishlistProfileUrlDraft.trim()}
+              onClick={() => void saveSteamWishlistProfile()}
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faFloppyDisk} />
+              <span>{wishlistBusy ? 'Saving...' : 'Save URL'}</span>
+            </button>
+            <button
+              className="ghost-button settings-icon-text-button"
+              onClick={() =>
+                void window.gameVaultApi.openExternal(
+                  STEAM_WISHLIST_SIGN_IN_URL,
+                )
+              }
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faUpRightFromSquare} />
+              <span>Open Steam Wishlist</span>
+            </button>
+          </div>
+        </div>
+
+        <ol className="onboarding-instruction-list">
+          <li>
+            <strong>Open your Steam wishlist</strong>
+            <span>
+              Use the button above. Steam will ask you to sign in when needed.
+            </span>
+          </li>
+          <li>
+            <strong>Copy the final wishlist URL</strong>
+            <span>
+              Once your wishlist is visible, copy the full browser URL. It
+              should look like store.steampowered.com/wishlist/profiles/...
+            </span>
+          </li>
+          <li>
+            <strong>Paste and save it here</strong>
+            <span>
+              GameVault validates the profile URL format and saves the SteamID
+              for future sync and removal actions.
+            </span>
+          </li>
+          <li>
+            <strong>Sync and review matches</strong>
+            <span>
+              The extension reads the signed-in Steam session, then GameVault
+              matches wishlist games to your library by Steam AppID.
+            </span>
+          </li>
+        </ol>
+
+        {wishlistMessage || steamWishlist.lastError ? (
+          <p className="onboarding-message">
+            {wishlistMessage ??
+              (steamWishlist.lastError
+                ? `Sync failed: ${steamWishlist.lastError}`
+                : null)}
+          </p>
+        ) : null}
+
+        <div className="action-row onboarding-inline-actions">
+          {!extensionConnectedForWishlist ? (
+            <button
+              className="ghost-button settings-icon-text-button"
+              onClick={() => setOnboardingStep('extension')}
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faPuzzlePiece} />
+              <span>Extension Setup</span>
+            </button>
+          ) : null}
+          <button
+            className="ghost-button settings-icon-text-button"
+            onClick={() =>
+              void Promise.all([
+                refreshBrowserExtensionStatus(),
+                refreshDesktopHealth({ forceRefresh: true }),
+                window.gameVaultApi.getSteamWishlist().then((nextWishlist) => {
+                  setSteamWishlist(nextWishlist);
+                  setWishlistProfileUrlDraft(nextWishlist.profileUrl ?? '');
+                }),
+              ]).catch(() => undefined)
+            }
+            type="button"
+          >
+            <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
+            <span>Refresh Status</span>
+          </button>
+          <button
+            className="primary-button settings-icon-text-button"
+            disabled={wishlistBusy || wishlistSyncPending}
+            onClick={() => void refreshSteamWishlist()}
+            type="button"
+          >
+            <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
+            <span>
+              {wishlistBusy
+                ? 'Syncing...'
+                : wishlistSyncPending
+                  ? 'Sync Pending'
+                  : 'Sync Wishlist'}
+            </span>
+          </button>
+        </div>
+
+        {steamWishlistReadyForOnboarding ? (
+          <p className="onboarding-success">
+            Wishlist sync is ready. The Wishlist tab will hide GameVault library
+            matches by default.
+          </p>
+        ) : null}
+      </div>
+    );
+  }
+
   function renderPlayniteReviewModal() {
     if (!playniteReview) return null;
     const candidates = playniteReview.selection.candidates.filter(
@@ -7687,6 +8044,7 @@ function App() {
       { key: 'jdownloader', label: 'JDownloader' },
       { key: 'myjdownloader', label: 'MyJDownloader' },
       { key: 'extension', label: 'Extension' },
+      { key: 'wishlist', label: 'Steam Wishlist' },
     ];
     const activeStepIndex = steps.findIndex(
       (step) => step.key === onboardingStep,
@@ -7920,6 +8278,12 @@ function App() {
             </div>
           ) : null}
 
+          {onboardingStep === 'wishlist' ? (
+            <div className="onboarding-panel">
+              {renderSteamWishlistSetupPanel()}
+            </div>
+          ) : null}
+
           <footer className="onboarding-footer">
             <button
               className="ghost-button"
@@ -7977,18 +8341,42 @@ function App() {
                   <button
                     className="ghost-button"
                     disabled={onboardingBusy}
-                    onClick={() => void skipExtensionAndCloseOnboarding()}
+                    onClick={() => void skipExtensionSetup()}
                     type="button"
                   >
-                    Skip Setup
+                    Skip Extension
                   </button>
                   <button
                     className="primary-button"
                     disabled={onboardingBusy || !extensionRegistered}
-                    onClick={() => void finishOnboarding()}
+                    onClick={() => void continueFromExtensionSetup()}
                     type="button"
                   >
-                    Finish
+                    Continue
+                  </button>
+                </>
+              ) : null}
+              {onboardingStep === 'wishlist' ? (
+                <>
+                  <button
+                    className="ghost-button"
+                    disabled={onboardingBusy}
+                    onClick={() =>
+                      void skipSteamWishlistAndFinishOnboarding()
+                    }
+                    type="button"
+                  >
+                    Skip Wishlist
+                  </button>
+                  <button
+                    className="primary-button"
+                    disabled={
+                      onboardingBusy || !steamWishlistReadyForOnboarding
+                    }
+                    onClick={() => void finishSteamWishlistSetup()}
+                    type="button"
+                  >
+                    {wishlistSyncPending ? 'Waiting for Sync' : 'Finish'}
                   </button>
                 </>
               ) : null}

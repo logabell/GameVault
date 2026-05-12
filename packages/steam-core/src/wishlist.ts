@@ -9,6 +9,8 @@ const STORE_BROWSE_ITEMS_URL =
   'https://api.steampowered.com/IStoreBrowseService/GetItems/v1/';
 const STEAM_ASSET_CDN_BASE =
   'https://shared.akamai.steamstatic.com/store_item_assets/';
+const STEAM_WISHLIST_PROFILE_URL_RE =
+  /\/wishlist\/profiles\/(?<steamId>\d{17})\/?/i;
 
 type StoreItemAssets = {
   asset_url_format?: unknown;
@@ -16,6 +18,8 @@ type StoreItemAssets = {
   hero_capsule?: unknown;
   library_capsule?: unknown;
   library_capsule_2x?: unknown;
+  library_600x900?: unknown;
+  library_600x900_2x?: unknown;
   library_hero?: unknown;
   library_hero_2x?: unknown;
   main_capsule?: unknown;
@@ -47,11 +51,8 @@ function unixTimestampToIso(value: unknown): string | null {
 function buildStoreAssetUrl(assets: StoreItemAssets): string | null {
   const format = stringOrNull(assets.asset_url_format);
   const filename =
-    stringOrNull(assets.library_hero_2x) ??
-    stringOrNull(assets.library_hero) ??
-    stringOrNull(assets.hero_capsule) ??
-    stringOrNull(assets.main_capsule) ??
-    stringOrNull(assets.header) ??
+    stringOrNull(assets.library_600x900_2x) ??
+    stringOrNull(assets.library_600x900) ??
     stringOrNull(assets.library_capsule_2x) ??
     stringOrNull(assets.library_capsule);
   if (!format || !filename || !format.includes('${FILENAME}')) {
@@ -95,6 +96,30 @@ export function buildSteamStoreAppUrl(appId: number): string {
 
 export function buildSteamWishlistProfileUrl(steamId: string): string {
   return `https://store.steampowered.com/wishlist/profiles/${encodeURIComponent(steamId)}/`;
+}
+
+export function parseSteamWishlistProfileUrl(value: string): {
+  profileUrl: string;
+  steamId: string;
+} | null {
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(value.trim());
+  } catch {
+    return null;
+  }
+
+  if (parsedUrl.hostname.toLowerCase() !== 'store.steampowered.com') {
+    return null;
+  }
+
+  const match = parsedUrl.pathname.match(STEAM_WISHLIST_PROFILE_URL_RE);
+  const steamId = match?.groups?.steamId;
+  if (!steamId) return null;
+  return {
+    profileUrl: buildSteamWishlistProfileUrl(steamId),
+    steamId,
+  };
 }
 
 export async function fetchSteamWishlistApiItems(

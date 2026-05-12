@@ -290,7 +290,10 @@ function mockSteamNetwork(
 }
 
 function mockSteamWishlistNetwork(params: {
-  metadata: Record<number, { title: string; releaseDate?: number }>;
+  metadata: Record<
+    number,
+    { libraryCapsule?: string | null; releaseDate?: number; title: string }
+  >;
   wishlistItems?: Array<{ appid: number; date_added?: number; priority?: number }>;
 }) {
   return vi.fn(async (input: RequestInfo | URL) => {
@@ -328,6 +331,10 @@ function mockSteamWishlistNetwork(params: {
                       appid: appId,
                       assets: {
                         asset_url_format: `steam/apps/${appId}/\${FILENAME}?t=123`,
+                        library_capsule:
+                          metadata.libraryCapsule === null
+                            ? undefined
+                            : (metadata.libraryCapsule ?? 'library_capsule.jpg'),
                         library_hero: 'library_hero.jpg',
                       },
                       name: metadata.title,
@@ -865,6 +872,55 @@ describe('GameVaultService Steam wishlist workflow', () => {
         view.items.find((item) => item.appId === 220200)?.library.status,
       ).toBe('not_in_library');
       expect(view.steamId).toBe('76561198086715287');
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('refreshes stale wishlist banner covers with Steam library capsule art', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.replaceSteamWishlistItems([
+        {
+          appId: 3265700,
+          coverUrl:
+            'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3265700/hash/capsule_231x87.jpg?t=1',
+          dateAdded: '2026-04-22T12:00:00.000Z',
+          lastSeenAt: '2026-04-22T12:00:00.000Z',
+          normalizedTitle: 'vampire crawlers the turbo wildcard from vampire survivors',
+          priceLabel: null,
+          priority: null,
+          releaseDate: '2026-04-21T12:00:00.000Z',
+          reviewSummary: null,
+          storeUrl: 'https://store.steampowered.com/app/3265700/',
+          title: 'Vampire Crawlers: The Turbo Wildcard from Vampire Survivors',
+        },
+      ]);
+
+      vi.stubGlobal(
+        'fetch',
+        mockSteamWishlistNetwork({
+          metadata: {
+            3265700: {
+              libraryCapsule:
+                'd2b2ab54dfdf9304856d25867bb6d659562d6d10/library_capsule.jpg',
+              title:
+                'Vampire Crawlers: The Turbo Wildcard from Vampire Survivors',
+            },
+          },
+          wishlistItems: [{ appid: 3265700 }],
+        }),
+      );
+
+      const service = createService(database);
+      const view = await service.syncSteamWishlist({
+        items: [{ appId: 3265700 }],
+        source: 'extension_session',
+      });
+
+      expect(view.items[0]?.coverUrl).toBe(
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3265700/d2b2ab54dfdf9304856d25867bb6d659562d6d10/library_capsule.jpg?t=123',
+      );
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }

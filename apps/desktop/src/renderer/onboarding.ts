@@ -6,12 +6,14 @@ import type {
   HealthColor,
   JDownloaderInstallStatus,
   SettingsView,
+  SteamWishlistView,
 } from '@gamevault/shared-types';
 
 export type DesktopOnboardingStep =
   | 'jdownloader'
   | 'myjdownloader'
-  | 'extension';
+  | 'extension'
+  | 'wishlist';
 
 type EmptyLibraryState = 'items' | 'no-results' | 'start';
 
@@ -35,6 +37,12 @@ export function canConfirmMyJDownloaderStep(
   health: ConnectionHealthSummary | null,
 ): boolean {
   return health?.myJDownloader.color === 'green';
+}
+
+export function canConfirmSteamWishlistStep(
+  wishlist: Pick<SteamWishlistView, 'fetchedAt' | 'steamId'> | null,
+): boolean {
+  return Boolean(wishlist?.fetchedAt && wishlist.steamId);
 }
 
 export function getWorstHealthColor(

@@ -139,6 +139,8 @@ export interface OnboardingState {
   myJDownloaderConfirmedAt?: string | null;
   myJDownloaderSkippedAt?: string | null;
   skippedAt?: string | null;
+  steamWishlistConfirmedAt?: string | null;
+  steamWishlistSkippedAt?: string | null;
   updatedAt?: string | null;
 }
 
@@ -796,6 +798,12 @@ export interface PendingSteamWishlistAction {
 export interface CompleteSteamWishlistRemovalPayload {
   actionId: string;
   appId: number;
+  errorMessage?: string | null;
+  success: boolean;
+}
+
+export interface CompleteSteamWishlistSyncPayload {
+  actionId: string;
   errorMessage?: string | null;
   success: boolean;
 }

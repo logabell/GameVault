@@ -1,8 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  buildSteamLibraryPortraitCoverUrl,
+  isSteamLandscapeArtworkUrl,
   isSteamLibraryCoverUrl,
   resolveSteamLibraryCoverUrl,
+  resolveSteamLibraryPortraitCoverUrl,
 } from '../src/covers.js';
 import {
   buildSteamSearchQueries,
@@ -20,6 +23,7 @@ import {
   buildSteamWishlistProfileUrl,
   fetchSteamWishlistApiItems,
   fetchSteamWishlistMetadata,
+  parseSteamWishlistProfileUrl,
 } from '../src/wishlist.js';
 import { compareSourceToUpstream, createWatchWindow } from '../src/watch.js';
 
@@ -189,6 +193,7 @@ describe('steam matching', () => {
                 appid: 105600,
                 assets: {
                   asset_url_format: 'steam/apps/105600/${FILENAME}?t=123',
+                  library_capsule: 'library_capsule.jpg',
                   library_hero: 'library_hero.jpg',
                 },
                 best_purchase_option: {
@@ -217,7 +222,7 @@ describe('steam matching', () => {
       {
         appId: 105600,
         coverUrl:
-          'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/105600/library_hero.jpg?t=123',
+          'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/105600/library_capsule.jpg?t=123',
         priceLabel: '$9.99',
         releaseDate: '2011-05-16T17:47:00.000Z',
         reviewSummary: 'Overwhelmingly Positive',
@@ -230,6 +235,18 @@ describe('steam matching', () => {
   it('builds Steam wishlist profile URLs', () => {
     expect(buildSteamWishlistProfileUrl('76561198086715287')).toBe(
       'https://store.steampowered.com/wishlist/profiles/76561198086715287/',
+    );
+    expect(
+      parseSteamWishlistProfileUrl(
+        'https://store.steampowered.com/wishlist/profiles/76561198086715287/#sort=order',
+      ),
+    ).toEqual({
+      profileUrl:
+        'https://store.steampowered.com/wishlist/profiles/76561198086715287/',
+      steamId: '76561198086715287',
+    });
+    expect(parseSteamWishlistProfileUrl('https://example.com/wishlist')).toBe(
+      null,
     );
   });
 
@@ -353,6 +370,82 @@ describe('steam matching', () => {
     );
   });
 
+  it('resolves Steam portrait artwork from Store Browse library capsules', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      expect(url.pathname).toBe('/IStoreBrowseService/GetItems/v1/');
+      return new Response(
+        JSON.stringify({
+          response: {
+            store_items: [
+              {
+                appid: 3265700,
+                assets: {
+                  asset_url_format:
+                    'steam/apps/3265700/${FILENAME}?t=1776925935',
+                  library_capsule:
+                    'd2b2ab54dfdf9304856d25867bb6d659562d6d10/library_capsule.jpg',
+                  library_capsule_2x:
+                    'd2b2ab54dfdf9304856d25867bb6d659562d6d10/library_capsule_2x.jpg',
+                  library_hero:
+                    'baf02b93170c9ca0b0e6b28be34b04a77009213d/library_hero.jpg',
+                },
+              },
+            ],
+          },
+        }),
+        { status: 200 },
+      );
+    });
+
+    await expect(
+      resolveSteamLibraryPortraitCoverUrl(3265700, fetchMock as typeof fetch),
+    ).resolves.toBe(
+      'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3265700/d2b2ab54dfdf9304856d25867bb6d659562d6d10/library_capsule_2x.jpg?t=1776925935',
+    );
+  });
+
+  it('falls back to legacy Steam portrait artwork when Store Browse has no library capsule', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === 'api.steampowered.com') {
+        return new Response(
+          JSON.stringify({
+            response: {
+              store_items: [
+                {
+                  appid: 1245620,
+                  assets: {
+                    asset_url_format:
+                      'steam/apps/1245620/${FILENAME}?t=1776359117',
+                    library_hero: 'library_hero.jpg',
+                  },
+                },
+              ],
+            },
+          }),
+          { status: 200 },
+        );
+      }
+
+      return new Response('', {
+        headers: {
+          'content-length': url.pathname.endsWith('library_600x900_2x.jpg')
+            ? '0'
+            : '52021',
+          'content-type': 'image/jpeg',
+        },
+        status: url.pathname.endsWith('library_600x900_2x.jpg') ? 404 : 200,
+      });
+    });
+
+    await expect(
+      resolveSteamLibraryPortraitCoverUrl(1245620, fetchMock as typeof fetch),
+    ).resolves.toBe(
+      'https://cdn.cloudflare.steamstatic.com/steam/apps/1245620/library_600x900.jpg',
+    );
+  });
+
   it('rejects tiny or non-image legacy fallback responses', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = new URL(String(input));
@@ -397,6 +490,28 @@ describe('steam matching', () => {
     expect(
       isSteamLibraryCoverUrl(
         'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2807960/hash/capsule_231x87.jpg',
+      ),
+    ).toBe(false);
+  });
+
+  it('builds Steam portrait URLs and flags landscape Steam artwork', () => {
+    expect(buildSteamLibraryPortraitCoverUrl(105600)).toBe(
+      'https://cdn.cloudflare.steamstatic.com/steam/apps/105600/library_600x900.jpg',
+    );
+    expect(buildSteamLibraryPortraitCoverUrl(null)).toBeNull();
+    expect(
+      isSteamLandscapeArtworkUrl(
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3265700/hash/capsule_231x87.jpg?t=1776925935',
+      ),
+    ).toBe(true);
+    expect(
+      isSteamLandscapeArtworkUrl(
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3265700/hash/library_hero_2x.jpg?t=1776925935',
+      ),
+    ).toBe(true);
+    expect(
+      isSteamLandscapeArtworkUrl(
+        'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3265700/hash/library_capsule_2x.jpg?t=1776925935',
       ),
     ).toBe(false);
   });

@@ -9,6 +9,7 @@ import type {
   CacheSteamDbBuildLookupPayload,
   CompleteSteamDbBuildLookupPayload,
   CompleteSteamWishlistRemovalPayload,
+  CompleteSteamWishlistSyncPayload,
   ConnectionHealthSummary,
   ConfirmedSteamMatch,
   DesktopHealthSummary,
@@ -109,10 +110,13 @@ import {
   createWatchWindow,
   fetchSteamWishlistApiItems,
   fetchSteamWishlistMetadata,
+  isSteamLandscapeArtworkUrl,
   isSteamLibraryCoverUrl,
   normalizeSteamTitle,
   parseSteamDbPatchCandidates,
+  parseSteamWishlistProfileUrl,
   resolveSteamLibraryCoverUrl,
+  resolveSteamLibraryPortraitCoverUrl,
   resolveSteamMatch as resolveSteamSearch,
 } from '@gamevault/steam-core';
 import {
@@ -4381,6 +4385,11 @@ export class GameVaultService {
     payload: SteamWishlistSyncPayload,
   ): Promise<void> {
     const fetchedAt = payload.fetchedAt ?? new Date().toISOString();
+    const cachedByAppId = new Map(
+      this.database
+        .listSteamWishlistItems()
+        .map((item) => [item.appId, item] as const),
+    );
     const byAppId = new Map<number, SteamWishlistCachedItem>();
     const inputItems = new Map<number, SteamWishlistSyncItem>();
     for (const item of payload.items) {
@@ -4410,27 +4419,69 @@ export class GameVaultService {
       }
     }
 
+    const metadataFetchAppIds = [...inputItems.keys()].filter((appId) => {
+      const cached = cachedByAppId.get(appId);
+      return (
+        !cached ||
+        cached.title === `Steam App ${appId}` ||
+        !cached.coverUrl ||
+        isSteamLandscapeArtworkUrl(cached.coverUrl) ||
+        !cached.releaseDate
+      );
+    });
     const metadataByAppId = new Map(
-      await fetchSteamWishlistMetadata([...inputItems.keys()], this.steamFetch)
+      await fetchSteamWishlistMetadata(metadataFetchAppIds, this.steamFetch)
         .then((metadata) =>
           metadata.map((entry) => [entry.appId, entry] as const),
         )
         .catch(() => []),
     );
+    const coverFallbackByAppId = new Map(
+      await Promise.all(
+        metadataFetchAppIds.map(async (appId) => {
+          const cached = cachedByAppId.get(appId);
+          const metadata = metadataByAppId.get(appId);
+          const cachedCoverUrl =
+            cached?.coverUrl && !isSteamLandscapeArtworkUrl(cached.coverUrl)
+              ? cached.coverUrl
+              : null;
+          if (cachedCoverUrl || metadata?.coverUrl) {
+            return [appId, null] as const;
+          }
+          return [
+            appId,
+            await resolveSteamLibraryPortraitCoverUrl(
+              appId,
+              this.steamFetch,
+            ).catch(() => null),
+          ] as const;
+        }),
+      ),
+    );
     for (const item of inputItems.values()) {
       const metadata = metadataByAppId.get(item.appId);
-      const title = metadata?.title ?? `Steam App ${item.appId}`;
+      const cached = cachedByAppId.get(item.appId);
+      const title = metadata?.title ?? cached?.title ?? `Steam App ${item.appId}`;
+      const cachedCoverUrl =
+        cached?.coverUrl && !isSteamLandscapeArtworkUrl(cached.coverUrl)
+          ? cached.coverUrl
+          : null;
       byAppId.set(item.appId, {
         appId: item.appId,
-        coverUrl: metadata?.coverUrl ?? null,
-        dateAdded: item.dateAdded ?? null,
+        coverUrl:
+          metadata?.coverUrl ??
+          cachedCoverUrl ??
+          coverFallbackByAppId.get(item.appId) ??
+          null,
+        dateAdded: item.dateAdded ?? cached?.dateAdded ?? null,
         lastSeenAt: fetchedAt,
         normalizedTitle: normalizeSteamTitle(title),
-        priceLabel: metadata?.priceLabel ?? null,
-        priority: item.priority ?? null,
-        releaseDate: metadata?.releaseDate ?? null,
-        reviewSummary: metadata?.reviewSummary ?? null,
-        storeUrl: metadata?.storeUrl ?? buildSteamStoreAppUrl(item.appId),
+        priceLabel: metadata?.priceLabel ?? cached?.priceLabel ?? null,
+        priority: item.priority && item.priority > 0 ? item.priority : null,
+        releaseDate: metadata?.releaseDate ?? cached?.releaseDate ?? null,
+        reviewSummary: metadata?.reviewSummary ?? cached?.reviewSummary ?? null,
+        storeUrl:
+          metadata?.storeUrl ?? cached?.storeUrl ?? buildSteamStoreAppUrl(item.appId),
         title,
       });
     }
@@ -4475,7 +4526,35 @@ export class GameVaultService {
     return this.buildSteamWishlistView();
   }
 
+  async configureSteamWishlistProfile(payload: {
+    profileUrl: string;
+  }): Promise<SteamWishlistView> {
+    const parsed = parseSteamWishlistProfileUrl(payload.profileUrl);
+    if (!parsed) {
+      throw new Error(
+        'Paste a Steam wishlist URL like https://store.steampowered.com/wishlist/profiles/76561198086715287/.',
+      );
+    }
+
+    this.saveSteamWishlistSettings({
+      lastError: null,
+      profileUrl: parsed.profileUrl,
+      source: 'cache',
+      steamId: parsed.steamId,
+    });
+    this.appendEvent('info', 'Configured Steam wishlist profile', {
+      steamId: parsed.steamId,
+    });
+    return this.buildSteamWishlistView();
+  }
+
   async requestSteamWishlistRefresh(): Promise<SteamWishlistView> {
+    const settings = this.getSteamWishlistSettings();
+    if (!settings.profileUrl || !settings.steamId) {
+      throw new Error(
+        'Paste your Steam wishlist profile URL in setup before syncing.',
+      );
+    }
     const pendingSync = this.database
       .listSteamWishlistActions('pending')
       .find((action) => action.actionType === 'sync');
@@ -4484,6 +4563,7 @@ export class GameVaultService {
         actionType: 'sync',
         title: 'Steam wishlist sync',
       });
+      this.saveSteamWishlistSettings({ lastError: null });
       this.appendEvent('info', 'Requested Steam wishlist sync');
     }
     return this.buildSteamWishlistView();
@@ -4508,6 +4588,27 @@ export class GameVaultService {
     return this.buildSteamWishlistView('extension_session');
   }
 
+  completeSteamWishlistSync(
+    payload: CompleteSteamWishlistSyncPayload,
+  ): SteamWishlistRemovalRecord {
+    const action = this.database.completeSteamWishlistAction({
+      actionId: payload.actionId,
+      errorMessage: payload.success ? null : payload.errorMessage,
+      status: payload.success ? 'complete' : 'failed',
+    });
+    if (payload.success) {
+      this.saveSteamWishlistSettings({ lastError: null });
+    } else {
+      const errorMessage =
+        payload.errorMessage ?? 'Steam wishlist sync failed in browser.';
+      this.saveSteamWishlistSettings({ lastError: errorMessage });
+      this.appendEvent('warn', 'Steam wishlist sync failed', {
+        errorMessage,
+      });
+    }
+    return action;
+  }
+
   listPendingSteamWishlistActions(): PendingSteamWishlistAction[] {
     const settings = this.getSteamWishlistSettings();
     const actions = this.database.listPendingSteamWishlistActions({
@@ -4520,6 +4621,9 @@ export class GameVaultService {
       : 0;
     if (
       !hasPendingSync &&
+      settings.profileUrl &&
+      settings.steamId &&
+      !settings.lastError &&
       (!settings.fetchedAt ||
         Number.isNaN(fetchedAtMs) ||
         Date.now() - fetchedAtMs > STEAM_WISHLIST_REFRESH_STALE_MS)

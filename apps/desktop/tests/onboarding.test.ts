@@ -4,6 +4,7 @@ import { FIREFOX_EXTENSION_ID } from '@gamevault/shared-types';
 import {
   canConfirmJDownloaderStep,
   canConfirmMyJDownloaderStep,
+  canConfirmSteamWishlistStep,
   getDesktopHealthMenuTitle,
   getEmptyLibraryState,
   getWorstHealthColor,
@@ -49,6 +50,15 @@ describe('desktop onboarding helpers', () => {
         myJDownloader: { color: 'green', label: 'Ready', message: 'Ready' },
       }),
     ).toBe(true);
+    expect(
+      canConfirmSteamWishlistStep({
+        fetchedAt: '2026-05-12T12:00:00.000Z',
+        steamId: '76561198086715287',
+      }),
+    ).toBe(true);
+    expect(canConfirmSteamWishlistStep({ fetchedAt: null, steamId: null })).toBe(
+      false,
+    );
   });
 
   it('validates extension IDs and empty library states', () => {

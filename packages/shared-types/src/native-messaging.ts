@@ -3,6 +3,7 @@ import type {
   CacheSteamDbBuildLookupPayload,
   CompleteSteamDbBuildLookupPayload,
   CompleteSteamWishlistRemovalPayload,
+  CompleteSteamWishlistSyncPayload,
   ConnectionHealthSummary,
   CreateMatchedDraftPayload,
   PendingSteamWishlistAction,
@@ -91,6 +92,10 @@ export type NativeMessageRequest =
   | {
       type: 'completeSteamWishlistRemoval';
       payload: CompleteSteamWishlistRemovalPayload;
+    }
+  | {
+      type: 'completeSteamWishlistSync';
+      payload: CompleteSteamWishlistSyncPayload;
     }
   | {
       type: 'updateSteamDbBuildLookup';
@@ -286,6 +291,11 @@ export type NativeMessageResponse =
   | {
       ok: true;
       type: 'completeSteamWishlistRemoval';
+      payload: SteamWishlistRemovalRecord;
+    }
+  | {
+      ok: true;
+      type: 'completeSteamWishlistSync';
       payload: SteamWishlistRemovalRecord;
     }
   | {

@@ -1063,6 +1063,9 @@ async function bootstrap() {
   ipcMain.handle('gamevault:getSteamWishlist', () =>
     service.getSteamWishlist(),
   );
+  ipcMain.handle('gamevault:configureSteamWishlistProfile', (_event, payload) =>
+    service.configureSteamWishlistProfile(payload),
+  );
   ipcMain.handle('gamevault:requestSteamWishlistRefresh', () =>
     service.requestSteamWishlistRefresh(),
   );

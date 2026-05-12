@@ -9,6 +9,8 @@ const api = {
     ipcRenderer.invoke('gamevault:cancelDownload', trackedItemId),
   confirmManualDownloadReady: (trackedItemId: string) =>
     ipcRenderer.invoke('gamevault:confirmManualDownloadReady', trackedItemId),
+  configureSteamWishlistProfile: (payload: { profileUrl: string }) =>
+    ipcRenderer.invoke('gamevault:configureSteamWishlistProfile', payload),
   completeStagedInstall: (trackedItemId: string) =>
     ipcRenderer.invoke('gamevault:completeStagedInstall', trackedItemId),
   disconnectMyJDownloader: () =>

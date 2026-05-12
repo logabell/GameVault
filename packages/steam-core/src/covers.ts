@@ -48,16 +48,12 @@ function buildGetItemsUrl(appId: number): URL {
   return url;
 }
 
-function buildStoreAssetUrl(assets: StoreItemAssets): string | null {
+function buildStoreAssetUrl(
+  assets: StoreItemAssets,
+  filenames: Array<string | null>,
+): string | null {
   const format = stringOrNull(assets.asset_url_format);
-  const filename =
-    stringOrNull(assets.library_hero_2x) ??
-    stringOrNull(assets.library_hero) ??
-    stringOrNull(assets.hero_capsule) ??
-    stringOrNull(assets.main_capsule) ??
-    stringOrNull(assets.header) ??
-    stringOrNull(assets.library_capsule_2x) ??
-    stringOrNull(assets.library_capsule);
+  const filename = filenames.find((entry) => entry);
   if (!format || !filename || !format.includes('${FILENAME}')) {
     return null;
   }
@@ -66,6 +62,25 @@ function buildStoreAssetUrl(assets: StoreItemAssets): string | null {
   return assetPath.startsWith('http')
     ? assetPath
     : `${STEAM_ASSET_CDN_BASE}${assetPath.replace(/^\/+/, '')}`;
+}
+
+function buildStoreLandscapeAssetUrl(assets: StoreItemAssets): string | null {
+  return buildStoreAssetUrl(assets, [
+    stringOrNull(assets.library_hero_2x),
+    stringOrNull(assets.library_hero),
+    stringOrNull(assets.hero_capsule),
+    stringOrNull(assets.main_capsule),
+    stringOrNull(assets.header),
+    stringOrNull(assets.library_capsule_2x),
+    stringOrNull(assets.library_capsule),
+  ]);
+}
+
+function buildStorePortraitAssetUrl(assets: StoreItemAssets): string | null {
+  return buildStoreAssetUrl(assets, [
+    stringOrNull(assets.library_capsule_2x),
+    stringOrNull(assets.library_capsule),
+  ]);
 }
 
 async function resolveCoverFromStoreBrowse(
@@ -88,7 +103,30 @@ async function resolveCoverFromStoreBrowse(
     : [];
   const item = asRecord(storeItems[0]);
   const assets = asRecord(item?.assets);
-  return assets ? buildStoreAssetUrl(assets) : null;
+  return assets ? buildStoreLandscapeAssetUrl(assets) : null;
+}
+
+async function resolvePortraitFromStoreBrowse(
+  appId: number,
+  fetchImpl: typeof fetch,
+): Promise<string | null> {
+  const response = await fetchImpl(buildGetItemsUrl(appId), {
+    headers: {
+      'User-Agent': 'GameVault/0.1 (+https://example.invalid/gamevault)',
+    },
+  });
+  if (!response.ok) {
+    return null;
+  }
+
+  const payload = asRecord(await response.json());
+  const responsePayload = asRecord(payload?.response);
+  const storeItems = Array.isArray(responsePayload?.store_items)
+    ? responsePayload.store_items
+    : [];
+  const item = asRecord(storeItems[0]);
+  const assets = asRecord(item?.assets);
+  return assets ? buildStorePortraitAssetUrl(assets) : null;
 }
 
 async function legacyCoverLooksUsable(
@@ -152,6 +190,38 @@ async function resolveLegacyCoverUrl(
   return null;
 }
 
+async function resolveLegacyPortraitCoverUrl(
+  appId: number,
+  fetchImpl: typeof fetch,
+): Promise<string | null> {
+  const candidates = [
+    `${LEGACY_STEAM_CDN_BASE}/steam/apps/${appId}/library_600x900_2x.jpg`,
+    `${LEGACY_STEAM_CDN_BASE}/steam/apps/${appId}/library_600x900.jpg`,
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      if (await legacyCoverLooksUsable(candidate, fetchImpl)) {
+        return candidate;
+      }
+    } catch {
+      // Try the next candidate.
+    }
+  }
+
+  return null;
+}
+
+export function buildSteamLibraryPortraitCoverUrl(
+  appId: number | null | undefined,
+): string | null {
+  if (!Number.isInteger(appId) || !appId || appId <= 0) {
+    return null;
+  }
+
+  return `${LEGACY_STEAM_CDN_BASE}/steam/apps/${appId}/library_600x900.jpg`;
+}
+
 export async function resolveSteamLibraryCoverUrl(
   appId: number,
   fetchImpl: typeof fetch = fetch,
@@ -172,6 +242,29 @@ export async function resolveSteamLibraryCoverUrl(
   return resolveLegacyCoverUrl(appId, fetchImpl);
 }
 
+export async function resolveSteamLibraryPortraitCoverUrl(
+  appId: number,
+  fetchImpl: typeof fetch = fetch,
+): Promise<string | null> {
+  if (!Number.isInteger(appId) || appId <= 0) {
+    return null;
+  }
+
+  try {
+    const storeBrowseCover = await resolvePortraitFromStoreBrowse(
+      appId,
+      fetchImpl,
+    );
+    if (storeBrowseCover) {
+      return storeBrowseCover;
+    }
+  } catch {
+    // Fall back to legacy CDN paths below.
+  }
+
+  return resolveLegacyPortraitCoverUrl(appId, fetchImpl);
+}
+
 export function isSteamLibraryCoverUrl(url: string | null | undefined): boolean {
   if (!url) {
     return false;
@@ -182,6 +275,26 @@ export function isSteamLibraryCoverUrl(url: string | null | undefined): boolean 
     return (
       /(^|\.)steamstatic\.com$/i.test(parsed.hostname) &&
       /\/(?:library_hero(?:_2x)?|hero_capsule|capsule_616x353|header)\.jpg$/i.test(
+        parsed.pathname,
+      )
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function isSteamLandscapeArtworkUrl(
+  url: string | null | undefined,
+): boolean {
+  if (!url) {
+    return false;
+  }
+
+  try {
+    const parsed = new URL(url);
+    return (
+      /(^|\.)steamstatic\.com$/i.test(parsed.hostname) &&
+      /\/(?:library_hero(?:_2x)?|hero_capsule(?:_2x)?|capsule_\d+x\d+(?:_2x)?|header(?:_2x)?|main_capsule(?:_2x)?)\.jpg$/i.test(
         parsed.pathname,
       )
     );
