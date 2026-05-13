@@ -1,5 +1,7 @@
 # GameVault
 
+![GameVault library dashboard demo](docs/assets/gamevault-demo.gif)
+
 GameVault is a desktop app and browser extension for tracking a PC game library against supported source pages and SteamDB patch metadata. It helps you understand what is installed, what source release it came from, whether a newer release is available, and what action is needed next.
 
 ## What It Does
