@@ -1616,6 +1616,7 @@ export class GameVaultService {
     string,
     DirectHttpDownloadHandle
   >();
+  private readonly activeDirectHttpJobs = new Set<string>();
   private readonly steamDbBuildLookups = new Map<
     string,
     SteamDbBuildLookupState
@@ -2520,6 +2521,20 @@ export class GameVaultService {
   }
 
   private async runDirectHttpDownloadJob(params: {
+    job: DownloadJobRecord;
+    onStarted?: () => void;
+    parsedSource: ParsedSourcePayload;
+    trackedItemId: string;
+  }): Promise<void> {
+    this.activeDirectHttpJobs.add(params.trackedItemId);
+    try {
+      await this.runDirectHttpDownloadJobInternal(params);
+    } finally {
+      this.activeDirectHttpJobs.delete(params.trackedItemId);
+    }
+  }
+
+  private async runDirectHttpDownloadJobInternal(params: {
     job: DownloadJobRecord;
     onStarted?: () => void;
     parsedSource: ParsedSourcePayload;
@@ -8643,7 +8658,7 @@ export class GameVaultService {
               continue;
             }
             if (isDirectHttpProvider(job.provider)) {
-              if (!this.activeDirectHttpDownloads.has(item.id)) {
+              if (!this.activeDirectHttpJobs.has(item.id)) {
                 const recoveredJob = await this.recoverDirectHttpDownloadJob(
                   item,
                   job,

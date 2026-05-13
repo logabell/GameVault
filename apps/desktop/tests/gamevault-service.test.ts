@@ -7565,6 +7565,107 @@ describe('GameVaultService SteamDB patch workflow', () => {
     }
   });
 
+  it('keeps Ankergames curl installs extracting while background ZIP extraction is active', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const downloadCompletion = createDeferred<{
+        fileName: string;
+        savePath: string;
+      }>();
+      const extractionStarted = createDeferred<void>();
+      const releaseExtraction = createDeferred<void>();
+      let extractAttemptCount = 0;
+      const extractStagedZipArchive = vi.fn(
+        async (params: { extractPath: string }) => {
+          extractAttemptCount += 1;
+          if (extractAttemptCount > 1) {
+            return null;
+          }
+
+          extractionStarted.resolve();
+          await releaseExtraction.promise;
+          await mkdir(join(params.extractPath, 'Shape of Dreams'), {
+            recursive: true,
+          });
+          await writeFile(
+            join(params.extractPath, 'Shape of Dreams', 'ShapeOfDreams.exe'),
+            'game',
+          );
+          return join(params.extractPath, 'Shape-Of-Dreams-AnkerGames.zip');
+        },
+      );
+      const startEmbeddedBrowserDownload = createEmbeddedBrowserRunner({
+        completion: downloadCompletion.promise,
+      });
+      const service = createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        fetch,
+        undefined,
+        undefined,
+        extractStagedZipArchive,
+        startEmbeddedBrowserDownload,
+      );
+
+      const queued = await service.addTrackedItem({
+        parsedSource: ankergamesDirectReadySource,
+        queueDownload: true,
+        selectedDownloads: {
+          fullUrl: 'https://ankergames.net/generate-download-url/2557',
+        },
+        selectedSteamPatch: {
+          ...selectedPatch,
+          appId: 2444750,
+          buildId: '22630308',
+        },
+        steamMatch: {
+          ...steamMatch,
+          appId: 2444750,
+          normalizedTitle: 'shape of dreams',
+          title: 'Shape of Dreams',
+        },
+      });
+      const stagePath = queued.currentDownload?.stagePath;
+      const finalPath = join(tempRoot, 'Library', 'Shape of Dreams');
+      expect(stagePath).toEqual(expect.any(String));
+      await writeFile(
+        join(stagePath!, 'Shape-Of-Dreams-AnkerGames.zip'),
+        'zip',
+      );
+
+      downloadCompletion.resolve({
+        fileName: 'Shape-Of-Dreams-AnkerGames.zip',
+        savePath: join(stagePath!, 'Shape-Of-Dreams-AnkerGames.zip'),
+      });
+      await extractionStarted.promise;
+      await service.pollDownloadJobs();
+
+      expect(extractStagedZipArchive).toHaveBeenCalledTimes(1);
+      expect(database.getDownloadJob(queued.item.id)).toMatchObject({
+        provider: 'direct_http',
+        stage: 'extracting',
+        statusMessage: 'Extracting staged archive',
+      });
+
+      releaseExtraction.resolve();
+      await waitForCondition(
+        () => database.getDownloadJob(queued.item.id)?.stage === 'complete',
+      );
+
+      expect(existsSync(join(finalPath, 'ShapeOfDreams.exe'))).toBe(true);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('refreshes the Playnite manifest after a direct download installs', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -7742,7 +7843,7 @@ describe('GameVaultService SteamDB patch workflow', () => {
       await recoveredService.pollDownloadJobs();
 
       expect(existsSync(join(finalPath, 'ShapeOfDreams.exe'))).toBe(true);
-      expect(existsSync(join(finalPath, 'Run me!.bat'))).toBe(true);
+      expect(existsSync(join(finalPath, 'Run me!.bat'))).toBe(false);
       expect(existsSync(stagePath!)).toBe(false);
       expect(database.getDownloadJob(queued.item.id)).toMatchObject({
         provider: 'direct_http',
@@ -7943,9 +8044,7 @@ describe('GameVaultService SteamDB patch workflow', () => {
       await expect(readFile(join(finalPath, 'MOUSE.exe'), 'utf8')).resolves.toBe(
         'game',
       );
-      await expect(readFile(join(finalPath, 'Run Me!.bat'), 'utf8')).resolves.toBe(
-        'bat',
-      );
+      expect(existsSync(join(finalPath, 'Run Me!.bat'))).toBe(false);
       expect(existsSync(join(finalPath, 'Redist'))).toBe(false);
       expect(existsSync(stagePath)).toBe(false);
       expect(database.getDownloadJob(item.id)).toMatchObject({

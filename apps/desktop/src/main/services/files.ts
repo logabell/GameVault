@@ -409,59 +409,6 @@ function isPortableArchiveExtraFile(fileName: string): boolean {
   );
 }
 
-function isAnkerGamesRunMeBatchFile(fileName: string): boolean {
-  return fileName.toLowerCase() === 'run me!.bat';
-}
-
-async function findAnkerGamesRunMeBatchFile(
-  rootPath: string,
-): Promise<string | null> {
-  const entries = (await readdir(rootPath, { withFileTypes: true })).sort(
-    (left, right) => left.name.localeCompare(right.name),
-  );
-
-  for (const entry of entries) {
-    if (entry.isFile() && isAnkerGamesRunMeBatchFile(entry.name)) {
-      return resolve(join(rootPath, entry.name));
-    }
-  }
-
-  for (const entry of entries) {
-    if (!entry.isDirectory()) {
-      continue;
-    }
-
-    const childMatch = await findAnkerGamesRunMeBatchFile(
-      resolve(join(rootPath, entry.name)),
-    );
-    if (childMatch) {
-      return childMatch;
-    }
-  }
-
-  return null;
-}
-
-async function preserveAnkerGamesRunMeBatchFile(params: {
-  extractPath: string;
-  finalPath: string;
-}): Promise<void> {
-  const sourcePath = await findAnkerGamesRunMeBatchFile(params.extractPath);
-  if (!sourcePath) {
-    return;
-  }
-
-  const targetPath = resolve(join(params.finalPath, basename(sourcePath)));
-  assertPathInside(params.extractPath, sourcePath);
-  assertPathInside(params.finalPath, targetPath);
-
-  if (await pathExists(targetPath)) {
-    return;
-  }
-
-  await rename(sourcePath, targetPath);
-}
-
 async function directoryContainsPayloadFile(
   rootPath: string,
 ): Promise<boolean> {
@@ -698,12 +645,6 @@ export async function finalizePortableArchiveExtraction(params: {
     await rm(finalPath, { force: true, recursive: true });
   }
   await stageMove({ finalPath, stagePath: contentFolderPath });
-  if (params.sourceKind === 'ankergames') {
-    await preserveAnkerGamesRunMeBatchFile({
-      extractPath: params.extractPath,
-      finalPath,
-    });
-  }
   await rm(extractWorkspacePath, { force: true, recursive: true });
 }
 
