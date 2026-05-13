@@ -58,6 +58,10 @@ const STEAMDB_BACKFILL_TTL_MS = 30 * 60 * 1000;
 const DESKTOP_STEAMDB_LOOKUP_FAST_POLL_MS = 2500;
 const STEAMDB_RETRY_AFTER_HINT_TTL_MS = 10 * 60 * 1000;
 const STEAM_WISHLIST_SYNC_MIN_INTERVAL_MS = 5 * 60 * 1000;
+const STEAM_WISHLIST_SIGN_IN_MESSAGE =
+  'Steam did not return a signed-in wishlist. Open Steam Wishlist in this browser, sign in, then run Sync again.';
+const STEAM_WISHLIST_ACCOUNT_MISMATCH_MESSAGE =
+  'Steam is signed in as a different account than the saved wishlist URL. Open the saved Steam Wishlist, sign in as that account, then run Sync again.';
 
 interface CachedParsedPage {
   canonicalUrl: string;
@@ -1050,6 +1054,22 @@ function unixTimestampToIso(value: unknown): string | null {
     : null;
 }
 
+function parseSteamUserIdFromHtml(html: string): string | null {
+  return (
+    html.match(/g_steamID\s*=\s*["']?(?<steamId>\d{17})["']?/)
+      ?.groups?.steamId ??
+    null
+  );
+}
+
+function looksLikeSteamSignInPage(html: string): boolean {
+  return (
+    /<title>\s*(Welcome to Steam|Steam Login)/i.test(html) ||
+    /g_steamID\s*=\s*false/i.test(html) ||
+    /<form[^>]+action="[^"]*\/login\//i.test(html)
+  );
+}
+
 function parseSteamWishlistDataItems(value: unknown): SteamWishlistSyncItem[] {
   if (Array.isArray(value)) {
     return value.flatMap((entry) => {
@@ -1091,6 +1111,8 @@ async function fetchSteamWishlistProfile(action?: {
   html: string;
   profileUrl: string;
   sessionId: string | null;
+  signedIn: boolean;
+  signedInSteamId: string | null;
   steamId: string;
 }> {
   const targetUrl =
@@ -1113,6 +1135,14 @@ async function fetchSteamWishlistProfile(action?: {
 
   const profile = parseSteamWishlistProfileUrl(response.url);
   const html = await response.text();
+  const steamUserId = parseSteamUserIdFromHtml(html);
+  const signedIn = Boolean(steamUserId) && !looksLikeSteamSignInPage(html);
+  const sessionId =
+    html.match(/g_sessionID\s*=\s*"(?<sessionId>[^"]+)"/)?.groups
+      ?.sessionId ??
+    html.match(/"sessionid"\s*:\s*"(?<sessionId>[^"]+)"/)?.groups
+      ?.sessionId ??
+    null;
   if (!profile) {
     const fallbackProfile = parseSteamWishlistProfileUrl(targetUrl);
     if (!fallbackProfile) {
@@ -1121,26 +1151,19 @@ async function fetchSteamWishlistProfile(action?: {
     return {
       html,
       profileUrl: fallbackProfile.profileUrl,
-      sessionId:
-        html.match(/g_sessionID\s*=\s*"(?<sessionId>[^"]+)"/)?.groups
-          ?.sessionId ??
-        html.match(/"sessionid"\s*:\s*"(?<sessionId>[^"]+)"/)?.groups
-          ?.sessionId ??
-        null,
+      sessionId,
+      signedIn,
+      signedInSteamId: steamUserId,
       steamId: fallbackProfile.steamId,
     };
   }
 
-  const sessionId =
-    html.match(/g_sessionID\s*=\s*"(?<sessionId>[^"]+)"/)?.groups
-      ?.sessionId ??
-    html.match(/"sessionid"\s*:\s*"(?<sessionId>[^"]+)"/)?.groups
-      ?.sessionId ??
-    null;
   return {
     html,
     profileUrl: profile.profileUrl,
     sessionId,
+    signedIn,
+    signedInSteamId: steamUserId,
     steamId: profile.steamId,
   };
 }
@@ -1162,6 +1185,14 @@ async function readSteamWishlistDataItems(profileUrl: string): Promise<
       },
     });
     if (!response.ok) break;
+    const contentType = response.headers.get('content-type') ?? '';
+    if (contentType && !/\bjson\b/i.test(contentType)) {
+      const html = await response.text().catch(() => '');
+      if (looksLikeSteamSignInPage(html)) {
+        throw new Error(STEAM_WISHLIST_SIGN_IN_MESSAGE);
+      }
+      throw new Error('Steam wishlist data did not return JSON.');
+    }
     const items = parseSteamWishlistDataItems(await response.json());
     if (items.length === 0) break;
     let addedCount = 0;
@@ -1192,6 +1223,12 @@ async function readSteamWishlistSessionItems(
       steamId: profile.steamId,
     };
   }
+  if (
+    profile.signedInSteamId &&
+    profile.signedInSteamId !== profile.steamId
+  ) {
+    throw new Error(STEAM_WISHLIST_ACCOUNT_MISMATCH_MESSAGE);
+  }
 
   const userDataUrl = new URL(
     'https://store.steampowered.com/dynamicstore/userdata/',
@@ -1217,6 +1254,9 @@ async function readSteamWishlistSessionItems(
     const appId = numberOrNull(value);
     return appId ? [{ appId }] : [];
   });
+  if (items.length === 0 && !profile.signedIn) {
+    throw new Error(STEAM_WISHLIST_SIGN_IN_MESSAGE);
+  }
 
   return {
     fetchedAt: new Date().toISOString(),
@@ -1270,6 +1310,15 @@ async function removeSteamWishlistItem(
     throw new Error('Wishlist removal action is missing a Steam AppID.');
   }
   const profile = await fetchSteamWishlistProfile(action);
+  if (!profile.signedIn) {
+    throw new Error(STEAM_WISHLIST_SIGN_IN_MESSAGE);
+  }
+  if (
+    profile.signedInSteamId &&
+    profile.signedInSteamId !== profile.steamId
+  ) {
+    throw new Error(STEAM_WISHLIST_ACCOUNT_MISMATCH_MESSAGE);
+  }
   if (!profile.sessionId) {
     throw new Error('Steam session id was unavailable. Open Steam and sign in.');
   }

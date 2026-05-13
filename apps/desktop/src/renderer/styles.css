@@ -619,6 +619,10 @@ code {
   margin-top: 10px;
 }
 
+.wishlist-status-actions {
+  margin-top: 8px;
+}
+
 .wishlist-toolbar {
   grid-template-columns: 1fr;
   align-items: start;

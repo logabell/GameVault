@@ -178,7 +178,6 @@ const IMPORT_STEAM_MATCH_CONCURRENCY = 3;
 const STEAMDB_BUILD_LOOKUP_TTL_MS = 60 * 60 * 1000;
 const SOURCE_CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
 const STEAMRIP_UPLOAD_PATCH_WINDOW_DAYS = 2;
-const STEAM_WISHLIST_REFRESH_STALE_MS = 5 * 60 * 1000;
 const WAITING_FOR_JDOWNLOADER_EXTRACTION_STATUS =
   'Waiting for JDownloader extraction to finish';
 const SOURCE_MATCH_PROBABLE_SCORE = 0.92;
@@ -4421,19 +4420,6 @@ export class GameVaultService {
     };
   }
 
-  private async refreshSteamWishlistFromPublicApi(
-    steamId: string,
-  ): Promise<void> {
-    const apiItems = await fetchSteamWishlistApiItems(steamId, this.steamFetch);
-    await this.replaceSteamWishlistCache({
-      fetchedAt: new Date().toISOString(),
-      items: apiItems,
-      profileUrl: `https://store.steampowered.com/wishlist/profiles/${steamId}/`,
-      source: 'public_api',
-      steamId,
-    });
-  }
-
   private async replaceSteamWishlistCache(
     payload: SteamWishlistSyncPayload,
   ): Promise<void> {
@@ -4550,32 +4536,6 @@ export class GameVaultService {
   }
 
   async getSteamWishlist(): Promise<SteamWishlistView> {
-    const settings = this.getSteamWishlistSettings();
-    const fetchedAtMs = settings.fetchedAt
-      ? new Date(settings.fetchedAt).getTime()
-      : 0;
-    if (
-      settings.steamId &&
-      this.database.listSteamWishlistItems().length === 0 &&
-      (!settings.fetchedAt ||
-        Number.isNaN(fetchedAtMs) ||
-        Date.now() - fetchedAtMs > STEAM_WISHLIST_REFRESH_STALE_MS) &&
-      !this.database
-        .listSteamWishlistActions('pending')
-        .some((action) => action.actionType === 'sync')
-    ) {
-      try {
-        await this.refreshSteamWishlistFromPublicApi(settings.steamId);
-        return this.buildSteamWishlistView('public_api');
-      } catch (error) {
-        this.saveSteamWishlistSettings({
-          lastError:
-            error instanceof Error
-              ? error.message
-              : 'Unable to load Steam wishlist.',
-        });
-      }
-    }
     return this.buildSteamWishlistView();
   }
 
@@ -4616,9 +4576,9 @@ export class GameVaultService {
         actionType: 'sync',
         title: 'Steam wishlist sync',
       });
-      this.saveSteamWishlistSettings({ lastError: null });
       this.appendEvent('info', 'Requested Steam wishlist sync');
     }
+    this.saveSteamWishlistSettings({ lastError: null });
     return this.buildSteamWishlistView();
   }
 
@@ -4664,39 +4624,10 @@ export class GameVaultService {
 
   listPendingSteamWishlistActions(): PendingSteamWishlistAction[] {
     const settings = this.getSteamWishlistSettings();
-    const actions = this.database.listPendingSteamWishlistActions({
+    return this.database.listPendingSteamWishlistActions({
       profileUrl: settings.profileUrl,
       steamId: settings.steamId,
     });
-    const hasPendingSync = actions.some((action) => action.actionType === 'sync');
-    const fetchedAtMs = settings.fetchedAt
-      ? new Date(settings.fetchedAt).getTime()
-      : 0;
-    if (
-      !hasPendingSync &&
-      settings.profileUrl &&
-      settings.steamId &&
-      !settings.lastError &&
-      (!settings.fetchedAt ||
-        Number.isNaN(fetchedAtMs) ||
-        Date.now() - fetchedAtMs > STEAM_WISHLIST_REFRESH_STALE_MS)
-    ) {
-      const action = this.database.createSteamWishlistAction({
-        actionType: 'sync',
-        title: 'Steam wishlist sync',
-      });
-      actions.push({
-        actionType: 'sync',
-        appId: null,
-        id: action.id,
-        profileUrl: settings.profileUrl,
-        requestedAt: action.requestedAt,
-        steamId: settings.steamId,
-        title: action.title,
-        trackedItemId: null,
-      });
-    }
-    return actions;
   }
 
   async requestSteamWishlistRemoval(payload: {

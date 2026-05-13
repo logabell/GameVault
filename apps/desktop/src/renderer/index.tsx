@@ -2680,7 +2680,7 @@ function App() {
       setSteamWishlist(nextWishlist);
       setWishlistProfileUrlDraft(nextWishlist.profileUrl ?? '');
       setWishlistMessage(
-        'Sync queued. Waiting for the browser extension to read Steam and report back.',
+        'Sync queued. Open Steam Wishlist in the same browser if Steam needs you to sign in again.',
       );
     } catch (error) {
       setWishlistMessage(
@@ -7116,6 +7116,22 @@ function App() {
                 ? `Sync failed: ${steamWishlist.lastError}`
                 : null)}
           </p>
+        ) : null}
+        {wishlistSyncPending || steamWishlist.lastError ? (
+          <div className="action-row wishlist-status-actions">
+            <button
+              className="ghost-button settings-icon-text-button"
+              onClick={() =>
+                void window.gameVaultApi.openExternal(
+                  steamWishlist.profileUrl ?? STEAM_WISHLIST_SIGN_IN_URL,
+                )
+              }
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faUpRightFromSquare} />
+              <span>Open Steam Wishlist</span>
+            </button>
+          </div>
         ) : null}
         <div className="wishlist-list">
           {visibleWishlistItems.length > 0 ? (

@@ -822,6 +822,52 @@ afterEach(() => {
 });
 
 describe('GameVaultService Steam wishlist workflow', () => {
+  it('does not auto-queue wishlist syncs while building the view', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const service = createService(database);
+      await service.configureSteamWishlistProfile({
+        profileUrl:
+          'https://store.steampowered.com/wishlist/profiles/76561198086715287/',
+      });
+      database.setSetting(
+        'steamWishlist.fetchedAt',
+        '2026-05-10T12:00:00.000Z',
+      );
+
+      const view = await service.getSteamWishlist();
+
+      expect(view.pendingActions).toEqual([]);
+      expect(service.listPendingSteamWishlistActions()).toEqual([]);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('queues wishlist sync only when the user requests one', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const service = createService(database);
+      await service.configureSteamWishlistProfile({
+        profileUrl:
+          'https://store.steampowered.com/wishlist/profiles/76561198086715287/',
+      });
+      database.setSetting('steamWishlist.lastError', 'Steam session expired.');
+
+      const view = await service.requestSteamWishlistRefresh();
+
+      expect(view.lastError).toBeNull();
+      expect(view.pendingActions).toEqual([
+        expect.objectContaining({
+          actionType: 'sync',
+          steamId: '76561198086715287',
+        }),
+      ]);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('syncs wishlist items and marks exact Steam AppID library matches', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
