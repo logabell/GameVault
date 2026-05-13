@@ -18,13 +18,19 @@ namespace GameVault.Playnite
     public class GameVaultLibraryPlugin : LibraryPlugin
     {
         private const string LibraryName = "GameVault";
-        private const string PluginVersion = "0.1.9";
+        private const string PluginVersion = "0.1.14";
         private const int ManifestSyncDebounceMs = 1500;
+        private const int MetadataBackfillDebounceMs = 8000;
+        private const int MetadataBackfillGameDelayMs = 750;
+        private static readonly ILogger logger = LogManager.GetLogger();
         private readonly object manifestSyncLock = new object();
+        private readonly object metadataBackfillLock = new object();
         private readonly IPlayniteAPI playniteApi;
         private FileSystemWatcher manifestWatcher;
         private Timer manifestSyncTimer;
+        private Timer metadataBackfillTimer;
         private SynchronizationContext playniteSynchronizationContext;
+        private int metadataBackfillRunning;
         private string watchedManifestPath;
 
         public override Guid Id
@@ -74,16 +80,24 @@ namespace GameVault.Playnite
             playniteSynchronizationContext = SynchronizationContext.Current;
             EnsureManifestWatcher();
             QueueManifestSync();
+            QueueMetadataBackfill(MetadataBackfillDebounceMs);
         }
 
         public override void OnLibraryUpdated(OnLibraryUpdatedEventArgs args)
         {
             WriteCurrentSyncStatus();
+            QueueMetadataBackfill();
         }
 
         public override void OnApplicationStopped(OnApplicationStoppedEventArgs args)
         {
             DisposeManifestWatcher();
+            DisposeMetadataBackfill();
+        }
+
+        public override LibraryMetadataProvider GetMetadataDownloader()
+        {
+            return new GameVaultIgdbMetadataProvider(playniteApi, Id);
         }
 
         private static bool IsImportable(GameVaultManifestGame game)
@@ -421,6 +435,7 @@ namespace GameVault.Playnite
                 ImportOrUpdateManifestGames(importableGames);
                 ApplyExecutableIcons(importableGames);
                 WriteSyncStatus(manifest, importableGames.Count, error);
+                QueueMetadataBackfill();
             }
         }
 
@@ -570,6 +585,725 @@ namespace GameVault.Playnite
                 WorkingDir = Path.GetDirectoryName(game.ExecutablePath),
                 IsPlayAction = true
             };
+        }
+
+        private void QueueMetadataBackfill()
+        {
+            QueueMetadataBackfill(MetadataBackfillDebounceMs);
+        }
+
+        private void QueueMetadataBackfill(int delayMs)
+        {
+            try
+            {
+                lock (metadataBackfillLock)
+                {
+                    if (metadataBackfillTimer == null)
+                    {
+                        metadataBackfillTimer = new Timer(_ => RunMetadataBackfill(), null, Timeout.Infinite, Timeout.Infinite);
+                    }
+
+                    metadataBackfillTimer.Change(Math.Max(1000, delayMs), Timeout.Infinite);
+                }
+            }
+            catch
+            {
+                // Metadata can still be downloaded manually from Playnite.
+            }
+        }
+
+        private void DisposeMetadataBackfill()
+        {
+            try
+            {
+                lock (metadataBackfillLock)
+                {
+                    if (metadataBackfillTimer != null)
+                    {
+                        metadataBackfillTimer.Dispose();
+                        metadataBackfillTimer = null;
+                    }
+                }
+            }
+            catch
+            {
+                // Shutdown cleanup should never block Playnite.
+            }
+        }
+
+        private void RunMetadataBackfill()
+        {
+            if (Interlocked.Exchange(ref metadataBackfillRunning, 1) == 1)
+            {
+                QueueMetadataBackfill();
+                return;
+            }
+
+            try
+            {
+                var igdbAvailable = RunOnPlayniteThread(() => GetIgdbMetadataPlugin(playniteApi) != null);
+                if (!igdbAvailable)
+                {
+                    logger.Warn("GameVault IGDB metadata backfill skipped because the IGDB metadata provider is not available.");
+                    return;
+                }
+
+                var games = RunOnPlayniteThread(GetMetadataBackfillCandidates);
+                if (games.Count == 0)
+                {
+                    return;
+                }
+
+                logger.Info("GameVault IGDB metadata backfill starting for " + games.Count + " game(s).");
+                var updatedGames = 0;
+
+                foreach (var game in games)
+                {
+                    GameMetadata metadata = null;
+                    try
+                    {
+                        metadata = DownloadIgdbMetadata(playniteApi, game);
+                    }
+                    catch (Exception downloadError)
+                    {
+                        logger.Warn(downloadError, "GameVault IGDB metadata download failed for " + game.Name + ".");
+                    }
+
+                    if (metadata != null)
+                    {
+                        var gameId = game.Id;
+                        var changed = RunOnPlayniteThread(() => ApplyIgdbMetadata(gameId, metadata));
+                        if (changed)
+                        {
+                            updatedGames++;
+                        }
+                    }
+
+                    Thread.Sleep(MetadataBackfillGameDelayMs);
+                }
+
+                logger.Info("GameVault IGDB metadata backfill finished. Updated " + updatedGames + " of " + games.Count + " game(s).");
+            }
+            catch (Exception error)
+            {
+                logger.Warn(error, "GameVault IGDB metadata backfill failed.");
+            }
+            finally
+            {
+                Interlocked.Exchange(ref metadataBackfillRunning, 0);
+            }
+        }
+
+        private T RunOnPlayniteThread<T>(Func<T> action)
+        {
+            var context = playniteSynchronizationContext;
+            if (context == null || SynchronizationContext.Current == context)
+            {
+                return action();
+            }
+
+            T result = default(T);
+            Exception error = null;
+            using (var waitHandle = new ManualResetEvent(false))
+            {
+                context.Post(_ =>
+                {
+                    try
+                    {
+                        result = action();
+                    }
+                    catch (Exception actionError)
+                    {
+                        error = actionError;
+                    }
+                    finally
+                    {
+                        waitHandle.Set();
+                    }
+                }, null);
+
+                if (!waitHandle.WaitOne(TimeSpan.FromSeconds(30)))
+                {
+                    throw new TimeoutException("Timed out waiting for Playnite UI thread.");
+                }
+            }
+
+            if (error != null)
+            {
+                throw error;
+            }
+
+            return result;
+        }
+
+        private List<Game> GetMetadataBackfillCandidates()
+        {
+            try
+            {
+                return playniteApi.Database.Games
+                    .Where(ShouldBackfillIgdbMetadata)
+                    .Select(CreateMetadataRequestGame)
+                    .ToList();
+            }
+            catch
+            {
+                return new List<Game>();
+            }
+        }
+
+        private static Game CreateMetadataRequestGame(Game game)
+        {
+            return new Game(game.Name)
+            {
+                Id = game.Id,
+                GameId = game.GameId,
+                PluginId = game.PluginId,
+                SourceId = game.SourceId,
+                Description = game.Description,
+                CoverImage = game.CoverImage,
+                ReleaseDate = game.ReleaseDate,
+                GenreIds = CopyIds(game.GenreIds),
+                DeveloperIds = CopyIds(game.DeveloperIds),
+                PublisherIds = CopyIds(game.PublisherIds)
+            };
+        }
+
+        private static List<Guid> CopyIds(IEnumerable<Guid> ids)
+        {
+            return ids == null ? null : ids.ToList();
+        }
+
+        private bool ShouldBackfillIgdbMetadata(Game game)
+        {
+            return IsGameVaultGame(game) &&
+                !string.IsNullOrWhiteSpace(game.GameId) &&
+                (string.IsNullOrWhiteSpace(game.Description) ||
+                    game.ReleaseDate == null ||
+                    string.IsNullOrWhiteSpace(game.CoverImage) ||
+                    !HasItems(game.GenreIds) ||
+                    !HasItems(game.DeveloperIds) ||
+                    !HasItems(game.PublisherIds));
+        }
+
+        private bool IsGameVaultGame(Game game)
+        {
+            return game != null &&
+                (game.PluginId == Id ||
+                    IsNamedMetadata(game.Source, LibraryName) ||
+                    HasNamedMetadata(game.Tags, LibraryName));
+        }
+
+        private static bool IsNamedMetadata(DatabaseObject metadata, string name)
+        {
+            return metadata != null &&
+                string.Equals(metadata.Name, name, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool HasNamedMetadata<T>(IEnumerable<T> metadata, string name) where T : DatabaseObject
+        {
+            return metadata != null &&
+                metadata.Any(item => IsNamedMetadata(item, name));
+        }
+
+        private bool ApplyIgdbMetadata(Guid gameId, GameMetadata metadata)
+        {
+            try
+            {
+                var game = playniteApi.Database.Games.Get(gameId);
+                if (!ShouldBackfillIgdbMetadata(game) || metadata == null)
+                {
+                    return false;
+                }
+
+                var changed = false;
+                if (string.IsNullOrWhiteSpace(game.Description) &&
+                    !string.IsNullOrWhiteSpace(metadata.Description))
+                {
+                    game.Description = metadata.Description;
+                    changed = true;
+                }
+
+                if (game.ReleaseDate == null && metadata.ReleaseDate != null)
+                {
+                    game.ReleaseDate = metadata.ReleaseDate;
+                    changed = true;
+                }
+
+                if (game.CriticScore == null && metadata.CriticScore != null)
+                {
+                    game.CriticScore = metadata.CriticScore;
+                    changed = true;
+                }
+
+                if (game.CommunityScore == null && metadata.CommunityScore != null)
+                {
+                    game.CommunityScore = metadata.CommunityScore;
+                    changed = true;
+                }
+
+                changed |= TryApplyMetadataImage(metadata.CoverImage, game.Id, game.CoverImage, value => game.CoverImage = value);
+                changed |= TryApplyMetadataImage(metadata.BackgroundImage, game.Id, game.BackgroundImage, value => game.BackgroundImage = value);
+                changed |= MergeLinks(game, metadata.Links);
+                changed |= SetMetadataIdsIfEmpty(game.GenreIds, metadata.Genres, properties => playniteApi.Database.Genres.Add(properties), ids => game.GenreIds = ids);
+                changed |= SetMetadataIdsIfEmpty(game.DeveloperIds, metadata.Developers, properties => playniteApi.Database.Companies.Add(properties), ids => game.DeveloperIds = ids);
+                changed |= SetMetadataIdsIfEmpty(game.PublisherIds, metadata.Publishers, properties => playniteApi.Database.Companies.Add(properties), ids => game.PublisherIds = ids);
+                changed |= SetMetadataIdsIfEmpty(game.FeatureIds, metadata.Features, properties => playniteApi.Database.Features.Add(properties), ids => game.FeatureIds = ids);
+                changed |= SetMetadataIdsIfEmpty(game.SeriesIds, metadata.Series, properties => playniteApi.Database.Series.Add(properties), ids => game.SeriesIds = ids);
+                changed |= SetMetadataIdsIfEmpty(game.AgeRatingIds, metadata.AgeRatings, properties => playniteApi.Database.AgeRatings.Add(properties), ids => game.AgeRatingIds = ids);
+                changed |= SetMetadataIdsIfEmpty(game.RegionIds, metadata.Regions, properties => playniteApi.Database.Regions.Add(properties), ids => game.RegionIds = ids);
+                changed |= SetMetadataIdsIfEmpty(game.PlatformIds, metadata.Platforms, properties => playniteApi.Database.Platforms.Add(properties), ids => game.PlatformIds = ids);
+                changed |= MergeTagsIfOnlyGameVault(game, metadata.Tags);
+
+                if (changed)
+                {
+                    playniteApi.Database.Games.Update(game);
+                }
+
+                return changed;
+            }
+            catch (Exception error)
+            {
+                logger.Warn(error, "Could not apply IGDB metadata for GameVault game.");
+                return false;
+            }
+        }
+
+        private bool TryApplyMetadataImage(MetadataFile metadataFile, Guid gameId, string currentValue, Action<string> setter)
+        {
+            if (!string.IsNullOrWhiteSpace(currentValue) || metadataFile == null)
+            {
+                return false;
+            }
+
+            var file = SaveMetadataFile(metadataFile, gameId);
+            if (string.IsNullOrWhiteSpace(file))
+            {
+                return false;
+            }
+
+            setter(file);
+            return true;
+        }
+
+        private string SaveMetadataFile(MetadataFile metadataFile, Guid gameId)
+        {
+            try
+            {
+                if (metadataFile.Content != null && metadataFile.Content.Length > 0)
+                {
+                    var tempPath = Path.Combine(
+                        Path.GetTempPath(),
+                        "gamevault-" + Guid.NewGuid().ToString("N") + GetMetadataFileExtension(metadataFile));
+                    File.WriteAllBytes(tempPath, metadataFile.Content);
+                    try
+                    {
+                        return playniteApi.Database.AddFile(tempPath, gameId);
+                    }
+                    finally
+                    {
+                        TryDeleteFile(tempPath);
+                    }
+                }
+
+                if (!string.IsNullOrWhiteSpace(metadataFile.Path))
+                {
+                    if (File.Exists(metadataFile.Path))
+                    {
+                        return playniteApi.Database.AddFile(metadataFile.Path, gameId);
+                    }
+
+                    return metadataFile.Path;
+                }
+            }
+            catch (Exception error)
+            {
+                logger.Warn(error, "Could not save IGDB metadata image for GameVault game.");
+            }
+
+            return null;
+        }
+
+        private static string GetMetadataFileExtension(MetadataFile metadataFile)
+        {
+            var fileName = metadataFile.FileName;
+            if (string.IsNullOrWhiteSpace(fileName))
+            {
+                fileName = metadataFile.Path;
+            }
+
+            var extension = string.IsNullOrWhiteSpace(fileName) ? null : Path.GetExtension(fileName);
+            return string.IsNullOrWhiteSpace(extension) || extension.Length > 10 ? ".tmp" : extension;
+        }
+
+        private static void TryDeleteFile(string path)
+        {
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+            catch
+            {
+                // Temporary image files can be cleaned by the OS later.
+            }
+        }
+
+        private static bool MergeLinks(Game game, IEnumerable<Link> links)
+        {
+            if (!HasItems(links))
+            {
+                return false;
+            }
+
+            if (game.Links == null)
+            {
+                game.Links = new ObservableCollection<Link>();
+            }
+
+            var existingLinks = new HashSet<string>(
+                game.Links
+                    .Where(link => link != null)
+                    .Select(link => GetLinkKey(link)));
+            var changed = false;
+
+            foreach (var link in links.Where(link => link != null))
+            {
+                var key = GetLinkKey(link);
+                if (existingLinks.Contains(key))
+                {
+                    continue;
+                }
+
+                game.Links.Add(new Link(link.Name, link.Url));
+                existingLinks.Add(key);
+                changed = true;
+            }
+
+            return changed;
+        }
+
+        private static string GetLinkKey(Link link)
+        {
+            return ((link.Name ?? string.Empty) + "\n" + (link.Url ?? string.Empty)).ToLowerInvariant();
+        }
+
+        private static bool SetMetadataIdsIfEmpty<TItem>(
+            List<Guid> currentIds,
+            IEnumerable<MetadataProperty> properties,
+            Func<IEnumerable<MetadataProperty>, IEnumerable<TItem>> addItems,
+            Action<List<Guid>> setIds) where TItem : DatabaseObject
+        {
+            if (HasItems(currentIds) || !HasItems(properties))
+            {
+                return false;
+            }
+
+            var ids = addItems(properties)
+                .Where(item => item != null && item.Id != Guid.Empty)
+                .Select(item => item.Id)
+                .Distinct()
+                .ToList();
+            if (ids.Count == 0)
+            {
+                return false;
+            }
+
+            setIds(ids);
+            return true;
+        }
+
+        private bool MergeTagsIfOnlyGameVault(Game game, IEnumerable<MetadataProperty> properties)
+        {
+            if (!HasItems(properties))
+            {
+                return false;
+            }
+
+            var currentTags = game.Tags ?? new List<Tag>();
+            var canMergeTags = currentTags.Count == 0 ||
+                currentTags.All(tag => IsNamedMetadata(tag, LibraryName));
+            if (!canMergeTags)
+            {
+                return false;
+            }
+
+            var currentIds = game.TagIds ?? new List<Guid>();
+            var currentIdSet = new HashSet<Guid>(currentIds);
+            var addedTags = playniteApi.Database.Tags.Add(properties)
+                .Where(tag => tag != null && tag.Id != Guid.Empty)
+                .ToList();
+            foreach (var tag in addedTags)
+            {
+                currentIdSet.Add(tag.Id);
+            }
+
+            if (currentIdSet.Count == currentIds.Distinct().Count())
+            {
+                return false;
+            }
+
+            game.TagIds = currentIdSet.ToList();
+            return true;
+        }
+
+        private static MetadataPlugin GetIgdbMetadataPlugin(IPlayniteAPI api)
+        {
+            if (api == null || api.Addons == null || api.Addons.Plugins == null)
+            {
+                return null;
+            }
+
+            var igdbPluginId = BuiltinExtensions.GetIdFromExtension(BuiltinExtension.IgdbMetadata);
+            if (api.Addons.DisabledAddons != null &&
+                api.Addons.DisabledAddons.Any(disabled =>
+                    string.Equals(disabled, igdbPluginId.ToString(), StringComparison.OrdinalIgnoreCase)))
+            {
+                return null;
+            }
+
+            return api.Addons.Plugins
+                .OfType<MetadataPlugin>()
+                .FirstOrDefault(plugin => plugin.Id == igdbPluginId) ??
+                api.Addons.Plugins
+                    .OfType<MetadataPlugin>()
+                    .FirstOrDefault(plugin =>
+                        string.Equals(plugin.Name, "IGDB", StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static GameMetadata DownloadIgdbMetadata(IPlayniteAPI api, Game game)
+        {
+            var metadataPlugin = GetIgdbMetadataPlugin(api);
+            if (metadataPlugin == null || game == null)
+            {
+                return null;
+            }
+
+            using (var provider = metadataPlugin.GetMetadataProvider(
+                new MetadataRequestOptions(game, true)))
+            {
+                if (provider == null)
+                {
+                    return null;
+                }
+
+                return BuildMetadata(provider);
+            }
+        }
+
+        private static GameMetadata BuildMetadata(OnDemandMetadataProvider provider)
+        {
+            var metadata = new GameMetadata();
+            var args = new GetMetadataFieldArgs();
+            var availableFields = GetAvailableFields(provider);
+
+            if (availableFields.Contains(MetadataField.Name))
+            {
+                TrySetMetadata(() => metadata.Name = provider.GetName(args));
+            }
+
+            if (availableFields.Contains(MetadataField.Genres))
+            {
+                TrySetMetadata(() => metadata.Genres = ToMetadataSet(provider.GetGenres(args)));
+            }
+
+            if (availableFields.Contains(MetadataField.ReleaseDate))
+            {
+                TrySetMetadata(() => metadata.ReleaseDate = provider.GetReleaseDate(args));
+            }
+
+            if (availableFields.Contains(MetadataField.Developers))
+            {
+                TrySetMetadata(() => metadata.Developers = ToMetadataSet(provider.GetDevelopers(args)));
+            }
+
+            if (availableFields.Contains(MetadataField.Publishers))
+            {
+                TrySetMetadata(() => metadata.Publishers = ToMetadataSet(provider.GetPublishers(args)));
+            }
+
+            if (availableFields.Contains(MetadataField.Tags))
+            {
+                TrySetMetadata(() => metadata.Tags = ToMetadataSet(provider.GetTags(args)));
+            }
+
+            if (availableFields.Contains(MetadataField.Description))
+            {
+                TrySetMetadata(() => metadata.Description = provider.GetDescription(args));
+            }
+
+            if (availableFields.Contains(MetadataField.Links))
+            {
+                TrySetMetadata(() =>
+                {
+                    var links = provider.GetLinks(args);
+                    metadata.Links = links == null ? null : links.Where(link => link != null).ToList();
+                });
+            }
+
+            if (availableFields.Contains(MetadataField.CriticScore))
+            {
+                TrySetMetadata(() => metadata.CriticScore = provider.GetCriticScore(args));
+            }
+
+            if (availableFields.Contains(MetadataField.CommunityScore))
+            {
+                TrySetMetadata(() => metadata.CommunityScore = provider.GetCommunityScore(args));
+            }
+
+            if (availableFields.Contains(MetadataField.CoverImage))
+            {
+                TrySetMetadata(() => metadata.CoverImage = MaterializeMetadataFile(provider.GetCoverImage(args)));
+            }
+
+            if (availableFields.Contains(MetadataField.BackgroundImage))
+            {
+                TrySetMetadata(() => metadata.BackgroundImage = MaterializeMetadataFile(provider.GetBackgroundImage(args)));
+            }
+
+            if (availableFields.Contains(MetadataField.Features))
+            {
+                TrySetMetadata(() => metadata.Features = ToMetadataSet(provider.GetFeatures(args)));
+            }
+
+            if (availableFields.Contains(MetadataField.AgeRating))
+            {
+                TrySetMetadata(() => metadata.AgeRatings = ToMetadataSet(provider.GetAgeRatings(args)));
+            }
+
+            if (availableFields.Contains(MetadataField.Series))
+            {
+                TrySetMetadata(() => metadata.Series = ToMetadataSet(provider.GetSeries(args)));
+            }
+
+            if (availableFields.Contains(MetadataField.Region))
+            {
+                TrySetMetadata(() => metadata.Regions = ToMetadataSet(provider.GetRegions(args)));
+            }
+
+            if (availableFields.Contains(MetadataField.Platform))
+            {
+                TrySetMetadata(() => metadata.Platforms = ToMetadataSet(provider.GetPlatforms(args)));
+            }
+
+            return MetadataIsEmpty(metadata) ? null : metadata;
+        }
+
+        private static List<MetadataField> GetAvailableFields(OnDemandMetadataProvider provider)
+        {
+            try
+            {
+                return provider.AvailableFields ?? new List<MetadataField>();
+            }
+            catch
+            {
+                return new List<MetadataField>();
+            }
+        }
+
+        private static MetadataFile MaterializeMetadataFile(MetadataFile metadataFile)
+        {
+            if (metadataFile == null ||
+                metadataFile.Content != null ||
+                string.IsNullOrWhiteSpace(metadataFile.Path) ||
+                !File.Exists(metadataFile.Path))
+            {
+                return metadataFile;
+            }
+
+            try
+            {
+                var fileName = metadataFile.FileName;
+                if (string.IsNullOrWhiteSpace(fileName))
+                {
+                    fileName = Path.GetFileName(metadataFile.Path);
+                }
+
+                return new MetadataFile(fileName, File.ReadAllBytes(metadataFile.Path));
+            }
+            catch
+            {
+                return metadataFile;
+            }
+        }
+
+        private static void TrySetMetadata(Action setter)
+        {
+            try
+            {
+                setter();
+            }
+            catch
+            {
+                // Individual IGDB fields can fail independently.
+            }
+        }
+
+        private static HashSet<MetadataProperty> ToMetadataSet(
+            IEnumerable<MetadataProperty> properties)
+        {
+            return properties == null
+                ? null
+                : new HashSet<MetadataProperty>(properties.Where(property => property != null));
+        }
+
+        private static bool MetadataIsEmpty(GameMetadata metadata)
+        {
+            return metadata == null ||
+                (string.IsNullOrWhiteSpace(metadata.Name) &&
+                    string.IsNullOrWhiteSpace(metadata.Description) &&
+                    metadata.ReleaseDate == null &&
+                    metadata.CriticScore == null &&
+                    metadata.CommunityScore == null &&
+                    metadata.CoverImage == null &&
+                    metadata.BackgroundImage == null &&
+                    !HasItems(metadata.Links) &&
+                    !HasItems(metadata.Genres) &&
+                    !HasItems(metadata.Developers) &&
+                    !HasItems(metadata.Publishers) &&
+                    !HasItems(metadata.Tags) &&
+                    !HasItems(metadata.Features) &&
+                    !HasItems(metadata.AgeRatings) &&
+                    !HasItems(metadata.Series) &&
+                    !HasItems(metadata.Regions) &&
+                    !HasItems(metadata.Platforms));
+        }
+
+        private static bool HasItems<T>(IEnumerable<T> items)
+        {
+            return items != null && items.Any();
+        }
+
+        private class GameVaultIgdbMetadataProvider : LibraryMetadataProvider
+        {
+            private readonly IPlayniteAPI api;
+            private readonly Guid pluginId;
+
+            public GameVaultIgdbMetadataProvider(IPlayniteAPI api, Guid pluginId)
+            {
+                this.api = api;
+                this.pluginId = pluginId;
+            }
+
+            public override GameMetadata GetMetadata(Game game)
+            {
+                try
+                {
+                    if (game == null ||
+                        game.PluginId != pluginId ||
+                        string.IsNullOrWhiteSpace(game.GameId))
+                    {
+                        return null;
+                    }
+
+                    return DownloadIgdbMetadata(api, game);
+                }
+                catch
+                {
+                    return null;
+                }
+            }
         }
 
         private void WriteSyncStatus(GameVaultManifest manifest, int importableGames, string error)

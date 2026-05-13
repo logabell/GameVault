@@ -198,7 +198,7 @@ const FILE_CLEANUP_RETRY_ATTEMPTS = IS_TEST_ENV ? 2 : 8;
 const FILE_CLEANUP_RETRY_DELAY_MS = IS_TEST_ENV ? 1 : 1000;
 const EXTENSION_ACTIVITY_SETTING_KEY = 'extension.lastNativeMessageAt';
 const PLAYNITE_PLUGIN_FOLDER_NAME = 'GameVault';
-const PLAYNITE_PLUGIN_VERSION = '0.1.9';
+const PLAYNITE_PLUGIN_VERSION = '0.1.14';
 
 const SOURCE_CATALOG_URLS: Record<SupportedSourceKind, string[]> = {
   ankergames: [
