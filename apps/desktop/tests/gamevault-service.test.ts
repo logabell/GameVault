@@ -5500,6 +5500,113 @@ describe('GameVaultService SteamDB patch workflow', () => {
     }
   });
 
+  it('cancels every active download job for an item so stale rows do not stay queued', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootLibraryPath = join(tempRoot, 'Library');
+      const finalPath = join(rootLibraryPath, 'No Mans Sky');
+      const firstStagePath = join(rootLibraryPath, '_STAGING', 'nms-current');
+      const staleStagePath = join(rootLibraryPath, '_STAGING', 'nms-stale');
+      await mkdir(firstStagePath, { recursive: true });
+      await mkdir(staleStagePath, { recursive: true });
+      await mkdir(finalPath, { recursive: true });
+      await writeFile(join(firstStagePath, 'setup.bin'), 'current');
+      await writeFile(join(staleStagePath, 'setup.bin'), 'stale');
+      await writeFile(join(finalPath, 'NMS.exe'), 'installed');
+      database.setSetting('library.rootPath', rootLibraryPath);
+      const item = database.upsertTrackedItem({
+        id: 'no-mans-sky',
+        normalizedTitle: 'no mans sky',
+        sourceKind: 'elamigos',
+        sourceUrl: 'https://elamigos.site/no-mans-sky',
+        title: 'No Mans Sky',
+      });
+      const now = '2026-05-12T12:00:00.000Z';
+      const createJob = (
+        id: string,
+        packageId: number,
+        stagePath: string,
+      ): DownloadJobRecord => ({
+        bytesLoaded: null,
+        bytesTotal: null,
+        completedParts: 0,
+        createdAt: now,
+        errorMessage: null,
+        etaSeconds: null,
+        finalPath,
+        id,
+        packageId,
+        packageName: `No Mans Sky_${packageId}`,
+        parts: [
+          {
+            bytesLoaded: null,
+            bytesTotal: null,
+            createdAt: now,
+            errorMessage: null,
+            etaSeconds: null,
+            id: `${id}:full`,
+            jobId: id,
+            mirrorUrl: `https://filecrypt.cc/${id}`,
+            packageId,
+            packageName: `No Mans Sky_${packageId}`,
+            role: 'full',
+            speed: null,
+            stage: 'queued',
+            statusMessage: null,
+            trackedItemId: item.id,
+            updatedAt: now,
+          },
+        ],
+        provider: 'jdownloader',
+        selectedMirrorUrl: `https://filecrypt.cc/${id}`,
+        selectedPatchMirrorUrl: null,
+        sourceKind: 'elamigos',
+        speed: null,
+        stage: 'queued',
+        stagePath,
+        statusMessage: null,
+        totalParts: 1,
+        trackedItemId: item.id,
+        updatedAt: now,
+      });
+      database.upsertDownloadJob(createJob('nms-current', 9001, firstStagePath));
+      database.upsertDownloadJob(createJob('nms-stale', 9002, staleStagePath));
+      const removePackage = vi.fn(async () => undefined);
+      const service = createService(database, undefined, removePackage);
+
+      const cancelled = await service.cancelDownload(item.id);
+
+      expect(removePackage).toHaveBeenCalledTimes(2);
+      expect(removePackage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          packageId: 9001,
+          packageIds: [9001],
+          packageName: 'No Mans Sky_9001',
+          packageNames: ['No Mans Sky_9001'],
+          stagePath: firstStagePath,
+        }),
+      );
+      expect(removePackage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          packageId: 9002,
+          packageIds: [9002],
+          packageName: 'No Mans Sky_9002',
+          packageNames: ['No Mans Sky_9002'],
+          stagePath: staleStagePath,
+        }),
+      );
+      expect(existsSync(firstStagePath)).toBe(false);
+      expect(existsSync(staleStagePath)).toBe(false);
+      expect(existsSync(join(finalPath, 'NMS.exe'))).toBe(true);
+      expect(database.listDownloadJobsForTrackedItem(item.id)).toEqual([]);
+      expect(database.getDownloadJob(item.id)).toBeNull();
+      expect(cancelled.currentDownload).toBeNull();
+      expect(cancelled.status).not.toBe('queued');
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('retries Ankergames curl downloads with the resolved selected mirror URL', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {

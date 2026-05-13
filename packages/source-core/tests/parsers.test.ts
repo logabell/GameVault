@@ -423,6 +423,33 @@ describe('source parsers', () => {
     });
   });
 
+  it('parses SteamRIP build-labeled game versions without treating them as SteamDB build ids', () => {
+    expect(
+      parseSupportedPageForKind(
+        'steamrip',
+        'https://steamrip.com/grand-theft-auto-v-enhanced-free-download/',
+        `
+          <html><body>
+            <h1>Grand Theft Auto V Enhanced Free Download</h1>
+            <h4>GAME INFO</h4>
+            <div>
+              <ul>
+                <li><strong>Version:</strong> Build 1491.50 | Ultimate Edition + UE Unlocker</li>
+              </ul>
+            </div>
+            <a href="https://gofile.io/d/gtav">DOWNLOAD HERE</a>
+          </body></html>
+        `,
+      ),
+    ).toMatchObject({
+      latestSourceRelease: {
+        buildId: null,
+        version: '1491.50',
+      },
+      title: 'Grand Theft Auto V Enhanced',
+    });
+  });
+
   it('keeps ElAmigos dotted versions separate from explicit numeric build ids', () => {
     expect(
       parseSupportedPageForKind(
@@ -491,6 +518,39 @@ describe('source parsers', () => {
           </button>
           <div>
             <h3>Download Link</h3>
+            <div>DataNodes</div>
+            <a href="#" class="download-button" @click.prevent="generateDownloadUrl(2726)">
+              <span>Download</span>
+            </a>
+          </div>
+        </body>
+      </html>`,
+    );
+
+    expect(parsed.fullDownloadUrls).toEqual([
+      {
+        kind: 'full',
+        label: 'DataNodes',
+        url: 'https://ankergames.net/generate-download-url/2726',
+      },
+    ]);
+  });
+
+  it('ignores Ankergames launcher download actions', () => {
+    const parsed = parseSupportedPage(
+      'https://ankergames.net/game/mouse-p-i-for-hire',
+      `<html>
+        <head><title>MOUSE: P.I. For Hire Free Download - AnkerGames</title></head>
+        <body>
+          <h1>MOUSE: P.I. For Hire</h1>
+          <span>V 1.0.5</span>
+          <div>
+            <div>Launcher</div>
+            <a href="#" class="download-button" @click.prevent="generateDownloadUrl(1111)">
+              <span>Download</span>
+            </a>
+          </div>
+          <div>
             <div>DataNodes</div>
             <a href="#" class="download-button" @click.prevent="generateDownloadUrl(2726)">
               <span>Download</span>
@@ -1197,6 +1257,38 @@ describe('source parsers', () => {
     expect(parsed.fullDownloadUrls).toHaveLength(1);
     expect(parsed.patchDownloadUrls).toHaveLength(1);
     expect(parsed.patchDownloadUrls[0]?.kind).toBe('patch');
+  });
+
+  it('parses ElAmigos update headers with version ranges and dotted dates', () => {
+    const html = `
+      <html>
+        <head>
+          <title>No Mans Sky - ElAmigos</title>
+        </head>
+        <body>
+          <h2>No Mans Sky (2016),  16.38GB</h2>
+          <h3>ElAmigos release, game is already cracked after installation. Updated to version 6.30 (12.04.2026).</h3>
+          <h2>DDOWNLOAD</h2>
+          <a href="https://filecrypt.cc/Container/17FDC65535.html">https://filecrypt.cc/Container/17FDC65535.html</a>
+          <h3>No Mans Sky update 6.30 - 6.34 (21.04.2026), 1216MB</h3>
+          <h2>DDOWNLOAD</h2>
+          <a href="https://filecrypt.cc/Container/17FDC65535-update.html">https://filecrypt.cc/Container/17FDC65535-update.html</a>
+        </body>
+      </html>
+    `;
+
+    const parsed = parseSupportedPage(
+      'https://elamigos.site/data/No_Mans_Sky_MULTi14_-_ElAmigos.html',
+      html,
+    );
+
+    expect(parsed.latestSourceRelease).toMatchObject({
+      buildId: null,
+      isPatch: true,
+      patchDate: '04/21/2026',
+      version: '6.34',
+    });
+    expect(parsed.patchDownloadUrls).toHaveLength(1);
   });
 
   it('parses live ElAmigos heading-only pages with FileCrypt containers', () => {

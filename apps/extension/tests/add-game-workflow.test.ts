@@ -30,6 +30,7 @@ import {
   inferSourceComparisonRows,
   isSourceCurrentForInstall,
   isSourceReadyForAutomation,
+  mergeParsedSourceIntoTrackedItem,
   trackedItemMatchesSourceUrls,
 } from '../src/popup/add-game-workflow.js';
 import { getSteamPatchKey } from '../src/popup/patch-matching.js';
@@ -244,6 +245,53 @@ describe('extension add-game workflow helpers', () => {
     expect(selection.selectedDownloads?.fullUrl).not.toBe(
       parsedSource.fullDownloadUrls[0]?.url,
     );
+  });
+
+  it('allows patch-only ElAmigos sources when update mirrors are available', () => {
+    const source = sourceView('elamigos', { observedBuildId: '200' }, [
+      mirror(
+        'elamigos',
+        'patch',
+        'https://filecrypt.example.test/update',
+        'Update FileCrypt',
+      ),
+    ]);
+
+    const selection = getSourceDownloadSelection(source);
+
+    expect(selection.canSelect).toBe(true);
+    expect(selection.selectedDownloads).toEqual({
+      fullUrl: '',
+      patchUrl: 'https://filecrypt.example.test/update',
+      sourceKind: 'elamigos',
+    });
+  });
+
+  it('filters AnkerGames launcher mirrors from source selection', () => {
+    const source = sourceView('ankergames', { observedBuildId: '200' }, [
+      mirror(
+        'ankergames',
+        'full',
+        'https://ankergames.example.test/generate-download-url/launcher',
+        'Launcher',
+      ),
+      mirror(
+        'ankergames',
+        'full',
+        'https://ankergames.example.test/generate-download-url/datanodes',
+        'DataNodes',
+      ),
+    ]);
+
+    const selection = getSourceDownloadSelection(source);
+
+    expect(selection.canSelect).toBe(true);
+    expect(selection.fullMirrors).toHaveLength(1);
+    expect(selection.selectedDownloads).toEqual({
+      fullUrl: 'https://ankergames.example.test/generate-download-url/datanodes',
+      patchUrl: null,
+      sourceKind: 'ankergames',
+    });
   });
 
   it('auto-selects the only available mirror for the active source', () => {
@@ -524,6 +572,108 @@ describe('extension add-game workflow helpers', () => {
     ).toBe('Latest');
   });
 
+  it('uses the current page SteamRIP version before cross-source inference', () => {
+    const steamRipParsedSource: ParsedSourcePayload = {
+      ...parsedSource,
+      fingerprint: 'steamrip-grand-theft-auto-v-enhanced',
+      fullRelease: {
+        buildId: null,
+        isPatch: false,
+        label: 'Build 1491.50',
+        patchDate: null,
+        version: '1491.50',
+      },
+      latestSourceRelease: {
+        buildId: null,
+        isPatch: false,
+        label: 'Build 1491.50',
+        patchDate: null,
+        version: '1491.50',
+      },
+      normalizedTitle: 'grand theft auto v enhanced',
+      sourceKind: 'steamrip',
+      sourceUrl: 'https://steamrip.example.test/grand-theft-auto-v-enhanced',
+      title: 'Grand Theft Auto V Enhanced',
+    };
+    const ankergames = sourceView(
+      'ankergames',
+      {
+        observedBuildId: '13773296',
+        observedVersion: 'V 1491.50',
+      },
+      [],
+    );
+    const elamigos = {
+      ...sourceView(
+        'elamigos',
+        {
+          observedBuildId: null,
+          observedVersion: '1491.50',
+        },
+        [
+          mirror(
+            'elamigos',
+            'full',
+            'https://elamigos.example.test/full',
+            'Full',
+          ),
+        ],
+      ),
+      match: {
+        ...sourceView('elamigos', {}, []).match,
+        status: 'probable' as const,
+        usable: false,
+      },
+      updateStatus: 'unknown' as const,
+      versionsBehindLatest: null,
+    };
+    const steamrip = {
+      ...sourceView(
+        'steamrip',
+        {
+          observedBuildId: null,
+          observedVersion: 'unknown',
+        },
+        [],
+      ),
+      match: {
+        ...sourceView('steamrip', {}, []).match,
+        sourceUrl: steamRipParsedSource.sourceUrl,
+      },
+      updateStatus: 'unknown' as const,
+      versionsBehindLatest: null,
+    };
+    const mergedItem = mergeParsedSourceIntoTrackedItem(
+      trackedItem({
+        sourceMatches: [ankergames, elamigos, steamrip],
+      }),
+      steamRipParsedSource,
+    );
+
+    const rows = inferSourceComparisonRows(mergedItem, []);
+
+    for (const sourceKind of ['elamigos', 'steamrip'] as const) {
+      expect(
+        rows.find((source) => source.match.sourceKind === sourceKind),
+      ).toMatchObject({
+        match: {
+          status: 'verified',
+          usable: true,
+        },
+        snapshot: {
+          observedBuildId: '13773296',
+          observedVersion: '1491.50',
+        },
+        updateStatus: 'matches_upstream',
+        versionsBehindLatest: 0,
+      });
+    }
+    const inferredElamigos = rows.find(
+      (source) => source.match.sourceKind === 'elamigos',
+    );
+    expect(getSourceDownloadSelection(inferredElamigos!).canSelect).toBe(true);
+  });
+
   it('does not infer a SteamRIP build when same-version peers conflict', () => {
     const ankergames = sourceView(
       'ankergames',
@@ -626,6 +776,109 @@ describe('extension add-game workflow helpers', () => {
       updateStatus: 'matches_upstream',
       versionsBehindLatest: 0,
     });
+  });
+
+  it('uses the current ElAmigos update date to resolve a build for matching SteamRIP peers', () => {
+    const latestPatch = {
+      ...patch('23076725', "No Man's Sky update for 4 May 2026"),
+      patchDate: '05/04/2026',
+      publishedAt: '2026-05-04T14:00:00.000Z',
+    };
+    const matchingSameDayPatch = {
+      ...patch('22885608', "No Man's Sky update for 21 April 2026"),
+      patchDate: '04/21/2026',
+      publishedAt: '2026-04-21T22:00:00.000Z',
+    };
+    const olderSameDayPatch = {
+      ...patch('22880000', "No Man's Sky hotfix for 21 April 2026"),
+      patchDate: '04/21/2026',
+      publishedAt: '2026-04-21T09:00:00.000Z',
+    };
+    const currentElamigosPage: ParsedSourcePayload = {
+      ...parsedSource,
+      latestSourceRelease: {
+        buildId: null,
+        isPatch: true,
+        label: 'No Mans Sky update 6.30 - 6.34 (21.04.2026), 1216MB',
+        patchDate: '04/21/2026',
+        version: '6.34',
+      },
+    };
+    const elamigos = {
+      ...sourceView(
+        'elamigos',
+        {
+          observedBuildId: null,
+          observedPatchDate: null,
+          observedVersion: 'unknown',
+        },
+        [
+          mirror(
+            'elamigos',
+            'full',
+            'https://elamigos.example.test/full',
+            'Full',
+          ),
+        ],
+      ),
+      match: {
+        ...sourceView('elamigos', {}, []).match,
+        status: 'probable' as const,
+        usable: true,
+      },
+      matchedPatch: null,
+      updateStatus: 'newer_than_installed' as const,
+      versionsBehindLatest: null,
+    };
+    const steamrip = {
+      ...sourceView(
+        'steamrip',
+        {
+          observedBuildId: null,
+          observedVersion: '6.34',
+        },
+        [
+          mirror(
+            'steamrip',
+            'full',
+            'https://steamrip.example.test/full',
+            'Full',
+          ),
+        ],
+      ),
+      matchedPatch: null,
+      updateStatus: 'newer_than_installed' as const,
+      versionsBehindLatest: null,
+    };
+
+    const mergedItem = mergeParsedSourceIntoTrackedItem(
+      trackedItem({
+        sourceMatches: [elamigos, steamrip],
+      }),
+      currentElamigosPage,
+    );
+    const rows = inferSourceComparisonRows(mergedItem, [
+      latestPatch,
+      olderSameDayPatch,
+      matchingSameDayPatch,
+    ]);
+
+    for (const sourceKind of ['elamigos', 'steamrip'] as const) {
+      expect(
+        rows.find((source) => source.match.sourceKind === sourceKind),
+      ).toMatchObject({
+        matchedPatch: {
+          buildId: matchingSameDayPatch.buildId,
+        },
+        snapshot: {
+          observedBuildId: matchingSameDayPatch.buildId,
+          observedPatchDate: matchingSameDayPatch.patchDate,
+          observedVersion: '6.34',
+        },
+        updateStatus: 'source_behind_upstream',
+        versionsBehindLatest: 1,
+      });
+    }
   });
 
   it('labels Steam-matched draft-only items as discovered in the hero', () => {

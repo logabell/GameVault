@@ -44,7 +44,7 @@ const ACTIVE_DRAFT_KEY = 'activeDraft';
 const CLIPBOARD_DRAFT_KEY = 'clipboardDraft';
 const POPUP_REOPEN_PREFIX = 'popupReopen';
 const STATUS_CACHE_TTL_MS = 30 * 1000;
-const PARSE_CACHE_PREFIX = 'parsedPage:v2';
+const PARSE_CACHE_PREFIX = 'parsedPage:v4';
 const STATUS_CACHE_PREFIX = 'trackedStatus';
 const STEAMDB_SELECTION_CONTEXT_PREFIX = 'steamDbSelectionContext';
 const STEAMDB_BACKFILL_STATE_PREFIX = 'steamDbBackfill';
@@ -207,6 +207,16 @@ function getStatusCacheStorageKey(url: string): string {
   return `${STATUS_CACHE_PREFIX}:${canonicalizeSupportedUrl(url)}`;
 }
 
+function hasPlaceholderSourceVersion(value: string | null | undefined): boolean {
+  const trimmed = value?.trim();
+  return !trimmed || /^(?:unknown|n\/?a|version|build)$/i.test(trimmed);
+}
+
+function hasNumericSteamBuildId(value: string | null | undefined): boolean {
+  const trimmed = value?.trim();
+  return Boolean(trimmed && /^\d+$/.test(trimmed));
+}
+
 function isParsedCacheFresh(
   cacheEntry: CachedParsedPage | null,
   fingerprint?: string | null,
@@ -216,6 +226,16 @@ function isParsedCacheFresh(
   }
 
   if (fingerprint && cacheEntry.fingerprint !== fingerprint) {
+    return false;
+  }
+
+  if (
+    cacheEntry.parsedSource.sourceKind === 'steamrip' &&
+    hasPlaceholderSourceVersion(
+      cacheEntry.parsedSource.latestSourceRelease.version,
+    ) &&
+    !hasNumericSteamBuildId(cacheEntry.parsedSource.latestSourceRelease.buildId)
+  ) {
     return false;
   }
 

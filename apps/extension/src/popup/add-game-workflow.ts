@@ -6,6 +6,7 @@ import type {
   MatchedSourceView,
   ParsedSourcePayload,
   SelectedDownloads,
+  SourceSnapshot,
   SteamCandidate,
   SteamPatchCandidate,
   SupportedSourceKind,
@@ -252,6 +253,100 @@ export function trackedItemMatchesSourceUrls(
   );
 }
 
+function sourceViewMatchesParsedSource(
+  source: MatchedSourceView,
+  parsedSource: ParsedSourcePayload,
+): boolean {
+  if (source.match.sourceKind !== parsedSource.sourceKind) {
+    return false;
+  }
+
+  const targetUrls = new Set(
+    comparableSourcePageUrlVariants(parsedSource.sourceUrl),
+  );
+  if (targetUrls.size === 0) {
+    return true;
+  }
+
+  return [source.match.sourceUrl, source.snapshot?.sourceUrl].some((url) =>
+    comparableSourcePageUrlVariants(url).some((variant) =>
+      targetUrls.has(variant),
+    ),
+  );
+}
+
+function numericBuildSignal(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  return trimmed && /^\d+$/.test(trimmed) ? trimmed : null;
+}
+
+function snapshotFromParsedSource(
+  item: TrackedItemView,
+  source: MatchedSourceView,
+  parsedSource: ParsedSourcePayload,
+): SourceSnapshot {
+  const release = parsedSource.latestSourceRelease;
+  const existingSnapshot = source.snapshot;
+  const observedVersion =
+    release.version?.trim() || existingSnapshot?.observedVersion || 'unknown';
+  const observedBuildId =
+    release.buildId?.trim() ||
+    numericBuildSignal(existingSnapshot?.observedBuildId);
+
+  return {
+    checkedAt:
+      existingSnapshot?.checkedAt ??
+      source.match.lastCheckedAt ??
+      source.match.updatedAt,
+    fingerprint: parsedSource.fingerprint,
+    observedBuildId: observedBuildId ?? null,
+    observedPatchDate:
+      release.patchDate ?? existingSnapshot?.observedPatchDate ?? null,
+    observedPatchLink: existingSnapshot?.observedPatchLink ?? null,
+    observedPatchTitle: existingSnapshot?.observedPatchTitle ?? null,
+    observedVersion,
+    patchSelectionSource: existingSnapshot?.patchSelectionSource ?? null,
+    sourceKind: parsedSource.sourceKind,
+    sourceUrl: parsedSource.sourceUrl,
+    trackedItemId: item.item.id,
+  };
+}
+
+export function mergeParsedSourceIntoTrackedItem(
+  item: TrackedItemView | null | undefined,
+  parsedSource: ParsedSourcePayload | null | undefined,
+): TrackedItemView | null {
+  if (!item || !parsedSource) {
+    return item ?? null;
+  }
+
+  let merged = false;
+  const sourceMatches = item.sourceMatches.map((source) => {
+    if (!sourceViewMatchesParsedSource(source, parsedSource)) {
+      return source;
+    }
+
+    merged = true;
+    return {
+      ...source,
+      match: {
+        ...source.match,
+        normalizedTitle: parsedSource.normalizedTitle,
+        sourceTitle: parsedSource.title,
+        sourceUrl: parsedSource.sourceUrl,
+      },
+      snapshot: snapshotFromParsedSource(item, source, parsedSource),
+    };
+  });
+
+  return merged
+    ? {
+        ...item,
+        sourceMatches,
+      }
+    : item;
+}
+
 export function isSourceCurrentForInstall(
   item: TrackedItemView | null | undefined,
   source: MatchedSourceView | null | undefined,
@@ -487,7 +582,12 @@ export function getSourceDownloadSelection(
   source: MatchedSourceView | null | undefined,
 ): SourceDownloadSelection {
   const fullMirrors =
-    source?.downloadMirrors.filter((mirror) => mirror.kind === 'full') ?? [];
+    source?.downloadMirrors.filter(
+      (mirror) =>
+        mirror.kind === 'full' &&
+        (source.match.sourceKind !== 'ankergames' ||
+          /^datanodes$/i.test(mirror.label.trim())),
+    ) ?? [];
   const patchMirrors =
     source?.downloadMirrors.filter((mirror) => mirror.kind === 'patch') ?? [];
   const selectedFullUrl =
@@ -502,11 +602,16 @@ export function getSourceDownloadSelection(
       patchMirrors[0]?.url ??
       null);
   const requiresPatchMirror = patchMirrors.length > 0 && !sharedPatchMirrors;
+  const canUsePatchOnly = Boolean(
+    source?.match.sourceKind === 'elamigos' &&
+      selectedPatchUrl &&
+      fullMirrors.length === 0,
+  );
   const canSelect = Boolean(
     source?.match.usable &&
-    source.match.sourceUrl &&
-    selectedFullUrl &&
-    (!requiresPatchMirror || selectedPatchUrl),
+      source.match.sourceUrl &&
+      (selectedFullUrl || canUsePatchOnly) &&
+      (!requiresPatchMirror || selectedPatchUrl),
   );
 
   return {
@@ -515,9 +620,9 @@ export function getSourceDownloadSelection(
     patchMirrors,
     requiresPatchMirror,
     selectedDownloads:
-      source && selectedFullUrl
+      source && (selectedFullUrl || selectedPatchUrl)
         ? {
-            fullUrl: selectedFullUrl,
+            fullUrl: selectedFullUrl ?? '',
             patchUrl: selectedPatchUrl,
             sourceKind: source.match.sourceKind,
           }
@@ -531,12 +636,8 @@ export function getSourceDownloadSelection(
 
 export { hasActionableSourceUpdate } from '@gamevault/shared-types';
 
-function sourceHasSelectableFullMirror(source: MatchedSourceView): boolean {
-  return Boolean(
-    source.match.usable &&
-      source.match.sourceUrl &&
-      source.downloadMirrors.some((mirror) => mirror.kind === 'full'),
-  );
+function sourceHasSelectableMirror(source: MatchedSourceView): boolean {
+  return getSourceDownloadSelection(source).canSelect;
 }
 
 export function getPreferredUpdateSource(
@@ -545,13 +646,13 @@ export function getPreferredUpdateSource(
   return (
     item.sourceMatches.find(
       (source) =>
-        source.isUpdateSource && sourceHasSelectableFullMirror(source),
+        source.isUpdateSource && sourceHasSelectableMirror(source),
     ) ??
     item.sourceMatches.find(
       (source) =>
-        source.match.isPrimary && sourceHasSelectableFullMirror(source),
+        source.match.isPrimary && sourceHasSelectableMirror(source),
     ) ??
-    item.sourceMatches.find(sourceHasSelectableFullMirror) ??
+    item.sourceMatches.find(sourceHasSelectableMirror) ??
     item.sourceMatches.find((source) => source.isUpdateSource) ??
     item.sourceMatches[0] ??
     null

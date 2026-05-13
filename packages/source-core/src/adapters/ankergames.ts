@@ -175,14 +175,25 @@ function collectDownloadUrls(
     seenIds.add(id);
     const label =
       compactText($(element).closest('li').children('div').first().text()) ||
+      ($(element)
+        .prevAll('div, span, p, strong')
+        .toArray()
+        .map((sibling) => compactText($(sibling).text()))
+        .find(Boolean) ??
+        '') ||
       compactText($(element).text())
         .replace(/\bdownload\b/gi, '')
         .trim() ||
       'DataNodes';
 
+    const normalizedLabel = normalizeDownloadLabel(label, stableUrl);
+    if (!/^datanodes$/i.test(normalizedLabel)) {
+      return;
+    }
+
     downloadUrls.push({
       kind: 'full',
-      label: normalizeDownloadLabel(label, stableUrl),
+      label: normalizedLabel,
       url: stableUrl,
     });
   });

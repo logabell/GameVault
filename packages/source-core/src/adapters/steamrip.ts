@@ -20,8 +20,8 @@ const STEAMRIP_NON_DETAIL_PATHS = new Set([
   'top-games',
   'updated-games',
 ]);
-const VERSION_RE = /version[:\s]+(?<version>[0-9a-z.-]+)/i;
-const BUILD_RE = /build[:\s#]+(?<build>[0-9a-z.-]+)/i;
+const VERSION_RE = /version[:\s]+v?\s*(?<version>[0-9][0-9a-z.-]*)/i;
+const BUILD_VALUE_RE = /build(?:\s*id)?[:\s#]+(?<build>[0-9][0-9a-z.-]*)/i;
 const HOST_LABELS = new Map<string, string>([
   ['buzzheavier.com', 'Buzzheavier'],
   ['bzzhr.to', 'Buzzheavier'],
@@ -115,10 +115,21 @@ function parseInfoSection(text: string): {
   patchDate?: string | null;
   version: string;
 } | null {
+  const buildValue = text.match(BUILD_VALUE_RE)?.groups?.build?.trim() ?? null;
+  const numericBuildId =
+    buildValue && /^\d{4,}$/.test(buildValue) ? buildValue : null;
+  const versionBuildValue =
+    text
+      .match(/version\s*:?\s*build[:\s#]+(?<version>[0-9][0-9a-z.-]*)/i)
+      ?.groups?.version?.trim() ?? null;
   const version =
     text.match(/Version\s*:?\s*v?(?<version>[0-9][0-9a-z.\-+]*)/i)?.groups?.version?.trim() ??
-    text.match(VERSION_RE)?.groups?.version?.trim();
-  const buildId = text.match(BUILD_RE)?.groups?.build?.trim() ?? null;
+    text.match(VERSION_RE)?.groups?.version?.trim() ??
+    (versionBuildValue && versionBuildValue !== numericBuildId
+      ? versionBuildValue
+      : null) ??
+    (buildValue && buildValue !== numericBuildId ? buildValue : null);
+  const buildId = numericBuildId;
   const patchDate = normalizeSlashDate(text);
 
   if (!version && !buildId) {

@@ -77,6 +77,7 @@ import {
   derivePatchLag,
   deriveTrackedItemStatus,
   deriveTrackedItemTrackingStatus,
+  findConservativeSteamPatchByDateAndVersion,
   findSteamPatchByDateAndVersion,
   findUniqueSteamPatchByTitleVersion,
   compareNumericSourceVersions,
@@ -3213,6 +3214,7 @@ export class GameVaultService {
     snapshot: SourceSnapshot,
     patchEntries: SteamPatchEntry[],
     parsedSource?: ParsedSourcePayload | null,
+    options: { elamigosDateMatchMode?: 'any' | 'unique' | 'none' } = {},
   ): SteamPatchEntry | null {
     const signals = this.getRawSourceReleaseSignals(snapshot, parsedSource);
     const buildMatch = this.findPatchByBuildId(patchEntries, signals.buildId);
@@ -3220,12 +3222,21 @@ export class GameVaultService {
       return buildMatch;
     }
 
-    if (snapshot.sourceKind === 'elamigos') {
-      return findSteamPatchByDateAndVersion(
-        patchEntries,
-        signals.patchDate,
-        signals.version,
-      );
+    if (
+      snapshot.sourceKind === 'elamigos' &&
+      options.elamigosDateMatchMode !== 'none'
+    ) {
+      return options.elamigosDateMatchMode === 'unique'
+        ? findConservativeSteamPatchByDateAndVersion(
+            patchEntries,
+            signals.patchDate,
+            signals.version,
+          )
+        : findSteamPatchByDateAndVersion(
+            patchEntries,
+            signals.patchDate,
+            signals.version,
+          );
     }
 
     if (snapshot.sourceKind === 'ankergames' && signals.buildId) {
@@ -3278,6 +3289,10 @@ export class GameVaultService {
       if (!snapshot) {
         continue;
       }
+      const sourceMatch = this.database.getSourceMatch(
+        trackedItemId,
+        sourceKind,
+      );
       const parsedSource = this.database.getRawParsedSourcePayload(
         trackedItemId,
         sourceKind,
@@ -3306,11 +3321,30 @@ export class GameVaultService {
         snapshot,
         patchEntries,
         parsedSource,
+        {
+          elamigosDateMatchMode:
+            sourceMatch?.method !== 'fuzzy_title' &&
+            (sourceMatch?.status === 'verified' ||
+              (sourceMatch?.status === 'probable' && sourceMatch.usable))
+              ? 'any'
+              : 'unique',
+        },
       );
-      const nextSnapshot = matchedPatch
+      const normalizedVersion = normalizeSourceVersion(
+        parsedSource?.latestSourceRelease.version ?? snapshot.observedVersion,
+      );
+      const peerPatches = normalizedVersion
+        ? resolvedPeersByVersion.get(normalizedVersion)
+        : null;
+      const inheritedPatch =
+        !matchedPatch && peerPatches?.size === 1
+          ? Array.from(peerPatches.values())[0]!
+          : null;
+      const resolvedPatch = matchedPatch ?? inheritedPatch;
+      const nextSnapshot = resolvedPatch
         ? this.canonicalizeSourceSnapshotWithPatch(
             snapshot,
-            matchedPatch,
+            resolvedPatch,
             parsedSource,
           )
         : parsedSource
@@ -3320,16 +3354,19 @@ export class GameVaultService {
         this.database.upsertSourceSnapshot(nextSnapshot);
       }
 
-      if (matchedPatch) {
-        const normalizedVersion = normalizeSourceVersion(
-          parsedSource?.latestSourceRelease.version ?? snapshot.observedVersion,
-        );
+      if (resolvedPatch) {
         if (normalizedVersion) {
-          const peerPatches =
+          const resolvedVersionPeerPatches =
             resolvedPeersByVersion.get(normalizedVersion) ??
             new Map<string, SteamPatchEntry>();
-          peerPatches.set(getSteamPatchIdentityKey(matchedPatch), matchedPatch);
-          resolvedPeersByVersion.set(normalizedVersion, peerPatches);
+          resolvedVersionPeerPatches.set(
+            getSteamPatchIdentityKey(resolvedPatch),
+            resolvedPatch,
+          );
+          resolvedPeersByVersion.set(
+            normalizedVersion,
+            resolvedVersionPeerPatches,
+          );
         }
       }
     }
@@ -3596,6 +3633,7 @@ export class GameVaultService {
     });
     const matchedSourceViews = inferSourceComparisonRows(
       {
+        installRecord,
         item,
         sourceMatches: rawMatchedSourceViews,
       } as TrackedItemView,
@@ -8365,66 +8403,108 @@ export class GameVaultService {
   }
 
   async cancelDownload(trackedItemId: string): Promise<TrackedItemView> {
-    const job = this.database.getDownloadJob(trackedItemId);
-    if (!job) {
+    const jobs = this.database.listDownloadJobsForTrackedItem(trackedItemId);
+    if (jobs.length === 0) {
       throw new Error('No download job is available to cancel.');
     }
-    if (job.stage === 'complete') {
+    const cancellableJobs = jobs.filter((job) => job.stage !== 'complete');
+    if (cancellableJobs.length === 0) {
       throw new Error('Completed installs cannot be cancelled.');
     }
 
-    await this.cancelDirectHttpDownload(
-      trackedItemId,
-      'Download cancelled',
-    ).catch(() => undefined);
-    await this.removeJDownloaderPackagesForJob(
-      job,
-      trackedItemId,
-      'Unable to remove JDownloader package while cancelling download',
-    );
+    await this.cancelDirectHttpDownload(trackedItemId, 'Download cancelled')
+      .catch((error) => {
+        this.appendEvent(
+          'warn',
+          'Unable to stop direct download while cancelling',
+          {
+            error:
+              error instanceof Error
+                ? error.message
+                : 'Unknown direct download cancellation error',
+            trackedItemId,
+          },
+        );
+      });
 
-    const settings = this.database.getSettings();
-    if (!settings.rootLibraryPath) {
-      throw new Error(
-        'Root library path is not configured, so staged files cannot be deleted safely.',
+    for (const job of cancellableJobs) {
+      await this.removeJDownloaderPackagesForJob(
+        job,
+        trackedItemId,
+        'Unable to remove JDownloader package while cancelling download',
       );
     }
 
-    const sourceKind =
-      job.sourceKind === 'ankergames' ||
-      job.sourceKind === 'elamigos' ||
-      job.sourceKind === 'steamrip'
-        ? job.sourceKind
-        : null;
+    const settings = this.database.getSettings();
+    const deletedPaths: string[] = [];
     const ejectedIsoPaths: string[] = [];
-    if (sourceKind === 'elamigos') {
-      for (const rootPath of getElamigosPartContentPaths(job)) {
-        if (!(await pathExists(rootPath))) {
-          continue;
+    const cleanupErrors: string[] = [];
+
+    if (settings.rootLibraryPath) {
+      for (const job of cancellableJobs) {
+        const sourceKind =
+          job.sourceKind === 'ankergames' ||
+          job.sourceKind === 'elamigos' ||
+          job.sourceKind === 'steamrip'
+            ? job.sourceKind
+            : null;
+
+        try {
+          if (sourceKind === 'elamigos') {
+            for (const rootPath of getElamigosPartContentPaths(job)) {
+              if (!(await pathExists(rootPath))) {
+                continue;
+              }
+              ejectedIsoPaths.push(
+                ...(await this.dismountIsoUnderPath({ rootPath })),
+              );
+            }
+          }
+
+          const extractionPath =
+            sourceKind === 'ankergames' || sourceKind === 'steamrip'
+              ? getPortableArchiveExtractPath({
+                  finalPath: job.finalPath,
+                  sourceKind,
+                  stagePath: job.stagePath,
+                })
+              : job.stagePath;
+          deletedPaths.push(
+            ...(await removeKnownStagingPaths({
+              extractionPath,
+              rootLibraryPath: settings.rootLibraryPath,
+              stagePath: job.stagePath,
+            })),
+          );
+        } catch (error) {
+          cleanupErrors.push(
+            error instanceof Error
+              ? error.message
+              : 'Unknown staged file cleanup error',
+          );
         }
-        ejectedIsoPaths.push(
-          ...(await this.dismountIsoUnderPath({ rootPath })),
-        );
       }
+    } else {
+      cleanupErrors.push(
+        'Root library path is not configured, so staged files were not deleted.',
+      );
     }
 
-    const extractionPath =
-      sourceKind === 'ankergames' || sourceKind === 'steamrip'
-        ? getPortableArchiveExtractPath({
-            finalPath: job.finalPath,
-            sourceKind,
-            stagePath: job.stagePath,
-          })
-        : job.stagePath;
-    const deletedPaths = await removeKnownStagingPaths({
-      extractionPath,
-      rootLibraryPath: settings.rootLibraryPath,
-      stagePath: job.stagePath,
-    });
-    this.database.deleteDownloadJob(job.id);
+    this.database.deleteDownloadJobsForTrackedItem(trackedItemId);
+    if (cleanupErrors.length > 0) {
+      this.appendEvent(
+        'warn',
+        'Cancelled download but could not clean up every staged path',
+        {
+          cleanupErrors,
+          trackedItemId,
+        },
+      );
+    }
     this.appendEvent('info', 'Cancelled download and deleted staged files', {
       deletedPaths,
       ejectedIsoPaths,
+      jobsCancelled: cancellableJobs.length,
       trackedItemId,
     });
     return this.buildTrackedItemView(trackedItemId);

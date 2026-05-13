@@ -2311,6 +2311,12 @@ export class GameVaultDatabase {
     }));
   }
 
+  listDownloadJobsForTrackedItem(trackedItemId: string): DownloadJobRecord[] {
+    return this.listDownloadJobs().filter(
+      (job) => job.trackedItemId === trackedItemId,
+    );
+  }
+
   listDownloadJobParts(jobId: string): DownloadJobPartRecord[] {
     return this.queryAll<{
       id: string;
@@ -2467,6 +2473,18 @@ export class GameVaultDatabase {
   deleteDownloadJob(jobId: string): void {
     this.exec(`DELETE FROM download_job_parts WHERE job_id = ?`, [jobId]);
     this.exec(`DELETE FROM download_jobs WHERE id = ?`, [jobId]);
+  }
+
+  deleteDownloadJobsForTrackedItem(
+    trackedItemId: string,
+    options: { includeComplete?: boolean } = {},
+  ): void {
+    const jobs = this.listDownloadJobsForTrackedItem(trackedItemId).filter(
+      (job) => options.includeComplete || job.stage !== 'complete',
+    );
+    for (const job of jobs) {
+      this.deleteDownloadJob(job.id);
+    }
   }
 
   dismissActivityIssue(params: {

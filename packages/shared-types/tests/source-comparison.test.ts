@@ -271,6 +271,59 @@ describe('source comparison inference', () => {
     });
   });
 
+  it('shares a usable probable ElAmigos date match with same-version peers', () => {
+    const latestPatch = patch(
+      '23076725',
+      "No Man's Sky update for 4 May 2026",
+      '05/04/2026',
+      '2026-05-04T14:00:00.000Z',
+    );
+    const matchingSameDayPatch = patch(
+      '22885608',
+      "No Man's Sky update for 21 April 2026",
+      '04/21/2026',
+      '2026-04-21T22:00:00.000Z',
+    );
+    const olderSameDayPatch = patch(
+      '22880000',
+      "No Man's Sky hotfix for 21 April 2026",
+      '04/21/2026',
+      '2026-04-21T09:00:00.000Z',
+    );
+    const elamigos = sourceView('elamigos', {
+      observedPatchDate: '21.04.2026',
+      observedVersion: '6.34',
+    });
+    elamigos.match.status = 'probable';
+    elamigos.match.usable = true;
+    const steamrip = sourceView('steamrip', {
+      observedBuildId: null,
+      observedVersion: '6.34',
+    });
+
+    const rows = inferSourceComparisonRows(
+      trackedItem([elamigos, steamrip]),
+      [latestPatch, olderSameDayPatch, matchingSameDayPatch],
+    );
+
+    for (const sourceKind of ['elamigos', 'steamrip'] as const) {
+      expect(
+        rows.find((source) => source.match.sourceKind === sourceKind),
+      ).toMatchObject({
+        matchedPatch: {
+          buildId: matchingSameDayPatch.buildId,
+        },
+        snapshot: {
+          observedBuildId: matchingSameDayPatch.buildId,
+          observedPatchDate: matchingSameDayPatch.patchDate,
+          observedVersion: '6.34',
+        },
+        updateStatus: 'source_behind_upstream',
+        versionsBehindLatest: 1,
+      });
+    }
+  });
+
   it('uses the same-date untitled SteamDB build for ElAmigos full-release versions', () => {
     const hotfixPatch = patch(
       '19434067',
@@ -564,6 +617,121 @@ describe('source comparison inference', () => {
       updateStatus: 'matches_upstream',
       versionsBehindLatest: 0,
     });
+  });
+
+  it('infers version-only peers from a resolved AnkerGames build', () => {
+    const latestPatch = patch('13773296', 'Grand Theft Auto V update');
+    const ankergames = sourceView('ankergames', {
+      observedBuildId: latestPatch.buildId,
+      observedVersion: 'V 1491.50',
+    });
+    const elamigos = sourceView('elamigos', {
+      observedBuildId: null,
+      observedVersion: '1491.50',
+    });
+    elamigos.match.status = 'probable';
+    elamigos.match.usable = false;
+    const steamrip = sourceView('steamrip', {
+      observedBuildId: null,
+      observedVersion: '1491.50',
+    });
+
+    const rows = inferSourceComparisonRows(
+      trackedItem([ankergames, elamigos, steamrip]),
+      [latestPatch],
+    );
+
+    for (const sourceKind of ['elamigos', 'steamrip'] as const) {
+      expect(
+        rows.find((source) => source.match.sourceKind === sourceKind),
+      ).toMatchObject({
+        isUpdateSource: true,
+        matchedPatch: {
+          buildId: latestPatch.buildId,
+        },
+        snapshot: {
+          observedBuildId: latestPatch.buildId,
+          observedVersion: '1491.50',
+        },
+        updateStatus: 'matches_upstream',
+        versionsBehindLatest: 0,
+      });
+    }
+  });
+
+  it('uses legacy non-numeric build signals as version-only peer evidence', () => {
+    const latestPatch = patch('13773296', 'Grand Theft Auto V update');
+    const ankergames = sourceView('ankergames', {
+      observedBuildId: latestPatch.buildId,
+      observedVersion: 'V 1491.50',
+    });
+    const steamrip = sourceView('steamrip', {
+      observedBuildId: '1491.50',
+      observedVersion: 'Build',
+    });
+
+    const rows = inferSourceComparisonRows(
+      trackedItem([ankergames, steamrip]),
+      [latestPatch],
+    );
+    const inferredSteamRip = rows.find(
+      (source) => source.match.sourceKind === 'steamrip',
+    );
+
+    expect(inferredSteamRip).toMatchObject({
+      matchedPatch: {
+        buildId: latestPatch.buildId,
+      },
+      snapshot: {
+        observedBuildId: latestPatch.buildId,
+        observedVersion: '1491.50',
+      },
+      updateStatus: 'matches_upstream',
+      versionsBehindLatest: 0,
+    });
+  });
+
+  it('inherits a same-version peer build even without local SteamDB history', () => {
+    const ankergames = {
+      ...sourceView('ankergames', {
+        observedBuildId: '13773296',
+        observedVersion: 'V 1491.50',
+      }),
+      isUpdateSource: true,
+      updateStatus: 'matches_upstream' as const,
+      versionsBehindLatest: 0,
+    };
+    const elamigos = sourceView('elamigos', {
+      observedBuildId: null,
+      observedVersion: '1491.50',
+    });
+    const steamrip = sourceView('steamrip', {
+      observedBuildId: null,
+      observedVersion: '1491.50',
+    });
+
+    const rows = inferSourceComparisonRows(
+      trackedItem([ankergames, elamigos, steamrip]),
+      [],
+    );
+
+    for (const sourceKind of ['elamigos', 'steamrip'] as const) {
+      expect(
+        rows.find((source) => source.match.sourceKind === sourceKind),
+      ).toMatchObject({
+        match: {
+          status: 'verified',
+          usable: true,
+        },
+        matchedPatch: null,
+        snapshot: {
+          observedBuildId: '13773296',
+          observedVersion: '1491.50',
+        },
+        updateStatus: 'matches_upstream',
+        versionsBehindLatest: 0,
+      });
+    }
   });
 
   it('does not treat an older version-only SteamRIP source as newer than the installed build', () => {

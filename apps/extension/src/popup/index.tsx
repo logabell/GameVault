@@ -83,6 +83,7 @@ import {
   inferSourceComparisonRows,
   isSourceCurrentForInstall,
   isSourceReadyForAutomation,
+  mergeParsedSourceIntoTrackedItem,
   normalizeComparableUrl,
   trackedItemMatchesSourceUrls,
 } from './add-game-workflow.js';
@@ -1292,19 +1293,26 @@ function App() {
         : null) ?? currentPageTrackedItem,
     [currentPageTrackedItem, libraryItems, libraryUpdateItem, matchedDraftItemId],
   );
+  const activeDraftItemWithParsedSource = useMemo(
+    () =>
+      isLibraryUpdateFlow
+        ? baseActiveDraftItem
+        : mergeParsedSourceIntoTrackedItem(baseActiveDraftItem, parsedSource),
+    [baseActiveDraftItem, isLibraryUpdateFlow, parsedSource],
+  );
   const sourceRows = useMemo(
-    () => inferSourceComparisonRows(baseActiveDraftItem, steamPatches),
-    [baseActiveDraftItem, steamPatches],
+    () => inferSourceComparisonRows(activeDraftItemWithParsedSource, steamPatches),
+    [activeDraftItemWithParsedSource, steamPatches],
   );
   const activeDraftItem = useMemo(
     () =>
-      baseActiveDraftItem
+      activeDraftItemWithParsedSource
         ? {
-            ...baseActiveDraftItem,
+            ...activeDraftItemWithParsedSource,
             sourceMatches: sourceRows,
           }
         : null,
-    [baseActiveDraftItem, sourceRows],
+    [activeDraftItemWithParsedSource, sourceRows],
   );
   const selectedSourceView =
     sourceRows.find(
@@ -1313,19 +1321,17 @@ function App() {
     sourceRows.find((source) => source.match.isPrimary) ??
     sourceRows[0] ??
     null;
-  const selectedSourceFullMirrors = useMemo(
-    () =>
-      selectedSourceView?.downloadMirrors.filter(
-        (mirror) => mirror.kind === 'full',
-      ) ?? [],
+  const selectedSourceDownloadSelection = useMemo(
+    () => getSourceDownloadSelection(selectedSourceView),
     [selectedSourceView],
   );
+  const selectedSourceFullMirrors = useMemo(
+    () => selectedSourceDownloadSelection.fullMirrors,
+    [selectedSourceDownloadSelection],
+  );
   const selectedSourcePatchMirrors = useMemo(
-    () =>
-      selectedSourceView?.downloadMirrors.filter(
-        (mirror) => mirror.kind === 'patch',
-      ) ?? [],
-    [selectedSourceView],
+    () => selectedSourceDownloadSelection.patchMirrors,
+    [selectedSourceDownloadSelection],
   );
   const sharedSourcePatchMirrors = haveSharedMirrorUrls(
     selectedSourceFullMirrors,
@@ -1339,6 +1345,22 @@ function App() {
     .join('\n');
   const requiresSourcePatchMirror =
     selectedSourcePatchMirrors.length > 0 && !sharedSourcePatchMirrors;
+  const effectiveSelectedPatchMirrorUrl = getEffectivePatchMirrorUrl(
+    selectedFullMirrorUrl,
+    selectedPatchMirrorUrl,
+  );
+  const canUseSelectedPatchOnly = Boolean(
+    selectedSourceView?.match.sourceKind === 'elamigos' &&
+      !selectedFullMirrorUrl &&
+      effectiveSelectedPatchMirrorUrl,
+  );
+  const hasSelectedDownloadMirror = Boolean(
+    selectedFullMirrorUrl || canUseSelectedPatchOnly,
+  );
+  const hasRequiredSelectedMirrors = Boolean(
+    hasSelectedDownloadMirror &&
+      (!requiresSourcePatchMirror || effectiveSelectedPatchMirrorUrl),
+  );
   const likelySteamPatch = useMemo(
     () =>
       getLikelyPatchForSelectedSource(
@@ -1372,7 +1394,11 @@ function App() {
     step === 'game' || Boolean(activeDraftItem?.item.steamAppId);
   const canVisitPatchStep =
     step === 'patch' ||
-    Boolean(selectedAppId && selectedSourceFullMirrors.length > 0) ||
+    Boolean(
+      selectedAppId &&
+        (selectedSourceFullMirrors.length > 0 ||
+          selectedSourcePatchMirrors.length > 0),
+    ) ||
     steamPatches.length > 0;
   const detailsItem = useMemo(
     () => libraryItems.find((item) => item.item.id === detailsItemId) ?? null,
@@ -3677,14 +3703,19 @@ function App() {
       setMessage('Choose a download source first.');
       return false;
     }
-    if (!selectedFullMirrorUrl) {
-      setMessage('Choose a full download mirror first.');
-      return false;
-    }
     const effectivePatchMirrorUrl = getEffectivePatchMirrorUrl(
       selectedFullMirrorUrl,
       selectedPatchMirrorUrl,
     );
+    const canUsePatchOnly = Boolean(
+      selectedSourceView.match.sourceKind === 'elamigos' &&
+        !selectedFullMirrorUrl &&
+        effectivePatchMirrorUrl,
+    );
+    if (!selectedFullMirrorUrl && !canUsePatchOnly) {
+      setMessage('Choose a download mirror first.');
+      return false;
+    }
     if (requiresSourcePatchMirror && !effectivePatchMirrorUrl) {
       setMessage('Choose an update mirror first.');
       return false;
@@ -3707,7 +3738,7 @@ function App() {
           selectedSteamPatch,
           steamPatchEntries: getSteamPatchEntriesForSelectedPatch(),
           selectedDownloads: {
-            fullUrl: selectedFullMirrorUrl,
+            fullUrl: selectedFullMirrorUrl ?? '',
             patchUrl: effectivePatchMirrorUrl,
           },
           sourceKind: selectedSourceView.match.sourceKind,
@@ -4541,11 +4572,21 @@ function App() {
                             selectedSourceView?.match.sourceKind === sourceKind;
                           const isCurrentInstallSource =
                             isSourceCurrentForInstall(activeDraftItem, source);
-                          const fullMirrors = source.downloadMirrors.filter(
-                            (mirror) => mirror.kind === 'full',
-                          );
-                          const canSelect =
-                            source.match.usable && fullMirrors.length > 0;
+                          const sourceDownloadSelection =
+                            getSourceDownloadSelection(source);
+                          const hasAnyMirror =
+                            sourceDownloadSelection.fullMirrors.length > 0 ||
+                            sourceDownloadSelection.patchMirrors.length > 0;
+                          const canSelect = sourceDownloadSelection.canSelect;
+                          const unavailableLabel = !source.match.usable
+                            ? formatLabel(
+                                source.match.status === 'candidate'
+                                  ? 'not_matched'
+                                  : source.match.status,
+                              )
+                            : !hasAnyMirror
+                              ? 'No Mirrors'
+                              : null;
                           const lagLabel = getSourceComparisonLabel(
                             source,
                             activeDraftItem,
@@ -4608,13 +4649,9 @@ function App() {
                                 {isSelected ? (
                                   <span className="mini-chip">Selected</span>
                                 ) : null}
-                                {!canSelect ? (
+                                {unavailableLabel ? (
                                   <span className="mini-chip is-danger">
-                                    {formatLabel(
-                                      source.match.status === 'candidate'
-                                        ? 'not_matched'
-                                        : source.match.status,
-                                    )}
+                                    {unavailableLabel}
                                   </span>
                                 ) : null}
                               </div>
@@ -4774,8 +4811,7 @@ function App() {
                         className="primary-button compact-button"
                         disabled={
                           busy ||
-                          !selectedFullMirrorUrl ||
-                          (requiresSourcePatchMirror && !selectedPatchMirrorUrl)
+                          !hasRequiredSelectedMirrors
                         }
                         onClick={() => void openSteamPatchFlow()}
                         type="button"
@@ -5001,9 +5037,7 @@ function App() {
                           busy ||
                           patchLoading ||
                           !selectedSteamPatch ||
-                          !selectedFullMirrorUrl ||
-                          (requiresSourcePatchMirror &&
-                            !selectedPatchMirrorUrl) ||
+                          !hasRequiredSelectedMirrors ||
                           !canFinishSelectedSourceDownload
                         }
                         onClick={() => void confirmAdd()}

@@ -24,11 +24,20 @@ export function normalizeSourceComparisonVersion(
   const normalized = value
     ?.trim()
     .toLowerCase()
-    .replace(/^version\s*:?\s*/i, '')
+    .replace(/^(?:version|build)\s*:?\s*/i, '')
     .replace(/^v\s*(?=\d)/i, '')
     .replace(/\s+/g, ' ')
     .replace(/(\d)\s*r$/i, '$1');
   return normalized || null;
+}
+
+function meaningfulSourceVersion(
+  value: string | null | undefined,
+): string | null {
+  const normalized = normalizeSourceComparisonVersion(value);
+  return normalized && !/^(?:unknown|n\/?a)$/i.test(normalized)
+    ? normalized
+    : null;
 }
 
 export function numericSourceVersionSegments(
@@ -113,9 +122,22 @@ function steamPatchTitleMatchesSourceVersion(
   return extractSteamPatchTitleVersion(patch.patchTitle) === version;
 }
 
+function sourceVersionFromBuildSignal(
+  source: MatchedSourceView,
+): string | null {
+  const buildSignal =
+    source.snapshot?.observedBuildId ?? source.matchedPatch?.buildId;
+  if (!buildSignal || numericSourceBuildId(buildSignal)) {
+    return null;
+  }
+  return normalizeSourceComparisonVersion(buildSignal);
+}
+
 function sourceVersion(source: MatchedSourceView): string | null {
-  return normalizeSourceComparisonVersion(
-    source.snapshot?.observedVersion ?? source.matchedPatch?.version,
+  return (
+    meaningfulSourceVersion(
+      source.snapshot?.observedVersion ?? source.matchedPatch?.version,
+    ) ?? sourceVersionFromBuildSignal(source)
   );
 }
 
@@ -192,6 +214,16 @@ export function findSteamPatchByDateAndVersion(
     return sameDatePatches[0] ?? null;
   }
 
+  return (
+    findDisambiguatedSteamPatchByDateAndVersion(sameDatePatches, version) ??
+    findMostRecentSteamPatch(sameDatePatches)
+  );
+}
+
+function findDisambiguatedSteamPatchByDateAndVersion(
+  sameDatePatches: SteamPatchEntry[],
+  version: string | null | undefined,
+): SteamPatchEntry | null {
   const normalizedVersion = normalizeSourceComparisonVersion(version);
   const versionMatches = sameDatePatches.filter((patch) =>
     steamPatchTitleMatchesSourceVersion(patch, normalizedVersion),
@@ -221,7 +253,45 @@ export function findSteamPatchByDateAndVersion(
     return untitledPatches[0]!;
   }
 
-  return findMostRecentSteamPatch(sameDatePatches);
+  return null;
+}
+
+export function findConservativeSteamPatchByDateAndVersion(
+  patches: SteamPatchEntry[],
+  patchDate: string | null | undefined,
+  version: string | null | undefined,
+): SteamPatchEntry | null {
+  const dateKey = normalizePatchDateKey(patchDate);
+  if (!dateKey) return null;
+
+  const sameDatePatches = uniquePatchesByIdentity(
+    patches.filter(
+      (patch) => normalizePatchDateKey(patch.patchDate) === dateKey,
+    ),
+  );
+  if (sameDatePatches.length <= 1) {
+    return sameDatePatches[0] ?? null;
+  }
+
+  return findDisambiguatedSteamPatchByDateAndVersion(
+    sameDatePatches,
+    version,
+  );
+}
+
+export function findUniqueSteamPatchByDate(
+  patches: SteamPatchEntry[],
+  patchDate: string | null | undefined,
+): SteamPatchEntry | null {
+  const dateKey = normalizePatchDateKey(patchDate);
+  if (!dateKey) return null;
+
+  const sameDatePatches = uniquePatchesByIdentity(
+    patches.filter(
+      (patch) => normalizePatchDateKey(patch.patchDate) === dateKey,
+    ),
+  );
+  return sameDatePatches.length === 1 ? sameDatePatches[0]! : null;
 }
 
 export function getSteamPatchIdentityKey(patch: SteamPatchEntry): string {
@@ -328,12 +398,32 @@ function findUniqueResolvedPeerPatchByDate(
   return patches.size === 1 ? Array.from(patches.values())[0]! : null;
 }
 
+function promoteCorroboratedSourceMatch(
+  source: MatchedSourceView,
+): MatchedSourceView['match'] {
+  if (
+    source.match.status !== 'probable' &&
+    source.match.status !== 'candidate'
+  ) {
+    return source.match;
+  }
+
+  return {
+    ...source.match,
+    confidence: Math.max(source.match.confidence, 0.97),
+    status: 'verified',
+    usable: true,
+  };
+}
+
 function canonicalizeSourceWithPatch(params: {
   fallbackVersionsBehindLatest?: number | null;
   matchedPatch: SteamPatchEntry;
   patchEntries: SteamPatchEntry[];
+  promoteMatch?: boolean;
   source: MatchedSourceView;
 }): MatchedSourceView {
+  const comparableSourceVersion = sourceVersion(params.source);
   const patchLag = derivePatchLag({
     feedEntries: params.patchEntries,
     selectedPatch: params.matchedPatch,
@@ -343,12 +433,20 @@ function canonicalizeSourceWithPatch(params: {
     params.fallbackVersionsBehindLatest ??
     params.source.versionsBehindLatest ??
     null;
+  const sourceIsSameAsInstalled =
+    params.source.updateStatus === 'same_as_installed' &&
+    versionsBehindLatest === 0;
+  const effectiveMatch = params.promoteMatch
+    ? promoteCorroboratedSourceMatch(params.source)
+    : params.source.match;
 
   return {
     ...params.source,
     isUpdateSource:
-      params.source.isUpdateSource ||
-      (versionsBehindLatest === 0 && params.source.match.usable),
+      !sourceIsSameAsInstalled &&
+      (params.source.isUpdateSource ||
+        (versionsBehindLatest === 0 && effectiveMatch.usable)),
+    match: effectiveMatch,
     matchedPatch: params.matchedPatch,
     snapshot: params.source.snapshot
       ? {
@@ -365,17 +463,79 @@ function canonicalizeSourceWithPatch(params: {
           observedPatchTitle:
             params.matchedPatch.patchTitle ??
             params.source.snapshot.observedPatchTitle,
+          observedVersion:
+            meaningfulSourceVersion(params.source.snapshot.observedVersion)
+              ? params.source.snapshot.observedVersion
+              : (comparableSourceVersion ??
+                params.source.snapshot.observedVersion),
         }
       : params.source.snapshot,
     updateStatus:
-      typeof versionsBehindLatest === 'number'
-        ? versionsBehindLatest === 0
-          ? 'matches_upstream'
-          : 'source_behind_upstream'
-        : params.source.updateStatus,
+      sourceIsSameAsInstalled
+        ? 'same_as_installed'
+        : typeof versionsBehindLatest === 'number'
+          ? versionsBehindLatest === 0
+            ? 'matches_upstream'
+            : 'source_behind_upstream'
+          : params.source.updateStatus,
     versionsBehindLatest,
     versionsBehindLatestIsLowerBound:
       patchLag.versionsBehindLatestIsLowerBound ??
+      params.source.versionsBehindLatestIsLowerBound,
+  };
+}
+
+function peerVersionsBehindLatest(source: MatchedSourceView): number | null {
+  if (typeof source.versionsBehindLatest === 'number') {
+    return source.versionsBehindLatest;
+  }
+  return source.updateStatus === 'matches_upstream' ? 0 : null;
+}
+
+function canonicalizeSourceWithPeerBuild(params: {
+  buildId: string;
+  matchingPeer: MatchedSourceView;
+  source: MatchedSourceView;
+}): MatchedSourceView {
+  const comparableSourceVersion = sourceVersion(params.source);
+  const versionsBehindLatest =
+    peerVersionsBehindLatest(params.matchingPeer) ??
+    params.source.versionsBehindLatest ??
+    null;
+  const sourceIsSameAsInstalled =
+    params.source.updateStatus === 'same_as_installed' &&
+    versionsBehindLatest === 0;
+  const promotedMatch = promoteCorroboratedSourceMatch(params.source);
+
+  return {
+    ...params.source,
+    isUpdateSource:
+      !sourceIsSameAsInstalled &&
+      (params.source.isUpdateSource ||
+        (versionsBehindLatest === 0 && promotedMatch.usable)),
+    match: promotedMatch,
+    snapshot: params.source.snapshot
+      ? {
+          ...params.source.snapshot,
+          observedBuildId: params.buildId,
+          observedVersion:
+            meaningfulSourceVersion(params.source.snapshot.observedVersion)
+              ? params.source.snapshot.observedVersion
+              : (comparableSourceVersion ??
+                params.source.snapshot.observedVersion),
+        }
+      : params.source.snapshot,
+    updateStatus:
+      sourceIsSameAsInstalled
+        ? 'same_as_installed'
+        : typeof versionsBehindLatest === 'number'
+          ? versionsBehindLatest === 0
+            ? 'matches_upstream'
+            : 'source_behind_upstream'
+          : params.source.updateStatus,
+    versionsBehindLatest,
+    versionsBehindLatestIsLowerBound:
+      params.matchingPeer.versionsBehindLatestIsLowerBound ??
       params.source.versionsBehindLatestIsLowerBound,
   };
 }
@@ -397,11 +557,21 @@ function resolveDirectSourcePatch(
   }
 
   if (source.match.sourceKind === 'elamigos') {
-    return findSteamPatchByDateAndVersion(
-      patchEntries,
-      source.snapshot?.observedPatchDate,
-      sourceVersion(source),
-    );
+    const dateMatchedSourceIsTrusted =
+      source.match.method !== 'fuzzy_title' &&
+      (source.match.status === 'verified' ||
+        (source.match.status === 'probable' && source.match.usable));
+    return dateMatchedSourceIsTrusted
+      ? findSteamPatchByDateAndVersion(
+          patchEntries,
+          source.snapshot?.observedPatchDate,
+          sourceVersion(source),
+        )
+      : findConservativeSteamPatchByDateAndVersion(
+          patchEntries,
+          source.snapshot?.observedPatchDate,
+          sourceVersion(source),
+        );
   }
 
   if (source.match.sourceKind === 'ankergames' && buildId) {
@@ -445,51 +615,69 @@ function inferElamigosDatePatch(
   });
 }
 
-function inferSteamRipBuildFromPeers(
+function inferSourcePatchFromVersionPeers(
   source: MatchedSourceView,
   sources: MatchedSourceView[],
   patchEntries: SteamPatchEntry[],
 ): MatchedSourceView {
-  if (source.match.sourceKind !== 'steamrip' || !source.snapshot) {
+  if (!source.snapshot || source.matchedPatch) {
     return source;
   }
 
-  if (source.matchedPatch) {
-    return source;
-  }
-
-  const steamRipVersion = sourceVersion(source);
-  const matchingVersionPeers = steamRipVersion
+  const normalizedVersion = sourceVersion(source);
+  const matchingVersionPeers = normalizedVersion
     ? sources.filter(
         (peer) =>
-          (peer.match.sourceKind === 'ankergames' ||
-            peer.match.sourceKind === 'elamigos') &&
-          sourceVersion(peer) === steamRipVersion &&
-          peer.matchedPatch,
+          peer !== source && sourceVersion(peer) === normalizedVersion,
       )
     : [];
   const peerPatches = new Map<string, SteamPatchEntry>();
   for (const peer of matchingVersionPeers) {
     if (peer.matchedPatch) {
-      peerPatches.set(getSteamPatchIdentityKey(peer.matchedPatch), peer.matchedPatch);
+      peerPatches.set(
+        getSteamPatchIdentityKey(peer.matchedPatch),
+        peer.matchedPatch,
+      );
     }
   }
-  if (peerPatches.size !== 1) {
+
+  if (peerPatches.size === 1) {
+    const matchedPatch = Array.from(peerPatches.values())[0]!;
+    const matchingPeer = matchingVersionPeers.find(
+      (peer) =>
+        peer.matchedPatch &&
+        getSteamPatchIdentityKey(peer.matchedPatch) ===
+          getSteamPatchIdentityKey(matchedPatch),
+    );
+
+    return canonicalizeSourceWithPatch({
+      fallbackVersionsBehindLatest: matchingPeer?.versionsBehindLatest,
+      matchedPatch,
+      patchEntries,
+      promoteMatch: true,
+      source,
+    });
+  }
+  if (peerPatches.size > 1) {
     return source;
   }
 
-  const matchedPatch = Array.from(peerPatches.values())[0]!;
-  const matchingPeer = matchingVersionPeers.find(
-    (peer) =>
-      peer.matchedPatch &&
-      getSteamPatchIdentityKey(peer.matchedPatch) ===
-        getSteamPatchIdentityKey(matchedPatch),
-  );
+  const peerBuilds = new Map<string, MatchedSourceView>();
+  for (const peer of matchingVersionPeers) {
+    const buildId = sourceBuildId(peer);
+    if (!buildId || peerVersionsBehindLatest(peer) == null) {
+      continue;
+    }
+    peerBuilds.set(buildId, peer);
+  }
+  if (peerBuilds.size !== 1) {
+    return source;
+  }
 
-  return canonicalizeSourceWithPatch({
-    fallbackVersionsBehindLatest: matchingPeer?.versionsBehindLatest,
-    matchedPatch,
-    patchEntries,
+  const [buildId, matchingBuildPeer] = Array.from(peerBuilds.entries())[0]!;
+  return canonicalizeSourceWithPeerBuild({
+    buildId,
+    matchingPeer: matchingBuildPeer,
     source,
   });
 }
@@ -535,9 +723,28 @@ function normalizeInstallRelativeSourceStatus(
   source: MatchedSourceView,
   item: TrackedItemView | null | undefined,
 ): MatchedSourceView {
+  const buildId = sourceBuildId(source);
+  if (buildId && item?.installRecord?.installedBuildId === buildId) {
+    if (
+      source.versionsBehindLatest === 0 ||
+      source.updateStatus === 'matches_upstream'
+    ) {
+      return {
+        ...source,
+        isUpdateSource: false,
+        updateStatus: 'same_as_installed',
+      };
+    }
+
+    return {
+      ...source,
+      isUpdateSource: false,
+    };
+  }
+
   if (
     source.updateStatus !== 'newer_than_installed' ||
-    sourceBuildId(source) ||
+    buildId ||
     !item?.installRecord?.installedVersion
   ) {
     return source;
@@ -584,7 +791,11 @@ export function inferSourceComparisonRows(
 
   return dateResolvedSources
     .map((source) =>
-      inferSteamRipBuildFromPeers(source, dateResolvedSources, patchEntries),
+      inferSourcePatchFromVersionPeers(
+        source,
+        dateResolvedSources,
+        patchEntries,
+      ),
     )
     .map((source) => inferSourceLagFromBuildId(source, patchEntries))
     .map((source) => normalizeInstallRelativeSourceStatus(source, item));
