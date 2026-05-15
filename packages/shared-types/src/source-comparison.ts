@@ -141,6 +141,43 @@ function sourceVersion(source: MatchedSourceView): string | null {
   );
 }
 
+function addSourceVersionSignal(
+  signals: Set<string>,
+  value: string | null | undefined,
+): void {
+  const titleVersion = extractSteamPatchTitleVersion(value);
+  if (titleVersion) {
+    signals.add(titleVersion);
+  }
+
+  const version = meaningfulSourceVersion(value);
+  if (version) {
+    signals.add(version);
+  }
+}
+
+function sourceVersionSignals(source: MatchedSourceView): Set<string> {
+  const signals = new Set<string>();
+  addSourceVersionSignal(signals, source.snapshot?.observedVersion);
+  addSourceVersionSignal(signals, source.matchedPatch?.version);
+  addSourceVersionSignal(signals, sourceVersionFromBuildSignal(source));
+  addSourceVersionSignal(signals, source.snapshot?.observedPatchTitle);
+  addSourceVersionSignal(signals, source.matchedPatch?.patchTitle);
+  return signals;
+}
+
+function sourceVersionSignalsOverlap(
+  left: Set<string>,
+  right: Set<string>,
+): boolean {
+  for (const signal of left) {
+    if (right.has(signal)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function sourceBuildId(source: MatchedSourceView): string | null {
   return (
     numericSourceBuildId(source.snapshot?.observedBuildId) ??
@@ -624,11 +661,12 @@ function inferSourcePatchFromVersionPeers(
     return source;
   }
 
-  const normalizedVersion = sourceVersion(source);
-  const matchingVersionPeers = normalizedVersion
+  const versionSignals = sourceVersionSignals(source);
+  const matchingVersionPeers = versionSignals.size > 0
     ? sources.filter(
         (peer) =>
-          peer !== source && sourceVersion(peer) === normalizedVersion,
+          peer !== source &&
+          sourceVersionSignalsOverlap(versionSignals, sourceVersionSignals(peer)),
       )
     : [];
   const peerPatches = new Map<string, SteamPatchEntry>();

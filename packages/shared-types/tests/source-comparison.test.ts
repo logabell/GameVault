@@ -619,6 +619,55 @@ describe('source comparison inference', () => {
     });
   });
 
+  it('infers version-only peers from a resolved patch-title version', () => {
+    const latestPatch = patch(
+      '21237829',
+      '1.1 Fixes v1.1.2.2',
+      '12/19/2025',
+      '2025-12-19T17:00:00.000Z',
+    );
+    const elamigos = sourceView('elamigos', {
+      observedBuildId: latestPatch.buildId,
+      observedPatchDate: latestPatch.patchDate,
+      observedVersion: '463028',
+    });
+    const steamrip = sourceView('steamrip', {
+      observedBuildId: null,
+      observedPatchTitle: '1.1.2.2',
+      observedVersion: '1.1.2.2',
+    });
+    const ankergames = sourceView('ankergames', {
+      observedBuildId: null,
+      observedPatchTitle: 'V 1.1.2.2',
+      observedVersion: 'V 1.1.2.2',
+    });
+
+    const rows = inferSourceComparisonRows(
+      trackedItem([elamigos, steamrip, ankergames]),
+      [latestPatch],
+    );
+
+    for (const sourceKind of ['elamigos', 'steamrip', 'ankergames'] as const) {
+      expect(
+        rows.find((source) => source.match.sourceKind === sourceKind),
+      ).toMatchObject({
+        isUpdateSource: true,
+        matchedPatch: {
+          buildId: latestPatch.buildId,
+          patchDate: latestPatch.patchDate,
+          patchTitle: latestPatch.patchTitle,
+        },
+        snapshot: {
+          observedBuildId: latestPatch.buildId,
+          observedPatchDate: latestPatch.patchDate,
+          observedPatchTitle: latestPatch.patchTitle,
+        },
+        updateStatus: 'matches_upstream',
+        versionsBehindLatest: 0,
+      });
+    }
+  });
+
   it('infers version-only peers from a resolved AnkerGames build', () => {
     const latestPatch = patch('13773296', 'Grand Theft Auto V update');
     const ankergames = sourceView('ankergames', {

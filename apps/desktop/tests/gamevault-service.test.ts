@@ -10560,6 +10560,117 @@ describe('GameVaultService SteamDB patch workflow', () => {
     }
   });
 
+  it('persists version-only source alignment from a resolved patch-title peer', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'satisfactory',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:satisfactory',
+        title: 'Satisfactory',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 526870,
+        coverUrl: null,
+        matchedAt: '2026-04-22T12:00:00.000Z',
+        normalizedTitle: 'satisfactory',
+        title: 'Satisfactory',
+      });
+      database.upsertPatchEntries([
+        {
+          appId: 526870,
+          buildId: '21237829',
+          link: 'https://steamdb.info/patchnotes/21237829/',
+          patchDate: '12/19/2025',
+          patchTitle: '1.1 Fixes v1.1.2.2',
+          publishedAt: '2025-12-19T17:00:00.000Z',
+          title: '1.1 Fixes v1.1.2.2',
+          trackedItemId: item.id,
+        },
+      ]);
+
+      const sources = [
+        {
+          buildId: '21237829',
+          kind: 'elamigos' as const,
+          patchTitle: null,
+          version: '463028',
+        },
+        {
+          buildId: null,
+          kind: 'steamrip' as const,
+          patchTitle: '1.1.2.2',
+          version: '1.1.2.2',
+        },
+        {
+          buildId: null,
+          kind: 'ankergames' as const,
+          patchTitle: 'V 1.1.2.2',
+          version: 'V 1.1.2.2',
+        },
+      ];
+
+      for (const source of sources) {
+        database.upsertSourceMatch({
+          confidence: 1,
+          createdAt: '2026-04-22T12:00:00.000Z',
+          isPrimary: source.kind === 'elamigos',
+          lastCheckedAt: '2026-04-22T12:00:00.000Z',
+          lastError: null,
+          method: 'steam_app_id',
+          normalizedTitle: 'satisfactory',
+          score: 1,
+          sourceKind: source.kind,
+          sourceTitle: 'Satisfactory',
+          sourceUrl: `https://${source.kind}.example.test/satisfactory`,
+          status: 'verified',
+          trackedItemId: item.id,
+          updatedAt: '2026-04-22T12:00:00.000Z',
+          usable: true,
+        });
+        database.upsertSourceSnapshot({
+          checkedAt: '2026-04-22T12:00:00.000Z',
+          fingerprint: `${source.kind}-satisfactory`,
+          observedBuildId: source.buildId,
+          observedPatchDate:
+            source.kind === 'elamigos' ? '12/19/2025' : null,
+          observedPatchLink: null,
+          observedPatchTitle: source.patchTitle,
+          observedVersion: source.version,
+          patchSelectionSource: null,
+          sourceKind: source.kind,
+          sourceUrl: `https://${source.kind}.example.test/satisfactory`,
+          trackedItemId: item.id,
+        });
+      }
+
+      const [view] = await createService(database).listTrackedItems();
+
+      for (const sourceKind of ['elamigos', 'steamrip', 'ankergames'] as const) {
+        expect(
+          view?.sourceMatches.find(
+            (source) => source.match.sourceKind === sourceKind,
+          ),
+        ).toMatchObject({
+          matchedPatch: {
+            buildId: '21237829',
+            patchDate: '12/19/2025',
+            patchTitle: '1.1 Fixes v1.1.2.2',
+          },
+          updateStatus: 'matches_upstream',
+          versionsBehindLatest: 0,
+        });
+        expect(database.getSourceSnapshot(item.id, sourceKind)).toMatchObject({
+          observedBuildId: '21237829',
+          observedPatchDate: '12/19/2025',
+          observedPatchTitle: '1.1 Fixes v1.1.2.2',
+        });
+      }
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('infers SteamRIP patch alignment from updated-games timing and higher version', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {

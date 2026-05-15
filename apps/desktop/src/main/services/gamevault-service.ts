@@ -464,6 +464,70 @@ function normalizeSourceVersion(
   return normalizeSourceComparisonVersion(value);
 }
 
+function addComparableVersionSignal(
+  signals: Set<string>,
+  value: string | null | undefined,
+): void {
+  const titleVersion = extractSteamPatchTitleVersion(value);
+  if (titleVersion) {
+    signals.add(titleVersion);
+  }
+
+  const normalized = normalizeSourceComparisonVersion(value);
+  if (normalized && !/^(?:unknown|n\/?a)$/i.test(normalized)) {
+    signals.add(normalized);
+  }
+}
+
+function sourceSnapshotVersionSignals(
+  snapshot: SourceSnapshot,
+  parsedSource?: ParsedSourcePayload | null,
+  patch?: SteamPatchEntry | null,
+): Set<string> {
+  const signals = new Set<string>();
+  addComparableVersionSignal(
+    signals,
+    parsedSource?.latestSourceRelease.version,
+  );
+  addComparableVersionSignal(signals, parsedSource?.latestSourceRelease.label);
+  addComparableVersionSignal(signals, parsedSource?.catalogMetadata?.listedVersion);
+  addComparableVersionSignal(signals, snapshot.observedVersion);
+  addComparableVersionSignal(signals, snapshot.observedPatchTitle);
+  addComparableVersionSignal(signals, patch?.version);
+  addComparableVersionSignal(signals, patch?.patchTitle);
+  return signals;
+}
+
+function getResolvedPatchesByVersionSignals(
+  resolvedPeersByVersion: Map<string, Map<string, SteamPatchEntry>>,
+  signals: Set<string>,
+): Map<string, SteamPatchEntry> | null {
+  const peerPatches = new Map<string, SteamPatchEntry>();
+  for (const signal of signals) {
+    const signalPatches = resolvedPeersByVersion.get(signal);
+    if (!signalPatches) {
+      continue;
+    }
+    for (const [key, patch] of signalPatches) {
+      peerPatches.set(key, patch);
+    }
+  }
+  return peerPatches.size > 0 ? peerPatches : null;
+}
+
+function addResolvedPatchVersionSignals(
+  resolvedPeersByVersion: Map<string, Map<string, SteamPatchEntry>>,
+  signals: Set<string>,
+  patch: SteamPatchEntry,
+): void {
+  for (const signal of signals) {
+    const resolvedVersionPeerPatches =
+      resolvedPeersByVersion.get(signal) ?? new Map<string, SteamPatchEntry>();
+    resolvedVersionPeerPatches.set(getSteamPatchIdentityKey(patch), patch);
+    resolvedPeersByVersion.set(signal, resolvedVersionPeerPatches);
+  }
+}
+
 function dateOnlyTimestamp(value: string | null | undefined): number | null {
   if (!value) {
     return null;
@@ -3283,6 +3347,64 @@ export class GameVaultService {
     return this.findUniquePatchNearUploadDate(params.patchEntries, uploadDate);
   }
 
+  private inheritResolvedSourcePatchFromVersionPeers(params: {
+    patchEntries: SteamPatchEntry[];
+    resolvedPeersByVersion: Map<string, Map<string, SteamPatchEntry>>;
+    sourceKind: SupportedSourceKind;
+    trackedItemId: string;
+  }): void {
+    const snapshot = this.database.getSourceSnapshot(
+      params.trackedItemId,
+      params.sourceKind,
+    );
+    if (!snapshot) {
+      return;
+    }
+    if (
+      snapshot.patchSelectionSource &&
+      this.findPatchEntryForSnapshot(snapshot, params.patchEntries)
+    ) {
+      return;
+    }
+
+    const parsedSource = this.database.getRawParsedSourcePayload(
+      params.trackedItemId,
+      params.sourceKind,
+    );
+    const directPatch = this.findDirectPatchForSourceSnapshot(
+      snapshot,
+      params.patchEntries,
+      parsedSource,
+    );
+    const versionSignals = sourceSnapshotVersionSignals(
+      snapshot,
+      parsedSource,
+      directPatch,
+    );
+    const peerPatches = getResolvedPatchesByVersionSignals(
+      params.resolvedPeersByVersion,
+      versionSignals,
+    );
+    const matchedPatch =
+      directPatch ??
+      (peerPatches?.size === 1 ? Array.from(peerPatches.values())[0]! : null);
+    if (!matchedPatch) {
+      return;
+    }
+
+    const nextSnapshot = this.canonicalizeSourceSnapshotWithPatch(
+      snapshot,
+      matchedPatch,
+      parsedSource,
+    );
+    this.database.upsertSourceSnapshot(nextSnapshot);
+    addResolvedPatchVersionSignals(
+      params.resolvedPeersByVersion,
+      sourceSnapshotVersionSignals(snapshot, parsedSource, matchedPatch),
+      matchedPatch,
+    );
+  }
+
   private reconcileSourcePatchAlignments(trackedItemId: string): void {
     const patchEntries = this.sortPatchEntries(
       this.database.listPatchEntries(trackedItemId),
@@ -3316,19 +3438,11 @@ export class GameVaultService {
         patchEntries,
       );
       if (existingPatch && snapshot.patchSelectionSource) {
-        const normalizedVersion = normalizeSourceVersion(
-          snapshot.observedVersion,
+        addResolvedPatchVersionSignals(
+          resolvedPeersByVersion,
+          sourceSnapshotVersionSignals(snapshot, parsedSource, existingPatch),
+          existingPatch,
         );
-        if (normalizedVersion) {
-          const peerPatches =
-            resolvedPeersByVersion.get(normalizedVersion) ??
-            new Map<string, SteamPatchEntry>();
-          peerPatches.set(
-            getSteamPatchIdentityKey(existingPatch),
-            existingPatch,
-          );
-          resolvedPeersByVersion.set(normalizedVersion, peerPatches);
-        }
         continue;
       }
       const matchedPatch = this.findDirectPatchForSourceSnapshot(
@@ -3342,14 +3456,17 @@ export class GameVaultService {
               (sourceMatch?.status === 'probable' && sourceMatch.usable))
               ? 'any'
               : 'unique',
-        },
+          },
       );
-      const normalizedVersion = normalizeSourceVersion(
-        parsedSource?.latestSourceRelease.version ?? snapshot.observedVersion,
+      const versionSignals = sourceSnapshotVersionSignals(
+        snapshot,
+        parsedSource,
+        matchedPatch,
       );
-      const peerPatches = normalizedVersion
-        ? resolvedPeersByVersion.get(normalizedVersion)
-        : null;
+      const peerPatches = getResolvedPatchesByVersionSignals(
+        resolvedPeersByVersion,
+        versionSignals,
+      );
       const inheritedPatch =
         !matchedPatch && peerPatches?.size === 1
           ? Array.from(peerPatches.values())[0]!
@@ -3369,21 +3486,20 @@ export class GameVaultService {
       }
 
       if (resolvedPatch) {
-        if (normalizedVersion) {
-          const resolvedVersionPeerPatches =
-            resolvedPeersByVersion.get(normalizedVersion) ??
-            new Map<string, SteamPatchEntry>();
-          resolvedVersionPeerPatches.set(
-            getSteamPatchIdentityKey(resolvedPatch),
-            resolvedPatch,
-          );
-          resolvedPeersByVersion.set(
-            normalizedVersion,
-            resolvedVersionPeerPatches,
-          );
-        }
+        addResolvedPatchVersionSignals(
+          resolvedPeersByVersion,
+          sourceSnapshotVersionSignals(snapshot, parsedSource, resolvedPatch),
+          resolvedPatch,
+        );
       }
     }
+
+    this.inheritResolvedSourcePatchFromVersionPeers({
+      patchEntries,
+      resolvedPeersByVersion,
+      sourceKind: 'ankergames',
+      trackedItemId,
+    });
 
     const steamRipSnapshot = this.database.getSourceSnapshot(
       trackedItemId,
@@ -3411,9 +3527,15 @@ export class GameVaultService {
       parsedSteamRip?.latestSourceRelease.version ??
         steamRipSnapshot.observedVersion,
     );
-    const peerPatches = normalizedSteamRipVersion
-      ? resolvedPeersByVersion.get(normalizedSteamRipVersion)
-      : null;
+    const steamRipVersionSignals = sourceSnapshotVersionSignals(
+      steamRipSnapshot,
+      parsedSteamRip,
+      directPatch,
+    );
+    const peerPatches = getResolvedPatchesByVersionSignals(
+      resolvedPeersByVersion,
+      steamRipVersionSignals,
+    );
     const inheritedPatch =
       !directPatch && peerPatches?.size === 1
         ? Array.from(peerPatches.values())[0]!
