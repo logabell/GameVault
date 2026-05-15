@@ -32,6 +32,14 @@ describe('registerExtensionNativeHost', () => {
       });
 
       const manifest = JSON.parse(await readFile(result.manifestPath, 'utf8'));
+      await expect(readFile(result.launcherPath, 'utf8')).resolves.toBe(
+        [
+          '@echo off',
+          'set ELECTRON_RUN_AS_NODE=1',
+          `"${process.execPath}" "C:\\GameVault\\native-host\\index.cjs" %*`,
+          '',
+        ].join('\r\n'),
+      );
       expect(manifest).toEqual({
         allowed_origins: [
           'chrome-extension://abcdefghijklmnopabcdefghijklmnop/',

@@ -1143,7 +1143,9 @@ describe('GameVaultService import workflow', () => {
         database,
         decrypt: () => 'bad-password',
         listDevices: async () => {
-          throw new Error('403: Forbidden');
+          throw new Error(
+            'MyJDownloader rejected the email or password (403 Forbidden). Check your MyJDownloader login and try again.',
+          );
         },
       });
 
@@ -1157,6 +1159,37 @@ describe('GameVaultService import workflow', () => {
       expect(database.getSettings()).toMatchObject({
         encryptedPassword: null,
         myJDownloaderDeviceId: null,
+        myJDownloaderEmail: 'logan@example.test',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('keeps saved MyJDownloader credentials when device status is forbidden', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('myjd.email', 'logan@example.test');
+      database.setSetting('myjd.password', 'encrypted-secret');
+      database.setSetting('myjd.deviceId', 'device-1');
+      const service = createCredentialBackedService({
+        database,
+        decrypt: () => 'still-valid-password',
+        listDevices: async () => {
+          throw new Error('403: Forbidden');
+        },
+      });
+
+      const health = await service.getConnectionHealth({ forceRefresh: true });
+
+      expect(health.myJDownloader).toMatchObject({
+        color: 'yellow',
+        label: 'JDownloader offline',
+        message: expect.stringContaining('Open JDownloader'),
+      });
+      expect(database.getSettings()).toMatchObject({
+        encryptedPassword: 'encrypted-secret',
+        myJDownloaderDeviceId: 'device-1',
         myJDownloaderEmail: 'logan@example.test',
       });
     } finally {

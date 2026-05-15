@@ -122,7 +122,12 @@ export async function registerExtensionNativeHost(
   await mkdir(nativeHostDir, { recursive: true });
   await writeFile(
     launcherPath,
-    `@echo off\r\n"${process.execPath}" "${options.nativeHostBundlePath}" %*\r\n`,
+    [
+      '@echo off',
+      'set ELECTRON_RUN_AS_NODE=1',
+      `"${process.execPath}" "${options.nativeHostBundlePath}" %*`,
+      '',
+    ].join('\r\n'),
   );
   if (chromiumBrowsers.length) {
     await writeFile(

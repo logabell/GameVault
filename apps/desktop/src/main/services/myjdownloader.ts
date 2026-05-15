@@ -167,6 +167,8 @@ const LINK_CRAWLER_RESOLVE_TIMEOUT_MS = 12 * 1000;
 const LINK_CRAWLER_RESOLVE_POLL_MS = 500;
 const PACKAGE_RESOLVE_TIMEOUT_MS = 4000;
 const PACKAGE_RESOLVE_POLL_MS = 500;
+const MYJD_AUTHENTICATION_REJECTED_MESSAGE =
+  'MyJDownloader rejected the email or password (403 Forbidden). Check your MyJDownloader login and try again.';
 
 type MyJDownloaderHealthSnapshot = ConnectionHealthSummary['myJDownloader'] & {
   devices: MyJDownloaderDeviceSummary[];
@@ -206,20 +208,33 @@ function normalizeMyJDownloaderError(error: unknown): Error {
     error instanceof Error
       ? error.message
       : 'Unable to connect to MyJDownloader.';
-  if (/^403:\s*Forbidden$/i.test(message)) {
+  if (isMyJDownloaderAuthenticationRejected(error)) {
+    return new Error(MYJD_AUTHENTICATION_REJECTED_MESSAGE);
+  }
+  if (isMyJDownloaderForbidden(error)) {
     return new Error(
-      'MyJDownloader rejected the email or password (403 Forbidden). Check your MyJDownloader login and try again.',
+      'MyJDownloader could not check JDownloader device status (403 Forbidden). Open JDownloader, then refresh status once MyJDownloader reports it online.',
     );
   }
   return error instanceof Error ? error : new Error(message);
 }
 
-function isMyJDownloaderAuthenticationRejected(error: unknown): boolean {
+function isMyJDownloaderForbidden(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /^403:\s*Forbidden$/i.test(message);
+}
+
+function isMyJDownloaderDeviceStatusUnavailable(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return (
-    /^403:\s*Forbidden$/i.test(message) ||
-    /MyJDownloader rejected the email or password/i.test(message)
+    isMyJDownloaderForbidden(error) ||
+    /could not check JDownloader device status/i.test(message)
   );
+}
+
+function isMyJDownloaderAuthenticationRejected(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /MyJDownloader rejected the email or password/i.test(message);
 }
 
 function buildNotConnectedHealth(): MyJDownloaderHealthSnapshot {
@@ -718,6 +733,9 @@ class MyJDownloaderRawClient implements MyJDownloaderClient {
     );
 
     if (!response.ok) {
+      if (response.status === 403) {
+        throw new Error(MYJD_AUTHENTICATION_REJECTED_MESSAGE);
+      }
       throw new Error(`${response.status}: ${response.statusText}`);
     }
 
@@ -1092,10 +1110,21 @@ export class MyJDownloaderService {
           selectedDeviceId: null,
         };
       }
+      if (isMyJDownloaderDeviceStatusUnavailable(normalizedError)) {
+        return {
+          color: 'yellow',
+          devices: [],
+          label: 'JDownloader offline',
+          message: credentials.deviceId
+            ? 'Open JDownloader on the selected device, then refresh status.'
+            : 'Open JDownloader, then refresh status once MyJDownloader reports it online.',
+          selectedDeviceId: null,
+        };
+      }
       return {
         color: 'red',
         devices: [],
-        label: 'Authentication failed',
+        label: 'MyJDownloader unavailable',
         message: normalizedError.message,
         selectedDeviceId: null,
       };

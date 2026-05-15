@@ -924,7 +924,9 @@ async function bootstrap() {
   });
 
   await app.whenReady();
-  createWindow({ showOnReady: !backgroundLaunch });
+  if (!backgroundLaunch) {
+    createWindow({ showOnReady: true });
+  }
 
   const userDataPath = app.getPath('userData');
   const databasePath = join(userDataPath, DATABASE_FILE_NAME);

@@ -9,6 +9,7 @@ import type {
 
 const BRIDGE_URL = 'http://127.0.0.1:47615/native-message';
 const BRIDGE_POST_TIMEOUT_MS = 75000;
+const MAX_NATIVE_MESSAGE_BYTES = 1024 * 1024;
 const require = createRequire(__filename);
 
 function encodeMessage(message: NativeMessageResponse): Buffer {
@@ -18,20 +19,75 @@ function encodeMessage(message: NativeMessageResponse): Buffer {
   return Buffer.concat([header, payload]);
 }
 
-async function readMessage(): Promise<NativeMessageRequest | null> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of process.stdin) {
-    chunks.push(chunk as Buffer);
-  }
+function readMessage(): Promise<NativeMessageRequest | null> {
+  return new Promise((resolveMessage, rejectMessage) => {
+    let input = Buffer.alloc(0);
+    let expectedPayloadSize: number | null = null;
 
-  if (chunks.length === 0) {
-    return null;
-  }
+    const cleanup = () => {
+      process.stdin.off('data', handleData);
+      process.stdin.off('end', handleEnd);
+      process.stdin.off('error', handleError);
+    };
 
-  const input = Buffer.concat(chunks);
-  const size = input.readUInt32LE(0);
-  const payload = input.subarray(4, 4 + size).toString('utf8');
-  return JSON.parse(payload) as NativeMessageRequest;
+    const readBufferedMessage = () => {
+      if (expectedPayloadSize == null) {
+        if (input.length < 4) {
+          return false;
+        }
+
+        expectedPayloadSize = input.readUInt32LE(0);
+        if (
+          expectedPayloadSize <= 0 ||
+          expectedPayloadSize > MAX_NATIVE_MESSAGE_BYTES
+        ) {
+          throw new Error('Native message payload size is invalid.');
+        }
+      }
+
+      const totalSize = 4 + expectedPayloadSize;
+      if (input.length < totalSize) {
+        return false;
+      }
+
+      const payload = input.subarray(4, totalSize).toString('utf8');
+      cleanup();
+      resolveMessage(JSON.parse(payload) as NativeMessageRequest);
+      return true;
+    };
+
+    function handleData(chunk: Buffer | string) {
+      try {
+        input = Buffer.concat([
+          input,
+          Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk),
+        ]);
+        readBufferedMessage();
+      } catch (error) {
+        cleanup();
+        rejectMessage(error);
+      }
+    }
+
+    function handleEnd() {
+      cleanup();
+      if (input.length === 0) {
+        resolveMessage(null);
+        return;
+      }
+      rejectMessage(new Error('Native message stream ended early.'));
+    }
+
+    function handleError(error: Error) {
+      cleanup();
+      rejectMessage(error);
+    }
+
+    process.stdin.on('data', handleData);
+    process.stdin.once('end', handleEnd);
+    process.stdin.once('error', handleError);
+    process.stdin.resume();
+  });
 }
 
 function getDesktopRoot(): string {
@@ -39,14 +95,22 @@ function getDesktopRoot(): string {
 }
 
 function getElectronExecutable(): string {
-  const packageJsonPath = require.resolve('electron/package.json', {
-    paths: [getDesktopRoot()],
-  });
-  return join(
-    dirname(packageJsonPath),
-    'dist',
-    process.platform === 'win32' ? 'electron.exe' : 'electron',
-  );
+  if (process.versions.electron && process.execPath) {
+    return process.execPath;
+  }
+
+  try {
+    const packageJsonPath = require.resolve('electron/package.json', {
+      paths: [getDesktopRoot()],
+    });
+    return join(
+      dirname(packageJsonPath),
+      'dist',
+      process.platform === 'win32' ? 'electron.exe' : 'electron',
+    );
+  } catch {
+    return process.execPath;
+  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -85,12 +149,16 @@ async function postBridge(
 }
 
 function startDesktopInBackground(): void {
+  const env = { ...process.env };
+  delete env.ELECTRON_RUN_AS_NODE;
   const child = spawn(
     getElectronExecutable(),
     [getDesktopRoot(), '--background'],
     {
       detached: true,
+      env,
       stdio: 'ignore',
+      windowsHide: true,
     },
   );
   child.unref();
@@ -122,29 +190,48 @@ async function ensureBridge(
 }
 
 async function main() {
-  const request = await readMessage();
-  if (!request) {
-    return;
-  }
+  let exitCode = 0;
 
-  let response: NativeMessageResponse;
   try {
-    response = await ensureBridge(request);
-  } catch (error) {
-    response = {
-      error: {
-        code: 'DESKTOP_UNAVAILABLE',
-        message:
-          error instanceof Error
-            ? error.message
-            : 'GameVault desktop bridge is unavailable',
-      },
-      ok: false,
-      type: request.type,
-    };
-  }
+    const request = await readMessage();
+    if (!request) {
+      return;
+    }
 
-  process.stdout.write(encodeMessage(response));
+    let response: NativeMessageResponse;
+    try {
+      response = await ensureBridge(request);
+    } catch (error) {
+      response = {
+        error: {
+          code: 'DESKTOP_UNAVAILABLE',
+          message:
+            error instanceof Error
+              ? error.message
+              : 'GameVault desktop bridge is unavailable',
+        },
+        ok: false,
+        type: request.type,
+      };
+    }
+
+    await new Promise<void>((resolveWrite, rejectWrite) => {
+      process.stdout.write(encodeMessage(response), (error) => {
+        if (error) {
+          rejectWrite(error);
+          return;
+        }
+        resolveWrite();
+      });
+    });
+  } catch (error) {
+    exitCode = 1;
+    console.error(
+      error instanceof Error ? error.message : 'Native host failed.',
+    );
+  } finally {
+    process.exit(exitCode);
+  }
 }
 
 void main();

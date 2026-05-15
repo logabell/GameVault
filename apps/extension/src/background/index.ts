@@ -492,7 +492,11 @@ async function completeDesktopSteamDbLookup(
         },
         type: 'completeSteamDbBuildLookup',
       },
-      { bridgeTimeoutMs: 1000, retryBridgeTimeoutMs: 2500 },
+      {
+        allowNativeFallback: false,
+        bridgeTimeoutMs: 1000,
+        retryBridgeTimeoutMs: 2500,
+      },
     );
   } catch {
     // Desktop may be closed; its in-memory lookup will time out.
@@ -519,7 +523,11 @@ async function updateDesktopSteamDbLookup(
         },
         type: 'updateSteamDbBuildLookup',
       },
-      { bridgeTimeoutMs: 1000, retryBridgeTimeoutMs: 2500 },
+      {
+        allowNativeFallback: false,
+        bridgeTimeoutMs: 1000,
+        retryBridgeTimeoutMs: 2500,
+      },
     );
   } catch {
     // Desktop may be closed; its in-memory lookup can still time out.
@@ -544,7 +552,11 @@ async function cacheDesktopSteamDbBuildLookup(
         },
         type: 'cacheSteamDbBuildLookup',
       },
-      { bridgeTimeoutMs: 1000, retryBridgeTimeoutMs: 2500 },
+      {
+        allowNativeFallback: false,
+        bridgeTimeoutMs: 1000,
+        retryBridgeTimeoutMs: 2500,
+      },
     );
   } catch {
     // Desktop may be closed; the extension flow can still finish normally.
@@ -999,11 +1011,13 @@ async function getConnectionHealthForPrepareDraft(): Promise<ConnectionHealthSum
 async function sendDesktopRequest(
   request: NativeMessageRequest,
   options: {
+    allowNativeFallback?: boolean;
     bridgeTimeoutMs?: number;
     retryAfterTimeout?: boolean;
     retryBridgeTimeoutMs?: number;
   } = {},
 ): Promise<NativeMessageResponse> {
+  const allowNativeFallback = options.allowNativeFallback ?? true;
   const bridgeTimeoutMs = options.bridgeTimeoutMs ?? BRIDGE_HTTP_TIMEOUT_MS;
   const retryAfterTimeout = options.retryAfterTimeout ?? true;
   const retryBridgeTimeoutMs =
@@ -1016,6 +1030,9 @@ async function sendDesktopRequest(
     return response;
   } catch (error) {
     if (!retryAfterTimeout && isAbortError(error)) {
+      throw error;
+    }
+    if (!allowNativeFallback) {
       throw error;
     }
     // Fall through to single-flight desktop bootstrap.
@@ -1292,7 +1309,11 @@ async function listPendingSteamWishlistActions(): Promise<
         payload: {},
         type: 'listPendingSteamWishlistActions',
       },
-      { bridgeTimeoutMs: 1000, retryBridgeTimeoutMs: 2500 },
+      {
+        allowNativeFallback: false,
+        bridgeTimeoutMs: 1000,
+        retryBridgeTimeoutMs: 2500,
+      },
     );
     if (!response.ok || response.type !== 'listPendingSteamWishlistActions') {
       return [];
@@ -1735,7 +1756,11 @@ async function listPendingDesktopSteamDbBuildLookups(): Promise<
         payload: {},
         type: 'listPendingSteamDbBuildLookups',
       },
-      { bridgeTimeoutMs: 1000, retryBridgeTimeoutMs: 2500 },
+      {
+        allowNativeFallback: false,
+        bridgeTimeoutMs: 1000,
+        retryBridgeTimeoutMs: 2500,
+      },
     );
     if (!response.ok || response.type !== 'listPendingSteamDbBuildLookups') {
       return [];

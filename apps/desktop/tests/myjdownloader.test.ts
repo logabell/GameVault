@@ -269,10 +269,12 @@ describe('MyJDownloaderService authentication', () => {
     });
   });
 
-  it('maps MyJDownloader 403 responses to a clear login message', async () => {
+  it('maps explicit MyJDownloader login rejection to a clear login message', async () => {
     class ForbiddenClient extends FakeMyJDownloaderClient {
       override async listDevices(): Promise<RawDeviceInfo[]> {
-        throw new Error('403: Forbidden');
+        throw new Error(
+          'MyJDownloader rejected the email or password (403 Forbidden). Check your MyJDownloader login and try again.',
+        );
       }
     }
     const service = new MyJDownloaderService(
@@ -296,6 +298,26 @@ describe('MyJDownloaderService authentication', () => {
       label: 'Authentication failed',
       message: expect.stringMatching(/rejected the email or password/),
     });
+  });
+
+  it('treats raw 403 during device status checks as JDownloader offline', async () => {
+    class DeviceStatusForbiddenClient extends FakeMyJDownloaderClient {
+      override async listDevices(): Promise<RawDeviceInfo[]> {
+        throw new Error('403: Forbidden');
+      }
+    }
+    const service = createService(new DeviceStatusForbiddenClient());
+
+    const health = await service.getHealth({ forceRefresh: true });
+
+    expect(health).toMatchObject({
+      color: 'yellow',
+      devices: [],
+      label: 'JDownloader offline',
+      message: expect.stringContaining('Open JDownloader'),
+      selectedDeviceId: null,
+    });
+    expect('failureKind' in health).toBe(false);
   });
 
   it('returns reconnect health when stored credentials cannot be loaded', async () => {
