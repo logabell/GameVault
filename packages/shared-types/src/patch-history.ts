@@ -18,6 +18,54 @@ function normalizedTitle(value: string | null | undefined): string {
   return value?.replace(/\s+/g, ' ').trim() ?? '';
 }
 
+function patchTimestamp(patch: SteamPatchCandidate): number {
+  const publishedAt = new Date(patch.publishedAt).getTime();
+  if (!Number.isNaN(publishedAt)) {
+    return publishedAt;
+  }
+
+  const patchDate = new Date(patch.patchDate).getTime();
+  return Number.isNaN(patchDate) ? 0 : patchDate;
+}
+
+function numericPatchBuildId(value: string | null | undefined): bigint | null {
+  const trimmed = value?.trim();
+  return trimmed && /^\d+$/.test(trimmed) ? BigInt(trimmed) : null;
+}
+
+export function compareSteamPatchesByRecency(
+  left: SteamPatchCandidate,
+  right: SteamPatchCandidate,
+): number {
+  const timestampDelta = patchTimestamp(right) - patchTimestamp(left);
+  if (timestampDelta !== 0) {
+    return timestampDelta;
+  }
+
+  const leftBuildId = numericPatchBuildId(left.buildId);
+  const rightBuildId = numericPatchBuildId(right.buildId);
+  if (
+    leftBuildId != null &&
+    rightBuildId != null &&
+    leftBuildId !== rightBuildId
+  ) {
+    return leftBuildId > rightBuildId ? -1 : 1;
+  }
+  if (leftBuildId != null) {
+    return -1;
+  }
+  if (rightBuildId != null) {
+    return 1;
+  }
+  return 0;
+}
+
+export function sortSteamPatchesByRecency<T extends SteamPatchCandidate>(
+  patches: T[],
+): T[] {
+  return [...patches].sort(compareSteamPatchesByRecency);
+}
+
 function titleQuality(
   value: string | null | undefined,
   buildId: string | null | undefined,

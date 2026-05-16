@@ -197,7 +197,7 @@ const FILE_CLEANUP_RETRY_ATTEMPTS = IS_TEST_ENV ? 2 : 8;
 const FILE_CLEANUP_RETRY_DELAY_MS = IS_TEST_ENV ? 1 : 1000;
 const EXTENSION_ACTIVITY_SETTING_KEY = 'extension.lastNativeMessageAt';
 const PLAYNITE_PLUGIN_FOLDER_NAME = 'GameVault';
-const PLAYNITE_PLUGIN_VERSION = '0.1.14';
+const PLAYNITE_PLUGIN_VERSION = '0.1.15';
 
 const SOURCE_CATALOG_URLS: Record<SupportedSourceKind, string[]> = {
   ankergames: [
@@ -1181,6 +1181,27 @@ function pathIsInsideOrEqual(parentPath: string, targetPath: string): boolean {
   );
 }
 
+function pathsEqual(leftPath: string | null, rightPath: string | null): boolean {
+  return Boolean(
+    leftPath &&
+      rightPath &&
+      resolve(leftPath).toLowerCase() === resolve(rightPath).toLowerCase(),
+  );
+}
+
+function getPlayniteDataPathFromExtensionsPath(
+  extensionsPath: string | null | undefined,
+): string | null {
+  const trimmed = extensionsPath?.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const resolvedPath = resolve(trimmed);
+  return basename(resolvedPath).toLowerCase() === 'extensions'
+    ? dirname(resolvedPath)
+    : null;
+}
+
 function sourceSnapshotMatchesInstallRecord(
   sourceSnapshot: SourceSnapshot,
   installRecord: InstallRecord,
@@ -1314,6 +1335,54 @@ function getStoredMirrorUrl(
     return getAnkerGamesBrowserDownloadUrl(mirror) ?? mirror.url;
   }
   return mirror.url;
+}
+
+function findAnkerGamesGeneratedDownloadUrlForSelection(params: {
+  parsedSource: ParsedSourcePayload;
+  requestedUrl: string | null | undefined;
+}): string | null {
+  if (params.parsedSource.sourceKind !== 'ankergames') {
+    return null;
+  }
+
+  const requestedUrl = params.requestedUrl?.trim() ?? '';
+  if (!requestedUrl) {
+    return null;
+  }
+
+  return (
+    params.parsedSource.fullDownloadUrls.find(
+      (mirror) =>
+        isAnkerGamesGeneratedDownloadUrl(mirror.url) &&
+        (mirrorUrlMatches(mirror.url, requestedUrl) ||
+          mirrorUrlMatches(getAnkerGamesBrowserDownloadUrl(mirror), requestedUrl) ||
+          mirrorUrlMatches(
+            getStoredMirrorUrl(params.parsedSource.sourceKind, mirror),
+            requestedUrl,
+          )),
+    )?.url ?? null
+  );
+}
+
+function clearAnkerGamesBrowserDownloadUrlForSelection(params: {
+  parsedSource: ParsedSourcePayload;
+  stableDownloadUrl: string;
+}): ParsedSourcePayload {
+  if (params.parsedSource.sourceKind !== 'ankergames') {
+    return params.parsedSource;
+  }
+
+  return {
+    ...params.parsedSource,
+    fullDownloadUrls: params.parsedSource.fullDownloadUrls.map((mirror) => {
+      if (!mirrorUrlMatches(mirror.url, params.stableDownloadUrl)) {
+        return mirror;
+      }
+      const { browserDownloadUrl: _browserDownloadUrl, ...stableMirror } =
+        mirror;
+      return stableMirror;
+    }),
+  };
 }
 
 function isExtractionErrorMessage(value: string | null | undefined): boolean {
@@ -1541,6 +1610,11 @@ export interface SecureValueProvider {
 export interface PlayniteIntegrationPaths {
   appDataPath?: string;
   pluginBundlePath?: string;
+}
+
+export interface PlaynitePathOptions {
+  extensionsPath?: string | null;
+  manifestPath?: string | null;
 }
 
 async function fetchWithTimeout(
@@ -3970,12 +4044,25 @@ export class GameVaultService {
     );
   }
 
-  private getDefaultPlayniteExtensionsPath(): string | null {
+  private getDefaultInstalledPlayniteDataPath(): string | null {
     const appData = process.env.APPDATA?.trim();
-    return appData ? join(appData, 'Playnite', 'Extensions') : null;
+    return appData ? join(appData, 'Playnite') : null;
   }
 
-  private getPlayniteExtensionsPath(): string | null {
+  private getDefaultPlayniteExtensionsPath(): string | null {
+    const dataPath = this.getDefaultInstalledPlayniteDataPath();
+    return dataPath ? join(dataPath, 'Extensions') : null;
+  }
+
+  private getPlayniteExtensionsPath(
+    options: PlaynitePathOptions = {},
+  ): string | null {
+    if (options.extensionsPath !== undefined) {
+      return (
+        options.extensionsPath?.trim() ||
+        this.getDefaultPlayniteExtensionsPath()
+      );
+    }
     return (
       this.database.getSettings().playniteExtensionsPath?.trim() ||
       this.getDefaultPlayniteExtensionsPath()
@@ -3991,16 +4078,48 @@ export class GameVaultService {
     );
   }
 
-  private getPlayniteManifestPath(): string {
-    const configured = this.database.getSettings().playniteManifestPath?.trim();
-    if (configured) {
-      return configured;
+  private getDefaultPlayniteManifestPath(
+    extensionsPath: string | null = this.getPlayniteExtensionsPath(),
+  ): string {
+    const playniteDataPath =
+      getPlayniteDataPathFromExtensionsPath(extensionsPath);
+    const installedDataPath = this.getDefaultInstalledPlayniteDataPath();
+    if (playniteDataPath && !pathsEqual(playniteDataPath, installedDataPath)) {
+      return join(playniteDataPath, 'GameVault', 'playnite-library.json');
     }
     return join(this.getPlayniteAppDataPath(), 'playnite-library.json');
   }
 
-  private getPlayniteSyncStatusPath(): string {
-    return join(this.getPlayniteAppDataPath(), 'playnite-sync-status.json');
+  private getPlayniteManifestPath(options: PlaynitePathOptions = {}): string {
+    const extensionsPath = this.getPlayniteExtensionsPath(options);
+    if (options.manifestPath !== undefined) {
+      return (
+        options.manifestPath?.trim() ||
+        this.getDefaultPlayniteManifestPath(extensionsPath)
+      );
+    }
+    const configured = this.database.getSettings().playniteManifestPath?.trim();
+    const defaultManifestPath =
+      this.getDefaultPlayniteManifestPath(extensionsPath);
+    const installedManifestPath = join(
+      this.getPlayniteAppDataPath(),
+      'playnite-library.json',
+    );
+    if (
+      configured &&
+      (pathsEqual(defaultManifestPath, installedManifestPath) ||
+        !pathsEqual(configured, installedManifestPath))
+    ) {
+      return configured;
+    }
+    return defaultManifestPath;
+  }
+
+  private getPlayniteSyncStatusPath(options: PlaynitePathOptions = {}): string {
+    return join(
+      dirname(this.getPlayniteManifestPath(options)),
+      'playnite-sync-status.json',
+    );
   }
 
   private getPlaynitePluginBundlePath(): string {
@@ -4152,6 +4271,7 @@ export class GameVaultService {
   }
 
   async exportPlayniteManifest(options: {
+    paths?: PlaynitePathOptions;
     rescan?: boolean;
   } = {}): Promise<PlayniteManifest> {
     const views = await this.buildInstalledSteamMatchedViews();
@@ -4164,17 +4284,17 @@ export class GameVaultService {
           ),
         );
     const manifest = buildPlayniteManifest(views, selections);
-    const manifestPath = this.getPlayniteManifestPath();
+    const manifestPath = this.getPlayniteManifestPath(options.paths);
     await mkdir(dirname(manifestPath), { recursive: true });
     await writeFile(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
-    this.database.setSetting('playnite.manifestPath', manifestPath);
     return manifest;
   }
 
   private async getPlayniteSyncStatus(
     manifest: PlayniteManifest,
+    options: PlaynitePathOptions = {},
   ): Promise<PlayniteSyncStatus> {
-    const statusPath = this.getPlayniteSyncStatusPath();
+    const statusPath = this.getPlayniteSyncStatusPath(options);
     const fallback: PlayniteSyncStatus = {
       current: false,
       exportableGames: manifest.games.length,
@@ -4210,7 +4330,7 @@ export class GameVaultService {
       manifest.games.length,
     );
     const manifestPath = stringValue(raw.manifestPath);
-    const configuredManifestPath = this.getPlayniteManifestPath();
+    const configuredManifestPath = this.getPlayniteManifestPath(options);
     const sameManifestPath =
       !manifestPath ||
       resolve(manifestPath).toLowerCase() ===
@@ -4231,7 +4351,7 @@ export class GameVaultService {
     };
   }
 
-  async getPlayniteStatus(options: {
+  async getPlayniteStatus(options: PlaynitePathOptions & {
     refresh?: boolean;
   } = {}): Promise<PlayniteIntegrationStatus> {
     const settings = this.database.getSettings();
@@ -4241,6 +4361,7 @@ export class GameVaultService {
     );
     if (options.refresh) {
       manifest = await this.exportPlayniteManifest({
+        paths: options,
         rescan: true,
       });
       selections = this.normalizePlayniteExecutableSelections(
@@ -4248,6 +4369,7 @@ export class GameVaultService {
       );
     } else if (settings.playniteIntegrationEnabled && selections.length > 0) {
       manifest = await this.exportPlayniteManifest({
+        paths: options,
         rescan: false,
       });
     }
@@ -4275,7 +4397,7 @@ export class GameVaultService {
         };
       });
 
-    const extensionsPath = this.getPlayniteExtensionsPath();
+    const extensionsPath = this.getPlayniteExtensionsPath(options);
     const pluginInstallPath = extensionsPath
       ? join(extensionsPath, PLAYNITE_PLUGIN_FOLDER_NAME)
       : null;
@@ -4285,14 +4407,17 @@ export class GameVaultService {
     const installedPluginVersion = installed
       ? await readPlaynitePluginVersion(pluginInstallPath)
       : null;
-    const syncStatus = await this.getPlayniteSyncStatus(currentManifest);
+    const syncStatus = await this.getPlayniteSyncStatus(
+      currentManifest,
+      options,
+    );
     return {
       bundledPluginVersion: PLAYNITE_PLUGIN_VERSION,
       enabled: settings.playniteIntegrationEnabled === true,
       exportableGames: currentManifest.games.length,
       installed,
       installedPluginVersion,
-      manifestPath: this.getPlayniteManifestPath(),
+      manifestPath: this.getPlayniteManifestPath(options),
       pendingReviewCount: pendingReviews.length,
       pendingReviews,
       pluginInstallPath,
@@ -4307,9 +4432,9 @@ export class GameVaultService {
 
   async installPlaynitePlugin(params: {
     extensionsPath?: string | null;
+    manifestPath?: string | null;
   } = {}): Promise<PlayniteIntegrationStatus> {
-    const extensionsPath =
-      params.extensionsPath?.trim() || this.getPlayniteExtensionsPath();
+    const extensionsPath = this.getPlayniteExtensionsPath(params);
     if (!extensionsPath) {
       throw new Error(
         'Playnite extensions path is not configured. Choose the Playnite Extensions folder first.',
@@ -4321,12 +4446,16 @@ export class GameVaultService {
         `Bundled Playnite plugin was not found at ${pluginBundlePath}.`,
       );
     }
-    if (await playniteIsRunning()) {
-      throw new Error(
-        'Playnite is currently open. Close Playnite completely, then install the GameVault plugin before starting Playnite again.',
+    this.database.setSetting('playnite.extensionsPath', extensionsPath);
+    if (params.manifestPath !== undefined) {
+      this.database.setSetting(
+        'playnite.manifestPath',
+        params.manifestPath?.trim() || null,
       );
     }
-    await mkdir(extensionsPath, { recursive: true });
+    this.database.setSetting('playnite.integrationEnabled', 'true');
+    await this.exportPlayniteManifest({ paths: params, rescan: true });
+
     const pluginInstallPath = join(extensionsPath, PLAYNITE_PLUGIN_FOLDER_NAME);
     assertSafePlaynitePluginInstallTarget({
       extensionsPath,
@@ -4340,6 +4469,12 @@ export class GameVaultService {
           .map((record) => record.installPath),
       ],
     });
+    if (await playniteIsRunning()) {
+      throw new Error(
+        'Playnite is currently open. GameVault saved the new Playnite paths and refreshed the manifest; close Playnite completely, then install the plugin before starting Playnite again.',
+      );
+    }
+    await mkdir(extensionsPath, { recursive: true });
     try {
       await rm(pluginInstallPath, { force: true, recursive: true });
       await copyDirectoryRecursive(pluginBundlePath, pluginInstallPath);
@@ -4355,13 +4490,33 @@ export class GameVaultService {
       }
       throw error;
     }
-    this.database.setSetting('playnite.extensionsPath', extensionsPath);
-    this.database.setSetting('playnite.integrationEnabled', 'true');
     this.database.setSetting('playnite.pluginInstalledAt', new Date().toISOString());
     this.database.setSetting('playnite.pluginVersion', PLAYNITE_PLUGIN_VERSION);
-    await this.exportPlayniteManifest({ rescan: true });
     this.appendEvent('info', 'Installed Playnite plugin', {
       pluginInstallPath,
+    });
+    this.emitActivityChange();
+    return this.getPlayniteStatus();
+  }
+
+  async refreshPlayniteIntegration(
+    params: PlaynitePathOptions = {},
+  ): Promise<PlayniteIntegrationStatus> {
+    if (params.extensionsPath !== undefined) {
+      this.database.setSetting(
+        'playnite.extensionsPath',
+        params.extensionsPath?.trim() || null,
+      );
+    }
+    if (params.manifestPath !== undefined) {
+      this.database.setSetting(
+        'playnite.manifestPath',
+        params.manifestPath?.trim() || null,
+      );
+    }
+    await this.exportPlayniteManifest({ paths: params, rescan: true });
+    this.appendEvent('info', 'Refreshed Playnite manifest', {
+      manifestPath: this.getPlayniteManifestPath(params),
     });
     this.emitActivityChange();
     return this.getPlayniteStatus();
@@ -7836,11 +7991,37 @@ export class GameVaultService {
       );
     }
 
+    let queueParsedSource = parsedSource;
+    let selectedFullUrl = selectedFullMirror?.url ?? '';
+    if (
+      parsedSource.sourceKind === 'ankergames' &&
+      existingJob?.stage === 'failed' &&
+      isDirectHttpProvider(existingJob.provider)
+    ) {
+      const stableDownloadUrl = findAnkerGamesGeneratedDownloadUrlForSelection({
+        parsedSource,
+        requestedUrl: selectedFullUrl,
+      });
+      if (stableDownloadUrl) {
+        queueParsedSource = clearAnkerGamesBrowserDownloadUrlForSelection({
+          parsedSource,
+          stableDownloadUrl,
+        });
+        selectedFullUrl = stableDownloadUrl;
+        this.appendEvent(
+          'info',
+          'Refreshing AnkerGames direct mirror before retry',
+          { trackedItemId },
+          { notify: false },
+        );
+      }
+    }
+
     await this.queueDownload(
       trackedItemId,
-      parsedSource,
+      queueParsedSource,
       {
-        fullUrl: selectedFullMirror?.url ?? '',
+        fullUrl: selectedFullUrl,
         patchUrl: selectedPatchMirror?.url ?? null,
       },
       { force: true },

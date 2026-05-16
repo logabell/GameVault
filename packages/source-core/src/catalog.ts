@@ -141,6 +141,47 @@ function unmatchedSignificantTokenCount(
   return missing + extra;
 }
 
+function numericTitleSignature(tokens: string[]): string {
+  const numericTokens: string[] = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (!token || !/^\d+$/.test(token)) {
+      continue;
+    }
+
+    let value = token;
+    while (/^\d{3}$/.test(tokens[index + 1] ?? '')) {
+      index += 1;
+      value += tokens[index]!;
+    }
+    numericTokens.push(value.replace(/^0+(?=\d)/, ''));
+  }
+
+  return Array.from(new Set(numericTokens)).sort().join('|');
+}
+
+function tokensStartWith(tokens: string[], prefix: string[]): boolean {
+  return (
+    prefix.length > 0 &&
+    tokens.length > prefix.length &&
+    prefix.every((token, index) => tokens[index] === token)
+  );
+}
+
+function hasNumericPrefixMismatch(
+  expectedTokens: string[],
+  candidateTokens: string[],
+): boolean {
+  const prefixRelated =
+    tokensStartWith(expectedTokens, candidateTokens) ||
+    tokensStartWith(candidateTokens, expectedTokens);
+  return (
+    prefixRelated &&
+    numericTitleSignature(expectedTokens) !==
+      numericTitleSignature(candidateTokens)
+  );
+}
+
 function pushUnique(
   entries: SourceCatalogEntry[],
   seen: Set<string>,
@@ -525,8 +566,9 @@ export function rankSourceTitleMatch(
     };
   }
   if (
-    (expected.length >= 5 && candidate.startsWith(`${expected} `)) ||
-    (candidate.length >= 5 && expected.startsWith(`${candidate} `))
+    !hasNumericPrefixMismatch(expectedTokens, candidateTokens) &&
+    ((expected.length >= 5 && candidate.startsWith(`${expected} `)) ||
+      (candidate.length >= 5 && expected.startsWith(`${candidate} `)))
   ) {
     return {
       normalizedLength,

@@ -18,7 +18,7 @@ namespace GameVault.Playnite
     public class GameVaultLibraryPlugin : LibraryPlugin
     {
         private const string LibraryName = "GameVault";
-        private const string PluginVersion = "0.1.14";
+        private const string PluginVersion = "0.1.15";
         private const int ManifestSyncDebounceMs = 1500;
         private const int MetadataBackfillDebounceMs = 8000;
         private const int MetadataBackfillGameDelayMs = 750;
@@ -1400,20 +1400,86 @@ namespace GameVault.Playnite
                 return overridePath;
             }
 
-            var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-            return Path.Combine(appData, "GameVault", "playnite-library.json");
+            return Path.Combine(GetGameVaultDataDirectory(), "playnite-library.json");
         }
 
         private static string GetStatusPath()
         {
-            var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-            return Path.Combine(appData, "GameVault", "playnite-sync-status.json");
+            var manifestDirectory = Path.GetDirectoryName(GetManifestPath());
+            var statusDirectory = string.IsNullOrWhiteSpace(manifestDirectory)
+                ? GetGameVaultDataDirectory()
+                : manifestDirectory;
+            return Path.Combine(statusDirectory, "playnite-sync-status.json");
         }
 
         private static string GetIconDirectory()
         {
+            return Path.Combine(GetGameVaultDataDirectory(), "playnite-icons");
+        }
+
+        private static string GetGameVaultDataDirectory()
+        {
+            var playniteDataDirectory = GetPlayniteDataDirectoryFromPluginPath();
+            var installedDataDirectory = GetInstalledPlayniteDataDirectory();
+            if (!string.IsNullOrWhiteSpace(playniteDataDirectory) &&
+                !PathsEqual(playniteDataDirectory, installedDataDirectory))
+            {
+                return Path.Combine(playniteDataDirectory, "GameVault");
+            }
+
             var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-            return Path.Combine(appData, "GameVault", "playnite-icons");
+            return Path.Combine(appData, "GameVault");
+        }
+
+        private static string GetInstalledPlayniteDataDirectory()
+        {
+            var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            return string.IsNullOrWhiteSpace(appData) ? null : Path.Combine(appData, "Playnite");
+        }
+
+        private static string GetPlayniteDataDirectoryFromPluginPath()
+        {
+            try
+            {
+                var pluginDirectory = Path.GetDirectoryName(typeof(GameVaultLibraryPlugin).Assembly.Location);
+                var extensionsDirectory = string.IsNullOrWhiteSpace(pluginDirectory)
+                    ? null
+                    : Path.GetDirectoryName(pluginDirectory);
+                if (!string.IsNullOrWhiteSpace(extensionsDirectory) &&
+                    string.Equals(
+                        Path.GetFileName(extensionsDirectory),
+                        "Extensions",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return Path.GetDirectoryName(extensionsDirectory);
+                }
+            }
+            catch
+            {
+                // Fall back to the installed Playnite data directory.
+            }
+
+            return null;
+        }
+
+        private static bool PathsEqual(string left, string right)
+        {
+            if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right))
+            {
+                return false;
+            }
+
+            try
+            {
+                return string.Equals(
+                    Path.GetFullPath(left).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                    Path.GetFullPath(right).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                    StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+            }
         }
     }
 

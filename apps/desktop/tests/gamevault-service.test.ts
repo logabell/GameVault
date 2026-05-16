@@ -3655,6 +3655,71 @@ describe('GameVaultService SteamDB patch workflow', () => {
     }
   });
 
+  it('updates the installed patch record when editing the saved source patch', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const correctedPatch: SteamPatchCandidate = {
+        ...selectedPatch,
+        buildId: '22899999',
+        link: 'https://steamdb.info/patchnotes/22899999/?utm_source=rss',
+        patchDate: '04/20/2026',
+        patchTitle: 'MOUSE: P.I. For Hire update for 20 April 2026',
+        publishedAt: '2026-04-20T07:13:32.000Z',
+        title: 'MOUSE: P.I. For Hire update for 20 April 2026',
+        version: '1.0.5',
+      };
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(
+          async () =>
+            new Response(rss([correctedPatch, selectedPatch]), {
+              status: 200,
+            }),
+        ),
+      );
+      const service = createService(database);
+      const view = await service.addTrackedItem({
+        parsedSource,
+        queueDownload: false,
+        selectedDownloads: { fullUrl: 'https://gofile.io/d/full' },
+        selectedSteamPatch: selectedPatch,
+        steamMatch,
+      });
+      database.upsertInstallRecord({
+        installedAt: selectedPatch.patchDate,
+        installedBuildId: selectedPatch.buildId ?? null,
+        installedSourceKind: parsedSource.sourceKind,
+        installedSourceUrl: parsedSource.sourceUrl,
+        installedVersion: '1.0.4',
+        trackedItemId: view.item.id,
+        updatedAt: '2026-04-19T12:00:00.000Z',
+      });
+
+      const updated = await service.updateSourcePatch({
+        selectedSteamPatch: correctedPatch,
+        steamPatchEntries: [correctedPatch, selectedPatch],
+        trackedItemId: view.item.id,
+      });
+
+      expect(updated.installRecord).toMatchObject({
+        installedAt: '04/20/2026',
+        installedBuildId: '22899999',
+        installedVersion: '1.0.5',
+      });
+      expect(updated.selectedPatch).toMatchObject({
+        buildId: '22899999',
+        version: '1.0.5',
+      });
+      expect(database.getInstallRecord(view.item.id)).toMatchObject({
+        installedAt: '04/20/2026',
+        installedBuildId: '22899999',
+        installedVersion: '1.0.5',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('persists resolved installed patch metadata for non-manual installs after reload', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -5192,6 +5257,126 @@ describe('GameVaultService SteamDB patch workflow', () => {
     }
   });
 
+  it('refreshes failed Ankergames direct-ready mirrors before retrying curl downloads', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootLibraryPath = join(tempRoot, 'Library');
+      const refreshedProxyUrl =
+        'https://tunnel5.dlproxy.uk/download/refreshed-token?sig=refreshed-signature';
+      database.setSetting('library.rootPath', rootLibraryPath);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response(rss([selectedPatch]), { status: 200 })),
+      );
+      const sourceFetch = vi.fn(async (input: string, init?: RequestInit) => {
+        if (input === 'https://ankergames.net/csrf-token') {
+          return new Response(JSON.stringify({ token: 'csrf-token' }), {
+            status: 200,
+          });
+        }
+
+        if (input === 'https://ankergames.net/generate-download-url/2557') {
+          expect(init?.method).toBe('POST');
+          return new Response(
+            JSON.stringify({
+              download_url: 'https://ankergames.net/download/refreshed',
+              success: true,
+            }),
+            { status: 200 },
+          );
+        }
+
+        expect(input).toBe('https://ankergames.net/download/refreshed');
+        return new Response(
+          `<button data-clipboard-text="${refreshedProxyUrl}">Copy Link</button>`,
+          { status: 200 },
+        );
+      });
+      const startEmbeddedBrowserDownload = createEmbeddedBrowserRunner();
+      const service = createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+        undefined,
+        undefined,
+        undefined,
+        startEmbeddedBrowserDownload,
+      );
+
+      const draft = await service.createMatchedDraft({
+        parsedSource: ankergamesDirectReadySource,
+        steamMatch: {
+          ...steamMatch,
+          appId: 2444750,
+          normalizedTitle: 'shape of dreams',
+          title: 'Shape of Dreams',
+        },
+      });
+      const createdAt = '2026-05-15T14:57:50.206Z';
+      database.selectDownloadMirror(
+        draft.item.id,
+        ankergamesProxyUrl,
+        'full',
+        'ankergames',
+      );
+      database.upsertDownloadJob({
+        createdAt,
+        errorMessage: 'curl: (7) Could not connect to server',
+        finalPath: join(rootLibraryPath, 'Shape of Dreams'),
+        id: 'failed-ankergames-direct-retry',
+        packageName: 'Shape of Dreams_22630308',
+        provider: 'direct_http',
+        selectedMirrorUrl: ankergamesProxyUrl,
+        sourceKind: 'ankergames',
+        stage: 'failed',
+        stagePath: join(rootLibraryPath, '_STAGING', 'Shape of Dreams_22630308'),
+        statusMessage: 'curl: (7) Could not connect to server',
+        trackedItemId: draft.item.id,
+        updatedAt: '2026-05-15T14:59:24.833Z',
+      });
+
+      await service.retryDownload(draft.item.id);
+
+      expect(sourceFetch).toHaveBeenCalledWith(
+        'https://ankergames.net/generate-download-url/2557',
+        expect.objectContaining({
+          method: 'POST',
+        }),
+      );
+      expect(startEmbeddedBrowserDownload).toHaveBeenCalledWith(
+        expect.objectContaining({
+          url: refreshedProxyUrl,
+        }),
+      );
+      expect(database.getDownloadJob(draft.item.id)).toMatchObject({
+        provider: 'direct_http',
+        selectedMirrorUrl: refreshedProxyUrl,
+      });
+      expect(
+        database.getRawParsedSourcePayload(draft.item.id, 'ankergames'),
+      ).toMatchObject({
+        fullDownloadUrls: [
+          expect.objectContaining({
+            browserDownloadUrl: refreshedProxyUrl,
+            url: 'https://ankergames.net/generate-download-url/2557',
+          }),
+        ],
+      });
+      expect(database.listDownloadMirrors(draft.item.id, 'ankergames')).toEqual([
+        expect.objectContaining({
+          kind: 'full',
+          selectedAt: expect.any(String),
+          url: refreshedProxyUrl,
+        }),
+      ]);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('rewrites Ankergames refreshed mirrors to the direct-ready dlproxy URL without leaving the generated mirror behind', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -5689,11 +5874,35 @@ describe('GameVaultService SteamDB patch workflow', () => {
   it('retries Ankergames curl downloads with the resolved selected mirror URL', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
+      const refreshedProxyUrl =
+        'https://tunnel5.dlproxy.uk/download/retry-token?sig=retry-signature';
       database.setSetting('library.rootPath', join(tempRoot, 'Library'));
       vi.stubGlobal(
         'fetch',
         vi.fn(async () => new Response('', { status: 503 })),
       );
+      const sourceFetch = vi.fn(async (input: string, init?: RequestInit) => {
+        if (input === 'https://ankergames.net/csrf-token') {
+          return new Response(JSON.stringify({ token: 'csrf-token' }), {
+            status: 200,
+          });
+        }
+        if (input === 'https://ankergames.net/generate-download-url/2557') {
+          expect(init?.method).toBe('POST');
+          return new Response(
+            JSON.stringify({
+              download_url: 'https://ankergames.net/download/retry',
+              success: true,
+            }),
+            { status: 200 },
+          );
+        }
+        expect(input).toBe('https://ankergames.net/download/retry');
+        return new Response(
+          `<button data-clipboard-text="${refreshedProxyUrl}">Copy Link</button>`,
+          { status: 200 },
+        );
+      });
       const queueLinks = vi.fn(async (_params: unknown) => ({
         packageId: 9001,
         packageName: 'Shape of Dreams_22630308',
@@ -5705,7 +5914,7 @@ describe('GameVaultService SteamDB patch workflow', () => {
         undefined,
         undefined,
         undefined,
-        fetch,
+        sourceFetch,
         undefined,
         undefined,
         undefined,
@@ -5737,13 +5946,13 @@ describe('GameVaultService SteamDB patch workflow', () => {
       expect(startEmbeddedBrowserDownload).toHaveBeenCalledTimes(2);
       expect(startEmbeddedBrowserDownload).toHaveBeenLastCalledWith(
         expect.objectContaining({
-          url: ankergamesProxyUrl,
+          url: refreshedProxyUrl,
         }),
       );
       expect(queueLinks).not.toHaveBeenCalled();
       expect(database.getDownloadJob(queued.item.id)).toMatchObject({
         provider: 'direct_http',
-        selectedMirrorUrl: ankergamesProxyUrl,
+        selectedMirrorUrl: refreshedProxyUrl,
         stage: 'queued',
       });
     } finally {
@@ -7870,6 +8079,88 @@ describe('GameVaultService SteamDB patch workflow', () => {
     }
   });
 
+  it('writes Playnite manifests beside a portable extensions folder', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const service = createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        fetch,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        true,
+        undefined,
+        undefined,
+        { appDataPath: join(tempRoot, 'GameVaultAppData') },
+      );
+      const extensionsPath = join(tempRoot, 'PlaynitePortable', 'Extensions');
+      const manifestPath = join(
+        tempRoot,
+        'PlaynitePortable',
+        'GameVault',
+        'playnite-library.json',
+      );
+
+      const status = await service.refreshPlayniteIntegration({
+        extensionsPath,
+        manifestPath: null,
+      });
+
+      expect(status.playniteExtensionsPath).toBe(extensionsPath);
+      expect(status.manifestPath).toBe(manifestPath);
+      expect(existsSync(manifestPath)).toBe(true);
+      expect(database.getSettings().playniteExtensionsPath).toBe(extensionsPath);
+      expect(database.getSettings().playniteManifestPath).toBeNull();
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('keeps installed Playnite manifests in the GameVault app data folder', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    const previousAppData = process.env.APPDATA;
+    try {
+      const roamingPath = join(tempRoot, 'Roaming');
+      process.env.APPDATA = roamingPath;
+      const appDataPath = join(tempRoot, 'GameVaultAppData');
+      const service = createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        fetch,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        true,
+        undefined,
+        undefined,
+        { appDataPath },
+      );
+      const extensionsPath = join(roamingPath, 'Playnite', 'Extensions');
+      const manifestPath = join(appDataPath, 'playnite-library.json');
+
+      const status = await service.refreshPlayniteIntegration({
+        extensionsPath,
+        manifestPath: null,
+      });
+
+      expect(status.playniteExtensionsPath).toBe(extensionsPath);
+      expect(status.manifestPath).toBe(manifestPath);
+      expect(existsSync(manifestPath)).toBe(true);
+    } finally {
+      process.env.APPDATA = previousAppData;
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('recovers Ankergames curl downloads from extracted files during polling', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -9394,6 +9685,211 @@ describe('GameVaultService SteamDB patch workflow', () => {
       expect(database.listDownloadMirrors(item.id, 'steamrip')).toEqual([
         expect.objectContaining({ url: 'https://gofile.io/d/newer' }),
       ]);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('does not discover a base ElAmigos game for a numbered sequel', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'slay spire 2',
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.net/game/slay-the-spire-2',
+        title: 'Slay the Spire 2',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 2868840,
+        coverUrl: null,
+        matchedAt: '2026-04-22T12:00:00.000Z',
+        normalizedTitle: 'slay spire 2',
+        title: 'Slay the Spire 2',
+      });
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-04-22T12:00:00.000Z',
+        isPrimary: true,
+        lastCheckedAt: '2026-04-22T12:00:00.000Z',
+        lastError: null,
+        method: 'primary_source',
+        normalizedTitle: 'slay spire 2',
+        score: 1,
+        sourceKind: 'ankergames',
+        sourceTitle: 'Slay the Spire 2',
+        sourceUrl: item.sourceUrl,
+        status: 'verified',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-22T12:00:00.000Z',
+        usable: true,
+      });
+
+      const elamigosUrl =
+        'https://elamigos.site/data/Slay_the_Spire_ElAmigos.html';
+      const sourceFetch = vi.fn(async (input: string) => {
+        if (input === 'https://elamigos.site/') {
+          return new Response(
+            `<a href="/data/Slay_the_Spire_ElAmigos.html">Slay the Spire ElAmigos</a>`,
+            { status: 200 },
+          );
+        }
+        if (input === elamigosUrl) {
+          throw new Error('Base ElAmigos detail should not be probed');
+        }
+        if (input === 'https://steamrip.com/games-list-page/') {
+          return new Response(
+            `<a href="https://steamrip.com/slay-the-spire-2-free-download/">Slay the Spire 2 Free Download (v0.103.2)</a>`,
+            { status: 200 },
+          );
+        }
+        if (input === 'https://steamrip.com/updated-games/') {
+          return new Response('', { status: 200 });
+        }
+        if (
+          input === 'https://steamrip.com/slay-the-spire-2-free-download/'
+        ) {
+          return new Response(
+            steamRipSourceHtml({
+              buildId: '22823976',
+              mirrorUrl: 'https://gofile.io/d/slay-2',
+              title: 'Slay the Spire 2',
+              version: '0.103.2',
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response('', { status: 404 });
+      });
+
+      const view = await createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      ).discoverSourceMatches(item.id);
+      const elamigos = view.sourceMatches.find(
+        (source) => source.match.sourceKind === 'elamigos',
+      );
+      const steamrip = view.sourceMatches.find(
+        (source) => source.match.sourceKind === 'steamrip',
+      );
+
+      expect(elamigos).toMatchObject({
+        match: {
+          sourceTitle: null,
+          sourceUrl: null,
+          status: 'not_found',
+          usable: false,
+        },
+      });
+      expect(steamrip).toMatchObject({
+        match: {
+          sourceTitle: 'Slay the Spire 2',
+          status: 'probable',
+          usable: true,
+        },
+        snapshot: {
+          observedBuildId: '22823976',
+          observedVersion: '0.103.2',
+        },
+      });
+      expect(sourceFetch.mock.calls.map(([input]) => input)).not.toContain(
+        elamigosUrl,
+      );
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('does not discover a numbered AnkerGames sequel for a base game', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'slay spire',
+        sourceKind: 'elamigos',
+        sourceUrl: 'https://elamigos.site/data/Slay_the_Spire_ElAmigos.html',
+        title: 'Slay the Spire',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 646570,
+        coverUrl: null,
+        matchedAt: '2026-04-22T12:00:00.000Z',
+        normalizedTitle: 'slay spire',
+        title: 'Slay the Spire',
+      });
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-04-22T12:00:00.000Z',
+        isPrimary: true,
+        lastCheckedAt: '2026-04-22T12:00:00.000Z',
+        lastError: null,
+        method: 'primary_source',
+        normalizedTitle: 'slay spire',
+        score: 1,
+        sourceKind: 'elamigos',
+        sourceTitle: 'Slay the Spire',
+        sourceUrl: item.sourceUrl,
+        status: 'verified',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-22T12:00:00.000Z',
+        usable: true,
+      });
+
+      const ankerSequelUrl =
+        'https://ankergames.net/game/slay-the-spire-2';
+      const sourceFetch = vi.fn(async (input: string) => {
+        if (
+          input === 'https://ankergames.net/game/slay-the-spire' ||
+          input === 'https://ankergames.net/game/slay-spire'
+        ) {
+          return new Response('', { status: 404 });
+        }
+        if (
+          input === 'https://ankergames.net/recent-updates' ||
+          input === 'https://ankergames.net/games-list'
+        ) {
+          return new Response(
+            `<a href="/game/slay-the-spire-2">Slay the Spire 2 V 0.103.2 by Rune</a>`,
+            { status: 200 },
+          );
+        }
+        if (input === ankerSequelUrl) {
+          throw new Error('Sequel AnkerGames detail should not be probed');
+        }
+        if (
+          input === 'https://steamrip.com/games-list-page/' ||
+          input === 'https://steamrip.com/updated-games/'
+        ) {
+          return new Response('', { status: 200 });
+        }
+        return new Response('', { status: 404 });
+      });
+
+      const view = await createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      ).discoverSourceMatches(item.id);
+      const ankergames = view.sourceMatches.find(
+        (source) => source.match.sourceKind === 'ankergames',
+      );
+
+      expect(ankergames).toMatchObject({
+        match: {
+          sourceTitle: null,
+          sourceUrl: null,
+          status: 'not_found',
+          usable: false,
+        },
+      });
+      expect(sourceFetch.mock.calls.map(([input]) => input)).not.toContain(
+        ankerSequelUrl,
+      );
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }

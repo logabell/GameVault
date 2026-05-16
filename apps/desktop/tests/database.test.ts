@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { existsSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import {
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  utimes,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -38,6 +45,93 @@ async function removeTempRootAfterPendingSave(tempRoot: string): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 50));
   await rm(tempRoot, { force: true, recursive: true });
 }
+
+describe('GameVaultDatabase persistence recovery', () => {
+  it('keeps a last-good backup before replacing the live database', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    const databasePath = join(tempRoot, 'gamevault.sqlite');
+    try {
+      database.upsertTrackedItem({
+        normalizedTitle: 'barony',
+        sourceKind: 'manual',
+        title: 'Barony',
+      });
+      const firstSave = await readFile(databasePath);
+
+      database.upsertTrackedItem({
+        normalizedTitle: 'blue prince',
+        sourceKind: 'manual',
+        title: 'Blue Prince',
+      });
+
+      const lastGoodPath = `${databasePath}.last-good`;
+      expect(await GameVaultDatabase.countTrackedItems(
+        lastGoodPath,
+        resolveSqlWasmPath(),
+      )).toBe(1);
+      expect(Buffer.compare(await readFile(lastGoodPath), firstSave)).toBe(0);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('recovers a zeroed live database from the newest valid sibling backup', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    const databasePath = join(tempRoot, 'gamevault.sqlite');
+    try {
+      database.upsertTrackedItem({
+        normalizedTitle: 'barony',
+        sourceKind: 'manual',
+        title: 'Barony',
+      });
+      const olderBackupPath = `${databasePath}.older-backup`;
+      await writeFile(olderBackupPath, await readFile(databasePath));
+
+      database.upsertTrackedItem({
+        normalizedTitle: 'blue prince',
+        sourceKind: 'manual',
+        title: 'Blue Prince',
+      });
+      const newestBackupPath = `${databasePath}.newest-backup`;
+      await writeFile(newestBackupPath, await readFile(databasePath));
+
+      const olderTime = new Date('2026-05-13T12:00:00.000Z');
+      const newerTime = new Date(Date.now() + 60_000);
+      await utimes(olderBackupPath, olderTime, olderTime);
+      await utimes(`${databasePath}.last-good`, olderTime, olderTime);
+      await utimes(newestBackupPath, newerTime, newerTime);
+
+      const liveBytes = await readFile(databasePath);
+      await writeFile(databasePath, Buffer.alloc(liveBytes.byteLength, 0));
+
+      await expect(
+        GameVaultDatabase.recoverIfNeeded(databasePath, resolveSqlWasmPath()),
+      ).resolves.toBe(newestBackupPath);
+      await expect(
+        GameVaultDatabase.countTrackedItems(databasePath, resolveSqlWasmPath()),
+      ).resolves.toBe(2);
+      expect((await readdir(tempRoot)).some((entry) =>
+        entry.startsWith('gamevault.sqlite.corrupt-'),
+      )).toBe(true);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('reports corrupt database counts as unavailable', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'gamevault-db-'));
+    try {
+      const databasePath = join(tempRoot, 'gamevault.sqlite');
+      await writeFile(databasePath, Buffer.alloc(4096, 0));
+
+      await expect(
+        GameVaultDatabase.countTrackedItems(databasePath, resolveSqlWasmPath()),
+      ).resolves.toBeNull();
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+});
 
 describe('GameVaultDatabase cleanup metadata', () => {
   it('rejects duplicate Steam app ids', async () => {

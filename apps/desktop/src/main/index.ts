@@ -51,6 +51,8 @@ import {
 } from './services/gamevault-service.js';
 
 let mainWindow: BrowserWindow | null = null;
+let mainWindowReadyToShow = false;
+let mainWindowShowPending = false;
 let tray: Tray | null = null;
 let bridge: NativeBridgeServer | null = null;
 let scheduler: GameVaultScheduler | null = null;
@@ -206,17 +208,26 @@ async function migrateLegacyDatabaseIfNeeded(params: {
 }
 
 function createWindow(options?: { showOnReady?: boolean }) {
-  if (mainWindow) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (options?.showOnReady) {
+      mainWindowShowPending = true;
+      if (mainWindowReadyToShow) {
+        revealMainWindow(mainWindow);
+      }
+    }
     return mainWindow;
   }
 
+  mainWindowReadyToShow = false;
+  mainWindowShowPending = options?.showOnReady ?? false;
   mainWindow = new BrowserWindow({
-    backgroundColor: '#f4efe5',
+    backgroundColor: '#0a0f10',
     height: 840,
     icon: getWindowIconPath(),
     show: false,
     title: 'GameVault',
     webPreferences: {
+      backgroundThrottling: false,
       contextIsolation: true,
       preload: join(__dirname, 'preload.cjs'),
     },
@@ -253,7 +264,6 @@ function createWindow(options?: { showOnReady?: boolean }) {
       );
     },
   );
-  void mainWindow.loadFile(getRendererUrl());
 
   mainWindow.on('close', (event) => {
     if (!quitting) {
@@ -261,15 +271,50 @@ function createWindow(options?: { showOnReady?: boolean }) {
       mainWindow?.hide();
     }
   });
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+    mainWindowReadyToShow = false;
+    mainWindowShowPending = false;
+  });
+  mainWindow.on('restore', () => {
+    mainWindow?.webContents.invalidate();
+  });
+  mainWindow.on('show', () => {
+    mainWindow?.webContents.invalidate();
+  });
 
-  if (options?.showOnReady) {
-    mainWindow.once('ready-to-show', () => {
-      mainWindow?.show();
-      mainWindow?.focus();
-    });
-  }
+  mainWindow.once('ready-to-show', () => {
+    mainWindowReadyToShow = true;
+    if (mainWindowShowPending && mainWindow && !mainWindow.isDestroyed()) {
+      revealMainWindow(mainWindow);
+    }
+  });
+  void mainWindow.loadFile(getRendererUrl());
 
   return mainWindow;
+}
+
+function revealMainWindow(window: BrowserWindow) {
+  if (window.isDestroyed()) {
+    return window;
+  }
+  if (window.isMinimized()) {
+    window.restore();
+  }
+  if (!window.isVisible()) {
+    window.show();
+  }
+  window.webContents.invalidate();
+  window.focus();
+  return window;
+}
+
+function showMainWindow() {
+  const window = createWindow({ showOnReady: true });
+  if (mainWindowReadyToShow) {
+    revealMainWindow(window);
+  }
+  return window;
 }
 
 const BROWSER_RESOLVED_DOWNLOAD_HOSTS = new Set([
@@ -918,14 +963,12 @@ async function bootstrap() {
     if (argv.includes('--background')) {
       return;
     }
-    const window = createWindow({ showOnReady: true });
-    window.show();
-    window.focus();
+    showMainWindow();
   });
 
   await app.whenReady();
   if (!backgroundLaunch) {
-    createWindow({ showOnReady: true });
+    showMainWindow();
   }
 
   const userDataPath = app.getPath('userData');
@@ -937,6 +980,7 @@ async function bootstrap() {
     LEGACY_DATABASE_FILE_NAME,
   );
   const wasmPath = join(__dirname, 'sql-wasm.wasm');
+  await GameVaultDatabase.recoverIfNeeded(databasePath, wasmPath);
   await migrateLegacyDatabaseIfNeeded({
     databasePath,
     legacyDatabasePath,
@@ -986,8 +1030,7 @@ async function bootstrap() {
       },
     },
     showWindow: () => {
-      createWindow({ showOnReady: true }).show();
-      createWindow({ showOnReady: true }).focus();
+      showMainWindow();
     },
     sourceFetch: (input, init) => net.fetch(input, init),
     startDirectHttpDownload,
@@ -1040,8 +1083,7 @@ async function bootstrap() {
     Menu.buildFromTemplate([
       {
         click: () => {
-          createWindow().show();
-          createWindow().focus();
+          showMainWindow();
         },
         label: 'Open GameVault',
       },
@@ -1055,8 +1097,7 @@ async function bootstrap() {
     ]),
   );
   tray.on('double-click', () => {
-    createWindow().show();
-    createWindow().focus();
+    showMainWindow();
   });
 
   ipcMain.handle('gamevault:listTrackedItems', () =>
@@ -1103,8 +1144,8 @@ async function bootstrap() {
   ipcMain.handle('gamevault:installPlaynitePlugin', (_event, payload) =>
     service.installPlaynitePlugin(payload),
   );
-  ipcMain.handle('gamevault:refreshPlayniteIntegration', () =>
-    service.getPlayniteStatus({ refresh: true }),
+  ipcMain.handle('gamevault:refreshPlayniteIntegration', (_event, payload) =>
+    service.refreshPlayniteIntegration(payload),
   );
   ipcMain.handle('gamevault:savePlayniteExecutableSelection', (_event, payload) =>
     service.savePlayniteExecutableSelection(payload),
@@ -1254,7 +1295,7 @@ async function bootstrap() {
   );
 
   app.on('activate', () => {
-    createWindow({ showOnReady: true }).show();
+    showMainWindow();
   });
   app.on('before-quit', () => {
     quitting = true;

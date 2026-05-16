@@ -62,6 +62,7 @@ import {
   LIBRARY_STATUS_FILTER_OPTIONS,
   matchesLibrarySearch,
   matchesLibraryStatusFilter,
+  sortSteamPatchesByRecency,
   sortLibraryItems,
 } from '@gamevault/shared-types';
 
@@ -526,7 +527,7 @@ function getSteamPatchOptions(
   patches: SteamPatchCandidate[],
   appId: number | null | undefined,
 ): SteamPatchCandidate[] {
-  const merged = mergeSteamPatchLists([], patches);
+  const merged = sortSteamPatchesByRecency(mergeSteamPatchLists([], patches));
   const availablePatches = merged.filter(
     (patch) => patch.selectionSource !== 'older_than_available',
   );
@@ -3517,6 +3518,9 @@ function App() {
         );
       }
 
+      if (response.payload) {
+        applyUpdatedTrackedItem(response.payload as TrackedItemView);
+      }
       sourcePatchEditorRequestIdRef.current += 1;
       setSourcePatchEditor(null);
       await refreshLibrary();

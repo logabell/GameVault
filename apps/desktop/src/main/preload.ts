@@ -100,8 +100,8 @@ const api = {
     ipcRenderer.invoke('gamevault:ignoreImportFolder', payload),
   installPlaynitePlugin: (payload: unknown) =>
     ipcRenderer.invoke('gamevault:installPlaynitePlugin', payload),
-  refreshPlayniteIntegration: () =>
-    ipcRenderer.invoke('gamevault:refreshPlayniteIntegration'),
+  refreshPlayniteIntegration: (payload?: unknown) =>
+    ipcRenderer.invoke('gamevault:refreshPlayniteIntegration', payload),
   restoreImportFolder: (payload: unknown) =>
     ipcRenderer.invoke('gamevault:restoreImportFolder', payload),
   saveImportBatch: (payload: unknown) =>

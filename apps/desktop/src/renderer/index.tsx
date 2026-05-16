@@ -104,6 +104,7 @@ import {
   FIREFOX_EXTENSION_ID,
   getPatchHistoryKey,
   mergePatchHistory,
+  sortSteamPatchesByRecency,
 } from '@gamevault/shared-types';
 
 import {
@@ -377,6 +378,8 @@ declare global {
       getActivity(): Promise<ActivityView>;
       getLogs(): Promise<EventLogRecord[]>;
       getPlayniteStatus(payload?: {
+        extensionsPath?: string | null;
+        manifestPath?: string | null;
         refresh?: boolean;
       }): Promise<PlayniteIntegrationStatus>;
       getSettings(): Promise<SettingsView>;
@@ -460,8 +463,12 @@ declare global {
       }): Promise<IgnoredImportFolderRecord[]>;
       installPlaynitePlugin(payload: {
         extensionsPath?: string | null;
+        manifestPath?: string | null;
       }): Promise<PlayniteIntegrationStatus>;
-      refreshPlayniteIntegration(): Promise<PlayniteIntegrationStatus>;
+      refreshPlayniteIntegration(payload?: {
+        extensionsPath?: string | null;
+        manifestPath?: string | null;
+      }): Promise<PlayniteIntegrationStatus>;
       restoreImportFolder(payload: {
         id: string;
       }): Promise<IgnoredImportFolderRecord[]>;
@@ -651,7 +658,7 @@ function getPatchOptions(
   patches: SteamPatchCandidate[],
   appId: number | null | undefined,
 ): SteamPatchCandidate[] {
-  const merged = mergePatchCandidates(patches);
+  const merged = sortSteamPatchesByRecency(mergePatchCandidates(patches));
   const availablePatches = merged.filter(
     (patch) => !isOlderThanAvailablePatch(patch),
   );
@@ -764,6 +771,73 @@ function hasAnySavedExtensionRegistration(
 
 function getExtensionManifestPath(extensionPath: string): string {
   return `${extensionPath.replace(/[\\/]+$/g, '')}\\manifest.json`;
+}
+
+function trimTrailingPathSeparators(path: string): string {
+  return path.trim().replace(/[\\/]+$/g, '');
+}
+
+function getPathParent(path: string): string | null {
+  const trimmed = trimTrailingPathSeparators(path);
+  const separatorIndex = Math.max(
+    trimmed.lastIndexOf('\\'),
+    trimmed.lastIndexOf('/'),
+  );
+  if (separatorIndex <= 0) {
+    return null;
+  }
+  return trimmed.slice(0, separatorIndex);
+}
+
+function getPathName(path: string): string {
+  const trimmed = trimTrailingPathSeparators(path);
+  const separatorIndex = Math.max(
+    trimmed.lastIndexOf('\\'),
+    trimmed.lastIndexOf('/'),
+  );
+  return separatorIndex >= 0 ? trimmed.slice(separatorIndex + 1) : trimmed;
+}
+
+function getSuggestedPlayniteManifestPath(
+  extensionsPath: string,
+): string | null {
+  const trimmed = trimTrailingPathSeparators(extensionsPath);
+  if (!trimmed) {
+    return null;
+  }
+  const playniteDataPath =
+    getPathName(trimmed).toLowerCase() === 'extensions'
+      ? getPathParent(trimmed)
+      : null;
+  if (!playniteDataPath) {
+    return null;
+  }
+  const installedMatch = playniteDataPath.match(
+    /^(.*[\\/]AppData[\\/]Roaming)[\\/]Playnite$/i,
+  );
+  const gameVaultDataPath = installedMatch
+    ? `${installedMatch[1]}\\GameVault`
+    : `${playniteDataPath}\\GameVault`;
+  return `${gameVaultDataPath}\\playnite-library.json`;
+}
+
+function isAutomaticPlayniteManifestPath(path: string): boolean {
+  return /[\\/]GameVault[\\/]playnite-library\.json$/i.test(
+    trimTrailingPathSeparators(path),
+  );
+}
+
+function syncPlayniteManifestDraft(
+  extensionsPath: string,
+  manifestPath: string,
+): string {
+  const suggested = getSuggestedPlayniteManifestPath(extensionsPath);
+  if (!suggested) {
+    return manifestPath;
+  }
+  return !manifestPath.trim() || isAutomaticPlayniteManifestPath(manifestPath)
+    ? suggested
+    : manifestPath;
 }
 
 function browserExtensionBrowserLabel(
@@ -889,6 +963,7 @@ function createSettingsDraftFromSettings(loadedSettings: SettingsView): {
   sourceWatchDurationDays: string;
   sourceWatchIntervalHours: string;
 } {
+  const playniteExtensionsPath = loadedSettings.playniteExtensionsPath ?? '';
   return {
     jDownloaderEnabled:
       loadedSettings.jDownloaderEnabled ??
@@ -901,10 +976,13 @@ function createSettingsDraftFromSettings(loadedSettings: SettingsView): {
       loadedSettings.pollDailyHourLocal ??
         Number(DEFAULT_SETTINGS_DRAFT.pollDailyHourLocal),
     ),
-    playniteExtensionsPath: loadedSettings.playniteExtensionsPath ?? '',
+    playniteExtensionsPath,
     playniteIntegrationEnabled:
       loadedSettings.playniteIntegrationEnabled ?? false,
-    playniteManifestPath: loadedSettings.playniteManifestPath ?? '',
+    playniteManifestPath: syncPlayniteManifestDraft(
+      playniteExtensionsPath,
+      loadedSettings.playniteManifestPath ?? '',
+    ),
     sourceWatchDurationDays: String(
       loadedSettings.sourceWatchDurationDays ??
         Number(DEFAULT_SETTINGS_DRAFT.sourceWatchDurationDays),
@@ -2537,7 +2615,25 @@ function App() {
     }
   }
 
-  async function refreshPlayniteStatus(options?: { refresh?: boolean }) {
+  function getPlaynitePathPayloadFromDraft(): {
+    extensionsPath: string | null;
+    manifestPath: string | null;
+  } {
+    const playniteManifestPath = syncPlayniteManifestDraft(
+      settingsDraft.playniteExtensionsPath,
+      settingsDraft.playniteManifestPath,
+    );
+    return {
+      extensionsPath: settingsDraft.playniteExtensionsPath.trim() || null,
+      manifestPath: playniteManifestPath.trim() || null,
+    };
+  }
+
+  async function refreshPlayniteStatus(options?: {
+    extensionsPath?: string | null;
+    manifestPath?: string | null;
+    refresh?: boolean;
+  }) {
     try {
       const nextStatus = await window.gameVaultApi.getPlayniteStatus(options);
       setPlayniteStatus(nextStatus);
@@ -2557,14 +2653,23 @@ function App() {
     setPlayniteMessage(null);
     try {
       const nextStatus = await window.gameVaultApi.installPlaynitePlugin({
-        extensionsPath: settingsDraft.playniteExtensionsPath.trim() || null,
+        ...getPlaynitePathPayloadFromDraft(),
       });
       setPlayniteStatus(nextStatus);
       await refreshSettings();
+      setSettingsSaveStatus('saved');
       setPlayniteMessage(
         'Playnite plugin installed. Start or restart Playnite to load the GameVault integration.',
       );
     } catch (error) {
+      await refreshSettings();
+      await refreshPlayniteStatus();
+      if (
+        error instanceof Error &&
+        error.message.includes('saved the new Playnite paths')
+      ) {
+        setSettingsSaveStatus('saved');
+      }
       setPlayniteMessage(
         error instanceof Error
           ? error.message
@@ -2579,8 +2684,13 @@ function App() {
     setPlayniteBusy(true);
     setPlayniteMessage(null);
     try {
-      const nextStatus = await window.gameVaultApi.refreshPlayniteIntegration();
+      const nextStatus =
+        await window.gameVaultApi.refreshPlayniteIntegration(
+          getPlaynitePathPayloadFromDraft(),
+        );
       setPlayniteStatus(nextStatus);
+      await refreshSettings();
+      setSettingsSaveStatus('saved');
       setPlayniteMessage('Playnite manifest refreshed.');
     } catch (error) {
       setPlayniteMessage(
@@ -3118,6 +3228,10 @@ function App() {
   async function saveSettingsDraft() {
     setSettingsSaveStatus('saving');
     setPlayniteMessage(null);
+    const playniteManifestPath = syncPlayniteManifestDraft(
+      settingsDraft.playniteExtensionsPath,
+      settingsDraft.playniteManifestPath,
+    );
     try {
       const nextSettings = await window.gameVaultApi.saveSettings({
         jDownloaderEnabled: settingsDraft.jDownloaderEnabled,
@@ -3129,8 +3243,7 @@ function App() {
           settingsDraft.playniteExtensionsPath.trim() || null,
         playniteIntegrationEnabled:
           settingsDraft.playniteIntegrationEnabled,
-        playniteManifestPath:
-          settingsDraft.playniteManifestPath.trim() || null,
+        playniteManifestPath: playniteManifestPath.trim() || null,
         renameGameFoldersOnImport: renameOnImportDraft,
         sourceWatchDurationDays: Number(
           settingsDraft.sourceWatchDurationDays,
@@ -5398,12 +5511,13 @@ function App() {
     setBusyId(patchEditor.item.item.id);
     setBusyAction('updatePatch');
     try {
-      await window.gameVaultApi.updateSourcePatch({
+      const updated = await window.gameVaultApi.updateSourcePatch({
         selectedSteamPatch: selectedPatch,
         steamPatchEntries: patchEditor.patches,
         trackedItemId: patchEditor.item.item.id,
       });
       closePatchEditor();
+      mergeTrackedItemViews([updated]);
       await refreshItems();
     } catch (error) {
       await showAlert(error instanceof Error ? error.message : 'Action failed.');
@@ -9612,6 +9726,18 @@ function App() {
                         }));
                         setSettingsSaveStatus('idle');
                       }}
+                      onBlur={() => {
+                        setSettingsDraft((current) => ({
+                          ...current,
+                          playniteManifestPath: syncPlayniteManifestDraft(
+                            current.playniteExtensionsPath,
+                            current.playniteManifestPath,
+                          ),
+                        }));
+                        void refreshPlayniteStatus(
+                          getPlaynitePathPayloadFromDraft(),
+                        );
+                      }}
                       value={settingsDraft.playniteExtensionsPath}
                     />
                   </label>
@@ -9626,6 +9752,18 @@ function App() {
                         }));
                         setSettingsSaveStatus('idle');
                       }}
+                      placeholder={
+                        getSuggestedPlayniteManifestPath(
+                          settingsDraft.playniteExtensionsPath,
+                        ) ??
+                        playniteStatus?.manifestPath ??
+                        'Auto'
+                      }
+                      title={
+                        settingsDraft.playniteManifestPath ||
+                        playniteStatus?.manifestPath ||
+                        undefined
+                      }
                       value={settingsDraft.playniteManifestPath}
                     />
                   </label>
@@ -9640,8 +9778,19 @@ function App() {
                       setSettingsDraft((current) => ({
                         ...current,
                         playniteExtensionsPath: picked,
+                        playniteManifestPath: syncPlayniteManifestDraft(
+                          picked,
+                          current.playniteManifestPath,
+                        ),
                       }));
                       setSettingsSaveStatus('idle');
+                      void refreshPlayniteStatus({
+                        extensionsPath: picked,
+                        manifestPath: syncPlayniteManifestDraft(
+                          picked,
+                          settingsDraft.playniteManifestPath,
+                        ),
+                      });
                     }}
                     type="button"
                   >
@@ -9690,7 +9839,10 @@ function App() {
                             ? 'Plugin files installed'
                             : 'Plugin files not installed'}
                       </strong>
-                      <p className="muted-text">
+                      <p
+                        className="muted-text"
+                        title={playniteStatus?.pluginInstallPath ?? undefined}
+                      >
                         {playniteStatus?.installed
                           ? `Installed ${playniteStatus.installedPluginVersion ?? 'unknown'}; bundled ${playniteStatus.bundledPluginVersion} (SDK 6.x).`
                           : (playniteStatus?.pluginInstallPath ??
@@ -9713,7 +9865,10 @@ function App() {
                       <strong>
                         {playniteStatus?.exportableGames ?? 0} games exportable
                       </strong>
-                      <p className="muted-text">
+                      <p
+                        className="muted-text"
+                        title={playniteStatus?.manifestPath ?? undefined}
+                      >
                         {playniteStatus?.pendingReviewCount
                           ? `${playniteStatus.pendingReviewCount} launch executable review${playniteStatus.pendingReviewCount === 1 ? '' : 's'} pending.`
                           : playniteStatus?.manifestPath

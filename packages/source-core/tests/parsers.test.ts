@@ -335,6 +335,12 @@ describe('source parsers', () => {
       scoreSourceTitleMatch('Frostpunk 2', 'Frostpunk 2 Deluxe Edition'),
     ).toBeGreaterThanOrEqual(0.92);
     expect(
+      scoreSourceTitleMatch('Slay the Spire 2', 'Slay the Spire'),
+    ).toBeLessThan(0.84);
+    expect(
+      scoreSourceTitleMatch('Slay the Spire', 'Slay the Spire 2'),
+    ).toBeLessThan(0.84);
+    expect(
       scoreSourceTitleMatch(
         "Baldur's Gate 3",
         "Baldur's Gate III / Baldurs Gate 3 Deluxe Edition",

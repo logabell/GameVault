@@ -1,4 +1,11 @@
 import { ensureDir, readFileIfExists, writeBinaryFileSync } from './io.js';
+import {
+  existsSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+} from 'node:fs';
 
 import type {
   ConfirmedSteamMatch,
@@ -37,7 +44,7 @@ import initSqlJs, {
   type Database as SqlJsDatabase,
   type SqlJsStatic,
 } from 'sql.js';
-import { basename } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS tracked_items (
@@ -908,10 +915,148 @@ interface SteamDbBuildCacheRecord {
   patches: SteamPatchCandidate[];
 }
 
+const LAST_GOOD_DATABASE_SUFFIX = '.last-good';
+
+function getLastGoodDatabasePath(filePath: string): string {
+  return `${filePath}${LAST_GOOD_DATABASE_SUFFIX}`;
+}
+
+function getTimestampedDatabasePath(filePath: string, label: string): string {
+  const timestamp = new Date().toISOString().replace(/\D/g, '').slice(0, 14);
+  let candidate = `${filePath}.${label}-${timestamp}`;
+  let counter = 1;
+  while (existsSync(candidate)) {
+    candidate = `${filePath}.${label}-${timestamp}-${counter}`;
+    counter += 1;
+  }
+  return candidate;
+}
+
+function validateDatabaseBytes(SQL: SqlJsStatic, binary: Uint8Array): void {
+  if (binary.byteLength === 0) {
+    throw new Error('Database file is empty.');
+  }
+
+  const db = new SQL.Database(binary);
+  try {
+    const result = db.exec('PRAGMA quick_check');
+    const status = String(result[0]?.values[0]?.[0] ?? '');
+    if (status.toLowerCase() !== 'ok') {
+      throw new Error(`Database quick_check failed: ${status || 'unknown'}`);
+    }
+  } finally {
+    db.close();
+  }
+}
+
+function isValidDatabaseBytes(
+  SQL: SqlJsStatic,
+  binary: Uint8Array,
+): boolean {
+  try {
+    validateDatabaseBytes(SQL, binary);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function listDatabaseRecoveryCandidates(filePath: string): string[] {
+  const directory = dirname(filePath);
+  if (!existsSync(directory)) {
+    return [];
+  }
+
+  const prefix = `${basename(filePath)}.`;
+  return readdirSync(directory)
+    .filter(
+      (entry) => entry.startsWith(prefix) && !entry.includes('.corrupt'),
+    )
+    .map((entry) => join(directory, entry))
+    .filter((candidate) => candidate !== filePath)
+    .sort((left, right) => statSync(right).mtimeMs - statSync(left).mtimeMs);
+}
+
+function findNewestValidRecoveryCandidate(
+  SQL: SqlJsStatic,
+  filePath: string,
+): { bytes: Uint8Array; filePath: string } | null {
+  for (const candidatePath of listDatabaseRecoveryCandidates(filePath)) {
+    const bytes = readFileSync(candidatePath);
+    if (isValidDatabaseBytes(SQL, bytes)) {
+      return { bytes, filePath: candidatePath };
+    }
+  }
+
+  return null;
+}
+
+function writeValidatedDatabaseFileSync(
+  SQL: SqlJsStatic,
+  filePath: string,
+  binary: Uint8Array,
+): void {
+  validateDatabaseBytes(SQL, binary);
+  writeBinaryFileSync(filePath, binary, {
+    beforeReplace: () => {
+      if (!existsSync(filePath)) {
+        return;
+      }
+
+      const current = readFileSync(filePath);
+      if (!isValidDatabaseBytes(SQL, current)) {
+        return;
+      }
+
+      writeBinaryFileSync(getLastGoodDatabasePath(filePath), current, {
+        validateWrittenFile: (tempFilePath) =>
+          validateDatabaseBytes(SQL, readFileSync(tempFilePath)),
+      });
+    },
+    validateWrittenFile: (tempFilePath) =>
+      validateDatabaseBytes(SQL, readFileSync(tempFilePath)),
+  });
+}
+
+async function readOrRecoverPersistedDatabase(
+  SQL: SqlJsStatic,
+  filePath: string,
+): Promise<{ bytes: Uint8Array | null; recoveredFrom: string | null }> {
+  const persisted = await readFileIfExists(filePath);
+  if (!persisted) {
+    return { bytes: null, recoveredFrom: null };
+  }
+
+  if (isValidDatabaseBytes(SQL, persisted)) {
+    return { bytes: persisted, recoveredFrom: null };
+  }
+
+  const corruptPath = getTimestampedDatabasePath(filePath, 'corrupt');
+  renameSync(filePath, corruptPath);
+
+  const recoveryCandidate = findNewestValidRecoveryCandidate(SQL, filePath);
+  if (!recoveryCandidate) {
+    console.warn(
+      `Preserved corrupt GameVault database at ${corruptPath}; no valid recovery candidate was found.`,
+    );
+    return { bytes: null, recoveredFrom: null };
+  }
+
+  writeValidatedDatabaseFileSync(SQL, filePath, recoveryCandidate.bytes);
+  console.warn(
+    `Recovered GameVault database from ${recoveryCandidate.filePath}; preserved corrupt copy at ${corruptPath}.`,
+  );
+  return {
+    bytes: recoveryCandidate.bytes,
+    recoveredFrom: recoveryCandidate.filePath,
+  };
+}
+
 export class GameVaultDatabase {
   private constructor(
     private readonly db: SqlJsDatabase,
     private readonly filePath: string,
+    private readonly SQL: SqlJsStatic,
   ) {}
 
   static async open(
@@ -922,12 +1067,30 @@ export class GameVaultDatabase {
       locateFile: () => wasmPath,
     })) as SqlJsStatic;
     await ensureDir(filePath);
-    const persisted = await readFileIfExists(filePath);
+    const { bytes: persisted } = await readOrRecoverPersistedDatabase(
+      SQL,
+      filePath,
+    );
     const db = persisted ? new SQL.Database(persisted) : new SQL.Database();
     db.exec(SCHEMA_SQL);
     applyMigrations(db);
-    writeBinaryFileSync(filePath, db.export());
-    return new GameVaultDatabase(db, filePath);
+    writeValidatedDatabaseFileSync(SQL, filePath, db.export());
+    return new GameVaultDatabase(db, filePath, SQL);
+  }
+
+  static async recoverIfNeeded(
+    filePath: string,
+    wasmPath: string,
+  ): Promise<string | null> {
+    const SQL = (await initSqlJs({
+      locateFile: () => wasmPath,
+    })) as SqlJsStatic;
+    await ensureDir(filePath);
+    const { recoveredFrom } = await readOrRecoverPersistedDatabase(
+      SQL,
+      filePath,
+    );
+    return recoveredFrom;
   }
 
   static async countTrackedItems(
@@ -942,8 +1105,9 @@ export class GameVaultDatabase {
     const SQL = (await initSqlJs({
       locateFile: () => wasmPath,
     })) as SqlJsStatic;
-    const db = new SQL.Database(persisted);
+    let db: SqlJsDatabase | null = null;
     try {
+      db = new SQL.Database(persisted);
       const tableResult = db.exec(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tracked_items'",
       );
@@ -953,14 +1117,16 @@ export class GameVaultDatabase {
 
       const countResult = db.exec('SELECT COUNT(*) FROM tracked_items');
       return Number(countResult[0]?.values[0]?.[0] ?? 0);
+    } catch {
+      return null;
     } finally {
-      db.close();
+      db?.close();
     }
   }
 
   private save(): void {
     const binary = this.db.export();
-    writeBinaryFileSync(this.filePath, binary);
+    writeValidatedDatabaseFileSync(this.SQL, this.filePath, binary);
   }
 
   private exec(sql: string, params: SqlScalar[] = []): void {
