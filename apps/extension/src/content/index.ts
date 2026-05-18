@@ -3,6 +3,7 @@ import { copiedUrlMatchesPage, isSupportedDetailPage } from '../support.js';
 const ANKERGAMES_CURRENT_BUILD_RE =
   /\bCurrent\s+Build\b\D*(?<build>\d{5,})\b/i;
 const ANKERGAMES_VERSION_STATUS_TIMEOUT_MS = 3000;
+const ANKERGAMES_CAPTURE_SETTLE_MS = 500;
 
 function readHtml() {
   return document.documentElement.outerHTML;
@@ -42,7 +43,9 @@ function hasAnkerGamesCurrentBuild() {
   );
 }
 
-function waitForAnkerGamesCurrentBuild(): Promise<void> {
+function waitForAnkerGamesCurrentBuild(
+  timeoutMs = ANKERGAMES_VERSION_STATUS_TIMEOUT_MS,
+): Promise<void> {
   if (!isAnkerGamesDetailPage() || hasAnkerGamesCurrentBuild()) {
     return Promise.resolve();
   }
@@ -58,10 +61,7 @@ function waitForAnkerGamesCurrentBuild(): Promise<void> {
         finish();
       }
     });
-    const timer = window.setTimeout(
-      finish,
-      ANKERGAMES_VERSION_STATUS_TIMEOUT_MS,
-    );
+    const timer = window.setTimeout(finish, timeoutMs);
 
     observer.observe(document.documentElement, {
       characterData: true,
@@ -71,9 +71,17 @@ function waitForAnkerGamesCurrentBuild(): Promise<void> {
   });
 }
 
-async function readHtmlForSourceCapture() {
-  await waitForAnkerGamesCurrentBuild();
+async function readHtmlForSourceCapture(options: { settleMs?: number } = {}) {
+  await waitForAnkerGamesCurrentBuild(options.settleMs);
   return readHtml();
+}
+
+function sendPageReady(html: string) {
+  void chrome.runtime.sendMessage({
+    fingerprint: hashText(html),
+    type: 'gamevault:page-ready',
+    url: location.href,
+  });
 }
 
 declare global {
@@ -88,12 +96,17 @@ if (!globalThis.__gameVaultContentBound__ && isSupportedDetailPage(location.href
     url: location.href,
   });
 
-  void readHtmlForSourceCapture().then((html) => {
-    void chrome.runtime.sendMessage({
-      fingerprint: hashText(html),
-      type: 'gamevault:page-ready',
-      url: location.href,
-    });
+  void readHtmlForSourceCapture({
+    settleMs: ANKERGAMES_CAPTURE_SETTLE_MS,
+  }).then((html) => {
+    sendPageReady(html);
+    if (isAnkerGamesDetailPage() && !hasAnkerGamesCurrentBuild()) {
+      void waitForAnkerGamesCurrentBuild().then(() => {
+        if (hasAnkerGamesCurrentBuild()) {
+          sendPageReady(readHtml());
+        }
+      });
+    }
   });
 
   document.addEventListener('copy', (event) => {
@@ -111,17 +124,17 @@ if (!globalThis.__gameVaultContentBound__ && isSupportedDetailPage(location.href
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === 'gamevault:get-page-probe') {
-    void readHtmlForSourceCapture().then((html) => {
-      sendResponse({
-        fingerprint: hashText(html),
-        url: location.href,
-      });
+    sendResponse({
+      fingerprint: readFingerprint(),
+      url: location.href,
     });
-    return true;
+    return undefined;
   }
 
   if (message.type === 'gamevault:get-html') {
-    void readHtmlForSourceCapture().then((html) => {
+    void readHtmlForSourceCapture({
+      settleMs: ANKERGAMES_CAPTURE_SETTLE_MS,
+    }).then((html) => {
       sendResponse({
         fingerprint: hashText(html),
         html,

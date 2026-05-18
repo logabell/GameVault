@@ -4884,6 +4884,9 @@ function App() {
 
   useEffect(() => {
     const refresh = () => {
+      if (document.hidden) {
+        return;
+      }
       void Promise.all([
         refreshConnectionHealth(),
         refreshDesktopHealth(),
@@ -4895,7 +4898,7 @@ function App() {
         refresh();
       }
     };
-    const timer = window.setInterval(refresh, 5000);
+    const timer = window.setInterval(refresh, 30000);
     window.addEventListener('focus', refresh);
     document.addEventListener('visibilitychange', refreshWhenVisible);
     return () => {
@@ -5869,6 +5872,8 @@ function App() {
         alt={item.item.title}
         className={className}
         data-fallback-src={fallback}
+        decoding="async"
+        loading="lazy"
         onError={fallback ? handleArtworkFallback : undefined}
         src={cover}
       />
@@ -7310,6 +7315,8 @@ function App() {
         alt={item.title}
         className="wishlist-row__cover"
         data-fallback-src={fallbackCover}
+        decoding="async"
+        loading="lazy"
         onError={fallbackCover ? handleArtworkFallback : undefined}
         src={portraitCover ?? fallbackCover}
       />

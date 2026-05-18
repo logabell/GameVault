@@ -119,6 +119,7 @@ const POPUP_MYJD_HEALTH_CHECKING: HealthIndicator = {
 const STEAM_PATCH_MESSAGE_TIMEOUT_MS = 50000;
 const QUEUE_DOWNLOAD_MESSAGE_TIMEOUT_MS = 120000;
 const STATUS_REFRESH_MESSAGE_TIMEOUT_MS = 10000;
+const LIBRARY_REFRESH_STALE_MS = 30000;
 const STEAMDB_BACKFILL_POLL_INTERVAL_MS = 750;
 const STEAMDB_BACKFILL_POLL_TIMEOUT_MS = 26000;
 const EXTENSION_ACTIVE_TAB_STORAGE_KEY = 'gamevault:extension:active-tab';
@@ -1333,6 +1334,8 @@ function App() {
   const detectedWorkflowSnapshotRef = useRef<WorkflowSnapshot | null>(null);
   const restoredPopupStateKeyRef = useRef<string | null>(null);
   const skipNextPopupStatePersistKeyRef = useRef<string | null>(null);
+  const libraryRefreshInFlightRef = useRef<Promise<void> | null>(null);
+  const libraryLastLoadedAtRef = useRef(0);
   const scrollStageRef = useRef<HTMLElement | null>(null);
   const healthRef = useRef<ConnectionHealthSummary | null>(null);
 
@@ -1620,25 +1623,49 @@ function App() {
     syncTrackedStatus(updated);
   }
 
-  async function refreshLibrary() {
-    const response = await sendRuntimeMessageWithTimeout<{
-      ok?: boolean;
-      payload?: TrackedItemView[] | null;
-    }>(
-      {
-        allowNativeFallback: false,
-        type: 'gamevault:list-library',
-      },
-      STATUS_REFRESH_MESSAGE_TIMEOUT_MS,
-      'GameVault library refresh timed out.',
-    );
-    if (response.ok && Array.isArray(response.payload)) {
-      setLibraryItems(response.payload as TrackedItemView[]);
+  async function refreshLibrary(options: { force?: boolean } = {}) {
+    if (
+      !options.force &&
+      libraryLastLoadedAtRef.current > 0 &&
+      Date.now() - libraryLastLoadedAtRef.current < LIBRARY_REFRESH_STALE_MS
+    ) {
+      return;
     }
+    if (libraryRefreshInFlightRef.current) {
+      return libraryRefreshInFlightRef.current;
+    }
+
+    const request = (async () => {
+      const response = await sendRuntimeMessageWithTimeout<{
+        ok?: boolean;
+        payload?: TrackedItemView[] | null;
+      }>(
+        {
+          allowNativeFallback: false,
+          type: 'gamevault:list-library',
+        },
+        STATUS_REFRESH_MESSAGE_TIMEOUT_MS,
+        'GameVault library refresh timed out.',
+      );
+      if (response.ok && Array.isArray(response.payload)) {
+        setLibraryItems(response.payload as TrackedItemView[]);
+        libraryLastLoadedAtRef.current = Date.now();
+      }
+    })().finally(() => {
+      if (libraryRefreshInFlightRef.current === request) {
+        libraryRefreshInFlightRef.current = null;
+      }
+    });
+
+    libraryRefreshInFlightRef.current = request;
+    return request;
   }
 
   function refreshPopupStateInBackground(): void {
-    void Promise.allSettled([refreshLibrary(), refreshDraftStatus()]);
+    void Promise.allSettled([
+      refreshLibrary({ force: true }),
+      refreshDraftStatus(),
+    ]);
   }
 
   const writePopupStateForSourceUrl = useCallback(
@@ -1780,7 +1807,7 @@ function App() {
         );
         return;
       }
-      await refreshLibrary();
+      await refreshLibrary({ force: true });
     } finally {
       setBusy(false);
     }
@@ -1811,7 +1838,10 @@ function App() {
       }
       const updated = response.payload as TrackedItemView;
       applyUpdatedTrackedItem(updated);
-      await Promise.allSettled([refreshLibrary(), refreshDraftStatus()]);
+      await Promise.allSettled([
+        refreshLibrary({ force: true }),
+        refreshDraftStatus(),
+      ]);
       const retryNow = window.confirm('Retry this download with another link?');
       if (retryNow) {
         const fullRows = getRetryMirrorRows(updated, 'full');
@@ -1859,7 +1889,10 @@ function App() {
       const updated = response.payload as TrackedItemView;
       applyUpdatedTrackedItem(updated);
       setMessage(`${updated.item.title} marked installed.`);
-      await Promise.allSettled([refreshLibrary(), refreshDraftStatus()]);
+      await Promise.allSettled([
+        refreshLibrary({ force: true }),
+        refreshDraftStatus(),
+      ]);
     } finally {
       setBusy(false);
       setLibraryAction(null);
@@ -1889,7 +1922,10 @@ function App() {
       const updated = response.payload as TrackedItemView;
       applyUpdatedTrackedItem(updated);
       setMessage(`${updated.item.title} download is ready for install.`);
-      await Promise.allSettled([refreshLibrary(), refreshDraftStatus()]);
+      await Promise.allSettled([
+        refreshLibrary({ force: true }),
+        refreshDraftStatus(),
+      ]);
     } finally {
       setBusy(false);
       setLibraryAction(null);
@@ -1920,7 +1956,10 @@ function App() {
       const updated = response.payload as TrackedItemView;
       applyUpdatedTrackedItem(updated);
       setMessage(`Online Fix queued for ${updated.item.title}.`);
-      await Promise.allSettled([refreshLibrary(), refreshDraftStatus()]);
+      await Promise.allSettled([
+        refreshLibrary({ force: true }),
+        refreshDraftStatus(),
+      ]);
     } finally {
       setBusy(false);
       setLibraryAction(null);
@@ -1979,7 +2018,10 @@ function App() {
         return;
       }
       setRetrySelection(null);
-      await Promise.allSettled([refreshLibrary(), refreshDraftStatus()]);
+      await Promise.allSettled([
+        refreshLibrary({ force: true }),
+        refreshDraftStatus(),
+      ]);
     } finally {
       setBusy(false);
     }
@@ -2132,10 +2174,6 @@ function App() {
       setConnectionPending(false);
     }
   }, []);
-
-  useEffect(() => {
-    void refreshConnectionHealth();
-  }, [refreshConnectionHealth]);
 
   async function saveTheme(themeMode: ThemeMode) {
     setThemeBusy(true);
@@ -2459,86 +2497,76 @@ function App() {
   useEffect(() => {
     let cancelled = false;
 
-    void Promise.allSettled([
-      sendRuntimeMessageWithTimeout(
-        {
-          mode,
-          sourceUrl,
-          tabId: tabId ? Number(tabId) : null,
-          type: 'gamevault:get-draft-shell',
-        },
-        STATUS_REFRESH_MESSAGE_TIMEOUT_MS,
-        'GameVault draft shell load timed out.',
-      ),
-      sendRuntimeMessageWithTimeout(
-        { type: 'gamevault:get-settings' },
-        STATUS_REFRESH_MESSAGE_TIMEOUT_MS,
-        'GameVault settings load timed out.',
-      ),
-      sendRuntimeMessageWithTimeout(
-        { allowNativeFallback: false, type: 'gamevault:list-library' },
-        STATUS_REFRESH_MESSAGE_TIMEOUT_MS,
-        'GameVault library load timed out.',
-      ),
-      sendRuntimeMessageWithTimeout(
-        {
-          type: 'gamevault:get-steamdb-pending-confirmation',
-        },
-        STATUS_REFRESH_MESSAGE_TIMEOUT_MS,
-        'GameVault SteamDB confirmation load timed out.',
-      ),
-    ]).then(([shellResult, settingsResult, libraryResult, pendingResult]) => {
-      if (cancelled) return;
-
-      setShellLoading(false);
-
-      if (shellResult.status === 'fulfilled') {
-        const response = shellResult.value as {
-          ok: boolean;
-          payload?: DraftShellPayload;
-          message?: string;
-        };
+    void sendRuntimeMessageWithTimeout<{
+      message?: string;
+      ok: boolean;
+      payload?: DraftShellPayload;
+    }>(
+      {
+        mode,
+        sourceUrl,
+        tabId: tabId ? Number(tabId) : null,
+        type: 'gamevault:get-draft-shell',
+      },
+      STATUS_REFRESH_MESSAGE_TIMEOUT_MS,
+      'GameVault draft shell load timed out.',
+    )
+      .then((response) => {
+        if (cancelled) return;
         if (response.ok && response.payload) {
           setDraftShell(response.payload);
           syncTrackedStatus(response.payload.trackedStatus);
         } else if (response.message) {
           setMessage(response.message);
         }
-      }
-
-      if (settingsResult.status === 'fulfilled') {
-        const response = settingsResult.value as {
-          ok: boolean;
-          payload?: SettingsView;
-        };
-        if (response.ok && response.payload) {
-          setSettings(response.payload);
-          setSettingsLoaded(true);
-          setEmail(response.payload.myJDownloaderEmail ?? '');
-          setRootLibraryPathDraft(response.payload.rootLibraryPath ?? '');
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setMessage(
+            error instanceof Error
+              ? error.message
+              : 'GameVault draft shell load timed out.',
+          );
         }
-      }
-
-      if (libraryResult.status === 'fulfilled') {
-        const response = libraryResult.value as {
-          ok: boolean;
-          payload?: TrackedItemView[];
-        };
-        if (response.ok && Array.isArray(response.payload)) {
-          setLibraryItems(response.payload);
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setShellLoading(false);
         }
-      }
+      });
 
-      if (pendingResult.status === 'fulfilled') {
-        const response = pendingResult.value as {
-          ok: boolean;
-          payload?: SteamDbPendingConfirmation | null;
-        };
-        if (response.ok && response.payload) {
-          hydrateSteamDbConfirmation(response.payload);
-        }
-      }
-    });
+    void sendRuntimeMessageWithTimeout<{
+      ok: boolean;
+      payload?: SettingsView;
+    }>(
+      { type: 'gamevault:get-settings' },
+      STATUS_REFRESH_MESSAGE_TIMEOUT_MS,
+      'GameVault settings load timed out.',
+    )
+      .then((response) => {
+        if (cancelled || !response.ok || !response.payload) return;
+        setSettings(response.payload);
+        setSettingsLoaded(true);
+        setEmail(response.payload.myJDownloaderEmail ?? '');
+        setRootLibraryPathDraft(response.payload.rootLibraryPath ?? '');
+      })
+      .catch(() => undefined);
+
+    void sendRuntimeMessageWithTimeout<{
+      ok: boolean;
+      payload?: SteamDbPendingConfirmation | null;
+    }>(
+      {
+        type: 'gamevault:get-steamdb-pending-confirmation',
+      },
+      STATUS_REFRESH_MESSAGE_TIMEOUT_MS,
+      'GameVault SteamDB confirmation load timed out.',
+    )
+      .then((response) => {
+        if (cancelled || !response.ok || !response.payload) return;
+        hydrateSteamDbConfirmation(response.payload);
+      })
+      .catch(() => undefined);
 
     return () => {
       cancelled = true;
@@ -2759,7 +2787,10 @@ function App() {
       return undefined;
     }
 
-    const timer = window.setInterval(() => void refreshLibrary(), 5000);
+    const timer = window.setInterval(
+      () => void refreshLibrary({ force: true }),
+      5000,
+    );
     return () => window.clearInterval(timer);
   }, [activeTab, libraryItems]);
 
@@ -3834,7 +3865,7 @@ function App() {
       }
       sourcePatchEditorRequestIdRef.current += 1;
       setSourcePatchEditor(null);
-      await refreshLibrary();
+      await refreshLibrary({ force: true });
       setMessage('Source patch updated.');
     } catch (error) {
       setSourcePatchEditor((current) =>
@@ -4143,6 +4174,8 @@ function App() {
         alt={item.item.title}
         className={className}
         data-fallback-src={fallback}
+        decoding="async"
+        loading="lazy"
         onError={fallback ? handleArtworkFallback : undefined}
         src={cover}
       />

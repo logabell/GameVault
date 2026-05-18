@@ -611,12 +611,14 @@ select option {
 
 .library-card,
 .library-row {
+  content-visibility: auto;
   position: relative;
   overflow: visible;
   background: var(--card);
 }
 
 .library-card {
+  contain-intrinsic-size: 100% 290px;
   display: grid;
   gap: 12px;
   grid-template-rows: auto auto minmax(0, 1fr);
@@ -678,10 +680,16 @@ select option {
 }
 
 .library-row {
+  contain-intrinsic-size: 100% 132px;
   display: grid;
   grid-template-columns: 88px minmax(0, 1fr);
   min-height: 129px;
   align-items: start;
+}
+
+.library-card:has(.item-action-menu[open]),
+.library-row:has(.item-action-menu[open]) {
+  content-visibility: visible;
 }
 
 .library-row__cover {

@@ -761,6 +761,8 @@ code {
   --wishlist-row-cover-width: 127px;
   --wishlist-row-height: 190px;
 
+  content-visibility: auto;
+  contain-intrinsic-size: 100% var(--wishlist-row-height);
   display: grid;
   grid-template-columns: var(--wishlist-row-cover-width) minmax(0, 1fr);
   min-height: var(--wishlist-row-height);
@@ -917,6 +919,7 @@ code {
 
 .game-card,
 .game-row {
+  content-visibility: auto;
   overflow: visible;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -925,6 +928,7 @@ code {
 }
 
 .game-card {
+  contain-intrinsic-size: 100% 330px;
   position: relative;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
@@ -1056,6 +1060,7 @@ code {
   --game-row-cover-width: 127px;
   --game-row-height: 190px;
 
+  contain-intrinsic-size: 100% var(--game-row-height);
   position: relative;
   display: grid;
   grid-template-columns: var(--game-row-cover-width) minmax(0, 1fr);
@@ -1063,6 +1068,11 @@ code {
   height: auto;
   align-items: stretch;
   overflow: visible;
+}
+
+.game-card:has(.item-action-menu[open]),
+.game-row:has(.item-action-menu[open]) {
+  content-visibility: visible;
 }
 
 .game-row__media {

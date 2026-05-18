@@ -33,6 +33,7 @@ export class GameVaultScheduler {
   private tickPromise: Promise<void> | null = null;
   private downloadProgressTimer: NodeJS.Timeout | null = null;
   private downloadProgressTickPromise: Promise<void> | null = null;
+  private lastDownloadProgressPollingWarningAt = 0;
 
   constructor(private readonly service: GameVaultService) {}
 
@@ -65,7 +66,15 @@ export class GameVaultScheduler {
     if (this.downloadProgressTickPromise) {
       return this.downloadProgressTickPromise;
     }
-    if (!this.service.hasActiveDownloadJobs()) {
+
+    let hasActiveDownloadJobs = false;
+    try {
+      hasActiveDownloadJobs = this.service.hasActiveDownloadJobs();
+    } catch (error) {
+      this.recordDownloadProgressPollingWarning(error);
+      return;
+    }
+    if (!hasActiveDownloadJobs) {
       return;
     }
 
@@ -91,6 +100,29 @@ export class GameVaultScheduler {
         this.downloadProgressTickPromise = null;
       });
     return this.downloadProgressTickPromise;
+  }
+
+  private recordDownloadProgressPollingWarning(error: unknown): void {
+    const now = Date.now();
+    if (now - this.lastDownloadProgressPollingWarningAt < 60_000) {
+      return;
+    }
+    this.lastDownloadProgressPollingWarningAt = now;
+
+    try {
+      this.service.recordActivityEvent(
+        'warn',
+        'Live download progress polling failed',
+        {
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Unknown download progress polling error',
+        },
+      );
+    } catch {
+      // If the database is the failing dependency, avoid an unhandled 1s log loop.
+    }
   }
 
   private async tick(startup: boolean): Promise<void> {

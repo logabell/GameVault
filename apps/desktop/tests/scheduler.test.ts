@@ -195,6 +195,34 @@ describe('GameVaultScheduler', () => {
     scheduler.stop();
   });
 
+  it('contains live download polling probe failures', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 3, 24, 8));
+    const service = createSchedulerService({
+      hasActiveDownloadJobs: vi.fn(() => {
+        throw new Error('database unavailable');
+      }),
+    });
+    const scheduler = new GameVaultScheduler(service);
+
+    scheduler.start();
+    await flushStartupTick();
+    vi.mocked(service.pollDownloadJobs).mockClear();
+    vi.mocked(service.recordActivityEvent).mockClear();
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(service.pollDownloadJobs).not.toHaveBeenCalled();
+    expect(service.recordActivityEvent).toHaveBeenCalledTimes(1);
+    expect(service.recordActivityEvent).toHaveBeenCalledWith(
+      'warn',
+      'Live download progress polling failed',
+      { error: 'database unavailable' },
+    );
+    scheduler.stop();
+  });
+
   it('does not overlap live download progress ticks', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(2026, 3, 24, 8));

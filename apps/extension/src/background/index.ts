@@ -390,6 +390,13 @@ async function getBootstrapFallbackHealth(): Promise<ConnectionHealthSummary> {
   return fallbackConnectionHealth('Starting desktop');
 }
 
+function isSyntheticStartingHealth(health: ConnectionHealthSummary): boolean {
+  return (
+    health.desktop.label === 'Starting desktop' &&
+    health.desktop.message === 'Starting desktop'
+  );
+}
+
 function cacheSettings(settings: SettingsView): void {
   void chrome.storage.local
     .set({
@@ -414,6 +421,16 @@ async function getCachedSettings(): Promise<SettingsView | null> {
   }
 
   return null;
+}
+
+async function getSettingsForPrepareDraft(): Promise<SettingsView> {
+  const cached = await getCachedSettings();
+  if (cached) {
+    void getSettings().catch(() => undefined);
+    return cached;
+  }
+
+  return getSettings();
 }
 
 async function sendNativeMessage(
@@ -948,12 +965,9 @@ async function parseAndCachePage(params: {
   url: string;
 }): Promise<ParsedSourcePayload> {
   const canonicalUrl = canonicalizeSupportedUrl(params.url);
-  const parsedSource = await enrichParsedSourceWithAnkergamesBrowserDownloads(
-    await parseSupportedPageWithNetwork(
-      params.url,
-      params.html,
-      fetch,
-    ),
+  const parsedSource = await parseSupportedPageWithNetwork(
+    params.url,
+    params.html,
     fetch,
   );
   await writeParsedCache({
@@ -963,6 +977,32 @@ async function parseAndCachePage(params: {
     fingerprint: params.fingerprint,
     parsedSource,
   });
+  if (
+    parsedSource.sourceKind === 'ankergames' &&
+    parsedSource.fullDownloadUrls.length > 0
+  ) {
+    void enrichParsedSourceWithAnkergamesBrowserDownloads(
+      parsedSource,
+      fetch,
+    )
+      .then((enrichedSource) => {
+        if (enrichedSource === parsedSource) {
+          return;
+        }
+        const currentCache = hotParsedCache.get(canonicalUrl);
+        if (currentCache && currentCache.fingerprint !== params.fingerprint) {
+          return;
+        }
+        return writeParsedCache({
+          canonicalUrl,
+          capturedAt: Date.now(),
+          expiresAt: Date.now() + CACHE_TTL_MS,
+          fingerprint: params.fingerprint,
+          parsedSource: enrichedSource,
+        });
+      })
+      .catch(() => undefined);
+  }
   void primeSteamCandidatesForSource(parsedSource);
   return parsedSource;
 }
@@ -1111,6 +1151,16 @@ async function getConnectionHealth(options: {
     payload: { forceRefresh: options.forceRefresh ?? false },
     type: 'getConnectionHealth',
   };
+
+  if (!options.forceRefresh) {
+    const cachedHealth = await getBootstrapFallbackHealth();
+    if (!isSyntheticStartingHealth(cachedHealth)) {
+      void postBridgeRequest(healthRequest, CONNECTION_HEALTH_QUICK_TIMEOUT_MS)
+        .then(cacheHealthFromResponse)
+        .catch(() => undefined);
+      return cachedHealth;
+    }
+  }
 
   try {
     const response = await postBridgeRequest(
@@ -2377,7 +2427,9 @@ async function getDraftStatus(params: {
   tabId?: number | null;
 }): Promise<DraftStatusContext> {
   const target = await resolveDraftTarget(params);
-  const settingsPromise = getSettings().catch(() => getCachedSettings());
+  const settingsPromise = getSettingsForPrepareDraft().catch(() =>
+    getCachedSettings(),
+  );
   if (!target.url) {
     const [connectionHealth, settings] = await Promise.all([
       getConnectionHealthForPrepareDraft(),
@@ -2404,17 +2456,18 @@ async function getDraftStatus(params: {
   }
 
   let trackedStatus = await readTrackedStatusCache(target.url);
+  let trackedStatusRequestStarted = false;
   if (
     cachedParsedPage?.parsedSource.sourceUrl &&
-    !trackedStatusInFlight.has(target.url)
+    !trackedStatus &&
+    !trackedStatusInFlight.has(
+      canonicalizeSupportedUrl(cachedParsedPage.parsedSource.sourceUrl),
+    )
   ) {
-    try {
-      trackedStatus = await refreshTrackedStatus(
-        cachedParsedPage.parsedSource.sourceUrl,
-      );
-    } catch {
-      trackedStatus = await readTrackedStatusCache(target.url);
-    }
+    trackedStatusRequestStarted = true;
+    void refreshTrackedStatus(cachedParsedPage.parsedSource.sourceUrl).catch(
+      () => undefined,
+    );
   }
 
   const [connectionHealth, settings] = await Promise.all([
@@ -2437,7 +2490,13 @@ async function getDraftStatus(params: {
     settings,
     sourceUrl: target.url,
     trackedStatus,
-    trackedStatusPending: trackedStatusInFlight.has(target.url),
+    trackedStatusPending:
+      trackedStatusRequestStarted ||
+      (cachedParsedPage?.parsedSource.sourceUrl
+        ? trackedStatusInFlight.has(
+            canonicalizeSupportedUrl(cachedParsedPage.parsedSource.sourceUrl),
+          )
+        : false),
   };
 }
 
