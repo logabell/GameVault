@@ -304,6 +304,10 @@ export async function enrichAnkerGamesParsedSource(params: {
       versionStatus.version,
       versionStatus.buildId,
       params.parsedSource.fullDownloadUrls.map((entry) => entry.url).join('|'),
+      params.parsedSource.onlineFix?.mode ?? 'none',
+      params.parsedSource.onlineFix?.downloadUrls
+        .map((entry) => entry.url)
+        .join('|') ?? '',
     ]),
     fullRelease: latestSourceRelease,
     latestSourceRelease,

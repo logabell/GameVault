@@ -102,6 +102,24 @@ export class GameVaultScheduler {
           title: 'Starting maintenance',
         })
       : null;
+    const failures: string[] = [];
+
+    const runMaintenanceStep = async (
+      failureMessage: string,
+      operation: () => Promise<void>,
+    ) => {
+      try {
+        await operation();
+      } catch (error) {
+        failures.push(failureMessage);
+        this.service.recordActivityEvent('warn', failureMessage, {
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Unknown maintenance error',
+        });
+      }
+    };
 
     try {
       const steamDbMaintenanceDue =
@@ -113,16 +131,34 @@ export class GameVaultScheduler {
       }
 
       if (steamDbMaintenanceDue) {
-        await this.service.pollSteamFeeds();
+        await runMaintenanceStep('SteamDB maintenance failed', () =>
+          this.service.pollSteamFeeds(),
+        );
       }
 
-      await this.service.processDueWatches(now, { includeExpired: true });
-      await this.service.pollDownloadJobs();
+      await runMaintenanceStep('Source watch maintenance failed', () =>
+        this.service.processDueWatches(now, { includeExpired: true }),
+      );
+      if (startup) {
+        await runMaintenanceStep('Online Fix startup true-up failed', () =>
+          this.service.trueUpOnlineFixStatuses(),
+        );
+      }
+      await runMaintenanceStep('Download maintenance failed', () =>
+        this.service.pollDownloadJobs(),
+      );
 
       if (startup) {
-        this.service.recordActivityEvent('info', 'Startup maintenance completed', {
-          steamDbMaintenanceDue,
-        });
+        this.service.recordActivityEvent(
+          failures.length > 0 ? 'warn' : 'info',
+          failures.length > 0
+            ? 'Startup maintenance completed with warnings'
+            : 'Startup maintenance completed',
+          {
+            failures,
+            steamDbMaintenanceDue,
+          },
+        );
       }
     } catch (error) {
       if (startup) {

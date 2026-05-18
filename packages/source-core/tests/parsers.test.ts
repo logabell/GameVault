@@ -494,6 +494,7 @@ describe('source parsers', () => {
         url: 'https://ankergames.net/generate-download-url/2557',
       },
     ]);
+    expect(parsed.onlineFix).toBeNull();
     expect(parsed.patchDownloadUrls).toEqual([]);
   });
 
@@ -573,6 +574,130 @@ describe('source parsers', () => {
         url: 'https://ankergames.net/generate-download-url/2726',
       },
     ]);
+  });
+
+  it('detects bundled Ankergames Online Fix from multiplayer edition tags', () => {
+    const parsed = parseSupportedPage(
+      'https://ankergames.net/game/rv-there-yet',
+      `<html>
+        <head><title>RV There Yet Free Download - AnkerGames</title></head>
+        <body>
+          <h1>RV There Yet</h1>
+          <span>V 1.2.17491</span>
+          <div><span>Multiplayer</span><span>Edition</span></div>
+          <div>
+            <div>DataNodes</div>
+            <a href="#" @click.prevent="generateDownloadUrl(3001)">Download</a>
+          </div>
+        </body>
+      </html>`,
+    );
+
+    expect(parsed.onlineFix).toMatchObject({
+      detected: true,
+      downloadUrls: [],
+      evidence: ['AnkerGames Multiplayer / Edition tag'],
+      mode: 'included',
+    });
+  });
+
+  it('detects separate Ankergames Online Fix download actions', () => {
+    const parsed = parseSupportedPage(
+      'https://ankergames.net/game/forza-horizon-6',
+      `<html>
+        <head><title>Forza Horizon 6 Free Download - AnkerGames</title></head>
+        <body>
+          <h1>Forza Horizon 6</h1>
+          <span>V 1.0.0</span>
+          <div><span>Multiplayer</span><span>Edition</span></div>
+          <ul>
+            <li>
+              <div>DataNodes</div>
+              <a href="#" @click.prevent="generateDownloadUrl(3100)">Download</a>
+            </li>
+            <li>
+              <div>Online Fix</div>
+              <a href="#" @click.prevent="generateDownloadUrl(3101)">Download</a>
+            </li>
+          </ul>
+        </body>
+      </html>`,
+    );
+
+    expect(parsed.fullDownloadUrls).toEqual([
+      {
+        kind: 'full',
+        label: 'DataNodes',
+        url: 'https://ankergames.net/generate-download-url/3100',
+      },
+    ]);
+    expect(parsed.onlineFix).toMatchObject({
+      detected: true,
+      downloadUrls: [
+        {
+          label: 'Online Fix',
+          url: 'https://ankergames.net/generate-download-url/3101',
+        },
+      ],
+      mode: 'separate',
+    });
+  });
+
+  it('detects bundled Ankergames Online Fix from Game Features language', () => {
+    const parsed = parseSupportedPage(
+      'https://ankergames.net/game/escape-simulator-2',
+      `<html>
+        <head><title>Escape Simulator 2 Free Download - AnkerGames</title></head>
+        <body>
+          <h1>Escape Simulator 2</h1>
+          <span>V 18159r</span>
+          <section>
+            <h2>Game Features</h2>
+            <p>+ Co-Op</p>
+            <p>OFME fix has been applied for online/multiplayer functionality.</p>
+          </section>
+          <div>
+            <div>DataNodes</div>
+            <a href="#" @click.prevent="generateDownloadUrl(3200)">Download</a>
+          </div>
+        </body>
+      </html>`,
+    );
+
+    expect(parsed.onlineFix).toMatchObject({
+      detected: true,
+      evidence: [
+        'AnkerGames Game Features + Co-Op text',
+        'AnkerGames Game Features OFME fix text',
+        'AnkerGames applied online/multiplayer fix text',
+      ],
+      mode: 'included',
+    });
+  });
+
+  it('changes Ankergames fingerprints when Online Fix links change', () => {
+    const makeHtml = (onlineFixId: number) => `
+      <html>
+        <head><title>Forza Horizon 6 Free Download - AnkerGames</title></head>
+        <body>
+          <h1>Forza Horizon 6</h1>
+          <span>V 1.0.0</span>
+          <p>+ Co-Op</p>
+          <div><div>DataNodes</div><a href="#" @click.prevent="generateDownloadUrl(3100)">Download</a></div>
+          <div><div>Online Fix</div><a href="#" @click.prevent="generateDownloadUrl(${onlineFixId})">Download</a></div>
+        </body>
+      </html>`;
+
+    const first = parseSupportedPage(
+      'https://ankergames.net/game/forza-horizon-6',
+      makeHtml(3101),
+    );
+    const second = parseSupportedPage(
+      'https://ankergames.net/game/forza-horizon-6',
+      makeHtml(3102),
+    );
+
+    expect(first.fingerprint).not.toBe(second.fingerprint);
   });
 
   it('rejects Ankergames pages without a stable generated download endpoint', () => {
@@ -1552,6 +1677,96 @@ describe('source parsers', () => {
       },
     ]);
     expect(parsed.patchDownloadUrls).toEqual([]);
+  });
+
+  it('detects SteamRIP included Online Fix from title and game info evidence', () => {
+    const cases = [
+      {
+        html: `
+          <html><body>
+            <h1>RV There Yet Free Download (v1.2.17120 + Co-op)</h1>
+            <div class="entry-content">
+              <p>Game Info</p>
+              <p>Version: v1.2.17120</p>
+              <a href="https://gofile.io/d/rv">DOWNLOAD HERE</a>
+            </div>
+          </body></html>
+        `,
+        evidence: 'SteamRIP page title online/multiplayer keyword',
+      },
+      {
+        html: `
+          <html><body>
+            <h1>Example Game Free Download</h1>
+            <div class="entry-content">
+              <p>Game Info</p>
+              <p>Version: v1.0 | Co-op By: 0xdeadc0de (OFME)</p>
+              <a href="https://gofile.io/d/example">DOWNLOAD HERE</a>
+            </div>
+          </body></html>
+        `,
+        evidence: 'SteamRIP Game Info Co-op By label',
+      },
+      {
+        html: `
+          <html><body>
+            <h1>Example Game Free Download</h1>
+            <div class="entry-content">
+              <p>Game Info</p>
+              <p>Version: v1.0 | Multiplayer By: online-fix.me</p>
+              <a href="https://gofile.io/d/example">DOWNLOAD HERE</a>
+            </div>
+          </body></html>
+        `,
+        evidence: 'SteamRIP Game Info Multiplayer By label',
+      },
+      {
+        html: `
+          <html><body>
+            <h1>Example Game Free Download</h1>
+            <div class="entry-content">
+              <p>Game Info</p>
+              <p>Version: v1.0 | Released By: OnlineFix</p>
+              <a href="https://gofile.io/d/example">DOWNLOAD HERE</a>
+            </div>
+          </body></html>
+        `,
+        evidence: 'SteamRIP Game Info Released By online-fix value',
+      },
+    ];
+
+    for (const entry of cases) {
+      const parsed = parseSupportedPageForKind(
+        'steamrip',
+        'https://steamrip.com/example-game-free-download/',
+        entry.html,
+      );
+      expect(parsed.onlineFix).toMatchObject({
+        detected: true,
+        downloadUrls: [],
+        mode: 'included',
+      });
+      expect(parsed.onlineFix?.evidence).toContain(entry.evidence);
+    }
+  });
+
+  it('does not detect SteamRIP Online Fix without matching evidence', () => {
+    const parsed = parseSupportedPageForKind(
+      'steamrip',
+      'https://steamrip.com/example-game-free-download/',
+      `
+        <html><body>
+          <h1>Example Game Free Download</h1>
+          <div class="entry-content">
+            <p>Game Info</p>
+            <p>Version: v1.0 | Released By: Rune</p>
+            <a href="https://gofile.io/d/example">DOWNLOAD HERE</a>
+          </div>
+        </body></html>
+      `,
+    );
+
+    expect(parsed.onlineFix).toBeNull();
   });
 
   it('parses tracked SteamRIP refreshes by saved source kind', () => {

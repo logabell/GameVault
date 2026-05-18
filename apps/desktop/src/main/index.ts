@@ -1016,6 +1016,11 @@ async function bootstrap() {
     },
     playnitePaths: {
       appDataPath: userDataPath,
+      duoStreamLauncherScriptPath: join(
+        __dirname,
+        'duostream',
+        'Launch-GameVaultDuoSteamExe.ps1',
+      ),
       pluginBundlePath: join(__dirname, '..', 'playnite-plugin'),
     },
     secrets: {
@@ -1147,6 +1152,9 @@ async function bootstrap() {
   ipcMain.handle('gamevault:refreshPlayniteIntegration', (_event, payload) =>
     service.refreshPlayniteIntegration(payload),
   );
+  ipcMain.handle('gamevault:refreshDuoStreamIntegration', (_event, payload) =>
+    service.refreshDuoStreamIntegration(payload),
+  );
   ipcMain.handle('gamevault:savePlayniteExecutableSelection', (_event, payload) =>
     service.savePlayniteExecutableSelection(payload),
   );
@@ -1233,6 +1241,9 @@ async function bootstrap() {
   );
   ipcMain.handle('gamevault:queueUpdateFromSource', (_event, payload) =>
     service.queueUpdateFromSource(payload),
+  );
+  ipcMain.handle('gamevault:queueOnlineFixDownload', (_event, payload) =>
+    service.queueOnlineFixDownload(payload),
   );
   ipcMain.handle(
     'gamevault:retryDownloadWithSelection',

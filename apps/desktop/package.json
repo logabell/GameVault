@@ -33,6 +33,7 @@
     "productName": "GameVault",
     "asar": true,
     "asarUnpack": [
+      "dist/main/duostream/**/*",
       "dist/native-host/**/*",
       "dist/playnite-plugin/**/*",
       "node_modules/7zip-bin-full/**/*"

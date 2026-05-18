@@ -16,6 +16,8 @@ import type {
   IgnoredImportFolderRecord,
   InstallRecord,
   LibraryRootRecord,
+  OnlineFixLibraryState,
+  OnlineFixSourceInfo,
   OnboardingState,
   ParsedSourcePayload,
   PlayniteExecutableCandidate,
@@ -42,6 +44,7 @@ import type {
 import { mergePatchHistory } from '@gamevault/shared-types';
 import initSqlJs, {
   type Database as SqlJsDatabase,
+  type Statement as SqlJsStatement,
   type SqlJsStatic,
 } from 'sql.js';
 import { basename, dirname, join } from 'node:path';
@@ -69,6 +72,7 @@ CREATE TABLE IF NOT EXISTS source_snapshots (
   observed_patch_title TEXT,
   observed_patch_link TEXT,
   patch_selection_source TEXT,
+  online_fix_json TEXT,
   raw_payload_json TEXT NOT NULL,
   checked_at TEXT NOT NULL,
   PRIMARY KEY (tracked_item_id, source_kind)
@@ -178,6 +182,20 @@ CREATE TABLE IF NOT EXISTS install_records (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS online_fix_records (
+  tracked_item_id TEXT PRIMARY KEY,
+  status TEXT NOT NULL,
+  mode TEXT,
+  source_kind TEXT,
+  source_url TEXT,
+  download_url TEXT,
+  folder_path TEXT,
+  last_error TEXT,
+  evidence_json TEXT,
+  detected_at TEXT,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS playnite_executable_selections (
   tracked_item_id TEXT PRIMARY KEY,
   steam_app_id INTEGER,
@@ -279,6 +297,16 @@ function randomId(): string {
   return crypto.randomUUID();
 }
 
+function databaseError(error: unknown): Error {
+  if (error instanceof Error) {
+    return error;
+  }
+  if (typeof error === 'string' && error.trim()) {
+    return new Error(error);
+  }
+  return new Error('Database operation failed.');
+}
+
 function normalizePublishedAt(value: string | null, patchDate: string): string {
   const parsed = new Date(value ?? patchDate);
   return Number.isNaN(parsed.getTime())
@@ -314,6 +342,60 @@ function parseJsonObject<T extends object>(
   } catch {
     return null;
   }
+}
+
+function normalizeOnlineFixSourceInfo(
+  value: OnlineFixSourceInfo | null | undefined,
+): OnlineFixSourceInfo | null {
+  if (!value || value.detected !== true) {
+    return null;
+  }
+  if (value.mode !== 'included' && value.mode !== 'separate') {
+    return null;
+  }
+  return {
+    detected: true,
+    detectedAt: value.detectedAt ?? null,
+    downloadUrls: Array.isArray(value.downloadUrls)
+      ? value.downloadUrls
+          .filter(
+            (entry) =>
+              typeof entry?.url === 'string' && entry.url.trim().length > 0,
+          )
+          .map((entry) => ({
+            browserDownloadUrl:
+              typeof entry.browserDownloadUrl === 'string'
+                ? entry.browserDownloadUrl
+                : null,
+            label:
+              typeof entry.label === 'string' && entry.label.trim()
+                ? entry.label
+                : 'Online Fix',
+            url: entry.url,
+          }))
+      : [],
+    evidence: Array.isArray(value.evidence)
+      ? value.evidence.filter(
+          (entry): entry is string =>
+            typeof entry === 'string' && entry.trim().length > 0,
+        )
+      : [],
+    mode: value.mode,
+  };
+}
+
+function parseOnlineFixSourceInfo(
+  value: string | null | undefined,
+): OnlineFixSourceInfo | null {
+  return normalizeOnlineFixSourceInfo(
+    parseJsonObject<OnlineFixSourceInfo>(value),
+  );
+}
+
+function serializeOnlineFixSourceInfo(
+  value: OnlineFixSourceInfo | null | undefined,
+): string {
+  return JSON.stringify(normalizeOnlineFixSourceInfo(value) ?? null);
 }
 
 function normalizeJDownloaderSourcePreferences(
@@ -480,6 +562,7 @@ function applyMigrations(db: SqlJsDatabase): void {
     `ALTER TABLE source_snapshots ADD COLUMN observed_patch_title TEXT`,
     `ALTER TABLE source_snapshots ADD COLUMN observed_patch_link TEXT`,
     `ALTER TABLE source_snapshots ADD COLUMN patch_selection_source TEXT`,
+    `ALTER TABLE source_snapshots ADD COLUMN online_fix_json TEXT`,
     `ALTER TABLE steam_patch_entries ADD COLUMN published_at TEXT`,
     `ALTER TABLE steam_patch_entries ADD COLUMN version TEXT`,
     `ALTER TABLE steam_patch_entries ADD COLUMN description TEXT`,
@@ -605,13 +688,14 @@ function repairSourceSnapshotsFromRawPayload(db: SqlJsDatabase): void {
     observed_version: string;
     observed_build_id: string | null;
     observed_patch_date: string | null;
+    online_fix_json: string | null;
     patch_selection_source: string | null;
     raw_payload_json: string;
   }> = [];
   const statement = db.prepare(`
     SELECT tracked_item_id, source_kind, source_url, fingerprint,
            observed_version, observed_build_id, observed_patch_date,
-           patch_selection_source, raw_payload_json
+           online_fix_json, patch_selection_source, raw_payload_json
       FROM source_snapshots
      WHERE source_kind != 'manual'
        AND raw_payload_json IS NOT NULL
@@ -648,11 +732,13 @@ function repairSourceSnapshotsFromRawPayload(db: SqlJsDatabase): void {
       optionalTrimmedString(payload.sourceUrl) ?? row.source_url;
     const fingerprint =
       optionalTrimmedString(payload.fingerprint) ?? row.fingerprint;
+    const onlineFixJson = serializeOnlineFixSourceInfo(payload.onlineFix);
     const shouldRepair =
       row.patch_selection_source != null ||
       row.observed_version !== observedVersion ||
       row.observed_build_id !== observedBuildId ||
       row.observed_patch_date !== observedPatchDate ||
+      (row.online_fix_json ?? JSON.stringify(null)) !== onlineFixJson ||
       row.source_url !== sourceUrl ||
       row.fingerprint !== fingerprint;
 
@@ -669,7 +755,8 @@ function repairSourceSnapshotsFromRawPayload(db: SqlJsDatabase): void {
               observed_patch_date = ?,
               observed_patch_title = NULL,
               observed_patch_link = NULL,
-              patch_selection_source = NULL
+              patch_selection_source = NULL,
+              online_fix_json = ?
         WHERE tracked_item_id = ? AND source_kind = ?`,
       [
         sourceUrl,
@@ -677,6 +764,7 @@ function repairSourceSnapshotsFromRawPayload(db: SqlJsDatabase): void {
         observedVersion,
         observedBuildId,
         observedPatchDate,
+        onlineFixJson,
         row.tracked_item_id,
         row.source_kind,
       ],
@@ -708,6 +796,13 @@ function migrateSourceSnapshotsPrimaryKey(db: SqlJsDatabase): void {
   if (primaryKeyColumns.join('|') === 'tracked_item_id|source_kind') {
     return;
   }
+  const onlineFixSelectColumn = tableHasColumn(
+    db,
+    'source_snapshots',
+    'online_fix_json',
+  )
+    ? 'online_fix_json'
+    : 'NULL';
 
   db.exec(`
     DROP TABLE IF EXISTS source_snapshots_next;
@@ -723,18 +818,22 @@ function migrateSourceSnapshotsPrimaryKey(db: SqlJsDatabase): void {
       observed_patch_link TEXT,
       patch_selection_source TEXT,
       raw_payload_json TEXT NOT NULL,
+      online_fix_json TEXT,
       checked_at TEXT NOT NULL,
       PRIMARY KEY (tracked_item_id, source_kind)
     );
     INSERT OR REPLACE INTO source_snapshots_next (
       tracked_item_id, source_kind, source_url, fingerprint, observed_version,
       observed_build_id, observed_patch_date, observed_patch_title,
-      observed_patch_link, patch_selection_source, raw_payload_json, checked_at
+      observed_patch_link, patch_selection_source, raw_payload_json,
+      online_fix_json, checked_at
     )
     SELECT
       tracked_item_id, source_kind, source_url, fingerprint, observed_version,
       observed_build_id, observed_patch_date, observed_patch_title,
-      observed_patch_link, patch_selection_source, raw_payload_json, checked_at
+      observed_patch_link, patch_selection_source, raw_payload_json,
+      ${onlineFixSelectColumn},
+      checked_at
     FROM source_snapshots;
     DROP TABLE source_snapshots;
     ALTER TABLE source_snapshots_next RENAME TO source_snapshots;
@@ -1130,18 +1229,28 @@ export class GameVaultDatabase {
   }
 
   private exec(sql: string, params: SqlScalar[] = []): void {
-    this.db.run(sql, params);
-    this.save();
+    try {
+      this.db.run(sql, params);
+      this.save();
+    } catch (error) {
+      throw databaseError(error);
+    }
   }
 
   private queryAll<T>(sql: string, params: SqlScalar[] = []): T[] {
-    const statement = this.db.prepare(sql, params);
-    const rows: T[] = [];
-    while (statement.step()) {
-      rows.push(statement.getAsObject() as T);
+    let statement: SqlJsStatement | null = null;
+    try {
+      statement = this.db.prepare(sql, params);
+      const rows: T[] = [];
+      while (statement.step()) {
+        rows.push(statement.getAsObject() as T);
+      }
+      return rows;
+    } catch (error) {
+      throw databaseError(error);
+    } finally {
+      statement?.free();
     }
-    statement.free();
-    return rows;
   }
 
   private queryOne<T>(sql: string, params: SqlScalar[] = []): T | null {
@@ -1379,6 +1488,7 @@ export class GameVaultDatabase {
       observed_patch_link: string | null;
       observed_patch_title: string | null;
       observed_version: string;
+      online_fix_json: string | null;
       patch_selection_source: SourceSnapshot['patchSelectionSource'] | null;
       source_kind: SourceKind;
       source_url: string;
@@ -1392,6 +1502,7 @@ export class GameVaultDatabase {
       observedPatchDate: row.observed_patch_date,
       observedPatchLink: row.observed_patch_link,
       observedPatchTitle: row.observed_patch_title,
+      onlineFix: parseOnlineFixSourceInfo(row.online_fix_json),
       patchSelectionSource: row.patch_selection_source,
       observedVersion: row.observed_version,
       sourceKind: row.source_kind,
@@ -1414,6 +1525,7 @@ export class GameVaultDatabase {
       observed_patch_date: string | null;
       observed_patch_link: string | null;
       observed_patch_title: string | null;
+      online_fix_json: string | null;
       patch_selection_source: SourceSnapshot['patchSelectionSource'] | null;
       raw_payload_json: string;
       checked_at: string;
@@ -1442,6 +1554,7 @@ export class GameVaultDatabase {
       observedPatchDate: row.observed_patch_date,
       observedPatchLink: row.observed_patch_link,
       observedPatchTitle: row.observed_patch_title,
+      onlineFix: parseOnlineFixSourceInfo(row.online_fix_json),
       patchSelectionSource: row.patch_selection_source,
       observedVersion: row.observed_version,
       sourceKind: row.source_kind,
@@ -1460,8 +1573,8 @@ export class GameVaultDatabase {
       `INSERT INTO source_snapshots (
          tracked_item_id, source_kind, source_url, fingerprint, observed_version, observed_build_id,
          observed_patch_date, observed_patch_title, observed_patch_link, patch_selection_source,
-         raw_payload_json, checked_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         online_fix_json, raw_payload_json, checked_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(tracked_item_id, source_kind) DO UPDATE SET
          source_kind = excluded.source_kind,
          source_url = excluded.source_url,
@@ -1472,6 +1585,7 @@ export class GameVaultDatabase {
          observed_patch_title = excluded.observed_patch_title,
          observed_patch_link = excluded.observed_patch_link,
          patch_selection_source = excluded.patch_selection_source,
+         online_fix_json = excluded.online_fix_json,
          raw_payload_json = excluded.raw_payload_json,
          checked_at = excluded.checked_at`,
       [
@@ -1485,6 +1599,7 @@ export class GameVaultDatabase {
         snapshot.observedPatchTitle ?? null,
         snapshot.observedPatchLink ?? null,
         snapshot.patchSelectionSource ?? null,
+        serializeOnlineFixSourceInfo(snapshot.onlineFix),
         rawPayloadJson ?? JSON.stringify(null),
         snapshot.checkedAt,
       ],
@@ -1497,9 +1612,15 @@ export class GameVaultDatabase {
   ): void {
     this.exec(
       `UPDATE source_snapshots
-       SET raw_payload_json = ?
+       SET raw_payload_json = ?,
+           online_fix_json = ?
        WHERE tracked_item_id = ? AND source_kind = ?`,
-      [JSON.stringify(payload), trackedItemId, payload.sourceKind],
+      [
+        JSON.stringify(payload),
+        serializeOnlineFixSourceInfo(payload.onlineFix),
+        trackedItemId,
+        payload.sourceKind,
+      ],
     );
   }
 
@@ -2191,6 +2312,92 @@ export class GameVaultDatabase {
     }));
   }
 
+  getOnlineFixRecord(trackedItemId: string): OnlineFixLibraryState | null {
+    const row = this.queryOne<{
+      detected_at: string | null;
+      download_url: string | null;
+      evidence_json: string | null;
+      folder_path: string | null;
+      last_error: string | null;
+      mode: OnlineFixLibraryState['mode'];
+      source_kind: SupportedSourceKind | null;
+      source_url: string | null;
+      status: OnlineFixLibraryState['status'];
+      updated_at: string;
+    }>(`SELECT * FROM online_fix_records WHERE tracked_item_id = ?`, [
+      trackedItemId,
+    ]);
+    if (!row) {
+      return null;
+    }
+
+    return {
+      detectedAt: row.detected_at,
+      downloadUrl: row.download_url,
+      evidence: parseJsonArray<string>(row.evidence_json),
+      folderPath: row.folder_path,
+      iconColor:
+        row.status === 'enabled'
+          ? 'green'
+          : row.status === 'available_missing' ||
+              row.status === 'downloading' ||
+              row.status === 'failed'
+            ? 'red'
+            : null,
+      lastError: row.last_error,
+      mode:
+        row.mode === 'included' || row.mode === 'separate'
+          ? row.mode
+          : null,
+      sourceKind: row.source_kind,
+      sourceUrl: row.source_url,
+      status: row.status,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  upsertOnlineFixRecord(
+    trackedItemId: string,
+    record: OnlineFixLibraryState,
+  ): void {
+    this.exec(
+      `INSERT INTO online_fix_records (
+         tracked_item_id, status, mode, source_kind, source_url, download_url,
+         folder_path, last_error, evidence_json, detected_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(tracked_item_id) DO UPDATE SET
+         status = excluded.status,
+         mode = excluded.mode,
+         source_kind = excluded.source_kind,
+         source_url = excluded.source_url,
+         download_url = excluded.download_url,
+         folder_path = excluded.folder_path,
+         last_error = excluded.last_error,
+         evidence_json = excluded.evidence_json,
+         detected_at = excluded.detected_at,
+         updated_at = excluded.updated_at`,
+      [
+        trackedItemId,
+        record.status,
+        record.mode ?? null,
+        record.sourceKind ?? null,
+        record.sourceUrl ?? null,
+        record.downloadUrl ?? null,
+        record.folderPath ?? null,
+        record.lastError ?? null,
+        JSON.stringify(record.evidence ?? []),
+        record.detectedAt ?? null,
+        record.updatedAt ?? new Date().toISOString(),
+      ],
+    );
+  }
+
+  deleteOnlineFixRecord(trackedItemId: string): void {
+    this.exec(`DELETE FROM online_fix_records WHERE tracked_item_id = ?`, [
+      trackedItemId,
+    ]);
+  }
+
   getPlayniteExecutableSelection(
     trackedItemId: string,
   ): PlayniteExecutableSelectionRecord | null {
@@ -2310,9 +2517,9 @@ export class GameVaultDatabase {
       expired_at: string | null;
     }>(
       `SELECT * FROM source_watches
-       WHERE next_check_at <= ?
+       WHERE (next_check_at <= ? OR (expired_at IS NULL AND ends_at <= ?))
          AND (? = 1 OR expired_at IS NULL)`,
-      [nowIso, options.includeExpired ? 1 : 0],
+      [nowIso, nowIso, options.includeExpired ? 1 : 0],
     ).map((row) => ({
       endsAt: row.ends_at,
       expiredAt: row.expired_at,
@@ -2688,6 +2895,7 @@ export class GameVaultDatabase {
     const childTables = [
       'source_watches',
       'install_records',
+      'online_fix_records',
       'playnite_executable_selections',
       'source_matches',
       'source_snapshots',
@@ -2741,6 +2949,14 @@ export class GameVaultDatabase {
       libraryRoots,
       lastExtensionActivityAt:
         map.get('extension.lastNativeMessageAt') ?? null,
+      duoStreamCreateFolderLaunchers:
+        map.get('duostream.createFolderLaunchers') !== 'false',
+      duoStreamCreateSteamAppIdFiles:
+        map.get('duostream.createSteamAppIdFiles') !== 'false',
+      duoStreamIntegrationEnabled:
+        map.get('duostream.integrationEnabled') === 'true',
+      duoStreamUsePlayniteLauncher:
+        map.get('duostream.usePlayniteLauncher') !== 'false',
       myJDownloaderDeviceId: map.get('myjd.deviceId') ?? null,
       myJDownloaderEmail: map.get('myjd.email') ?? null,
       onboarding: parseJsonObject<OnboardingState>(

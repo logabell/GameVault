@@ -28,6 +28,7 @@ interface CreateMatchedDraftMessageInput {
   selectedAppId: number | null;
   selectedSteamCandidate: SteamCandidate;
   sourceUrl?: string | null;
+  steamPatchEntries?: SteamPatchCandidate[] | null;
   tabId?: number | null;
 }
 
@@ -36,6 +37,7 @@ interface CreateMatchedDraftMessage {
   selectedAppId: number | null;
   selectedSteamCandidate: SteamCandidate;
   sourceUrl?: string | null;
+  steamPatchEntries?: SteamPatchCandidate[] | null;
   tabId: number | null;
   type: 'gamevault:create-matched-draft';
 }
@@ -305,6 +307,7 @@ function snapshotFromParsedSource(
     observedPatchLink: existingSnapshot?.observedPatchLink ?? null,
     observedPatchTitle: existingSnapshot?.observedPatchTitle ?? null,
     observedVersion,
+    onlineFix: parsedSource.onlineFix ?? existingSnapshot?.onlineFix ?? null,
     patchSelectionSource: existingSnapshot?.patchSelectionSource ?? null,
     sourceKind: parsedSource.sourceKind,
     sourceUrl: parsedSource.sourceUrl,
@@ -335,6 +338,7 @@ export function mergeParsedSourceIntoTrackedItem(
         sourceTitle: parsedSource.title,
         sourceUrl: parsedSource.sourceUrl,
       },
+      onlineFix: parsedSource.onlineFix ?? source.onlineFix ?? null,
       snapshot: snapshotFromParsedSource(item, source, parsedSource),
     };
   });
@@ -453,6 +457,7 @@ export function buildCreateMatchedDraftMessage(
     selectedAppId: input.selectedAppId,
     selectedSteamCandidate: input.selectedSteamCandidate,
     sourceUrl: input.sourceUrl,
+    steamPatchEntries: input.steamPatchEntries ?? null,
     tabId: input.tabId ?? null,
     type: 'gamevault:create-matched-draft',
   };

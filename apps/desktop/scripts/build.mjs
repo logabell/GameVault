@@ -118,6 +118,10 @@ await copyFile(
   join(srcDir, 'renderer', 'styles.css'),
   join(distDir, 'renderer', 'styles.css'),
 );
+await copyDirectory(
+  join(srcDir, 'main', 'duostream'),
+  join(distDir, 'main', 'duostream'),
+);
 await copyDirectory(join(srcDir, 'assets'), join(distDir, 'assets'));
 await buildAndCopyExtension();
 await copyPlaynitePlugin();

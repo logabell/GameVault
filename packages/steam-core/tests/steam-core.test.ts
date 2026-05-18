@@ -879,6 +879,16 @@ describe('watch logic', () => {
     expect(watch.endsAt).toBe('2026-04-21T12:00:00.000Z');
   });
 
+  it('does not schedule the next source check past the watch window', () => {
+    const watch = createWatchWindow(
+      'tracked',
+      new Date('2026-04-19T12:00:00.000Z'),
+      { durationDays: 1, intervalHours: 72 },
+    );
+    expect(watch.nextCheckAt).toBe('2026-04-20T12:00:00.000Z');
+    expect(watch.endsAt).toBe('2026-04-20T12:00:00.000Z');
+  });
+
   it('marks the item as update available when the source has caught up but install is older', () => {
     expect(
       compareSourceToUpstream({

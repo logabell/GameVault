@@ -1,4 +1,4 @@
-import { createServer, type Server } from 'node:http';
+import { createServer, type Server, type ServerResponse } from 'node:http';
 
 import type {
   NativeMessageRequest,
@@ -7,6 +7,26 @@ import type {
 } from '@gamevault/shared-types';
 
 import { GameVaultService } from './gamevault-service.js';
+
+function nativeErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
+  }
+  if (typeof error === 'string' && error.trim()) {
+    return error;
+  }
+  if (
+    error &&
+    typeof error === 'object' &&
+    'message' in error &&
+    typeof (error as { message?: unknown }).message === 'string' &&
+    (error as { message: string }).message.trim()
+  ) {
+    return (error as { message: string }).message;
+  }
+
+  return fallback;
+}
 
 export class NativeBridgeServer {
   private server: Server | null = null;
@@ -33,32 +53,24 @@ export class NativeBridgeServer {
         try {
           const message = JSON.parse(
             Buffer.concat(chunks).toString('utf8'),
-          ) as NativeMessageRequest;
-          if (
-            message &&
-            typeof message === 'object' &&
-            typeof (message as { type?: unknown }).type === 'string'
-          ) {
-            this.service.recordExtensionActivity();
+          ) as unknown;
+          if (!this.isRequestMessage(message)) {
+            this.writeJsonResponse(
+              response,
+              this.buildRequestErrorResponse(
+                new Error('Native bridge request is missing a message type.'),
+              ),
+            );
+            return;
           }
+
+          this.recordExtensionActivity();
           const payload = await this.handleMessage(message);
-          response.setHeader('Content-Type', 'application/json');
-          response.end(JSON.stringify(payload));
+          this.writeJsonResponse(response, payload);
         } catch (error) {
-          response.statusCode = 500;
-          response.setHeader('Content-Type', 'application/json');
-          response.end(
-            JSON.stringify({
-              error: {
-                code: 'BRIDGE_REQUEST_ERROR',
-                message:
-                  error instanceof Error
-                    ? error.message
-                    : 'Unexpected native bridge request error',
-              },
-              ok: false,
-              type: 'getConnectionHealth',
-            } satisfies NativeMessageResponse),
+          this.writeJsonResponse(
+            response,
+            this.buildRequestErrorResponse(error),
           );
         }
       });
@@ -288,6 +300,14 @@ export class NativeBridgeServer {
             payload: await this.service.queueUpdateFromSource(request.payload),
             type: request.type,
           };
+        case 'queueOnlineFixDownload':
+          return {
+            ok: true,
+            payload: await this.service.queueOnlineFixDownload(
+              request.payload,
+            ),
+            type: request.type,
+          };
         case 'clearDownloadMirrorFailed':
           return {
             ok: true,
@@ -354,7 +374,7 @@ export class NativeBridgeServer {
         case 'saveSettings':
           return {
             ok: true,
-            payload: this.service.saveSettings(request.payload),
+            payload: await this.service.saveSettings(request.payload),
             type: request.type,
           };
         case 'pickDirectory':
@@ -376,17 +396,63 @@ export class NativeBridgeServer {
         }
       }
     } catch (error) {
+      const message = nativeErrorMessage(
+        error,
+        'Unknown native message error',
+      );
+      console.warn(`Native message ${request.type} failed: ${message}`);
       return {
         error: {
           code: 'NATIVE_MESSAGE_ERROR',
-          message:
-            error instanceof Error
-              ? error.message
-              : 'Unknown native message error',
+          message,
         },
         ok: false,
         type: request.type,
       };
     }
+  }
+
+  private isRequestMessage(value: unknown): value is NativeMessageRequest {
+    return (
+      value !== null &&
+      typeof value === 'object' &&
+      typeof (value as { type?: unknown }).type === 'string'
+    );
+  }
+
+  private recordExtensionActivity(): void {
+    try {
+      this.service.recordExtensionActivity();
+    } catch (error) {
+      console.warn(
+        `Unable to record extension activity: ${nativeErrorMessage(
+          error,
+          'Unknown activity recording error',
+        )}`,
+      );
+    }
+  }
+
+  private buildRequestErrorResponse(error: unknown): NativeMessageResponse {
+    return {
+      error: {
+        code: 'BRIDGE_REQUEST_ERROR',
+        message: nativeErrorMessage(
+          error,
+          'Unexpected native bridge request error',
+        ),
+      },
+      ok: false,
+      type: 'getConnectionHealth',
+    };
+  }
+
+  private writeJsonResponse(
+    response: ServerResponse,
+    payload: NativeMessageResponse,
+  ): void {
+    response.statusCode = 200;
+    response.setHeader('Content-Type', 'application/json');
+    response.end(JSON.stringify(payload));
   }
 }

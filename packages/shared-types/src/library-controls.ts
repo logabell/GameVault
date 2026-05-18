@@ -11,6 +11,7 @@ export type LibrarySortMode =
   | 'patchesBehind'
   | 'recentlyAdded'
   | 'recentlyUpdated'
+  | 'onlineFix'
   | 'status';
 export type LibraryStatusFilter =
   | 'all'
@@ -19,6 +20,7 @@ export type LibraryStatusFilter =
   | 'folderMissing'
   | 'installedUpToDate'
   | 'needsAttention'
+  | 'onlineFix'
   | 'sourceBehind'
   | 'updates';
 
@@ -30,6 +32,7 @@ export const LIBRARY_STATUS_FILTER_OPTIONS: Array<{
   { label: 'Needs attention', value: 'needsAttention' },
   { label: 'Updates available', value: 'updates' },
   { label: 'Source behind upstream', value: 'sourceBehind' },
+  { label: 'Online Fix', value: 'onlineFix' },
   { label: 'Installed / up to date', value: 'installedUpToDate' },
   { label: 'Folder missing', value: 'folderMissing' },
   { label: 'Downloads', value: 'downloads' },
@@ -121,6 +124,9 @@ export function matchesLibrarySearch(
     item.selectedMirror?.label,
     item.sourceSnapshot?.observedVersion,
     item.sourceSnapshot?.observedBuildId,
+    item.onlineFix?.status,
+    item.onlineFix?.mode,
+    item.onlineFix?.sourceKind,
     item.installRecord?.installedVersion,
     item.installRecord?.installedBuildId,
   ]
@@ -149,6 +155,7 @@ export function matchesLibraryStatusFilter(
   }
   if (filter === 'updates') return hasActionableSourceUpdate(item);
   if (filter === 'sourceBehind') return isSourceBehindUpstream(item);
+  if (filter === 'onlineFix') return item.onlineFix?.status !== 'none';
   if (filter === 'folderMissing') {
     return item.status === TrackedItemStatus.FolderMissing;
   }
@@ -224,6 +231,11 @@ export function sortLibraryItems(
         comparePatchesBehind(left, right, direction) || compareTitle(left, right)
       );
     }
+    if (sortMode === 'onlineFix') {
+      return (
+        compareOnlineFix(left, right, direction) || compareTitle(left, right)
+      );
+    }
     return 0;
   });
 }
@@ -273,6 +285,25 @@ function comparePatchesBehind(
 
   const valueCompare = leftValue - rightValue;
   return direction === 'asc' ? valueCompare : -valueCompare;
+}
+
+function compareOnlineFix(
+  left: TrackedItemView,
+  right: TrackedItemView,
+  direction: LibrarySortDirection,
+): number {
+  const leftRank = getOnlineFixSortRank(left);
+  const rightRank = getOnlineFixSortRank(right);
+  const valueCompare = leftRank - rightRank;
+  return direction === 'asc' ? valueCompare : -valueCompare;
+}
+
+function getOnlineFixSortRank(item: TrackedItemView): number {
+  const status = item.onlineFix?.status;
+  if (status === 'enabled') return 0;
+  if (status === 'available_missing' || status === 'failed') return 1;
+  if (status === 'downloading') return 2;
+  return 3;
 }
 
 function getPatchesBehindValue(item: TrackedItemView): number | null {

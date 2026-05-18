@@ -28,11 +28,15 @@ import type {
   ImportCandidate,
   ImportScanPayload,
   LibraryRootRecord,
+  OnlineFixLibraryState,
+  OnlineFixSourceInfo,
   OnboardingState,
   ParsedSourcePayload,
+  DuoStreamIntegrationStatus,
   PlayniteExecutableSelectionRecord,
   PlayniteIntegrationStatus,
   PlayniteManifest,
+  PlayniteManifestStatus,
   PlayniteSyncStatus,
   SavePlayniteExecutableSelectionPayload,
   QueueDraftDownloadPayload,
@@ -125,6 +129,7 @@ import {
   mkdir,
   readdir,
   readFile,
+  rename,
   rm,
   stat,
   writeFile,
@@ -163,6 +168,9 @@ import {
 } from './playnite.js';
 
 type RendererSettingsView = SettingsView;
+type SteamFeedMaintenanceMatch = ConfirmedSteamMatch & {
+  trackedItemId: string;
+};
 
 const execFileAsync = promisify(execFile);
 
@@ -196,8 +204,25 @@ const EXTENSION_ACTIVITY_RECENT_MS = 30 * 60 * 1000;
 const FILE_CLEANUP_RETRY_ATTEMPTS = IS_TEST_ENV ? 2 : 8;
 const FILE_CLEANUP_RETRY_DELAY_MS = IS_TEST_ENV ? 1 : 1000;
 const EXTENSION_ACTIVITY_SETTING_KEY = 'extension.lastNativeMessageAt';
+const ONLINE_FIX_TRUE_UP_SETTING_KEY = 'onlineFix.trueUpCompletedAt.v2';
 const PLAYNITE_PLUGIN_FOLDER_NAME = 'GameVault';
-const PLAYNITE_PLUGIN_VERSION = '0.1.15';
+const PLAYNITE_PLUGIN_VERSION = '0.1.16';
+const DUOSTREAM_LAUNCHER_FILE_NAME = 'Launch with GameVault Duo.vbs';
+const DUOSTREAM_LEGACY_CMD_LAUNCHER_FILE_NAME = 'Launch with GameVault Duo.cmd';
+const DUOSTREAM_LAUNCHER_SCRIPT_RELATIVE_PATH = [
+  'duostream',
+  'Launch-GameVaultDuoSteamExe.ps1',
+];
+const DUOSTREAM_LAST_SYNC_FINGERPRINT_SETTING_KEY =
+  'duostream.lastSyncFingerprint';
+const DUOSTREAM_LAST_SYNC_AT_SETTING_KEY = 'duostream.lastSyncedAt';
+const DUOSTREAM_LAST_SYNC_ERROR_SETTING_KEY = 'duostream.lastSyncError';
+const DUOSTREAM_LAST_SYNC_ELIGIBLE_GAMES_SETTING_KEY =
+  'duostream.lastSyncEligibleGames';
+const DUOSTREAM_LAST_SYNC_FOLDER_LAUNCHERS_SETTING_KEY =
+  'duostream.lastSyncFolderLaunchers';
+const DUOSTREAM_LAST_SYNC_STEAM_APPID_FILES_SETTING_KEY =
+  'duostream.lastSyncSteamAppIdFiles';
 
 const SOURCE_CATALOG_URLS: Record<SupportedSourceKind, string[]> = {
   ankergames: [
@@ -1181,11 +1206,142 @@ function pathIsInsideOrEqual(parentPath: string, targetPath: string): boolean {
   );
 }
 
+function pathForExternalProcess(filePath: string): string {
+  return filePath.replace(
+    /([\\/])app\.asar([\\/])/i,
+    '$1app.asar.unpacked$2',
+  );
+}
+
 function pathsEqual(leftPath: string | null, rightPath: string | null): boolean {
   return Boolean(
     leftPath &&
       rightPath &&
       resolve(leftPath).toLowerCase() === resolve(rightPath).toLowerCase(),
+  );
+}
+
+function supportedSourceKindFromSnapshot(
+  snapshot: SourceSnapshot | null | undefined,
+): SupportedSourceKind | null {
+  return snapshot?.sourceKind === 'ankergames' ||
+    snapshot?.sourceKind === 'elamigos' ||
+    snapshot?.sourceKind === 'steamrip'
+    ? snapshot.sourceKind
+    : null;
+}
+
+function quoteWindowsArgument(value: string): string {
+  return `"${value.replace(/"/g, '\\"')}"`;
+}
+
+function buildDuoStreamLauncherArguments(params: {
+  appId: number;
+  exePath: string;
+  launcherScriptPath: string;
+  mode: 'Auto' | 'Duo' | 'Direct';
+  waitForGameExit?: boolean;
+  workingDirectory: string;
+}): string {
+  const args = [
+    '-NoProfile',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-File',
+    params.launcherScriptPath,
+    '-ExePath',
+    params.exePath,
+    '-WorkingDirectory',
+    params.workingDirectory,
+    '-AppId',
+    String(params.appId),
+    '-Mode',
+    params.mode,
+    '-WriteSteamAppId',
+    '-MirrorSteamActiveProcess',
+  ];
+  if (params.waitForGameExit) {
+    args.push('-WaitForGameExit');
+  }
+  return args.map(quoteWindowsArgument).join(' ');
+}
+
+function quoteVbsString(value: string): string {
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+function buildHiddenDuoStreamLauncherScript(command: string): string {
+  return [
+    'Set shell = CreateObject("WScript.Shell")',
+    `command = ${quoteVbsString(command)}`,
+    'shell.Run command, 0, False',
+    '',
+  ].join('\r\n');
+}
+
+function manifestForComparison(manifest: PlayniteManifest): unknown {
+  return {
+    ...manifest,
+    generatedAt: null,
+    games: manifest.games.map((game) => ({
+      ...game,
+      launch: game.launch ?? null,
+    })),
+  };
+}
+
+function playniteManifestsMatch(
+  current: PlayniteManifest,
+  existing: PlayniteManifest,
+): boolean {
+  return (
+    JSON.stringify(manifestForComparison(current)) ===
+    JSON.stringify(manifestForComparison(existing))
+  );
+}
+
+function getOnlineFixDownloadDescriptor(
+  onlineFix: OnlineFixSourceInfo | null | undefined,
+): OnlineFixSourceInfo['downloadUrls'][number] | null {
+  return onlineFix?.downloadUrls?.[0] ?? null;
+}
+
+function getOnlineFixDownloadUrl(
+  onlineFix: OnlineFixSourceInfo | null | undefined,
+): string | null {
+  const download = getOnlineFixDownloadDescriptor(onlineFix);
+  return download?.browserDownloadUrl?.trim() || download?.url?.trim() || null;
+}
+
+function onlineFixIconColor(
+  status: OnlineFixLibraryState['status'],
+): OnlineFixLibraryState['iconColor'] {
+  if (status === 'enabled') return 'green';
+  if (
+    status === 'available_missing' ||
+    status === 'downloading' ||
+    status === 'failed'
+  ) {
+    return 'red';
+  }
+  return null;
+}
+
+function onlineFixStatesEqual(
+  left: OnlineFixLibraryState | null,
+  right: OnlineFixLibraryState,
+): boolean {
+  return Boolean(
+    left &&
+      left.status === right.status &&
+      left.mode === right.mode &&
+      left.sourceKind === right.sourceKind &&
+      left.sourceUrl === right.sourceUrl &&
+      left.folderPath === right.folderPath &&
+      left.downloadUrl === right.downloadUrl &&
+      left.lastError === right.lastError &&
+      JSON.stringify(left.evidence ?? []) ===
+        JSON.stringify(right.evidence ?? []),
   );
 }
 
@@ -1609,12 +1765,28 @@ export interface SecureValueProvider {
 
 export interface PlayniteIntegrationPaths {
   appDataPath?: string;
+  duoStreamLauncherScriptPath?: string;
   pluginBundlePath?: string;
 }
 
 export interface PlaynitePathOptions {
   extensionsPath?: string | null;
   manifestPath?: string | null;
+}
+
+interface DuoStreamLaunchAssetSyncResult {
+  folderLauncherWritten: boolean;
+  steamAppIdFileWritten: boolean;
+}
+
+interface DuoStreamLaunchAssetSyncSummary {
+  eligibleGames: number;
+  errors: number;
+  folderLaunchersWritten: number;
+  fingerprint: string;
+  lastError: string | null;
+  steamAppIdFilesWritten: number;
+  syncedAt: string | null;
 }
 
 async function fetchWithTimeout(
@@ -1750,6 +1922,10 @@ export class GameVaultService {
     new Set<DownloadProgressChangeListener>();
   private readonly pendingDownloadProgressItemIds = new Set<string>();
   private readonly activeDirectHttpDownloads = new Map<
+    string,
+    DirectHttpDownloadHandle
+  >();
+  private readonly activeOnlineFixDownloads = new Map<
     string,
     DirectHttpDownloadHandle
   >();
@@ -2983,6 +3159,192 @@ export class GameVaultService {
     });
   }
 
+  private upsertOnlineFixDownloadState(params: {
+    downloadUrl: string | null;
+    error?: string | null;
+    folderPath: string | null;
+    sourceInfo: OnlineFixSourceInfo;
+    sourceKind: SupportedSourceKind;
+    sourceUrl: string;
+    status: OnlineFixLibraryState['status'];
+    trackedItemId: string;
+  }): void {
+    this.database.upsertOnlineFixRecord(params.trackedItemId, {
+      detectedAt: params.sourceInfo.detectedAt ?? null,
+      downloadUrl: params.downloadUrl,
+      evidence: params.sourceInfo.evidence,
+      folderPath: params.folderPath,
+      iconColor: onlineFixIconColor(params.status),
+      lastError: params.error ?? null,
+      mode: params.sourceInfo.mode,
+      sourceKind: params.sourceKind,
+      sourceUrl: params.sourceUrl,
+      status: params.status,
+      updatedAt: new Date().toISOString(),
+    });
+    this.queueDownloadProgressChange(params.trackedItemId);
+  }
+
+  private async startOnlineFixDownload(params: {
+    downloadUrl: string;
+    folderPath: string;
+    packageName: string;
+    sourceInfo: OnlineFixSourceInfo;
+    sourceKind: SupportedSourceKind;
+    sourceUrl: string;
+    stagePath: string;
+    targetPath: string;
+    trackedItemId: string;
+  }): Promise<void> {
+    let started = false;
+    let rejectStarted!: (error: unknown) => void;
+    const startedPromise = new Promise<void>((resolve, reject) => {
+      rejectStarted = reject;
+      void this.runOnlineFixDownload({
+        ...params,
+        onStarted: () => {
+          started = true;
+          resolve();
+        },
+      }).catch((error) => {
+        if (!started) {
+          rejectStarted(error);
+        }
+        const message =
+          error instanceof Error
+            ? error.message
+            : 'Online Fix download failed.';
+        this.upsertOnlineFixDownloadState({
+          downloadUrl: params.downloadUrl,
+          error: message,
+          folderPath: params.folderPath,
+          sourceInfo: params.sourceInfo,
+          sourceKind: params.sourceKind,
+          sourceUrl: params.sourceUrl,
+          status: 'failed',
+          trackedItemId: params.trackedItemId,
+        });
+        this.appendEvent('warn', 'Online Fix download failed', {
+          error: message,
+          sourceKind: params.sourceKind,
+          trackedItemId: params.trackedItemId,
+        });
+      });
+    });
+    await startedPromise;
+  }
+
+  private async runOnlineFixDownload(params: {
+    downloadUrl: string;
+    folderPath: string;
+    onStarted?: () => void;
+    packageName: string;
+    sourceInfo: OnlineFixSourceInfo;
+    sourceKind: SupportedSourceKind;
+    sourceUrl: string;
+    stagePath: string;
+    targetPath: string;
+    trackedItemId: string;
+  }): Promise<void> {
+    if (!this.startDirectHttpDownload) {
+      throw new Error('Direct HTTP downloads are unavailable.');
+    }
+
+    this.upsertOnlineFixDownloadState({
+      downloadUrl: params.downloadUrl,
+      folderPath: params.folderPath,
+      sourceInfo: params.sourceInfo,
+      sourceKind: params.sourceKind,
+      sourceUrl: params.sourceUrl,
+      status: 'downloading',
+      trackedItemId: params.trackedItemId,
+    });
+
+    const handle = this.startDirectHttpDownload({
+      onProgress: () =>
+        this.upsertOnlineFixDownloadState({
+          downloadUrl: params.downloadUrl,
+          folderPath: params.folderPath,
+          sourceInfo: params.sourceInfo,
+          sourceKind: params.sourceKind,
+          sourceUrl: params.sourceUrl,
+          status: 'downloading',
+          trackedItemId: params.trackedItemId,
+        }),
+      packageName: params.packageName,
+      sourceKind: params.sourceKind,
+      sourceUrl: params.sourceUrl,
+      stagePath: params.stagePath,
+      url: params.downloadUrl,
+    });
+    this.activeOnlineFixDownloads.set(params.trackedItemId, handle);
+    params.onStarted?.();
+
+    let completedDownload: { fileName: string; savePath: string };
+    try {
+      completedDownload = await handle.completion;
+    } finally {
+      if (this.activeOnlineFixDownloads.get(params.trackedItemId) === handle) {
+        this.activeOnlineFixDownloads.delete(params.trackedItemId);
+      }
+    }
+
+    const tempExtractPath = `${params.targetPath}.__staging`;
+    await rm(tempExtractPath, { force: true, recursive: true }).catch(
+      () => undefined,
+    );
+    await ensureDirectory(tempExtractPath);
+    const extractedArchive = await extractDirectHttpArchive({
+      archivePath: completedDownload.savePath,
+      archiveRootPath: params.stagePath,
+      destinationPath: tempExtractPath,
+    });
+    if (!extractedArchive) {
+      throw new Error(
+        'Online Fix download completed, but no extractable archive was found.',
+      );
+    }
+    if (!(await directoryHasEntries(tempExtractPath))) {
+      throw new Error('Online Fix archive did not contain any files.');
+    }
+    if (await directoryHasEntries(params.targetPath).catch(() => false)) {
+      await rm(tempExtractPath, { force: true, recursive: true }).catch(
+        () => undefined,
+      );
+      this.upsertOnlineFixDownloadState({
+        downloadUrl: params.downloadUrl,
+        folderPath: params.targetPath,
+        sourceInfo: params.sourceInfo,
+        sourceKind: params.sourceKind,
+        sourceUrl: params.sourceUrl,
+        status: 'enabled',
+        trackedItemId: params.trackedItemId,
+      });
+      return;
+    }
+
+    await rm(params.targetPath, { force: true, recursive: true }).catch(
+      () => undefined,
+    );
+    await rename(tempExtractPath, params.targetPath);
+    await rm(params.stagePath, { force: true, recursive: true }).catch(
+      () => undefined,
+    );
+    this.upsertOnlineFixDownloadState({
+      downloadUrl: params.downloadUrl,
+      folderPath: params.targetPath,
+      sourceInfo: params.sourceInfo,
+      sourceKind: params.sourceKind,
+      sourceUrl: params.sourceUrl,
+      status: 'enabled',
+      trackedItemId: params.trackedItemId,
+    });
+    this.appendEvent('info', 'Downloaded Online Fix', {
+      sourceKind: params.sourceKind,
+      trackedItemId: params.trackedItemId,
+    });
+  }
+
   private async elamigosStagedContentExists(
     job: DownloadJobRecord,
   ): Promise<boolean> {
@@ -3208,6 +3570,7 @@ export class GameVaultService {
         : (parsedSource.latestSourceRelease.patchDate ?? null),
       observedPatchLink: selectedSteamPatch?.link ?? null,
       observedPatchTitle: selectedSteamPatch?.patchTitle ?? null,
+      onlineFix: parsedSource.onlineFix ?? null,
       observedVersion:
         selectedSteamPatch?.version?.trim() ||
         parsedSource.latestSourceRelease.version,
@@ -3233,6 +3596,7 @@ export class GameVaultService {
       observedPatchDate: parsedSource.latestSourceRelease.patchDate ?? null,
       observedPatchLink: null,
       observedPatchTitle: null,
+      onlineFix: parsedSource.onlineFix ?? null,
       observedVersion: parsedSource.latestSourceRelease.version,
       patchSelectionSource: null,
       sourceUrl: parsedSource.sourceUrl,
@@ -3251,11 +3615,113 @@ export class GameVaultService {
       observedPatchDate: patch.patchDate,
       observedPatchLink: patch.link,
       observedPatchTitle: patch.patchTitle,
+      onlineFix: parsedSource?.onlineFix ?? snapshot.onlineFix ?? null,
       observedVersion:
         parsedSource?.latestSourceRelease.version ?? snapshot.observedVersion,
       patchSelectionSource: patch.selectionSource ?? 'rss',
       sourceUrl: parsedSource?.sourceUrl ?? snapshot.sourceUrl,
     };
+  }
+
+  private async buildOnlineFixLibraryState(params: {
+    finalPath: string | null;
+    sourceSnapshot: SourceSnapshot | null;
+    trackedItemId: string;
+  }): Promise<OnlineFixLibraryState> {
+    const stored = this.database.getOnlineFixRecord(params.trackedItemId);
+    const sourceInfo = params.sourceSnapshot?.onlineFix?.detected
+      ? params.sourceSnapshot.onlineFix
+      : null;
+    const sourceKind = supportedSourceKindFromSnapshot(params.sourceSnapshot);
+    const folderPath =
+      params.finalPath != null
+        ? join(params.finalPath, 'OnlineFix')
+        : (stored?.folderPath ?? null);
+    const folderHasFiles = folderPath
+      ? await directoryHasEntries(folderPath).catch(() => false)
+      : false;
+    const sourceDownloadUrl = getOnlineFixDownloadUrl(sourceInfo);
+    const now = new Date().toISOString();
+    let state: OnlineFixLibraryState = {
+      iconColor: null,
+      status: 'none',
+      updatedAt: now,
+    };
+
+    if (folderHasFiles) {
+      state = {
+        detectedAt: sourceInfo?.detectedAt ?? stored?.detectedAt ?? null,
+        downloadUrl: sourceDownloadUrl ?? stored?.downloadUrl ?? null,
+        evidence: sourceInfo?.evidence ?? stored?.evidence ?? [],
+        folderPath,
+        iconColor: 'green',
+        lastError: null,
+        mode: sourceInfo?.mode ?? stored?.mode ?? 'separate',
+        sourceKind: sourceKind ?? stored?.sourceKind ?? null,
+        sourceUrl: params.sourceSnapshot?.sourceUrl ?? stored?.sourceUrl ?? null,
+        status: 'enabled',
+        updatedAt: now,
+      };
+    } else if (sourceInfo?.mode === 'included') {
+      state = {
+        detectedAt: sourceInfo.detectedAt ?? null,
+        downloadUrl: null,
+        evidence: sourceInfo.evidence,
+        folderPath,
+        iconColor: 'green',
+        lastError: null,
+        mode: 'included',
+        sourceKind,
+        sourceUrl: params.sourceSnapshot?.sourceUrl ?? null,
+        status: 'enabled',
+        updatedAt: now,
+      };
+    } else if (sourceInfo?.mode === 'separate') {
+      const preservedFailure =
+        stored?.status === 'failed' &&
+        (!sourceDownloadUrl || stored.downloadUrl === sourceDownloadUrl);
+      const status: OnlineFixLibraryState['status'] =
+        stored?.status === 'downloading'
+          ? 'downloading'
+          : preservedFailure
+            ? 'failed'
+            : 'available_missing';
+      state = {
+        detectedAt: sourceInfo.detectedAt ?? null,
+        downloadUrl: sourceDownloadUrl,
+        evidence: sourceInfo.evidence,
+        folderPath,
+        iconColor: onlineFixIconColor(status),
+        lastError: preservedFailure ? (stored?.lastError ?? null) : null,
+        mode: 'separate',
+        sourceKind,
+        sourceUrl: params.sourceSnapshot?.sourceUrl ?? null,
+        status,
+        updatedAt: now,
+      };
+    } else if (
+      stored?.status === 'enabled' ||
+      stored?.status === 'downloading'
+    ) {
+      state = {
+        ...stored,
+        folderPath: folderPath ?? stored.folderPath ?? null,
+        iconColor: onlineFixIconColor(stored.status),
+        updatedAt: stored.updatedAt ?? now,
+      };
+    }
+
+    if (state.status === 'none') {
+      if (stored) {
+        this.database.deleteOnlineFixRecord(params.trackedItemId);
+      }
+      return state;
+    }
+
+    if (!onlineFixStatesEqual(stored, state)) {
+      this.database.upsertOnlineFixRecord(params.trackedItemId, state);
+    }
+    return state;
   }
 
   private findUniquePatchByVersion(
@@ -3834,6 +4300,7 @@ export class GameVaultService {
             updateStatus === 'possible_update'),
         match: confirmedMatch,
         matchedPatch,
+        onlineFix: snapshot?.onlineFix ?? null,
         snapshot,
         updateStatus,
         versionsBehindLatest: sourcePatchLag?.versionsBehindLatest ?? null,
@@ -3933,6 +4400,18 @@ export class GameVaultService {
           }
         : recoveredDownload;
     const finalPathExists = finalPath ? await pathHasContent(finalPath) : false;
+    const shouldUseSourceOnlineFixFallback =
+      !installRecord && !currentDownload && !finalPathExists;
+    const onlineFixSourceSnapshot =
+      sourceSnapshot?.onlineFix?.detected || !shouldUseSourceOnlineFixFallback
+        ? sourceSnapshot
+        : (sourceSnapshots.find((snapshot) => snapshot.onlineFix?.detected) ??
+          sourceSnapshot);
+    const onlineFix = await this.buildOnlineFixLibraryState({
+      finalPath,
+      sourceSnapshot: onlineFixSourceSnapshot,
+      trackedItemId,
+    });
     const hasKnownFinalPath =
       Boolean(installRecord) ||
       currentDownload?.stage === 'complete' ||
@@ -3992,6 +4471,7 @@ export class GameVaultService {
         title: steamMatch?.title ?? item.title,
       },
       latestPatch,
+      onlineFix,
       patchMetadataStatus,
       selectedPatch,
       selectedPatchMissingFromFeed: patchLag.selectedPatchMissingFromFeed,
@@ -4127,6 +4607,333 @@ export class GameVaultService {
       this.playnitePaths.pluginBundlePath ??
       resolve(__dirname, '..', 'playnite-plugin')
     );
+  }
+
+  private getDuoStreamLauncherScriptPath(): string {
+    return pathForExternalProcess(
+      this.playnitePaths.duoStreamLauncherScriptPath ??
+        resolve(__dirname, ...DUOSTREAM_LAUNCHER_SCRIPT_RELATIVE_PATH),
+    );
+  }
+
+  private getDuoStreamPlayniteManifestOptions(settings = this.database.getSettings()) {
+    return {
+      duoStreamIntegrationEnabled:
+        settings.duoStreamIntegrationEnabled === true,
+      duoStreamLauncherScriptPath: this.getDuoStreamLauncherScriptPath(),
+      duoStreamUsePlayniteLauncher:
+        settings.duoStreamUsePlayniteLauncher !== false,
+    };
+  }
+
+  private getDuoStreamLaunchAssetTarget(
+    view: TrackedItemView,
+    selection: PlayniteExecutableSelectionRecord | null | undefined,
+    settings = this.database.getSettings(),
+  ):
+    | {
+        executablePath: string;
+        installPath: string;
+        steamAppId: number;
+        trackedItemId: string;
+      }
+    | null {
+    const installPath = view.installRecord?.installPath ?? view.fileState.finalPath;
+    const executablePath = selection?.selectedExePath ?? null;
+    const steamAppId = view.item.steamAppId;
+    if (
+      settings.duoStreamIntegrationEnabled !== true ||
+      view.onlineFix?.status !== 'enabled' ||
+      !installPath ||
+      !executablePath ||
+      !steamAppId ||
+      selection?.status === 'needs_review' ||
+      selection?.status === 'missing' ||
+      !pathIsInsideOrEqual(installPath, executablePath)
+    ) {
+      return null;
+    }
+
+    return {
+      executablePath: resolve(executablePath),
+      installPath: resolve(installPath),
+      steamAppId,
+      trackedItemId: view.item.id,
+    };
+  }
+
+  private buildDuoStreamLaunchAssetFingerprint(
+    views: TrackedItemView[],
+    selections: PlayniteExecutableSelectionRecord[],
+    settings = this.database.getSettings(),
+  ): string {
+    if (settings.duoStreamIntegrationEnabled !== true) {
+      return 'disabled';
+    }
+
+    const selectionsByItemId = new Map(
+      selections.map((selection) => [selection.trackedItemId, selection]),
+    );
+    const targets = views
+      .map((view) =>
+        this.getDuoStreamLaunchAssetTarget(
+          view,
+          selectionsByItemId.get(view.item.id),
+          settings,
+        ),
+      )
+      .filter(
+        (
+          target,
+        ): target is {
+          executablePath: string;
+          installPath: string;
+          steamAppId: number;
+          trackedItemId: string;
+        } => Boolean(target),
+      )
+      .sort((left, right) => left.trackedItemId.localeCompare(right.trackedItemId));
+
+    return JSON.stringify({
+      createFolderLaunchers: settings.duoStreamCreateFolderLaunchers !== false,
+      createSteamAppIdFiles: settings.duoStreamCreateSteamAppIdFiles !== false,
+      launcherFileName: DUOSTREAM_LAUNCHER_FILE_NAME,
+      launcherScriptPath: this.getDuoStreamLauncherScriptPath(),
+      targets,
+      usePlayniteLauncher: settings.duoStreamUsePlayniteLauncher !== false,
+    });
+  }
+
+  private async syncDuoStreamLaunchAssetsForView(
+    view: TrackedItemView,
+    selection: PlayniteExecutableSelectionRecord | null | undefined,
+    settings = this.database.getSettings(),
+  ): Promise<DuoStreamLaunchAssetSyncResult | null> {
+    const target = this.getDuoStreamLaunchAssetTarget(view, selection, settings);
+    if (!target) {
+      return null;
+    }
+
+    const resolvedInstallPath = target.installPath;
+    const resolvedExecutablePath = target.executablePath;
+    const result: DuoStreamLaunchAssetSyncResult = {
+      folderLauncherWritten: false,
+      steamAppIdFileWritten: false,
+    };
+    if (settings.duoStreamCreateSteamAppIdFiles !== false) {
+      await writeFile(
+        join(resolvedInstallPath, 'steam_appid.txt'),
+        String(target.steamAppId),
+        'ascii',
+      );
+      result.steamAppIdFileWritten = true;
+    }
+
+    if (settings.duoStreamCreateFolderLaunchers === false) {
+      return result;
+    }
+
+    const launcherScriptPath = this.getDuoStreamLauncherScriptPath();
+    const launcherPath = join(resolvedInstallPath, DUOSTREAM_LAUNCHER_FILE_NAME);
+    await rm(join(resolvedInstallPath, DUOSTREAM_LEGACY_CMD_LAUNCHER_FILE_NAME), {
+      force: true,
+    }).catch(() => undefined);
+    const launcherArguments = buildDuoStreamLauncherArguments({
+      appId: target.steamAppId,
+      exePath: resolvedExecutablePath,
+      launcherScriptPath,
+      mode: 'Duo',
+      waitForGameExit: true,
+      workingDirectory: resolvedInstallPath,
+    });
+    const launcherContent = buildHiddenDuoStreamLauncherScript(
+      `powershell.exe ${launcherArguments}`,
+    );
+    await writeFile(launcherPath, launcherContent, 'utf8');
+    result.folderLauncherWritten = true;
+    return result;
+  }
+
+  private async syncDuoStreamLaunchAssetsForViews(
+    views: TrackedItemView[],
+    selections: PlayniteExecutableSelectionRecord[],
+  ): Promise<DuoStreamLaunchAssetSyncSummary> {
+    const settings = this.database.getSettings();
+    const fingerprint = this.buildDuoStreamLaunchAssetFingerprint(
+      views,
+      selections,
+      settings,
+    );
+    const summary: DuoStreamLaunchAssetSyncSummary = {
+      eligibleGames: 0,
+      errors: 0,
+      fingerprint,
+      folderLaunchersWritten: 0,
+      lastError: null,
+      steamAppIdFilesWritten: 0,
+      syncedAt: settings.duoStreamIntegrationEnabled === true
+        ? new Date().toISOString()
+        : null,
+    };
+
+    const selectionsByItemId = new Map(
+      selections.map((selection) => [selection.trackedItemId, selection]),
+    );
+    for (const view of views) {
+      const selection = selectionsByItemId.get(view.item.id);
+      const target = this.getDuoStreamLaunchAssetTarget(view, selection, settings);
+      if (!target) {
+        continue;
+      }
+      summary.eligibleGames += 1;
+      await this.syncDuoStreamLaunchAssetsForView(view, selection, settings)
+        .then((result) => {
+          if (!result) {
+            return;
+          }
+          if (result.folderLauncherWritten) {
+            summary.folderLaunchersWritten += 1;
+          }
+          if (result.steamAppIdFileWritten) {
+            summary.steamAppIdFilesWritten += 1;
+          }
+        })
+        .catch((error) => {
+          summary.errors += 1;
+          summary.lastError =
+            error instanceof Error
+              ? error.message
+              : 'Unknown DuoStream launch asset error';
+          this.appendEvent(
+            'warn',
+            'Unable to refresh DuoStream launch assets',
+            {
+              error: summary.lastError,
+              trackedItemId: view.item.id,
+            },
+            { notify: false },
+          );
+        });
+    }
+    this.saveDuoStreamLaunchAssetSyncSummary(summary);
+    return summary;
+  }
+
+  private saveDuoStreamLaunchAssetSyncSummary(
+    summary: DuoStreamLaunchAssetSyncSummary,
+  ): void {
+    this.database.setSetting(
+      DUOSTREAM_LAST_SYNC_FINGERPRINT_SETTING_KEY,
+      summary.errors > 0 ? null : summary.fingerprint,
+    );
+    this.database.setSetting(
+      DUOSTREAM_LAST_SYNC_AT_SETTING_KEY,
+      summary.syncedAt,
+    );
+    this.database.setSetting(
+      DUOSTREAM_LAST_SYNC_ERROR_SETTING_KEY,
+      summary.lastError,
+    );
+    this.database.setSetting(
+      DUOSTREAM_LAST_SYNC_ELIGIBLE_GAMES_SETTING_KEY,
+      String(summary.eligibleGames),
+    );
+    this.database.setSetting(
+      DUOSTREAM_LAST_SYNC_FOLDER_LAUNCHERS_SETTING_KEY,
+      String(summary.folderLaunchersWritten),
+    );
+    this.database.setSetting(
+      DUOSTREAM_LAST_SYNC_STEAM_APPID_FILES_SETTING_KEY,
+      String(summary.steamAppIdFilesWritten),
+    );
+  }
+
+  private async syncDuoStreamLaunchAssetsAfterSettingsUpdate(): Promise<
+    DuoStreamLaunchAssetSyncSummary
+  > {
+    const views = await this.buildInstalledSteamMatchedViews();
+    const selections = await this.refreshStalePlayniteExecutableSelections(
+      views,
+      this.normalizePlayniteExecutableSelections(
+        this.database.listPlayniteExecutableSelections(),
+      ),
+    );
+    return this.syncDuoStreamLaunchAssetsForViews(views, selections);
+  }
+
+  private getDuoStreamIntegrationStatus(
+    views: TrackedItemView[],
+    selections: PlayniteExecutableSelectionRecord[],
+    settings = this.database.getSettings(),
+  ): DuoStreamIntegrationStatus {
+    const fingerprint = this.buildDuoStreamLaunchAssetFingerprint(
+      views,
+      selections,
+      settings,
+    );
+    const lastFingerprint = this.database.getSetting(
+      DUOSTREAM_LAST_SYNC_FINGERPRINT_SETTING_KEY,
+    );
+    const lastError = this.database.getSetting(
+      DUOSTREAM_LAST_SYNC_ERROR_SETTING_KEY,
+    );
+    const numericSetting = (key: string): number => {
+      const value = Number(this.database.getSetting(key));
+      return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+    };
+    const selectionsByItemId = new Map(
+      selections.map((selection) => [selection.trackedItemId, selection]),
+    );
+    const eligibleGames =
+      settings.duoStreamIntegrationEnabled === true
+        ? views.filter((view) =>
+            Boolean(
+              this.getDuoStreamLaunchAssetTarget(
+                view,
+                selectionsByItemId.get(view.item.id),
+                settings,
+              ),
+            ),
+          ).length
+        : 0;
+
+    return {
+      current:
+        settings.duoStreamIntegrationEnabled !== true ||
+        (lastFingerprint === fingerprint && !lastError),
+      enabled: settings.duoStreamIntegrationEnabled === true,
+      eligibleGames,
+      folderLauncherName: DUOSTREAM_LAUNCHER_FILE_NAME,
+      folderLaunchersWritten: numericSetting(
+        DUOSTREAM_LAST_SYNC_FOLDER_LAUNCHERS_SETTING_KEY,
+      ),
+      lastError,
+      lastSyncedAt: this.database.getSetting(DUOSTREAM_LAST_SYNC_AT_SETTING_KEY),
+      steamAppIdFilesWritten: numericSetting(
+        DUOSTREAM_LAST_SYNC_STEAM_APPID_FILES_SETTING_KEY,
+      ),
+    };
+  }
+
+  private async runDuoStreamSettingsSyncSafely(): Promise<void> {
+    try {
+      await this.syncDuoStreamLaunchAssetsAfterSettingsUpdate();
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : 'Unknown DuoStream launch asset error';
+      this.database.setSetting(DUOSTREAM_LAST_SYNC_ERROR_SETTING_KEY, message);
+      this.appendEvent(
+        'warn',
+        'Unable to refresh DuoStream launch assets after settings update',
+        {
+          error: message,
+        },
+        { notify: false },
+      );
+      throw error;
+    }
   }
 
   private async buildInstalledSteamMatchedViews(): Promise<TrackedItemView[]> {
@@ -4283,11 +5090,42 @@ export class GameVaultService {
             this.database.listPlayniteExecutableSelections(),
           ),
         );
-    const manifest = buildPlayniteManifest(views, selections);
+    await this.syncDuoStreamLaunchAssetsForViews(views, selections);
+    const manifest = buildPlayniteManifest(
+      views,
+      selections,
+      this.getDuoStreamPlayniteManifestOptions(),
+    );
     const manifestPath = this.getPlayniteManifestPath(options.paths);
     await mkdir(dirname(manifestPath), { recursive: true });
     await writeFile(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
     return manifest;
+  }
+
+  private async getPlayniteManifestStatus(
+    currentManifest: PlayniteManifest,
+    options: PlaynitePathOptions = {},
+  ): Promise<PlayniteManifestStatus> {
+    const manifestPath = this.getPlayniteManifestPath(options);
+    let existing: PlayniteManifest | null = null;
+    try {
+      existing = JSON.parse(await readFile(manifestPath, 'utf8')) as PlayniteManifest;
+    } catch {
+      return {
+        current: false,
+        exists: false,
+        generatedAt: null,
+        manifestPath,
+      };
+    }
+
+    return {
+      current: playniteManifestsMatch(currentManifest, existing),
+      exists: true,
+      generatedAt:
+        typeof existing.generatedAt === 'string' ? existing.generatedAt : null,
+      manifestPath,
+    };
   }
 
   private async getPlayniteSyncStatus(
@@ -4367,15 +5205,16 @@ export class GameVaultService {
       selections = this.normalizePlayniteExecutableSelections(
         this.database.listPlayniteExecutableSelections(),
       );
-    } else if (settings.playniteIntegrationEnabled && selections.length > 0) {
-      manifest = await this.exportPlayniteManifest({
-        paths: options,
-        rescan: false,
-      });
     }
 
     const views = await this.buildInstalledSteamMatchedViews();
-    const currentManifest = manifest ?? buildPlayniteManifest(views, selections);
+    const currentManifest =
+      manifest ??
+      buildPlayniteManifest(
+        views,
+        selections,
+        this.getDuoStreamPlayniteManifestOptions(settings),
+      );
     const eligibleItemIds = new Set(views.map((view) => view.item.id));
     const itemsById = new Map(
       this.database.listTrackedItems().map((item) => [item.id, item]),
@@ -4407,16 +5246,26 @@ export class GameVaultService {
     const installedPluginVersion = installed
       ? await readPlaynitePluginVersion(pluginInstallPath)
       : null;
+    const manifestStatus = await this.getPlayniteManifestStatus(
+      currentManifest,
+      options,
+    );
     const syncStatus = await this.getPlayniteSyncStatus(
       currentManifest,
       options,
     );
     return {
       bundledPluginVersion: PLAYNITE_PLUGIN_VERSION,
+      duoStream: this.getDuoStreamIntegrationStatus(
+        views,
+        selections,
+        settings,
+      ),
       enabled: settings.playniteIntegrationEnabled === true,
       exportableGames: currentManifest.games.length,
       installed,
       installedPluginVersion,
+      manifestStatus,
       manifestPath: this.getPlayniteManifestPath(options),
       pendingReviewCount: pendingReviews.length,
       pendingReviews,
@@ -4520,6 +5369,26 @@ export class GameVaultService {
     });
     this.emitActivityChange();
     return this.getPlayniteStatus();
+  }
+
+  async refreshDuoStreamIntegration(
+    params: PlaynitePathOptions = {},
+  ): Promise<PlayniteIntegrationStatus> {
+    const settings = this.database.getSettings();
+    if (settings.duoStreamIntegrationEnabled !== true) {
+      return this.getPlayniteStatus(params);
+    }
+
+    if (settings.playniteIntegrationEnabled === true) {
+      await this.exportPlayniteManifest({ paths: params, rescan: false });
+    } else {
+      await this.runDuoStreamSettingsSyncSafely();
+    }
+    this.appendEvent('info', 'Refreshed DuoStream launch files', {
+      folderLauncherName: DUOSTREAM_LAUNCHER_FILE_NAME,
+    });
+    this.emitActivityChange();
+    return this.getPlayniteStatus(params);
   }
 
   async savePlayniteExecutableSelection(
@@ -5662,6 +6531,7 @@ export class GameVaultService {
 
     let changed = false;
     const fullDownloadUrls: DownloadDescriptor[] = [];
+    let onlineFix = parsedSource.onlineFix ?? null;
     for (const mirror of parsedSource.fullDownloadUrls) {
       const existingBrowserUrl = getAnkerGamesBrowserDownloadUrl(mirror);
       if (existingBrowserUrl || !isAnkerGamesGeneratedDownloadUrl(mirror.url)) {
@@ -5704,11 +6574,61 @@ export class GameVaultService {
 
       fullDownloadUrls.push(mirror);
     }
+    if (onlineFix?.mode === 'separate') {
+      const downloadUrls: OnlineFixSourceInfo['downloadUrls'] = [];
+      for (const download of onlineFix.downloadUrls) {
+        const existingBrowserUrl = download.browserDownloadUrl?.trim() ?? '';
+        if (existingBrowserUrl || !isAnkerGamesGeneratedDownloadUrl(download.url)) {
+          downloadUrls.push(download);
+          continue;
+        }
+
+        try {
+          const resolvedUrl = await resolveAnkerGamesBrowserDownloadUrl({
+            fetch: this.sourceFetch,
+            sourceUrl: parsedSource.sourceUrl,
+            stableDownloadUrl: download.url,
+          });
+          if (
+            isAnkerGamesDirectDownloadUrl(resolvedUrl) ||
+            isAnkerGamesProxyDownloadUrl(resolvedUrl)
+          ) {
+            downloadUrls.push({
+              ...download,
+              browserDownloadUrl: resolvedUrl,
+            });
+            changed = true;
+            continue;
+          }
+        } catch (error) {
+          this.appendEvent(
+            'warn',
+            'Unable to resolve AnkerGames Online Fix mirror during source refresh',
+            {
+              error:
+                error instanceof Error
+                  ? error.message
+                  : 'Unknown AnkerGames Online Fix mirror resolution error',
+              trackedItemId,
+              url: download.url,
+            },
+            { notify: false },
+          );
+        }
+
+        downloadUrls.push(download);
+      }
+      onlineFix = {
+        ...onlineFix,
+        downloadUrls,
+      };
+    }
 
     return changed
       ? {
           ...parsedSource,
           fullDownloadUrls,
+          onlineFix,
         }
       : parsedSource;
   }
@@ -6428,6 +7348,55 @@ export class GameVaultService {
     return this.fetchSteamPatchFeed(appId);
   }
 
+  private persistSteamPatchCandidates(
+    trackedItemId: string,
+    appId: number,
+    patches: SteamPatchCandidate[] | null | undefined,
+  ): void {
+    const entries = (patches ?? [])
+      .filter((entry) => entry.appId === appId)
+      .map((entry) => ({
+        ...entry,
+        selectionSource: entry.selectionSource ?? 'rss',
+        trackedItemId,
+      }));
+    if (entries.length === 0) {
+      return;
+    }
+
+    this.database.upsertPatchEntries(entries);
+    this.reconcileSourcePatchAlignments(trackedItemId);
+    this.reconcileSteamPatchWatch(trackedItemId);
+  }
+
+  private warmMatchedDraftMetadata(
+    trackedItemId: string,
+    steamMatch: ConfirmedSteamMatch,
+  ): void {
+    void (async () => {
+      const canonicalSteamMatch = await this.withCanonicalSteamCover(steamMatch);
+      if (canonicalSteamMatch.coverUrl !== steamMatch.coverUrl) {
+        this.database.upsertSteamMatch(trackedItemId, canonicalSteamMatch);
+      }
+
+      if (this.database.listPatchEntries(trackedItemId).length === 0) {
+        await this.syncSteamPatchFeed(trackedItemId, canonicalSteamMatch);
+      }
+    })().catch((error) => {
+      this.appendEvent(
+        'warn',
+        'Steam metadata warm failed while creating matched draft',
+        {
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Unknown Steam metadata error',
+          trackedItemId,
+        },
+      );
+    });
+  }
+
   listSteamPatchEntries(trackedItemId: string): SteamPatchEntry[] {
     return this.database.listPatchEntries(trackedItemId);
   }
@@ -6435,7 +7404,9 @@ export class GameVaultService {
   async createMatchedDraft(
     payload: CreateMatchedDraftPayload,
   ): Promise<TrackedItemView> {
-    const steamMatch = await this.withCanonicalSteamCover(payload.steamMatch);
+    const steamMatch = payload.deferMetadata
+      ? payload.steamMatch
+      : await this.withCanonicalSteamCover(payload.steamMatch);
     const existingSteamMatch = this.database.findSteamMatchByAppId(
       steamMatch.appId,
     );
@@ -6465,7 +7436,14 @@ export class GameVaultService {
       ),
     );
     this.database.upsertSteamMatch(item.id, steamMatch);
-    if (this.database.listPatchEntries(item.id).length === 0) {
+    this.persistSteamPatchCandidates(
+      item.id,
+      steamMatch.appId,
+      payload.steamPatchEntries,
+    );
+    if (payload.deferMetadata) {
+      this.warmMatchedDraftMetadata(item.id, steamMatch);
+    } else if (this.database.listPatchEntries(item.id).length === 0) {
       await this.syncSteamPatchFeed(item.id, steamMatch).catch((error) => {
         this.appendEvent(
           'warn',
@@ -6500,17 +7478,11 @@ export class GameVaultService {
       throw new Error('Patch history does not match the tracked Steam app.');
     }
 
-    this.database.upsertPatchEntries(
-      payload.patches
-        .filter((entry) => entry.appId === payload.appId)
-        .map((entry) => ({
-          ...entry,
-          selectionSource: entry.selectionSource ?? 'rss',
-          trackedItemId: payload.trackedItemId,
-        })),
+    this.persistSteamPatchCandidates(
+      payload.trackedItemId,
+      payload.appId,
+      payload.patches,
     );
-    this.reconcileSourcePatchAlignments(payload.trackedItemId);
-    this.reconcileSteamPatchWatch(payload.trackedItemId);
     return this.buildTrackedItemView(payload.trackedItemId);
   }
 
@@ -7535,6 +8507,123 @@ export class GameVaultService {
         this.downloadQueueLocks.delete(queueKey);
       }
     }
+  }
+
+  async queueOnlineFixDownload(params: {
+    sourceKind?: SupportedSourceKind | null;
+    trackedItemId: string;
+  }): Promise<TrackedItemView> {
+    const view = await this.buildTrackedItemView(params.trackedItemId);
+    const settings = this.database.getSettings();
+    if (!settings.rootLibraryPath) {
+      throw new Error('Root library path is not configured');
+    }
+    const sourceKind = params.sourceKind ?? 'ankergames';
+    const sourceSnapshot = this.database.getSourceSnapshot(
+      params.trackedItemId,
+      sourceKind,
+    );
+    if (!sourceSnapshot || sourceSnapshot.sourceKind !== 'ankergames') {
+      throw new Error('No AnkerGames Online Fix source is available.');
+    }
+    const sourceInfo = sourceSnapshot.onlineFix;
+    if (!sourceInfo?.detected || sourceInfo.mode !== 'separate') {
+      throw new Error(
+        'This AnkerGames source does not have a separate Online Fix download.',
+      );
+    }
+    const download = getOnlineFixDownloadDescriptor(sourceInfo);
+    if (!download) {
+      throw new Error('No Online Fix download link is available.');
+    }
+
+    const finalPath = view.fileState.finalPath
+      ? resolve(view.fileState.finalPath)
+      : null;
+    if (!finalPath) {
+      throw new Error('Install folder is not available for this game.');
+    }
+    const rootLibraryPath = resolve(settings.rootLibraryPath);
+    if (!pathIsInsideOrEqual(rootLibraryPath, finalPath)) {
+      throw new Error('Install folder is outside the configured library root.');
+    }
+
+    const targetPath = resolve(join(finalPath, 'OnlineFix'));
+    if (!pathIsInsideOrEqual(finalPath, targetPath)) {
+      throw new Error('Online Fix folder path is outside the game folder.');
+    }
+    if (await directoryHasEntries(targetPath).catch(() => false)) {
+      this.upsertOnlineFixDownloadState({
+        downloadUrl: getOnlineFixDownloadUrl(sourceInfo),
+        folderPath: targetPath,
+        sourceInfo,
+        sourceKind: 'ankergames',
+        sourceUrl: sourceSnapshot.sourceUrl,
+        status: 'enabled',
+        trackedItemId: params.trackedItemId,
+      });
+      return this.buildTrackedItemView(params.trackedItemId);
+    }
+    if (this.activeOnlineFixDownloads.has(params.trackedItemId)) {
+      return this.buildTrackedItemView(params.trackedItemId);
+    }
+
+    let downloadUrl =
+      download.browserDownloadUrl?.trim() || download.url.trim();
+    if (isAnkerGamesGeneratedDownloadUrl(downloadUrl)) {
+      const resolvedUrl = await resolveAnkerGamesBrowserDownloadUrl({
+        fetch: this.sourceFetch,
+        sourceUrl: sourceSnapshot.sourceUrl,
+        stableDownloadUrl: downloadUrl,
+      });
+      if (
+        !isAnkerGamesDirectDownloadUrl(resolvedUrl) &&
+        !isAnkerGamesProxyDownloadUrl(resolvedUrl)
+      ) {
+        throw new Error(
+          'Online Fix download did not resolve to a direct dlproxy or DataNodes URL.',
+        );
+      }
+      downloadUrl = resolvedUrl;
+    }
+    if (
+      !isAnkerGamesDirectDownloadUrl(downloadUrl) &&
+      !isAnkerGamesProxyDownloadUrl(downloadUrl)
+    ) {
+      throw new Error(
+        'Online Fix download must resolve to a direct dlproxy or DataNodes URL.',
+      );
+    }
+
+    const releaseSuffix =
+      sourceSnapshot.observedBuildId ?? sourceSnapshot.observedVersion;
+    const packageName = sanitizePathSegment(
+      `${view.item.steamTitle ?? view.item.title}_${releaseSuffix}_OnlineFix`,
+    );
+    const stageRootPath = resolve(join(rootLibraryPath, '_STAGING'));
+    const stagePath = resolve(join(stageRootPath, packageName));
+    if (!pathIsInsideOrEqual(stageRootPath, stagePath)) {
+      throw new Error('Online Fix staging path is invalid.');
+    }
+    await ensureDirectory(stageRootPath);
+    await rm(stagePath, { force: true, recursive: true }).catch(
+      () => undefined,
+    );
+    await ensureDirectory(stagePath);
+    await ensureDirectory(finalPath);
+
+    await this.startOnlineFixDownload({
+      downloadUrl,
+      folderPath: targetPath,
+      packageName,
+      sourceInfo,
+      sourceKind: 'ankergames',
+      sourceUrl: sourceSnapshot.sourceUrl,
+      stagePath,
+      targetPath,
+      trackedItemId: params.trackedItemId,
+    });
+    return this.buildTrackedItemView(params.trackedItemId);
   }
 
   async addTrackedItem(
@@ -9175,7 +10264,41 @@ export class GameVaultService {
   private steamDbRssBackoffRemainingMs(): number {
     const nextAllowedAt =
       this.requestPacingStates.get('steamdb-rss')?.nextAllowedAt ?? 0;
-    return Math.max(0, nextAllowedAt - Date.now());
+    const persistedRetryAt = this.database
+      .listSteamMatches()
+      .reduce((latestRetryAt, match) => {
+        const check = this.database.getSteamFeedCheck(match.trackedItemId);
+        if (!check?.lastError || !/429|rate limit/i.test(check.lastError)) {
+          return latestRetryAt;
+        }
+        const checkedAt = timestampMs(check.lastCheckedAt ?? check.updatedAt);
+        return checkedAt == null
+          ? latestRetryAt
+          : Math.max(
+              latestRetryAt,
+              checkedAt + STEAMDB_RSS_RATE_LIMIT_BACKOFF_MS,
+            );
+      }, 0);
+    return Math.max(0, Math.max(nextAllowedAt, persistedRetryAt) - Date.now());
+  }
+
+  private latestExpectedSteamFeedPollAt(now = new Date()): Date {
+    const settings = this.database.getSettings();
+    const pollHour = clampNumber(settings.pollDailyHourLocal ?? 9, 0, 23);
+    return latestExpectedDailyPollAt(now, pollHour);
+  }
+
+  private listDueSteamFeedMatches(
+    now = new Date(),
+    matches: SteamFeedMaintenanceMatch[] = this.database.listSteamMatches(),
+  ): SteamFeedMaintenanceMatch[] {
+    const expectedPollAt = this.latestExpectedSteamFeedPollAt(now);
+    return matches.filter((match) =>
+      isBeforeWithGrace(
+        this.database.getSteamFeedCheck(match.trackedItemId)?.lastCheckedAt,
+        expectedPollAt,
+      ),
+    );
   }
 
   shouldRunSteamFeedMaintenance(now = new Date()): boolean {
@@ -9185,18 +10308,12 @@ export class GameVaultService {
     }
 
     const settings = this.database.getSettings();
-    const pollHour = clampNumber(settings.pollDailyHourLocal ?? 9, 0, 23);
-    const expectedPollAt = latestExpectedDailyPollAt(now, pollHour);
+    const expectedPollAt = this.latestExpectedSteamFeedPollAt(now);
     if (isBeforeWithGrace(settings.lastDailyPollAt, expectedPollAt)) {
       return true;
     }
 
-    return matches.some((match) =>
-      isBeforeWithGrace(
-        this.database.getSteamFeedCheck(match.trackedItemId)?.lastCheckedAt,
-        expectedPollAt,
-      ),
-    );
+    return this.listDueSteamFeedMatches(now, matches).length > 0;
   }
 
   async pollSteamFeeds(): Promise<void> {
@@ -9221,7 +10338,7 @@ export class GameVaultService {
       return;
     }
 
-    const matchCount = this.database.listSteamMatches().length;
+    const matchCount = this.listDueSteamFeedMatches(new Date()).length;
     this.steamFeedPollPromise = this.withActivityTask(
       {
         detail:
@@ -9241,7 +10358,8 @@ export class GameVaultService {
   }
 
   private async pollSteamFeedsInternal(): Promise<void> {
-    const matches = this.database.listSteamMatches();
+    const allMatches = this.database.listSteamMatches();
+    const matches = this.listDueSteamFeedMatches(new Date(), allMatches);
     let checked = 0;
     let failed = 0;
     let processed = 0;
@@ -9291,9 +10409,20 @@ export class GameVaultService {
     if (matches.length > 0) {
       this.appendEvent('info', 'SteamDB feed check completed', {
         checked,
+        due: matches.length,
         failed,
-        skipped: matches.length - checked - failed,
+        skipped: allMatches.length - checked - failed,
         stoppedByRateLimit,
+        total: allMatches.length,
+      });
+    } else if (allMatches.length > 0) {
+      this.appendEvent('info', 'SteamDB feed check completed', {
+        checked,
+        due: 0,
+        failed,
+        skipped: allMatches.length,
+        stoppedByRateLimit,
+        total: allMatches.length,
       });
     }
   }
@@ -9330,6 +10459,116 @@ export class GameVaultService {
   ensureSteamLibraryCoversBackfilled(): Promise<number> {
     this.steamLibraryCoverBackfillPromise ??= this.backfillSteamLibraryCovers();
     return this.steamLibraryCoverBackfillPromise;
+  }
+
+  async trueUpOnlineFixStatuses(): Promise<void> {
+    if (this.database.getSetting(ONLINE_FIX_TRUE_UP_SETTING_KEY)) {
+      return;
+    }
+
+    const items = this.database.listTrackedItems();
+    const candidates = items
+      .map((item) => {
+        const sourceKinds = new Set<SupportedSourceKind>();
+        if (
+          (item.sourceKind === 'ankergames' || item.sourceKind === 'steamrip') &&
+          item.sourceUrl
+        ) {
+          sourceKinds.add(item.sourceKind);
+        }
+        for (const match of this.database.listSourceMatches(item.id)) {
+          if (
+            (match.sourceKind === 'ankergames' ||
+              match.sourceKind === 'steamrip') &&
+            match.sourceUrl
+          ) {
+            sourceKinds.add(match.sourceKind);
+          }
+        }
+        for (const snapshot of this.database.listSourceSnapshots(item.id)) {
+          if (
+            (snapshot.sourceKind === 'ankergames' ||
+              snapshot.sourceKind === 'steamrip') &&
+            snapshot.sourceUrl
+          ) {
+            sourceKinds.add(snapshot.sourceKind);
+          }
+        }
+        return {
+          item,
+          sourceKinds: Array.from(sourceKinds),
+        };
+      })
+      .filter((entry) => entry.sourceKinds.length > 0);
+
+    if (candidates.length === 0) {
+      this.database.setSetting(
+        ONLINE_FIX_TRUE_UP_SETTING_KEY,
+        new Date().toISOString(),
+      );
+      return;
+    }
+
+    await this.withActivityTask(
+      {
+        detail: `Checking 0/${candidates.length} library item${candidates.length === 1 ? '' : 's'}.`,
+        id: 'online-fix-true-up',
+        progressCurrent: 0,
+        progressTotal: candidates.length,
+        title: 'Checking Online Fix status',
+      },
+      async () => {
+        let processed = 0;
+        let refreshed = 0;
+        for (const { item, sourceKinds } of candidates) {
+          for (const sourceKind of sourceKinds) {
+            try {
+              if (item.sourceKind === sourceKind && item.sourceUrl) {
+                await this.refreshTrackedItem(item.id);
+              } else {
+                await this.refreshMatchedSource(item.id, sourceKind, {
+                  bypassBackoff: false,
+                  forceCatalog: false,
+                });
+              }
+              refreshed += 1;
+            } catch (error) {
+              this.appendEvent(
+                'warn',
+                'Online Fix startup true-up source refresh failed',
+                {
+                  error:
+                    error instanceof Error
+                      ? error.message
+                      : 'Unknown Online Fix true-up error',
+                  sourceKind,
+                  trackedItemId: item.id,
+                },
+                { notify: false },
+              );
+            }
+          }
+
+          processed += 1;
+          this.updateActivityTaskProgress('online-fix-true-up', {
+            current: processed,
+            detail: `Checked ${processed}/${candidates.length} library item${candidates.length === 1 ? '' : 's'}.`,
+            total: candidates.length,
+          });
+        }
+
+        this.database.setSetting(
+          ONLINE_FIX_TRUE_UP_SETTING_KEY,
+          new Date().toISOString(),
+        );
+        this.appendEvent(
+          'info',
+          `Online Fix startup true-up completed for ${processed} library item${processed === 1 ? '' : 's'}`,
+          { refreshedSources: refreshed },
+          { notify: false },
+        );
+      },
+    );
   }
 
   private async refreshWatchedSources(watch: SourceWatch): Promise<void> {
@@ -9407,13 +10646,18 @@ export class GameVaultService {
         let expired = 0;
         let processed = 0;
         let recovered = 0;
+        let refreshed = 0;
         for (const watch of dueWatches) {
           try {
+            const watchEndsAt = timestampMs(watch.endsAt);
+            const watchWindowEnded =
+              watchEndsAt != null && watchEndsAt <= now.getTime();
             await this.refreshWatchedSources(watch);
+            refreshed += 1;
 
             const currentWatch = this.database.getWatch(watch.trackedItemId);
             if (!currentWatch) {
-              if (watch.expiredAt) {
+              if (watch.expiredAt || watchWindowEnded) {
                 recovered += 1;
               }
               continue;
@@ -9421,7 +10665,11 @@ export class GameVaultService {
 
             const shouldExpire =
               currentWatch.expiredAt ||
-              new Date(currentWatch.endsAt).getTime() <= now.getTime();
+              (timestampMs(currentWatch.endsAt) ?? Number.POSITIVE_INFINITY) <=
+                now.getTime();
+            const nextCheckAt = new Date(
+              now.getTime() + intervalHours * 60 * 60 * 1000,
+            ).toISOString();
             if (!currentWatch.expiredAt && shouldExpire) {
               expired += 1;
             }
@@ -9432,9 +10680,7 @@ export class GameVaultService {
                 ? (currentWatch.expiredAt ?? nowIso)
                 : null,
               lastCheckedAt: nowIso,
-              nextCheckAt: new Date(
-                now.getTime() + intervalHours * 60 * 60 * 1000,
-              ).toISOString(),
+              nextCheckAt,
             });
           } finally {
             processed += 1;
@@ -9449,6 +10695,7 @@ export class GameVaultService {
           checked: dueWatches.length,
           expired,
           recovered,
+          refreshed,
         });
       },
     );
@@ -9468,6 +10715,14 @@ export class GameVaultService {
       settings = this.database.getSettings();
     }
     return {
+      duoStreamCreateFolderLaunchers:
+        settings.duoStreamCreateFolderLaunchers ?? true,
+      duoStreamCreateSteamAppIdFiles:
+        settings.duoStreamCreateSteamAppIdFiles ?? true,
+      duoStreamIntegrationEnabled:
+        settings.duoStreamIntegrationEnabled ?? false,
+      duoStreamUsePlayniteLauncher:
+        settings.duoStreamUsePlayniteLauncher ?? true,
       ignoredImportFolders: settings.ignoredImportFolders ?? [],
       jDownloaderEnabled: settings.jDownloaderEnabled ?? false,
       jDownloaderSourcePreferences: settings.jDownloaderSourcePreferences ?? {
@@ -9494,7 +10749,11 @@ export class GameVaultService {
     };
   }
 
-  saveSettings(input: {
+  async saveSettings(input: {
+    duoStreamCreateFolderLaunchers?: boolean;
+    duoStreamCreateSteamAppIdFiles?: boolean;
+    duoStreamIntegrationEnabled?: boolean;
+    duoStreamUsePlayniteLauncher?: boolean;
     jDownloaderEnabled?: boolean;
     jDownloaderSourcePreferences?: SettingsView['jDownloaderSourcePreferences'];
     libraryRoots?: LibraryRootRecord[];
@@ -9510,7 +10769,18 @@ export class GameVaultService {
     sourceWatchDurationDays?: number;
     sourceWatchIntervalHours?: number;
     themeMode?: ThemeMode | null;
-  }): RendererSettingsView {
+  }): Promise<RendererSettingsView> {
+    const duoStreamSettingsChanged =
+      input.duoStreamIntegrationEnabled !== undefined ||
+      input.duoStreamCreateSteamAppIdFiles !== undefined ||
+      input.duoStreamCreateFolderLaunchers !== undefined ||
+      input.duoStreamUsePlayniteLauncher !== undefined;
+    const playniteManifestSettingsChanged =
+      duoStreamSettingsChanged ||
+      input.playniteIntegrationEnabled !== undefined ||
+      input.playniteManifestPath !== undefined ||
+      input.playniteExtensionsPath !== undefined;
+
     if (input.libraryRoots !== undefined) {
       const libraryRoots = normalizeLibraryRootsForSave(input.libraryRoots);
       const primaryRoot = libraryRoots.find((root) => root.isPrimary) ?? null;
@@ -9573,6 +10843,30 @@ export class GameVaultService {
         input.playniteManifestPath?.trim() || null,
       );
     }
+    if (input.duoStreamIntegrationEnabled !== undefined) {
+      this.database.setSetting(
+        'duostream.integrationEnabled',
+        input.duoStreamIntegrationEnabled ? 'true' : 'false',
+      );
+    }
+    if (input.duoStreamCreateSteamAppIdFiles !== undefined) {
+      this.database.setSetting(
+        'duostream.createSteamAppIdFiles',
+        input.duoStreamCreateSteamAppIdFiles ? 'true' : 'false',
+      );
+    }
+    if (input.duoStreamCreateFolderLaunchers !== undefined) {
+      this.database.setSetting(
+        'duostream.createFolderLaunchers',
+        input.duoStreamCreateFolderLaunchers ? 'true' : 'false',
+      );
+    }
+    if (input.duoStreamUsePlayniteLauncher !== undefined) {
+      this.database.setSetting(
+        'duostream.usePlayniteLauncher',
+        input.duoStreamUsePlayniteLauncher ? 'true' : 'false',
+      );
+    }
     if (typeof input.sourceWatchIntervalHours === 'number') {
       this.database.setSetting(
         'sourceWatch.intervalHours',
@@ -9614,6 +10908,14 @@ export class GameVaultService {
     }
 
     this.appendEvent('info', 'Updated settings');
+    const playniteEnabledAfterSave =
+      this.database.getSettings().playniteIntegrationEnabled === true;
+    if (duoStreamSettingsChanged && !playniteEnabledAfterSave) {
+      await this.runDuoStreamSettingsSyncSafely();
+    }
+    if (playniteManifestSettingsChanged && playniteEnabledAfterSave) {
+      await this.exportPlayniteManifest({ rescan: false });
+    }
     return this.getSettings();
   }
 
@@ -10736,7 +12038,7 @@ export class GameVaultService {
             trackedItemId: item.id,
           });
         }
-        sourceCheckTimes.push(watch.lastCheckedAt, watch.nextCheckAt);
+        sourceCheckTimes.push(watch.lastCheckedAt);
       }
 
       const sourceMatches = this.database.listSourceMatches(item.id);
@@ -10862,8 +12164,10 @@ export class GameVaultService {
       'steamdb_stale',
     ]);
     const sourceErrors = countActivityIssues(visibleIssues, ['source_error']);
-    const sourceWatchesDueOrExpired = countActivityIssues(visibleIssues, [
+    const sourceWatchesExpired = countActivityIssues(visibleIssues, [
       'source_watch_expired',
+    ]);
+    const sourceWatchesOverdue = countActivityIssues(visibleIssues, [
       'source_watch_overdue',
     ]);
     const failedDownloads = countActivityIssues(visibleIssues, [
@@ -10962,9 +12266,11 @@ export class GameVaultService {
           value:
             sourceErrors > 0
               ? `${sourceErrors} errors`
-              : sourceWatchesDueOrExpired > 0
-                ? `${sourceWatchesDueOrExpired} due`
-                : 'Current',
+              : sourceWatchesOverdue > 0
+                ? `${sourceWatchesOverdue} due`
+                : sourceWatchesExpired > 0
+                  ? `${sourceWatchesExpired} expired`
+                  : 'Current',
         },
         {
           detail:

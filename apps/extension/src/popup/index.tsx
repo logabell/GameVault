@@ -20,6 +20,7 @@ import {
   faFolderOpen,
   faGamepad,
   faGear,
+  faGlobe,
   faList,
   faMagnifyingGlass,
   faPenToSquare,
@@ -99,20 +100,20 @@ type HealthSeverity = 'yellow' | 'red' | null;
 type SettingsSaveStatus = 'idle' | 'saving' | 'saved';
 type SteamDbBackfillStatus = 'idle' | 'loading' | 'loaded' | 'failed';
 type LibraryAction = {
-  kind: 'completeInstall' | 'confirmDownloadReady';
+  kind: 'completeInstall' | 'confirmDownloadReady' | 'onlineFix';
   trackedItemId: string;
 } | null;
 
-const POPUP_DESKTOP_HEALTH_FALLBACK: HealthIndicator = {
-  color: 'red',
-  label: 'Desktop unavailable',
-  message: 'GameVault desktop bridge is unavailable.',
+const POPUP_DESKTOP_HEALTH_CHECKING: HealthIndicator = {
+  color: 'yellow',
+  label: 'Checking desktop',
+  message: 'Checking the GameVault desktop bridge.',
 };
 
-const POPUP_MYJD_HEALTH_FALLBACK: HealthIndicator = {
-  color: 'red',
-  label: 'JDownloader unavailable',
-  message: 'Reconnect MyJDownloader from the desktop app or settings.',
+const POPUP_MYJD_HEALTH_CHECKING: HealthIndicator = {
+  color: 'yellow',
+  label: 'Checking JDownloader',
+  message: 'Checking MyJDownloader status through the desktop app.',
 };
 
 const STEAM_PATCH_MESSAGE_TIMEOUT_MS = 50000;
@@ -120,6 +121,7 @@ const QUEUE_DOWNLOAD_MESSAGE_TIMEOUT_MS = 120000;
 const STATUS_REFRESH_MESSAGE_TIMEOUT_MS = 10000;
 const STEAMDB_BACKFILL_POLL_INTERVAL_MS = 750;
 const STEAMDB_BACKFILL_POLL_TIMEOUT_MS = 26000;
+const EXTENSION_ACTIVE_TAB_STORAGE_KEY = 'gamevault:extension:active-tab';
 const EXTENSION_LIBRARY_VIEW_STORAGE_KEY = 'gamevault:extension:library-view';
 const EXTENSION_POPUP_STATE_STORAGE_PREFIX =
   'gamevault:extension:popup-state';
@@ -170,6 +172,7 @@ interface DraftStatusPayload {
   connectionPending: boolean;
   parsedSource: ParsedSourcePayload | null;
   parsePending: boolean;
+  settings: SettingsView | null;
   sourceUrl: string | null;
   trackedStatus: TrackedItemView | null;
   trackedStatusPending: boolean;
@@ -433,6 +436,132 @@ function formatSourceKind(value: string | null | undefined): string {
   return formatLabel(value);
 }
 
+function formatLibraryBadgeLabel(value: string): string {
+  if (value === 'watching_source') return 'Watching';
+  if (value === 'update_available') return 'Update';
+  if (value === 'source_behind_upstream') return 'Behind';
+  if (value === 'watch_window_expired') return 'Expired';
+  if (value === 'needs_match') return 'Match';
+  if (value === 'folder_missing') return 'Missing';
+  return formatLabel(value);
+}
+
+function getOnlineFixSourceEvidence(item: TrackedItemView) {
+  if (item.sourceSnapshot?.onlineFix?.detected) {
+    return {
+      onlineFix: item.sourceSnapshot.onlineFix,
+      sourceKind: item.sourceSnapshot.sourceKind,
+      sourceUrl: item.sourceSnapshot.sourceUrl,
+    };
+  }
+  const matchedSource = item.sourceMatches?.find(
+    (source) => source.onlineFix?.detected,
+  );
+  return matchedSource?.onlineFix
+    ? {
+        onlineFix: matchedSource.onlineFix,
+        sourceKind: matchedSource.match.sourceKind,
+        sourceUrl: matchedSource.match.sourceUrl,
+      }
+    : null;
+}
+
+function hasVisibleOnlineFixState(item: TrackedItemView): boolean {
+  return Boolean(
+    (item.onlineFix && item.onlineFix.status !== 'none') ||
+      getOnlineFixSourceEvidence(item),
+  );
+}
+
+function isDiscoveredLibraryItem(item: TrackedItemView): boolean {
+  return getLifecycleStatus(item) === 'discovered';
+}
+
+function getOnlineFixBadgeTone(item: TrackedItemView): 'green' | 'red' | 'neutral' {
+  if (isDiscoveredLibraryItem(item)) {
+    return 'neutral';
+  }
+  if (item.onlineFix && item.onlineFix.status !== 'none') {
+    return item.onlineFix.iconColor ?? 'red';
+  }
+  return 'neutral';
+}
+
+function canDownloadOnlineFix(item: TrackedItemView): boolean {
+  return Boolean(
+    !isDiscoveredLibraryItem(item) &&
+      getItemFileState(item).finalPath &&
+    item.onlineFix &&
+      item.onlineFix.mode === 'separate' &&
+      item.onlineFix.sourceKind === 'ankergames' &&
+      (item.onlineFix.status === 'available_missing' ||
+        item.onlineFix.status === 'failed'),
+  );
+}
+
+function getOnlineFixBadgeLabel(item: TrackedItemView): string {
+  const state = item.onlineFix;
+  if (!state || state.status === 'none') return 'Online';
+  return 'Online';
+}
+
+function formatOnlineFixDetails(item: TrackedItemView): string {
+  const state = item.onlineFix;
+  if (state && state.status !== 'none') {
+    const source = formatSourceKind(state.sourceKind);
+    const mode = state.mode === 'included' ? 'included' : 'separate';
+    if (state.status === 'enabled') return `${source} ${mode}`;
+    if (state.status === 'downloading') return `${source} download in progress`;
+    if (state.status === 'failed') {
+      return state.lastError ?? `${source} download failed`;
+    }
+    return `${source} separate fix available`;
+  }
+  const sourceEvidence = getOnlineFixSourceEvidence(item);
+  if (!sourceEvidence) {
+    return 'No source evidence';
+  }
+  const source = formatSourceKind(sourceEvidence.sourceKind);
+  const mode =
+    sourceEvidence.onlineFix.mode === 'included' ? 'included' : 'separate';
+  return `${source} ${mode}`;
+}
+
+function formatSourceOnlineFixLabel(source: MatchedSourceView): string | null {
+  if (!source.onlineFix?.detected) return null;
+  return source.onlineFix.mode === 'included'
+    ? 'Online Fix included'
+    : 'Online Fix separate';
+}
+
+function sourceOnlineFixWarning(
+  item: TrackedItemView,
+  source: MatchedSourceView,
+): string | null {
+  if (!item.onlineFix || item.onlineFix.status === 'none') {
+    return null;
+  }
+  if (!source.onlineFix?.detected) {
+    if (item.onlineFix.status === 'enabled') {
+      return 'This source would lose Online Fix support.';
+    }
+    return null;
+  }
+  if (
+    item.onlineFix.status === 'enabled' &&
+    source.onlineFix.mode === 'separate'
+  ) {
+    return 'This source keeps Online Fix support as a separate download.';
+  }
+  if (
+    item.onlineFix.status !== 'enabled' &&
+    source.onlineFix.mode === 'included'
+  ) {
+    return 'This source would gain bundled Online Fix support.';
+  }
+  return null;
+}
+
 function formatSourceSignalValue(value: string | null | undefined): string {
   const trimmed = value?.trim();
   return trimmed && !/^(?:unknown|version|build)$/i.test(trimmed)
@@ -632,6 +761,18 @@ function readStoredLibraryViewMode(
 
 function isPopupTab(value: unknown): value is PopupTab {
   return value === 'game' || value === 'library' || value === 'settings';
+}
+
+function readStoredPopupTab(
+  storageKey: string,
+  fallback: PopupTab = 'game',
+): PopupTab {
+  try {
+    const value = window.localStorage.getItem(storageKey);
+    return isPopupTab(value) ? value : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 function isFlowStep(value: unknown): value is FlowStep {
@@ -1056,13 +1197,13 @@ function resolveHealthSeverity(
 function getPopupDesktopHealth(
   health: ConnectionHealthSummary | null,
 ): HealthIndicator {
-  return health?.desktop ?? POPUP_DESKTOP_HEALTH_FALLBACK;
+  return health?.desktop ?? POPUP_DESKTOP_HEALTH_CHECKING;
 }
 
 function getPopupJDownloaderHealth(
   health: ConnectionHealthSummary | null,
 ): HealthIndicator {
-  return health?.myJDownloader ?? POPUP_MYJD_HEALTH_FALLBACK;
+  return health?.myJDownloader ?? POPUP_MYJD_HEALTH_CHECKING;
 }
 
 function resolvePopupHealthColor(
@@ -1098,7 +1239,9 @@ function App() {
   const sourceUrl = searchParams.get('sourceUrl');
   const tabId = searchParams.get('tabId');
 
-  const [activeTab, setActiveTab] = useState<PopupTab>('game');
+  const [activeTab, setActiveTab] = useState<PopupTab>(() =>
+    readStoredPopupTab(EXTENSION_ACTIVE_TAB_STORAGE_KEY),
+  );
   const [libraryViewMode, setLibraryViewMode] = useState<LibraryViewMode>(() =>
     readStoredLibraryViewMode(EXTENSION_LIBRARY_VIEW_STORAGE_KEY),
   );
@@ -1146,6 +1289,7 @@ function App() {
     myJDownloaderPasswordConfigured: false,
     themeMode: 'dark',
   });
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [selectedDeviceId, setSelectedDeviceId] = useState('');
@@ -1179,16 +1323,18 @@ function App() {
   const [rootLibraryPathDraft, setRootLibraryPathDraft] = useState('');
   const steamSearchRequestIdRef = useRef(0);
   const steamPatchesRef = useRef<SteamPatchCandidate[]>([]);
+  const steamPatchHistoryRequestIdRef = useRef(0);
   const steamDbBackfillRequestIdRef = useRef(0);
   const sourcePatchEditorRequestIdRef = useRef(0);
   const steamReleaseDateRefreshKeysRef = useRef<Set<string>>(new Set());
+  const steamPatchWarmKeysRef = useRef<Set<string>>(new Set());
   const patchHistoryRestoreKeysRef = useRef<Set<string>>(new Set());
   const libraryRedirectTimerRef = useRef<number | null>(null);
   const detectedWorkflowSnapshotRef = useRef<WorkflowSnapshot | null>(null);
   const restoredPopupStateKeyRef = useRef<string | null>(null);
-  const restoredSavedPopupStateKeyRef = useRef<string | null>(null);
   const skipNextPopupStatePersistKeyRef = useRef<string | null>(null);
   const scrollStageRef = useRef<HTMLElement | null>(null);
+  const healthRef = useRef<ConnectionHealthSummary | null>(null);
 
   const resolvedTheme = resolveTheme(settings.themeMode);
   const parsedSource = draftShell?.parsedSource ?? null;
@@ -1379,17 +1525,19 @@ function App() {
     health,
     jDownloaderEnabled: settings.jDownloaderEnabled,
     jDownloaderSourcePreferences: settings.jDownloaderSourcePreferences,
-    rootLibraryPath: settings.rootLibraryPath,
+    rootLibraryPath: settingsLoaded ? settings.rootLibraryPath : 'loading',
     sourceKind: selectedDownloadSourceKind,
   });
   const navAlertSeverity = warningState ? resolveHealthSeverity(health) : null;
-  const canFinishSelectedSourceDownload = isSourceReadyForAutomation({
-    health,
-    jDownloaderEnabled: settings.jDownloaderEnabled,
-    jDownloaderSourcePreferences: settings.jDownloaderSourcePreferences,
-    rootLibraryPath: settings.rootLibraryPath,
-    sourceKind: selectedDownloadSourceKind,
-  });
+  const canFinishSelectedSourceDownload =
+    settingsLoaded &&
+    isSourceReadyForAutomation({
+      health,
+      jDownloaderEnabled: settings.jDownloaderEnabled,
+      jDownloaderSourcePreferences: settings.jDownloaderSourcePreferences,
+      rootLibraryPath: settings.rootLibraryPath,
+      sourceKind: selectedDownloadSourceKind,
+    });
   const canVisitSteamStep = !isLibraryUpdateFlow && Boolean(parsedSource);
   const canVisitGameStep =
     step === 'game' || Boolean(activeDraftItem?.item.steamAppId);
@@ -1478,6 +1626,7 @@ function App() {
       payload?: TrackedItemView[] | null;
     }>(
       {
+        allowNativeFallback: false,
         type: 'gamevault:list-library',
       },
       STATUS_REFRESH_MESSAGE_TIMEOUT_MS,
@@ -1747,6 +1896,37 @@ function App() {
     }
   }
 
+  async function queueOnlineFixDownload(item: TrackedItemView) {
+    setLibraryAction({
+      kind: 'onlineFix',
+      trackedItemId: item.item.id,
+    });
+    setBusy(true);
+    setMessage(`Downloading Online Fix for ${item.item.title}...`);
+    try {
+      const response = await chrome.runtime.sendMessage({
+        sourceKind: item.onlineFix?.sourceKind ?? 'ankergames',
+        trackedItemId: item.item.id,
+        type: 'gamevault:queue-online-fix-download',
+      });
+      if (!response.ok) {
+        setMessage(
+          response.message ??
+            response.error?.message ??
+            'Unable to queue Online Fix download.',
+        );
+        return;
+      }
+      const updated = response.payload as TrackedItemView;
+      applyUpdatedTrackedItem(updated);
+      setMessage(`Online Fix queued for ${updated.item.title}.`);
+      await Promise.allSettled([refreshLibrary(), refreshDraftStatus()]);
+    } finally {
+      setBusy(false);
+      setLibraryAction(null);
+    }
+  }
+
   function openRetrySelector(item: TrackedItemView) {
     const fullRows = getRetryMirrorRows(item, 'full');
     const patchRows = getRetryMirrorRows(item, 'patch');
@@ -1845,6 +2025,7 @@ function App() {
     if (response.ok && response.payload) {
       const nextSettings = response.payload as SettingsView;
       setSettings(nextSettings);
+      setSettingsLoaded(true);
       setEmail(nextSettings.myJDownloaderEmail ?? '');
       setRootLibraryPathDraft(nextSettings.rootLibraryPath ?? '');
     }
@@ -1876,10 +2057,22 @@ function App() {
       }
 
       const nextStatus = response.payload as DraftStatusPayload;
-      setHealth(nextStatus.connectionHealth);
+      setHealth((current) =>
+        current?.desktop.color === 'green' &&
+        nextStatus.connectionPending &&
+        nextStatus.connectionHealth.desktop.color !== 'green'
+          ? current
+          : nextStatus.connectionHealth,
+      );
       setConnectionPending(nextStatus.connectionPending);
       setTrackedStatusPending(nextStatus.trackedStatusPending);
       setSelectedDeviceId(nextStatus.connectionHealth.selectedDeviceId ?? '');
+      if (nextStatus.settings) {
+        setSettings(nextStatus.settings);
+        setSettingsLoaded(true);
+        setEmail(nextStatus.settings.myJDownloaderEmail ?? '');
+        setRootLibraryPathDraft(nextStatus.settings.rootLibraryPath ?? '');
+      }
       setDraftShell((current) => ({
         mode: current?.mode ?? mode,
         parsedSource: nextStatus.parsedSource ?? current?.parsedSource ?? null,
@@ -1893,7 +2086,7 @@ function App() {
     }
   }, [mode, sourceUrl, syncTrackedStatus, tabId]);
 
-  async function refreshConnectionHealth() {
+  const refreshConnectionHealth = useCallback(async (): Promise<void> => {
     setConnectionPending(true);
     try {
       const response = await sendRuntimeMessageWithTimeout<{
@@ -1902,6 +2095,7 @@ function App() {
         payload?: ConnectionHealthSummary | null;
       }>(
         {
+          forceRefresh: true,
           type: 'gamevault:get-connection-health',
         },
         STATUS_REFRESH_MESSAGE_TIMEOUT_MS,
@@ -1917,10 +2111,31 @@ function App() {
       const nextHealth = response.payload as ConnectionHealthSummary;
       setHealth(nextHealth);
       setSelectedDeviceId(nextHealth.selectedDeviceId ?? '');
+      setMessage((current) =>
+        current === 'GameVault health refresh timed out.' ? null : current,
+      );
+    } catch (error) {
+      const messageText =
+        error instanceof Error
+          ? error.message
+          : 'Unable to refresh GameVault health.';
+      if (
+        messageText === 'GameVault health refresh timed out.' &&
+        healthRef.current?.desktop.color === 'green'
+      ) {
+        return;
+      }
+      setMessage(
+        messageText,
+      );
     } finally {
       setConnectionPending(false);
     }
-  }
+  }, []);
+
+  useEffect(() => {
+    void refreshConnectionHealth();
+  }, [refreshConnectionHealth]);
 
   async function saveTheme(themeMode: ThemeMode) {
     setThemeBusy(true);
@@ -1933,6 +2148,7 @@ function App() {
       if (response.ok && response.payload) {
         const nextSettings = response.payload as SettingsView;
         setSettings(nextSettings);
+        setSettingsLoaded(true);
         setRootLibraryPathDraft(nextSettings.rootLibraryPath ?? '');
       } else {
         setMessage(response.message ?? 'Unable to save appearance settings.');
@@ -1954,6 +2170,7 @@ function App() {
       if (response.ok && response.payload) {
         const nextSettings = response.payload as SettingsView;
         setSettings(nextSettings);
+        setSettingsLoaded(true);
         setRootLibraryPathDraft(nextSettings.rootLibraryPath ?? '');
         setSettingsSaveStatus('saved');
       } else {
@@ -1987,6 +2204,7 @@ function App() {
           if (saveResponse.ok && saveResponse.payload) {
             const nextSettings = saveResponse.payload as SettingsView;
             setSettings(nextSettings);
+            setSettingsLoaded(true);
             setRootLibraryPathDraft(nextSettings.rootLibraryPath ?? pickedPath);
             setSettingsSaveStatus('saved');
             setMessage('Root library path saved.');
@@ -2047,6 +2265,7 @@ function App() {
           : (payload.candidates[0]?.appId ?? null),
       );
       steamPatchesRef.current = [];
+      steamPatchHistoryRequestIdRef.current += 1;
       steamDbBackfillRequestIdRef.current += 1;
       setSteamPatches([]);
       setSelectedSteamPatchKey(null);
@@ -2130,6 +2349,14 @@ function App() {
 
   useEffect(() => {
     try {
+      window.localStorage.setItem(EXTENSION_ACTIVE_TAB_STORAGE_KEY, activeTab);
+    } catch {
+      // localStorage can be unavailable in unusual popup contexts.
+    }
+  }, [activeTab]);
+
+  useEffect(() => {
+    try {
       window.localStorage.setItem(
         EXTENSION_LIBRARY_VIEW_STORAGE_KEY,
         libraryViewMode,
@@ -2156,7 +2383,6 @@ function App() {
       return;
     }
 
-    restoredSavedPopupStateKeyRef.current = storageKey;
     skipNextPopupStatePersistKeyRef.current = storageKey;
     steamSearchRequestIdRef.current += 1;
     setActiveTab(storedState.activeTab);
@@ -2234,17 +2460,33 @@ function App() {
     let cancelled = false;
 
     void Promise.allSettled([
-      chrome.runtime.sendMessage({
-        mode,
-        sourceUrl,
-        tabId: tabId ? Number(tabId) : null,
-        type: 'gamevault:get-draft-shell',
-      }),
-      chrome.runtime.sendMessage({ type: 'gamevault:get-settings' }),
-      chrome.runtime.sendMessage({ type: 'gamevault:list-library' }),
-      chrome.runtime.sendMessage({
-        type: 'gamevault:get-steamdb-pending-confirmation',
-      }),
+      sendRuntimeMessageWithTimeout(
+        {
+          mode,
+          sourceUrl,
+          tabId: tabId ? Number(tabId) : null,
+          type: 'gamevault:get-draft-shell',
+        },
+        STATUS_REFRESH_MESSAGE_TIMEOUT_MS,
+        'GameVault draft shell load timed out.',
+      ),
+      sendRuntimeMessageWithTimeout(
+        { type: 'gamevault:get-settings' },
+        STATUS_REFRESH_MESSAGE_TIMEOUT_MS,
+        'GameVault settings load timed out.',
+      ),
+      sendRuntimeMessageWithTimeout(
+        { allowNativeFallback: false, type: 'gamevault:list-library' },
+        STATUS_REFRESH_MESSAGE_TIMEOUT_MS,
+        'GameVault library load timed out.',
+      ),
+      sendRuntimeMessageWithTimeout(
+        {
+          type: 'gamevault:get-steamdb-pending-confirmation',
+        },
+        STATUS_REFRESH_MESSAGE_TIMEOUT_MS,
+        'GameVault SteamDB confirmation load timed out.',
+      ),
     ]).then(([shellResult, settingsResult, libraryResult, pendingResult]) => {
       if (cancelled) return;
 
@@ -2271,6 +2513,7 @@ function App() {
         };
         if (response.ok && response.payload) {
           setSettings(response.payload);
+          setSettingsLoaded(true);
           setEmail(response.payload.myJDownloaderEmail ?? '');
           setRootLibraryPathDraft(response.payload.rootLibraryPath ?? '');
         }
@@ -2317,8 +2560,6 @@ function App() {
     if (
       shellLoading ||
       !parsedSource ||
-      restoredSavedPopupStateKeyRef.current ===
-        getPopupStateStorageKey(draftShell?.sourceUrl ?? sourceUrl) ||
       step !== 'steam' ||
       candidateLoading ||
       steamCandidates.length > 0
@@ -2359,7 +2600,7 @@ function App() {
     const appId = activeDraftItem?.item.steamAppId;
     if (!appId) return;
     setMatchedDraftItemId((current) => current ?? activeDraftItem.item.id);
-    setSelectedAppId((current) => current ?? appId);
+    setSelectedAppId((current) => (current === appId ? current : appId));
     setSelectedSourceKind(
       (current) =>
         current ??
@@ -2369,6 +2610,26 @@ function App() {
         null,
     );
   }, [activeDraftItem]);
+
+  useEffect(() => {
+    healthRef.current = health;
+  }, [health]);
+
+  useEffect(() => {
+    if (
+      !selectedAppId ||
+      steamPatches.length === 0 ||
+      steamPatches.some((patch) => patch.appId === selectedAppId)
+    ) {
+      return;
+    }
+
+    steamPatchesRef.current = [];
+    setSteamPatches([]);
+    setSelectedSteamPatchKey(null);
+    setSteamPatchFeedUrl(null);
+    setSteamDbBackfillStatus('idle');
+  }, [selectedAppId, steamPatches]);
 
   useEffect(() => {
     steamPatchesRef.current = steamPatches;
@@ -2449,6 +2710,40 @@ function App() {
     patchLoading,
     selectedAppId,
     steamPatches.length,
+    step,
+  ]);
+
+  useEffect(() => {
+    if (
+      step !== 'steam' ||
+      patchLoading ||
+      !selectedAppId ||
+      steamPatches.some((patch) => patch.appId === selectedAppId)
+    ) {
+      return;
+    }
+
+    const warmKey = [
+      activeDraftItem?.item.id ?? sourceUrl ?? 'detected-source',
+      selectedAppId,
+    ].join(':');
+    if (steamPatchWarmKeysRef.current.has(warmKey)) {
+      return;
+    }
+
+    steamPatchWarmKeysRef.current.add(warmKey);
+    void loadSteamPatchHistory(selectedAppId, {
+      goToPatch: false,
+      trackedItemId: activeDraftItem?.item.id ?? null,
+    });
+    // This intentionally starts a one-shot warm load for the selected Steam app.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    activeDraftItem?.item.id,
+    patchLoading,
+    selectedAppId,
+    sourceUrl,
+    steamPatches,
     step,
   ]);
 
@@ -2926,6 +3221,9 @@ function App() {
 
     setBusy(true);
     setMessage(null);
+    const preloadedSteamPatches = steamPatchesRef.current.filter(
+      (patch) => patch.appId === selectedSteamCandidate.appId,
+    );
     try {
       const response = await chrome.runtime.sendMessage(
         buildCreateMatchedDraftMessage({
@@ -2933,6 +3231,8 @@ function App() {
           selectedAppId,
           selectedSteamCandidate,
           sourceUrl,
+          steamPatchEntries:
+            preloadedSteamPatches.length > 0 ? preloadedSteamPatches : null,
           tabId: tabId ? Number(tabId) : null,
         }),
       );
@@ -2961,10 +3261,21 @@ function App() {
       setStep('game');
       setMessage(null);
       void refreshSourceMatches(updated.item.id);
-      void loadSteamPatchHistory(selectedSteamCandidate.appId, {
-        goToPatch: false,
-        trackedItemId: updated.item.id,
-      });
+      if (preloadedSteamPatches.length > 0) {
+        void syncTrackedSteamPatches(
+          updated.item.id,
+          selectedSteamCandidate.appId,
+          preloadedSteamPatches,
+        );
+        if (!hasSteamDbBuildTableRows(preloadedSteamPatches)) {
+          void startSteamDbBackfill(selectedSteamCandidate.appId, updated.item.id);
+        }
+      } else {
+        void loadSteamPatchHistory(selectedSteamCandidate.appId, {
+          goToPatch: false,
+          trackedItemId: updated.item.id,
+        });
+      }
     } finally {
       setBusy(false);
     }
@@ -3554,6 +3865,7 @@ function App() {
       setBusy(true);
       setMessage(null);
     }
+    const requestId = ++steamPatchHistoryRequestIdRef.current;
     const trackedItemId =
       options.trackedItemId ?? activeDraftItem?.item.id ?? null;
     setPatchLoading(true);
@@ -3569,6 +3881,9 @@ function App() {
         trackedItemId,
         appId,
       );
+      if (steamPatchHistoryRequestIdRef.current !== requestId) {
+        return;
+      }
       if (persistedPatches.length > 0) {
         const mergedPatches = mergeSteamPatches([], persistedPatches);
         const likelyPatch = getLikelyPatchForSelectedSource(
@@ -3576,11 +3891,15 @@ function App() {
           selectedSourceView,
           mergedPatches,
         );
+        const hasBuildRows = hasSteamDbBuildTableRows(mergedPatches);
 
         steamPatchesRef.current = mergedPatches;
         setSteamPatches(mergedPatches);
         setSelectedSteamPatchKey(likelyPatch?.key ?? null);
-        setSteamDbBackfillStatus('loaded');
+        setSteamDbBackfillStatus(hasBuildRows ? 'loaded' : 'loading');
+        if (!hasBuildRows) {
+          void startSteamDbBackfill(appId, trackedItemId);
+        }
         return;
       }
 
@@ -3595,6 +3914,9 @@ function App() {
         appId,
         type: 'gamevault:resolve-steam-patches',
       });
+      if (steamPatchHistoryRequestIdRef.current !== requestId) {
+        return;
+      }
       if (!response.ok || !Array.isArray(response.payload)) {
         if (options.goToPatch) {
           setMessage(
@@ -3635,7 +3957,10 @@ function App() {
         setMessage(response.errorMessage);
       }
     } catch (error) {
-      if (options.goToPatch) {
+      if (
+        options.goToPatch &&
+        steamPatchHistoryRequestIdRef.current === requestId
+      ) {
         setMessage(
           error instanceof Error
             ? error.message
@@ -3643,10 +3968,15 @@ function App() {
         );
       }
     } finally {
-      if (options.goToPatch) {
+      if (
+        options.goToPatch &&
+        steamPatchHistoryRequestIdRef.current === requestId
+      ) {
         setBusy(false);
       }
-      setPatchLoading(false);
+      if (steamPatchHistoryRequestIdRef.current === requestId) {
+        setPatchLoading(false);
+      }
     }
   }
 
@@ -3833,6 +4163,9 @@ function App() {
     const isConfirmingDownloadReady =
       libraryAction?.kind === 'confirmDownloadReady' &&
       libraryAction.trackedItemId === item.item.id;
+    const isDownloadingOnlineFix =
+      libraryAction?.kind === 'onlineFix' &&
+      libraryAction.trackedItemId === item.item.id;
     return (
       <details className="item-action-menu">
         <summary aria-label={`Actions for ${item.item.title}`}>
@@ -3907,6 +4240,22 @@ function App() {
               <span>Retry Download</span>
             </button>
           ) : null}
+          {canDownloadOnlineFix(item) ? (
+            <button
+              aria-busy={isDownloadingOnlineFix}
+              disabled={busy}
+              onClick={() => void queueOnlineFixDownload(item)}
+              role="menuitem"
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faGlobe} />
+              <span>
+                {isDownloadingOnlineFix
+                  ? 'Downloading Online Fix...'
+                  : 'Download Online Fix'}
+              </span>
+            </button>
+          ) : null}
           {canMarkDownloadFailed(item) ? (
             <button
               className="is-danger"
@@ -3976,6 +4325,22 @@ function App() {
     );
   }
 
+  function renderOnlineFixBadge(item: TrackedItemView) {
+    if (!hasVisibleOnlineFixState(item)) {
+      return null;
+    }
+    const tone = getOnlineFixBadgeTone(item);
+    return (
+      <span
+        className={`online-fix-badge is-${tone}`}
+        title={formatOnlineFixDetails(item)}
+      >
+        <FontAwesomeIcon aria-hidden="true" icon={faGlobe} />
+        <span>{getOnlineFixBadgeLabel(item)}</span>
+      </span>
+    );
+  }
+
   function renderLibraryDetailGrid(
     item: TrackedItemView,
     variant: 'list' | 'modal',
@@ -3999,6 +4364,14 @@ function App() {
           <strong>Source</strong>
           <span>{formatSourceKind(item.item.sourceKind)}</span>
         </div>
+        {hasVisibleOnlineFixState(item) ? (
+          <div>
+            <strong>Online Fix</strong>
+            <span>{getOnlineFixBadgeLabel(item)}</span>
+            <span>{formatOnlineFixDetails(item)}</span>
+            <span>{item.onlineFix?.folderPath ?? 'Folder not created'}</span>
+          </div>
+        ) : null}
         <div>
           <strong>Installed Patch</strong>
           <span>{sourcePatchTitle}</span>
@@ -4063,7 +4436,7 @@ function App() {
               <span
                 className={`status-chip ${getLifecycleStatus(detailsItem)}`}
               >
-                {formatLabel(getLifecycleStatus(detailsItem))}
+                {formatLibraryBadgeLabel(getLifecycleStatus(detailsItem))}
               </span>
               <h2 id="details-modal-title">{detailsItem.item.title}</h2>
               <p>
@@ -4131,13 +4504,14 @@ function App() {
               <div>
                 <div className="chip-row library-row__chips">
                   <span className={`status-chip ${lifecycleStatus}`}>
-                    {formatLabel(lifecycleStatus)}
+                    {formatLibraryBadgeLabel(lifecycleStatus)}
                   </span>
                   {showTrackingStatus ? (
                     <span className={`status-chip ${trackingStatus}`}>
-                      {formatLabel(trackingStatus)}
+                      {formatLibraryBadgeLabel(trackingStatus)}
                     </span>
                   ) : null}
+                  {renderOnlineFixBadge(item)}
                 </div>
                 <strong>{item.item.title}</strong>
                 <div className="candidate-meta">
@@ -4193,13 +4567,14 @@ function App() {
           {renderLibraryArtwork(item, 'library-card__cover')}
           <div className="library-card__badges">
             <span className={`status-chip ${lifecycleStatus}`}>
-              {formatLabel(lifecycleStatus)}
+              {formatLibraryBadgeLabel(lifecycleStatus)}
             </span>
             {showTrackingStatus ? (
               <span className={`status-chip ${trackingStatus}`}>
-                {formatLabel(trackingStatus)}
+                {formatLibraryBadgeLabel(trackingStatus)}
               </span>
             ) : null}
+            {renderOnlineFixBadge(item)}
           </div>
         </div>
         <div className="library-card__top">
@@ -4596,6 +4971,12 @@ function App() {
                             activeDraftItem,
                           );
                           const sourceLabel = formatSourceKind(sourceKind);
+                          const onlineFixLabel =
+                            formatSourceOnlineFixLabel(source);
+                          const onlineFixNotice = sourceOnlineFixWarning(
+                            activeDraftItem,
+                            source,
+                          );
                           return (
                             <div
                               className={`source-row ${isSelected ? 'is-selected' : ''}`}
@@ -4658,6 +5039,15 @@ function App() {
                                     {unavailableLabel}
                                   </span>
                                 ) : null}
+                                {onlineFixLabel ? (
+                                  <span className="mini-chip online-fix-mini-chip">
+                                    <FontAwesomeIcon
+                                      aria-hidden="true"
+                                      icon={faGlobe}
+                                    />
+                                    {onlineFixLabel}
+                                  </span>
+                                ) : null}
                               </div>
                               <button
                                 aria-label={`Refresh ${sourceLabel}`}
@@ -4683,6 +5073,11 @@ function App() {
                               {source.match.lastError ? (
                                 <p className="source-row__error">
                                   {source.match.lastError}
+                                </p>
+                              ) : null}
+                              {onlineFixNotice ? (
+                                <p className="source-row__notice">
+                                  {onlineFixNotice}
                                 </p>
                               ) : null}
                             </div>
@@ -4880,6 +5275,7 @@ function App() {
                               onClick={() => {
                                 setSelectedAppId(candidate.appId);
                                 steamPatchesRef.current = [];
+                                steamPatchHistoryRequestIdRef.current += 1;
                                 steamDbBackfillRequestIdRef.current += 1;
                                 setSteamPatches([]);
                                 setSelectedSteamPatchKey(null);
@@ -4947,7 +5343,18 @@ function App() {
                           <span>Loading older SteamDB builds...</span>
                         </div>
                       ) : null}
-                      {!patchLoading && steamPatches.length === 0 ? (
+                      {!patchLoading &&
+                      steamPatches.length === 0 &&
+                      steamDbBackfillStatus === 'failed' ? (
+                        <p className="muted-text">
+                          SteamDB did not return patch rows yet. Open SteamDB to
+                          finish the build-table check.
+                        </p>
+                      ) : null}
+                      {!patchLoading &&
+                      steamPatches.length === 0 &&
+                      steamDbBackfillStatus !== 'loading' &&
+                      steamDbBackfillStatus !== 'failed' ? (
                         <p className="muted-text">
                           No SteamDB patches were returned for the selected app.
                         </p>
@@ -5145,6 +5552,7 @@ function App() {
                     >
                       <option value="name">Name</option>
                       <option value="status">Status</option>
+                      <option value="onlineFix">Online Fix</option>
                       <option value="patchesBehind">Patches behind</option>
                       <option value="recentlyAdded">Recently added</option>
                       <option value="recentlyUpdated">Recently updated</option>

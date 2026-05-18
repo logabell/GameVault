@@ -298,6 +298,17 @@ select option {
   border-color: color-mix(in srgb, var(--warning) 70%, var(--border));
 }
 
+.navbar-playnite-alert {
+  max-width: 220px;
+}
+
+.navbar-playnite-alert span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .utility-icon-button,
 .theme-switch__button,
 .view-toggle button,
@@ -967,6 +978,7 @@ code {
   z-index: 1;
   top: 10px;
   left: 10px;
+  right: 10px;
 }
 
 .game-card__body,
@@ -1115,6 +1127,26 @@ code {
   margin-bottom: 7px;
 }
 
+.game-chip-row {
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+
+.game-chip-row .status-chip,
+.game-chip-row .tracking-chip,
+.game-chip-row .online-fix-badge {
+  box-sizing: border-box;
+  flex: 0 0 82px;
+  width: 82px;
+  min-width: 82px;
+  max-width: 82px;
+  justify-content: center;
+  overflow: hidden;
+  text-align: center;
+  line-height: 1.08;
+  white-space: nowrap;
+}
+
 .game-card.is-refreshing,
 .game-row.is-refreshing {
   border-color: color-mix(in srgb, var(--accent) 34%, var(--border));
@@ -1188,9 +1220,11 @@ code {
 }
 
 .status-chip,
-.tracking-chip {
+.tracking-chip,
+.online-fix-badge {
   display: inline-flex;
   align-items: center;
+  gap: 4px;
   width: fit-content;
   min-height: 18px;
   padding: 3px 6px;
@@ -1205,7 +1239,8 @@ code {
 }
 
 .status-chip.installed,
-.tracking-chip.up_to_date {
+.tracking-chip.up_to_date,
+.online-fix-badge.is-green {
   color: color-mix(in srgb, var(--success) 72%, var(--ink));
   border-color: color-mix(in srgb, var(--success) 26%, var(--border));
   background: color-mix(in srgb, var(--success) 12%, var(--panel-soft));
@@ -1213,10 +1248,17 @@ code {
 
 .status-chip.failed,
 .status-chip.folder_missing,
-.tracking-chip.needs_attention {
+.tracking-chip.needs_attention,
+.online-fix-badge.is-red {
   color: color-mix(in srgb, var(--danger) 72%, var(--ink));
   border-color: color-mix(in srgb, var(--danger) 30%, var(--border));
   background: color-mix(in srgb, var(--danger) 12%, var(--panel-soft));
+}
+
+.online-fix-badge.is-neutral {
+  color: var(--muted-strong);
+  border-color: color-mix(in srgb, var(--muted) 28%, var(--border));
+  background: color-mix(in srgb, var(--muted) 10%, var(--panel-soft));
 }
 
 .status-chip.queued,
@@ -1902,6 +1944,11 @@ code {
   box-shadow: 0 0 0 5px color-mix(in srgb, var(--warning) 18%, transparent);
 }
 
+.health-dot.gray {
+  background: var(--muted);
+  box-shadow: 0 0 0 5px color-mix(in srgb, var(--muted) 14%, transparent);
+}
+
 .settings-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
@@ -2378,6 +2425,17 @@ code {
 
 .integration-detection-note {
   margin-left: 52px !important;
+}
+
+.integration-detection-note--warning {
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--warning) 36%, var(--border));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--warning) 10%, var(--panel-soft));
+  color: color-mix(in srgb, var(--warning) 78%, var(--ink));
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.35;
 }
 
 .integration-status-card {
@@ -3903,6 +3961,24 @@ code {
 .source-lag-chip.not_matched,
 .source-lag-chip.unknown {
   color: var(--muted);
+}
+
+.source-online-fix-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  width: fit-content;
+  min-height: 24px;
+  padding: 0 9px;
+  border: 1px solid color-mix(in srgb, var(--success) 34%, var(--border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--success) 12%, var(--panel-soft));
+  color: color-mix(in srgb, var(--success) 76%, var(--ink));
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
 }
 
 .source-tag-row {

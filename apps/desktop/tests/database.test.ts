@@ -245,11 +245,20 @@ describe('GameVaultDatabase cleanup metadata', () => {
         trackedItemId: item.id,
         updatedAt: '2026-04-19T12:00:00.000Z',
       });
+      database.upsertOnlineFixRecord(item.id, {
+        downloadUrl: 'https://ankergames.net/generate-download-url/online-fix',
+        mode: 'separate',
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.net/game/mouse-p-i-for-hire',
+        status: 'available_missing',
+        updatedAt: '2026-04-19T12:00:00.000Z',
+      });
 
       database.deleteTrackedItemCascade(item.id);
 
       expect(database.findTrackedItemById(item.id)).toBeNull();
       expect(database.getSteamFeedCheck(item.id)).toBeNull();
+      expect(database.getOnlineFixRecord(item.id)).toBeNull();
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
@@ -293,6 +302,18 @@ describe('GameVaultDatabase cleanup metadata', () => {
       database.upsertSourceSnapshot({
         checkedAt: '2026-04-21T13:00:00.000Z',
         fingerprint: 'anker-fingerprint',
+        onlineFix: {
+          detected: true,
+          detectedAt: '2026-04-21T13:00:00.000Z',
+          downloadUrls: [
+            {
+              label: 'Online Fix',
+              url: 'https://ankergames.net/generate-download-url/online-fix',
+            },
+          ],
+          evidence: ['Online Fix download action'],
+          mode: 'separate',
+        },
         observedBuildId: '22862861',
         observedVersion: 'V 1.0.5',
         sourceKind: 'ankergames',
@@ -322,6 +343,18 @@ describe('GameVaultDatabase cleanup metadata', () => {
         }),
       ]);
       expect(database.listSourceSnapshots(item.id)).toHaveLength(2);
+      expect(database.getSourceSnapshot(item.id, 'ankergames')).toMatchObject({
+        onlineFix: {
+          detected: true,
+          downloadUrls: [
+            {
+              label: 'Online Fix',
+              url: 'https://ankergames.net/generate-download-url/online-fix',
+            },
+          ],
+          mode: 'separate',
+        },
+      });
       expect(database.listDownloadMirrors(item.id, 'steamrip')).toEqual([
         expect.objectContaining({
           sourceKind: 'steamrip',
@@ -493,6 +526,13 @@ describe('GameVaultDatabase cleanup metadata', () => {
           version: 'V 5.0.2.2026.04.03',
         },
         normalizedTitle: 'barony',
+        onlineFix: {
+          detected: true,
+          detectedAt: '2026-04-22T12:00:00.000Z',
+          downloadUrls: [],
+          evidence: ['+ Co-Op'],
+          mode: 'included',
+        },
         patchDownloadUrls: [],
         sourceKind: 'ankergames',
         sourceUrl: 'https://ankergames.net/game/barony',
@@ -511,6 +551,11 @@ describe('GameVaultDatabase cleanup metadata', () => {
       });
       expect(reopened.getSourceSnapshot(item.id, 'ankergames')).toMatchObject({
         fingerprint: 'raw-anker',
+        onlineFix: {
+          detected: true,
+          evidence: ['+ Co-Op'],
+          mode: 'included',
+        },
         observedBuildId: '22630456',
         observedPatchDate: null,
         observedPatchLink: null,

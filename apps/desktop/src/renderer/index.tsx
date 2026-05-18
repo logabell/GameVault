@@ -33,6 +33,7 @@ import {
   faFolderOpen,
   faGamepad,
   faGear,
+  faGlobe,
   faHeart,
   faList,
   faLink,
@@ -180,6 +181,7 @@ type SortDirection = 'asc' | 'desc';
 type ResolvedTheme = 'light' | 'dark';
 type ImportInstalledSourceKind = SourceKind;
 type SettingsSaveStatus = 'idle' | 'saving' | 'saved';
+type DuoStreamSyncPhase = 'idle' | 'syncing' | 'success' | 'error';
 type ItemBusyAction =
   | 'cancelDownload'
   | 'clearMirrorFailed'
@@ -187,6 +189,7 @@ type ItemBusyAction =
   | 'confirmDownloadReady'
   | 'deleteFiles'
   | 'markFailed'
+  | 'onlineFix'
   | 'refresh'
   | 'remove'
   | 'retry'
@@ -320,6 +323,10 @@ const IMPORTED_SOURCE_EDIT_OPTIONS: Array<{
   { label: 'AnkerGames', value: 'ankergames' },
 ];
 const DEFAULT_SETTINGS_DRAFT = {
+  duoStreamCreateFolderLaunchers: true,
+  duoStreamCreateSteamAppIdFiles: true,
+  duoStreamIntegrationEnabled: false,
+  duoStreamUsePlayniteLauncher: true,
   jDownloaderEnabled: false,
   jDownloaderSourcePreferences: {
     elamigos: true,
@@ -431,10 +438,18 @@ declare global {
         sourceKind: SupportedSourceKind;
         trackedItemId: string;
       }): Promise<TrackedItemView>;
+      queueOnlineFixDownload(payload: {
+        sourceKind?: SupportedSourceKind | null;
+        trackedItemId: string;
+      }): Promise<TrackedItemView>;
       registerExtensionNativeHost(
         payload: RegisterExtensionNativeHostPayload,
       ): Promise<NativeHostRegistrationResult>;
       saveSettings(payload: {
+        duoStreamCreateFolderLaunchers?: boolean;
+        duoStreamCreateSteamAppIdFiles?: boolean;
+        duoStreamIntegrationEnabled?: boolean;
+        duoStreamUsePlayniteLauncher?: boolean;
         jDownloaderEnabled?: boolean;
         jDownloaderSourcePreferences?: SettingsView['jDownloaderSourcePreferences'];
         libraryRoots?: LibraryRootRecord[];
@@ -466,6 +481,10 @@ declare global {
         manifestPath?: string | null;
       }): Promise<PlayniteIntegrationStatus>;
       refreshPlayniteIntegration(payload?: {
+        extensionsPath?: string | null;
+        manifestPath?: string | null;
+      }): Promise<PlayniteIntegrationStatus>;
+      refreshDuoStreamIntegration(payload?: {
         extensionsPath?: string | null;
         manifestPath?: string | null;
       }): Promise<PlayniteIntegrationStatus>;
@@ -952,6 +971,10 @@ function hasConfiguredMyJDownloader(settings: SettingsView): boolean {
 }
 
 function createSettingsDraftFromSettings(loadedSettings: SettingsView): {
+  duoStreamCreateFolderLaunchers: boolean;
+  duoStreamCreateSteamAppIdFiles: boolean;
+  duoStreamIntegrationEnabled: boolean;
+  duoStreamUsePlayniteLauncher: boolean;
   jDownloaderEnabled: boolean;
   jDownloaderSourcePreferences: NonNullable<
     SettingsView['jDownloaderSourcePreferences']
@@ -965,6 +988,14 @@ function createSettingsDraftFromSettings(loadedSettings: SettingsView): {
 } {
   const playniteExtensionsPath = loadedSettings.playniteExtensionsPath ?? '';
   return {
+    duoStreamCreateFolderLaunchers:
+      loadedSettings.duoStreamCreateFolderLaunchers ?? true,
+    duoStreamCreateSteamAppIdFiles:
+      loadedSettings.duoStreamCreateSteamAppIdFiles ?? true,
+    duoStreamIntegrationEnabled:
+      loadedSettings.duoStreamIntegrationEnabled ?? false,
+    duoStreamUsePlayniteLauncher:
+      loadedSettings.duoStreamUsePlayniteLauncher ?? true,
     jDownloaderEnabled:
       loadedSettings.jDownloaderEnabled ??
       hasConfiguredMyJDownloader(loadedSettings),
@@ -992,6 +1023,40 @@ function createSettingsDraftFromSettings(loadedSettings: SettingsView): {
         Number(DEFAULT_SETTINGS_DRAFT.sourceWatchIntervalHours),
     ),
   };
+}
+
+function duoStreamSettingsChanged(
+  draft: typeof DEFAULT_SETTINGS_DRAFT,
+  loadedSettings: SettingsView,
+): boolean {
+  return (
+    draft.duoStreamIntegrationEnabled !==
+      (loadedSettings.duoStreamIntegrationEnabled ?? false) ||
+    draft.duoStreamCreateSteamAppIdFiles !==
+      (loadedSettings.duoStreamCreateSteamAppIdFiles ?? true) ||
+    draft.duoStreamCreateFolderLaunchers !==
+      (loadedSettings.duoStreamCreateFolderLaunchers ?? true) ||
+    draft.duoStreamUsePlayniteLauncher !==
+      (loadedSettings.duoStreamUsePlayniteLauncher ?? true)
+  );
+}
+
+function playniteManifestSettingsChanged(
+  draft: typeof DEFAULT_SETTINGS_DRAFT,
+  loadedSettings: SettingsView,
+): boolean {
+  return (
+    draft.playniteIntegrationEnabled !==
+      (loadedSettings.playniteIntegrationEnabled ?? false) ||
+    draft.playniteExtensionsPath !==
+      (loadedSettings.playniteExtensionsPath ?? '') ||
+    draft.playniteManifestPath !==
+      syncPlayniteManifestDraft(
+        loadedSettings.playniteExtensionsPath ?? '',
+        loadedSettings.playniteManifestPath ?? '',
+      ) ||
+    duoStreamSettingsChanged(draft, loadedSettings)
+  );
 }
 
 function buildSteamDbPatchnotesUrl(appId: number): string {
@@ -1655,6 +1720,17 @@ function formatTrackedSourceKind(value: string | null | undefined): string {
   return formatLabel(value);
 }
 
+function formatLibraryBadgeLabel(value: string): string {
+  if (value === 'watching_source') return 'Watching';
+  if (value === 'update_available') return 'Update';
+  if (value === 'source_behind_upstream') return 'Behind';
+  if (value === 'watch_window_expired') return 'Expired';
+  if (value === 'needs_match') return 'Match';
+  if (value === 'needs_attention') return 'Attention';
+  if (value === 'folder_missing') return 'Missing';
+  return formatLabel(value);
+}
+
 function getInstalledSourceKind(item: TrackedItemView): SourceKind | null {
   return (
     item.installRecord?.installedSourceKind ??
@@ -1911,6 +1987,127 @@ function getSourceOfferTags(
   }
 
   return tags;
+}
+
+function getOnlineFixSourceEvidence(item: TrackedItemView) {
+  if (item.sourceSnapshot?.onlineFix?.detected) {
+    return {
+      onlineFix: item.sourceSnapshot.onlineFix,
+      sourceKind: item.sourceSnapshot.sourceKind,
+      sourceUrl: item.sourceSnapshot.sourceUrl,
+    };
+  }
+  const matchedSource = item.sourceMatches?.find(
+    (source) => source.onlineFix?.detected,
+  );
+  return matchedSource?.onlineFix
+    ? {
+        onlineFix: matchedSource.onlineFix,
+        sourceKind: matchedSource.match.sourceKind,
+        sourceUrl: matchedSource.match.sourceUrl,
+      }
+    : null;
+}
+
+function hasVisibleOnlineFixState(item: TrackedItemView): boolean {
+  return Boolean(
+    (item.onlineFix && item.onlineFix.status !== 'none') ||
+      getOnlineFixSourceEvidence(item),
+  );
+}
+
+function isDiscoveredLibraryItem(item: TrackedItemView): boolean {
+  return item.status === 'discovered';
+}
+
+function getOnlineFixBadgeTone(item: TrackedItemView): 'green' | 'red' | 'neutral' {
+  if (isDiscoveredLibraryItem(item)) {
+    return 'neutral';
+  }
+  if (item.onlineFix && item.onlineFix.status !== 'none') {
+    return item.onlineFix.iconColor ?? 'red';
+  }
+  return 'neutral';
+}
+
+function canDownloadOnlineFix(item: TrackedItemView): boolean {
+  return Boolean(
+    !isDiscoveredLibraryItem(item) &&
+      item.fileState.finalPath &&
+    item.onlineFix &&
+      item.onlineFix.mode === 'separate' &&
+      item.onlineFix.sourceKind === 'ankergames' &&
+      (item.onlineFix.status === 'available_missing' ||
+        item.onlineFix.status === 'failed'),
+  );
+}
+
+function getOnlineFixBadgeLabel(item: TrackedItemView): string {
+  const state = item.onlineFix;
+  if (!state || state.status === 'none') {
+    return 'Online';
+  }
+  return 'Online';
+}
+
+function formatOnlineFixDetails(item: TrackedItemView): string {
+  const state = item.onlineFix;
+  if (state && state.status !== 'none') {
+    const source = formatTrackedSourceKind(state.sourceKind ?? null);
+    const mode = state.mode === 'included' ? 'included' : 'separate';
+    if (state.status === 'enabled') {
+      return `${source} ${mode}`;
+    }
+    if (state.status === 'downloading') {
+      return `${source} download in progress`;
+    }
+    if (state.status === 'failed') {
+      return state.lastError ?? `${source} download failed`;
+    }
+    return `${source} separate fix available`;
+  }
+
+  const sourceEvidence = getOnlineFixSourceEvidence(item);
+  if (!sourceEvidence) {
+    return 'No source evidence';
+  }
+  const source = formatTrackedSourceKind(sourceEvidence.sourceKind);
+  const mode =
+    sourceEvidence.onlineFix.mode === 'included' ? 'included' : 'separate';
+  return `${source} ${mode}`;
+}
+
+function formatSourceOnlineFixLabel(
+  source?: TrackedItemView['sourceMatches'][number],
+): string | null {
+  if (!source?.onlineFix?.detected) {
+    return null;
+  }
+  return source.onlineFix.mode === 'included'
+    ? 'Online Fix included'
+    : 'Online Fix separate';
+}
+
+function sourceOnlineFixWarning(
+  item: TrackedItemView,
+  source?: TrackedItemView['sourceMatches'][number],
+): string | null {
+  if (!item.onlineFix || item.onlineFix.status === 'none') {
+    return null;
+  }
+  if (!source?.onlineFix?.detected) {
+    if (item.onlineFix.status === 'enabled') {
+      return 'This source would lose Online Fix support.';
+    }
+    return null;
+  }
+  if (item.onlineFix.status === 'enabled' && source.onlineFix.mode === 'separate') {
+    return 'This source keeps Online Fix support as a separate download.';
+  }
+  if (item.onlineFix.status !== 'enabled' && source.onlineFix.mode === 'included') {
+    return 'This source would gain bundled Online Fix support.';
+  }
+  return null;
 }
 
 function isSubduedSourceIssue(
@@ -2191,6 +2388,9 @@ function App() {
     useState<PlayniteIntegrationStatus | null>(null);
   const [playniteBusy, setPlayniteBusy] = useState(false);
   const [playniteMessage, setPlayniteMessage] = useState<string | null>(null);
+  const [duoStreamMessage, setDuoStreamMessage] = useState<string | null>(null);
+  const [duoStreamSyncPhase, setDuoStreamSyncPhase] =
+    useState<DuoStreamSyncPhase>('idle');
   const [playniteReview, setPlayniteReview] = useState<{
     executablePath: string;
     selection: PlayniteExecutableSelectionRecord;
@@ -2405,6 +2605,67 @@ function App() {
     () => getNavbarAutomationStatus(activity),
     [activity],
   );
+  const duoStreamDraftChanged = useMemo(
+    () => duoStreamSettingsChanged(settingsDraft, settings),
+    [settings, settingsDraft],
+  );
+  const playniteManifestDraftChanged = useMemo(
+    () => playniteManifestSettingsChanged(settingsDraft, settings),
+    [settings, settingsDraft],
+  );
+  const playniteManifestNeedsRefresh = Boolean(
+    playniteStatus?.enabled &&
+      playniteStatus.manifestStatus.exists &&
+      !playniteStatus.manifestStatus.current,
+  );
+  const playniteManifestMissing = Boolean(
+    playniteStatus?.enabled && !playniteStatus.manifestStatus.exists,
+  );
+  const playniteSyncNeedsAttention = Boolean(
+    playniteStatus?.enabled &&
+      playniteStatus.syncStatus.pluginSeen &&
+      !playniteStatus.syncStatus.current,
+  );
+  const playniteNavbarNotice = useMemo(() => {
+    if (!playniteStatus?.enabled) return null;
+    if (playniteManifestDraftChanged) {
+      return {
+        detail: 'Save settings to update the Playnite manifest.',
+        label: 'Playnite changes pending',
+      };
+    }
+    if (playniteManifestMissing) {
+      return {
+        detail: 'Rescan games to create the Playnite manifest.',
+        label: 'Manifest missing',
+      };
+    }
+    if (playniteManifestNeedsRefresh) {
+      return {
+        detail: 'Rescan games to apply GameVault launch changes.',
+        label: 'Manifest refresh needed',
+      };
+    }
+    if (playniteSyncNeedsAttention) {
+      return {
+        detail: 'Start or refresh Playnite so it imports the current manifest.',
+        label: 'Playnite sync pending',
+      };
+    }
+    if (playniteStatus.duoStream.enabled && !playniteStatus.duoStream.current) {
+      return {
+        detail: 'Save settings or rescan games to refresh DuoStream launch files.',
+        label: 'DuoStream update needed',
+      };
+    }
+    return null;
+  }, [
+    playniteManifestDraftChanged,
+    playniteManifestMissing,
+    playniteManifestNeedsRefresh,
+    playniteStatus,
+    playniteSyncNeedsAttention,
+  ]);
   const visibleActivityLogs = useMemo(() => {
     const search = activitySearch.trim().toLowerCase();
     return (activity?.logs ?? []).filter((log) => {
@@ -2700,6 +2961,35 @@ function App() {
       );
     } finally {
       setPlayniteBusy(false);
+    }
+  }
+
+  async function refreshDuoStreamIntegration() {
+    setDuoStreamSyncPhase('syncing');
+    setDuoStreamMessage('Refreshing DuoStream launch files...');
+    setPlayniteMessage(null);
+    try {
+      const nextStatus =
+        await window.gameVaultApi.refreshDuoStreamIntegration(
+          getPlaynitePathPayloadFromDraft(),
+        );
+      setPlayniteStatus(nextStatus);
+      setDuoStreamSyncPhase('success');
+      setDuoStreamMessage(
+        nextStatus.duoStream.enabled
+          ? `DuoStream launch files updated for ${nextStatus.duoStream.eligibleGames} Online Fix game${nextStatus.duoStream.eligibleGames === 1 ? '' : 's'}.`
+          : 'DuoStream launch handling is disabled.',
+      );
+      if (nextStatus.enabled && !nextStatus.manifestStatus.current) {
+        setPlayniteMessage('Playnite manifest still needs a rescan.');
+      }
+    } catch (error) {
+      setDuoStreamSyncPhase('error');
+      setDuoStreamMessage(
+        error instanceof Error
+          ? error.message
+          : 'Unable to refresh DuoStream launch files.',
+      );
     }
   }
 
@@ -3228,12 +3518,32 @@ function App() {
   async function saveSettingsDraft() {
     setSettingsSaveStatus('saving');
     setPlayniteMessage(null);
+    const applyingDuoStream = duoStreamSettingsChanged(settingsDraft, settings);
+    const applyingPlayniteManifest = playniteManifestSettingsChanged(
+      settingsDraft,
+      settings,
+    );
+    if (applyingDuoStream) {
+      setDuoStreamSyncPhase('syncing');
+      setDuoStreamMessage('Updating DuoStream launch files...');
+    }
+    if (applyingPlayniteManifest && settingsDraft.playniteIntegrationEnabled) {
+      setPlayniteMessage('Updating Playnite manifest...');
+    }
     const playniteManifestPath = syncPlayniteManifestDraft(
       settingsDraft.playniteExtensionsPath,
       settingsDraft.playniteManifestPath,
     );
     try {
       const nextSettings = await window.gameVaultApi.saveSettings({
+        duoStreamCreateFolderLaunchers:
+          settingsDraft.duoStreamCreateFolderLaunchers,
+        duoStreamCreateSteamAppIdFiles:
+          settingsDraft.duoStreamCreateSteamAppIdFiles,
+        duoStreamIntegrationEnabled:
+          settingsDraft.duoStreamIntegrationEnabled,
+        duoStreamUsePlayniteLauncher:
+          settingsDraft.duoStreamUsePlayniteLauncher,
         jDownloaderEnabled: settingsDraft.jDownloaderEnabled,
         jDownloaderSourcePreferences:
           settingsDraft.jDownloaderSourcePreferences,
@@ -3256,6 +3566,15 @@ function App() {
       setSettings(nextSettings);
       await refreshSettings();
       const nextPlayniteStatus = await refreshPlayniteStatus();
+      if (applyingDuoStream) {
+        const duoStatus = nextPlayniteStatus?.duoStream;
+        setDuoStreamSyncPhase('success');
+        setDuoStreamMessage(
+          duoStatus?.enabled
+            ? `DuoStream launch files updated for ${duoStatus.eligibleGames} Online Fix game${duoStatus.eligibleGames === 1 ? '' : 's'}.`
+            : 'DuoStream launch handling disabled.',
+        );
+      }
       if (
         nextSettings.playniteIntegrationEnabled === true &&
         nextPlayniteStatus &&
@@ -3268,6 +3587,14 @@ function App() {
       setSettingsSaveStatus('saved');
     } catch (error) {
       setSettingsSaveStatus('idle');
+      if (applyingDuoStream) {
+        setDuoStreamSyncPhase('error');
+        setDuoStreamMessage(
+          error instanceof Error
+            ? error.message
+            : 'Unable to update DuoStream launch files.',
+        );
+      }
       setPlayniteMessage(
         error instanceof Error ? error.message : 'Unable to save settings.',
       );
@@ -5552,6 +5879,23 @@ function App() {
     );
   }
 
+  function renderOnlineFixBadge(item: TrackedItemView) {
+    if (!hasVisibleOnlineFixState(item)) {
+      return null;
+    }
+    const tone = getOnlineFixBadgeTone(item);
+    const label = getOnlineFixBadgeLabel(item);
+    return (
+      <span
+        className={`online-fix-badge is-${tone}`}
+        title={formatOnlineFixDetails(item)}
+      >
+        <FontAwesomeIcon aria-hidden="true" icon={faGlobe} />
+        <span>{label}</span>
+      </span>
+    );
+  }
+
   function renderLibraryStatusChips(item: TrackedItemView) {
     const trackingStatus = getTrackingStatus(item);
     const showTrackingStatus = shouldShowTrackingStatus(item);
@@ -5559,16 +5903,17 @@ function App() {
     return (
       <div className="chip-row game-chip-row">
         <span className={`status-chip ${item.status}`}>
-          {formatLabel(item.status)}
+          {formatLibraryBadgeLabel(item.status)}
         </span>
         {showNeedsAttention ? (
-          <span className="tracking-chip needs_attention">Needs attention</span>
+          <span className="tracking-chip needs_attention">Attention</span>
         ) : null}
         {showTrackingStatus ? (
           <span className={`tracking-chip ${trackingStatus}`}>
-            {formatLabel(trackingStatus)}
+            {formatLibraryBadgeLabel(trackingStatus)}
           </span>
         ) : null}
+        {renderOnlineFixBadge(item)}
       </div>
     );
   }
@@ -5619,6 +5964,14 @@ function App() {
           <strong>Source</strong>
           <span>{formatTrackedSourceKind(getInstalledSourceKind(item))}</span>
         </div>
+        {hasVisibleOnlineFixState(item) ? (
+          <div>
+            <strong>Online Fix</strong>
+            <span>{getOnlineFixBadgeLabel(item)}</span>
+            <span>{formatOnlineFixDetails(item)}</span>
+            <span>{item.onlineFix?.folderPath ?? 'Folder not created'}</span>
+          </div>
+        ) : null}
         <div>
           <strong>Installed Patch</strong>
           <span>{sourcePatchTitle}</span>
@@ -5835,6 +6188,7 @@ function App() {
     const itemBusy = busyId === item.item.id;
     const itemBusyAction = itemBusy ? busyAction : null;
     const showRetryDownload = canRetryDownload(item);
+    const showOnlineFixDownload = canDownloadOnlineFix(item);
     return (
       <details className="item-action-menu">
         <summary aria-label={`Actions for ${item.item.title}`}>
@@ -5970,6 +6324,34 @@ function App() {
             >
               <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
               <span>Retry Download</span>
+            </button>
+          ) : null}
+          {showOnlineFixDownload ? (
+            <button
+              aria-busy={itemBusyAction === 'onlineFix'}
+              disabled={itemBusy}
+              onClick={(event) =>
+                runItemMenuAction(event, () => {
+                  void runItemAction(
+                    item.item.id,
+                    () =>
+                      window.gameVaultApi.queueOnlineFixDownload({
+                        sourceKind: item.onlineFix?.sourceKind ?? 'ankergames',
+                        trackedItemId: item.item.id,
+                      }),
+                    'onlineFix',
+                  );
+                })
+              }
+              role="menuitem"
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faGlobe} />
+              <span>
+                {itemBusyAction === 'onlineFix'
+                  ? 'Downloading Online Fix...'
+                  : 'Download Online Fix'}
+              </span>
             </button>
           ) : null}
           {canMarkDownloadFailed(item) ? (
@@ -6321,6 +6703,8 @@ function App() {
                 const tags = getSourceOfferTags(item, sourceKind, source);
                 const sourceIssue = match?.lastError;
                 const issueIsSubdued = isSubduedSourceIssue(source);
+                const onlineFixLabel = formatSourceOnlineFixLabel(source);
+                const onlineFixNotice = sourceOnlineFixWarning(item, source);
                 const scanTime =
                   snapshot?.checkedAt ?? match?.lastCheckedAt ?? null;
                 const isRefreshing = sourceBusyKind === sourceKind;
@@ -6340,6 +6724,12 @@ function App() {
                         <span className={`source-lag-chip ${comparison.tone}`}>
                           {comparison.label}
                         </span>
+                        {onlineFixLabel ? (
+                          <span className="source-online-fix-badge">
+                            <FontAwesomeIcon aria-hidden="true" icon={faGlobe} />
+                            <span>{onlineFixLabel}</span>
+                          </span>
+                        ) : null}
                       </div>
                       {tags.length > 0 ? (
                         <div className="source-tag-row">
@@ -6457,6 +6847,9 @@ function App() {
                           ? `Last refresh issue: ${sourceIssue}`
                           : sourceIssue}
                       </p>
+                    ) : null}
+                    {onlineFixNotice ? (
+                      <p className="source-offer-notice">{onlineFixNotice}</p>
                     ) : null}
                   </article>
                 );
@@ -8993,6 +9386,18 @@ function App() {
               <span>{playniteStatus.pendingReviewCount}</span>
             </button>
           ) : null}
+          {playniteNavbarNotice ? (
+            <button
+              aria-label={`${playniteNavbarNotice.label}. ${playniteNavbarNotice.detail}`}
+              className="navbar-review-alert navbar-playnite-alert"
+              onClick={() => setSection('settings')}
+              title={playniteNavbarNotice.detail}
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
+              <span>{playniteNavbarNotice.label}</span>
+            </button>
+          ) : null}
           {renderNavbarHealthMenu()}
           <button
             className={`utility-icon-button ${section === 'imports' ? 'is-active' : ''}`}
@@ -9113,6 +9518,7 @@ function App() {
                     >
                       <option value="name">Name</option>
                       <option value="status">Status</option>
+                      <option value="onlineFix">Online Fix</option>
                       <option value="patchesBehind">Patches behind</option>
                       <option value="recentlyAdded">Recently added</option>
                       <option value="recentlyUpdated">Recently updated</option>
@@ -9853,7 +10259,11 @@ function App() {
                   <div className="integration-status-card">
                     <span
                       className={`health-dot ${
-                        playniteStatus?.pendingReviewCount ? 'yellow' : 'green'
+                        playniteStatus?.pendingReviewCount ||
+                        playniteManifestMissing ||
+                        playniteManifestNeedsRefresh
+                          ? 'yellow'
+                          : 'green'
                       }`}
                     />
                     <FontAwesomeIcon
@@ -9871,9 +10281,13 @@ function App() {
                       >
                         {playniteStatus?.pendingReviewCount
                           ? `${playniteStatus.pendingReviewCount} launch executable review${playniteStatus.pendingReviewCount === 1 ? '' : 's'} pending.`
-                          : playniteStatus?.manifestPath
-                            ? `Manifest: ${playniteStatus.manifestPath}`
-                            : 'Manifest will be generated after export is enabled.'}
+                          : playniteManifestMissing
+                            ? 'Manifest has not been generated yet. Rescan games to create it.'
+                            : playniteManifestNeedsRefresh
+                              ? 'Manifest is older than the current GameVault launch settings.'
+                              : playniteStatus?.manifestPath
+                                ? `Manifest: ${playniteStatus.manifestPath}`
+                                : 'Manifest will be generated after export is enabled.'}
                       </p>
                     </div>
                   </div>
@@ -9925,9 +10339,241 @@ function App() {
                     </button>
                   </div>
                 ) : null}
+                {playniteManifestDraftChanged ? (
+                  <p className="integration-detection-note integration-detection-note--warning">
+                    Save settings to apply launch changes to the Playnite
+                    manifest.
+                  </p>
+                ) : playniteManifestMissing ? (
+                  <p className="integration-detection-note integration-detection-note--warning">
+                    Rescan games to create the Playnite manifest.
+                  </p>
+                ) : playniteManifestNeedsRefresh ? (
+                  <p className="integration-detection-note integration-detection-note--warning">
+                    Rescan games to apply the latest GameVault launch settings
+                    to Playnite.
+                  </p>
+                ) : playniteSyncNeedsAttention ? (
+                  <p className="integration-detection-note integration-detection-note--warning">
+                    Playnite has not imported the latest manifest yet.
+                  </p>
+                ) : null}
                 {playniteMessage ? (
                   <p className="integration-detection-note muted-text">
                     {playniteMessage}
+                  </p>
+                ) : null}
+              </div>
+            </section>
+
+            <section
+              aria-labelledby="settings-duostream-title"
+              className="settings-card settings-card--duostream"
+            >
+              <div className="settings-card__heading">
+                <span
+                  aria-hidden="true"
+                  className="settings-card__icon settings-card__icon--integrations"
+                >
+                  <FontAwesomeIcon icon={faDesktop} />
+                </span>
+                <div>
+                  <h2 id="settings-duostream-title">DuoStream Integration</h2>
+                  <p>
+                    Prepare Online Fix games for Duo session launches from
+                    Playnite or the game folder.
+                  </p>
+                </div>
+              </div>
+              <div className="playnite-settings-panel">
+                <label className="settings-toggle-field download-behavior-global">
+                  <span className="settings-label-with-help">
+                    Enable DuoStream launch handling
+                    <span
+                      aria-label="Applies Duo Steam launch context only to Online Fix games"
+                      className="settings-help-icon"
+                      role="img"
+                      title="Applies Duo Steam launch context only to Online Fix games"
+                    >
+                      <FontAwesomeIcon
+                        aria-hidden="true"
+                        icon={faCircleQuestion}
+                      />
+                    </span>
+                  </span>
+                  <input
+                    checked={settingsDraft.duoStreamIntegrationEnabled}
+                    className="settings-toggle-input"
+                    onChange={(event) => {
+                      const duoStreamIntegrationEnabled =
+                        event.currentTarget.checked;
+                      setSettingsDraft((current) => ({
+                        ...current,
+                        duoStreamIntegrationEnabled,
+                      }));
+                      setSettingsSaveStatus('idle');
+                    }}
+                    type="checkbox"
+                  />
+                  <span aria-hidden="true" className="settings-toggle-track" />
+                  <small>
+                    GameVault uses the tracked Steam AppID and selected launch
+                    executable for eligible Online Fix games.
+                  </small>
+                </label>
+                <div className="download-source-grid">
+                  <label className="settings-toggle-field download-source-row download-source-row--toggle">
+                    <div>
+                      <strong>Create steam_appid.txt</strong>
+                      <span>Write the tracked Steam AppID into the game folder</span>
+                    </div>
+                    <input
+                      checked={settingsDraft.duoStreamCreateSteamAppIdFiles}
+                      className="settings-toggle-input"
+                      disabled={!settingsDraft.duoStreamIntegrationEnabled}
+                      onChange={(event) => {
+                        const duoStreamCreateSteamAppIdFiles =
+                          event.currentTarget.checked;
+                        setSettingsDraft((current) => ({
+                          ...current,
+                          duoStreamCreateSteamAppIdFiles,
+                        }));
+                        setSettingsSaveStatus('idle');
+                      }}
+                      type="checkbox"
+                    />
+                    <span aria-hidden="true" className="settings-toggle-track" />
+                  </label>
+                  <label className="settings-toggle-field download-source-row download-source-row--toggle">
+                    <div>
+                      <strong>Create folder launchers</strong>
+                      <span>Add silent GameVault Duo launcher beside the game</span>
+                    </div>
+                    <input
+                      checked={settingsDraft.duoStreamCreateFolderLaunchers}
+                      className="settings-toggle-input"
+                      disabled={!settingsDraft.duoStreamIntegrationEnabled}
+                      onChange={(event) => {
+                        const duoStreamCreateFolderLaunchers =
+                          event.currentTarget.checked;
+                        setSettingsDraft((current) => ({
+                          ...current,
+                          duoStreamCreateFolderLaunchers,
+                        }));
+                        setSettingsSaveStatus('idle');
+                      }}
+                      type="checkbox"
+                    />
+                    <span aria-hidden="true" className="settings-toggle-track" />
+                  </label>
+                  <label className="settings-toggle-field download-source-row download-source-row--toggle">
+                    <div>
+                      <strong>Use Duo launcher in Playnite</strong>
+                      <span>Make Online Fix Playnite actions use the wrapper</span>
+                    </div>
+                    <input
+                      checked={settingsDraft.duoStreamUsePlayniteLauncher}
+                      className="settings-toggle-input"
+                      disabled={!settingsDraft.duoStreamIntegrationEnabled}
+                      onChange={(event) => {
+                        const duoStreamUsePlayniteLauncher =
+                          event.currentTarget.checked;
+                        setSettingsDraft((current) => ({
+                          ...current,
+                          duoStreamUsePlayniteLauncher,
+                        }));
+                        setSettingsSaveStatus('idle');
+                      }}
+                      type="checkbox"
+                    />
+                    <span aria-hidden="true" className="settings-toggle-track" />
+                  </label>
+                </div>
+                <div className="integration-status-grid">
+                  <div className="integration-status-card">
+                    <span
+                      className={`health-dot ${
+                        duoStreamSyncPhase === 'error' ||
+                        playniteStatus?.duoStream.lastError
+                          ? 'red'
+                          : duoStreamDraftChanged ||
+                              duoStreamSyncPhase === 'syncing' ||
+                              (playniteStatus?.duoStream.enabled &&
+                                !playniteStatus.duoStream.current)
+                            ? 'yellow'
+                            : playniteStatus?.duoStream.enabled
+                              ? 'green'
+                              : 'gray'
+                      }`}
+                    />
+                    <FontAwesomeIcon
+                      aria-hidden="true"
+                      className="integration-status-card__icon"
+                      icon={faDesktop}
+                    />
+                    <div>
+                      <strong>
+                        {duoStreamSyncPhase === 'syncing'
+                          ? 'Updating DuoStream launch files'
+                          : duoStreamDraftChanged
+                            ? 'DuoStream changes pending'
+                            : playniteStatus?.duoStream.enabled &&
+                                !playniteStatus.duoStream.current
+                              ? 'DuoStream update needed'
+                            : playniteStatus?.duoStream.enabled
+                              ? 'DuoStream launch handling ready'
+                              : 'DuoStream launch handling disabled'}
+                      </strong>
+                      <p className="muted-text">
+                        {duoStreamDraftChanged
+                          ? 'Save settings to refresh folder launchers and the Playnite manifest.'
+                          : playniteStatus?.duoStream.enabled &&
+                              !playniteStatus.duoStream.current
+                            ? 'Launch files have not been generated for the current Online Fix games. Refresh DuoStream to create steam_appid.txt and silent folder launchers.'
+                          : duoStreamMessage ??
+                            (playniteStatus?.duoStream.enabled
+                              ? `${playniteStatus.duoStream.eligibleGames} Online Fix game${playniteStatus.duoStream.eligibleGames === 1 ? '' : 's'} eligible; last updated ${formatRelativeTime(playniteStatus.duoStream.lastSyncedAt)}.`
+                              : 'Online Fix games keep their standard launch behavior.')}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+                {duoStreamDraftChanged ? (
+                  <div className="action-row integration-quick-actions">
+                    <button
+                      className="primary-button settings-icon-text-button"
+                      disabled={settingsSaveStatus === 'saving'}
+                      onClick={() => void saveSettingsDraft()}
+                      type="button"
+                    >
+                      <FontAwesomeIcon aria-hidden="true" icon={faFloppyDisk} />
+                      <span>Save and Apply</span>
+                    </button>
+                  </div>
+                ) : playniteStatus?.duoStream.enabled &&
+                  !playniteStatus.duoStream.current ? (
+                  <div className="action-row integration-quick-actions">
+                    <button
+                      className="primary-button settings-icon-text-button"
+                      disabled={duoStreamSyncPhase === 'syncing'}
+                      onClick={() => void refreshDuoStreamIntegration()}
+                      type="button"
+                    >
+                      <FontAwesomeIcon
+                        aria-hidden="true"
+                        icon={faRotateRight}
+                      />
+                      <span>
+                        {duoStreamSyncPhase === 'syncing'
+                          ? 'Refreshing...'
+                          : 'Refresh DuoStream'}
+                      </span>
+                    </button>
+                  </div>
+                ) : null}
+                {playniteStatus?.duoStream.lastError ? (
+                  <p className="integration-detection-note integration-detection-note--warning">
+                    {playniteStatus.duoStream.lastError}
                   </p>
                 ) : null}
               </div>

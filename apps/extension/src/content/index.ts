@@ -83,6 +83,11 @@ declare global {
 if (!globalThis.__gameVaultContentBound__ && isSupportedDetailPage(location.href)) {
   globalThis.__gameVaultContentBound__ = true;
 
+  void chrome.runtime.sendMessage({
+    type: 'gamevault:page-detected',
+    url: location.href,
+  });
+
   void readHtmlForSourceCapture().then((html) => {
     void chrome.runtime.sendMessage({
       fingerprint: hashText(html),

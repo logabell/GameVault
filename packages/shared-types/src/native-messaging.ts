@@ -165,6 +165,13 @@ export type NativeMessageRequest =
       };
     }
   | {
+      type: 'queueOnlineFixDownload';
+      payload: {
+        sourceKind?: SupportedSourceKind | null;
+        trackedItemId: string;
+      };
+    }
+  | {
       type: 'clearDownloadMirrorFailed';
       payload: { trackedItemId: string; url: string };
     }
@@ -203,6 +210,10 @@ export type NativeMessageRequest =
   | {
       type: 'saveSettings';
       payload: {
+        duoStreamCreateFolderLaunchers?: boolean;
+        duoStreamCreateSteamAppIdFiles?: boolean;
+        duoStreamIntegrationEnabled?: boolean;
+        duoStreamUsePlayniteLauncher?: boolean;
         jDownloaderEnabled?: boolean;
         jDownloaderSourcePreferences?: SettingsView['jDownloaderSourcePreferences'];
         libraryRoots?: SettingsView['libraryRoots'];
@@ -356,6 +367,11 @@ export type NativeMessageResponse =
   | {
       ok: true;
       type: 'queueUpdateFromSource';
+      payload: TrackedItemView;
+    }
+  | {
+      ok: true;
+      type: 'queueOnlineFixDownload';
       payload: TrackedItemView;
     }
   | {

@@ -16,6 +16,7 @@ function createSchedulerService(overrides: Partial<{
   recordActivityEvent: () => void;
   beginActivityTask: () => () => void;
   shouldRunSteamFeedMaintenance: (now?: Date) => boolean;
+  trueUpOnlineFixStatuses: () => Promise<void>;
 }> = {}) {
   return {
     beginActivityTask: vi.fn(() => vi.fn()),
@@ -27,6 +28,7 @@ function createSchedulerService(overrides: Partial<{
     processDueWatches: vi.fn(async () => undefined),
     recordActivityEvent: vi.fn(),
     shouldRunSteamFeedMaintenance: vi.fn(() => false),
+    trueUpOnlineFixStatuses: vi.fn(async () => undefined),
     ...overrides,
   } as unknown as GameVaultService;
 }
@@ -34,6 +36,12 @@ function createSchedulerService(overrides: Partial<{
 afterEach(() => {
   vi.useRealTimers();
 });
+
+async function flushStartupTick(): Promise<void> {
+  for (let index = 0; index < 8; index += 1) {
+    await Promise.resolve();
+  }
+}
 
 describe('GameVaultScheduler', () => {
   it('detects missed startup SteamDB catch-up before the configured daily hour', () => {
@@ -63,17 +71,47 @@ describe('GameVaultScheduler', () => {
     const scheduler = new GameVaultScheduler(service);
 
     scheduler.start();
-    await Promise.resolve();
-    await Promise.resolve();
+    await flushStartupTick();
     scheduler.stop();
 
     expect(service.processDueWatches).toHaveBeenCalledTimes(1);
-    expect(service.processDueWatches).toHaveBeenCalledWith(
-      expect.any(Date),
-      { includeExpired: true },
-    );
+    expect(service.processDueWatches).toHaveBeenCalledWith(expect.any(Date), {
+      includeExpired: true,
+    });
+    expect(service.trueUpOnlineFixStatuses).toHaveBeenCalledTimes(1);
     expect(service.pollDownloadJobs).toHaveBeenCalledTimes(1);
     expect(service.pollSteamFeeds).not.toHaveBeenCalled();
+  });
+
+  it('continues startup maintenance after source watch failures', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 3, 24, 8));
+    const service = createSchedulerService({
+      processDueWatches: vi.fn(async () => {
+        throw new Error('source scraper unavailable');
+      }),
+    });
+    const scheduler = new GameVaultScheduler(service);
+
+    scheduler.start();
+    await flushStartupTick();
+    scheduler.stop();
+
+    expect(service.recordActivityEvent).toHaveBeenCalledWith(
+      'warn',
+      'Source watch maintenance failed',
+      { error: 'source scraper unavailable' },
+    );
+    expect(service.trueUpOnlineFixStatuses).toHaveBeenCalledTimes(1);
+    expect(service.pollDownloadJobs).toHaveBeenCalledTimes(1);
+    expect(service.recordActivityEvent).toHaveBeenCalledWith(
+      'warn',
+      'Startup maintenance completed with warnings',
+      {
+        failures: ['Source watch maintenance failed'],
+        steamDbMaintenanceDue: false,
+      },
+    );
   });
 
   it('checks SteamDB maintenance on every interval tick', async () => {
@@ -87,8 +125,7 @@ describe('GameVaultScheduler', () => {
     const scheduler = new GameVaultScheduler(service);
 
     scheduler.start();
-    await Promise.resolve();
-    await Promise.resolve();
+    await flushStartupTick();
     expect(service.pollSteamFeeds).not.toHaveBeenCalled();
 
     await vi.advanceTimersByTimeAsync(60_000);
@@ -109,7 +146,7 @@ describe('GameVaultScheduler', () => {
     const scheduler = new GameVaultScheduler(service);
 
     scheduler.start();
-    await Promise.resolve();
+    await flushStartupTick();
     await vi.advanceTimersByTimeAsync(60_000);
 
     expect(processDueWatches).toHaveBeenCalledTimes(1);
@@ -127,8 +164,7 @@ describe('GameVaultScheduler', () => {
     const scheduler = new GameVaultScheduler(service);
 
     scheduler.start();
-    await Promise.resolve();
-    await Promise.resolve();
+    await flushStartupTick();
     vi.mocked(service.pollDownloadJobs).mockClear();
 
     await vi.advanceTimersByTimeAsync(1_000);
@@ -150,8 +186,7 @@ describe('GameVaultScheduler', () => {
     const scheduler = new GameVaultScheduler(service);
 
     scheduler.start();
-    await Promise.resolve();
-    await Promise.resolve();
+    await flushStartupTick();
     vi.mocked(service.pollDownloadJobs).mockClear();
 
     await vi.advanceTimersByTimeAsync(1_000);
@@ -173,7 +208,7 @@ describe('GameVaultScheduler', () => {
     const scheduler = new GameVaultScheduler(service);
 
     scheduler.start();
-    await Promise.resolve();
+    await flushStartupTick();
     releasePoll();
     await Promise.resolve();
     vi.mocked(service.pollDownloadJobs).mockClear();

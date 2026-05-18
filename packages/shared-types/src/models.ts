@@ -39,6 +39,43 @@ export interface DownloadDescriptor {
   kind: 'full' | 'patch';
 }
 
+export type OnlineFixMode = 'included' | 'separate';
+export type OnlineFixIconColor = 'green' | 'red';
+export type OnlineFixLibraryStatus =
+  | 'enabled'
+  | 'available_missing'
+  | 'downloading'
+  | 'failed'
+  | 'none';
+
+export interface OnlineFixDownloadDescriptor {
+  url: string;
+  browserDownloadUrl?: string | null;
+  label: string;
+}
+
+export interface OnlineFixSourceInfo {
+  detected: boolean;
+  mode: OnlineFixMode;
+  downloadUrls: OnlineFixDownloadDescriptor[];
+  evidence: string[];
+  detectedAt?: string | null;
+}
+
+export interface OnlineFixLibraryState {
+  status: OnlineFixLibraryStatus;
+  iconColor?: OnlineFixIconColor | null;
+  mode?: OnlineFixMode | null;
+  sourceKind?: SupportedSourceKind | null;
+  sourceUrl?: string | null;
+  folderPath?: string | null;
+  downloadUrl?: string | null;
+  lastError?: string | null;
+  evidence?: string[];
+  detectedAt?: string | null;
+  updatedAt?: string | null;
+}
+
 export type HealthColor = 'green' | 'yellow' | 'red';
 
 export interface HealthIndicator {
@@ -154,6 +191,7 @@ export interface ParsedSourcePayload {
   latestSourceRelease: ReleaseDescriptor;
   fullRelease?: ReleaseDescriptor | null;
   fullDownloadUrls: DownloadDescriptor[];
+  onlineFix?: OnlineFixSourceInfo | null;
   patchDownloadUrls: DownloadDescriptor[];
   notes?: string[];
   catalogMetadata?: {
@@ -225,10 +263,24 @@ export interface PlayniteExecutableSelectionRecord {
   updatedAt: string;
 }
 
+export type PlayniteLaunchMode = 'directExe' | 'duoSteamExe';
+
+export interface PlayniteLaunchProfile {
+  executablePath: string;
+  launcherScriptPath?: string | null;
+  mode: PlayniteLaunchMode;
+  mirrorSteamActiveProcess?: boolean;
+  steamAppId: number;
+  waitForGameExit?: boolean;
+  workingDirectory: string;
+  writeSteamAppId?: boolean;
+}
+
 export interface PlayniteManifestGame {
   executablePath: string;
   executableRelativePath: string;
   installPath: string;
+  launch?: PlayniteLaunchProfile;
   source: 'GameVault';
   steamAppId: number;
   steamStoreUrl: string;
@@ -245,6 +297,24 @@ export interface PlayniteManifest {
   version: 1;
 }
 
+export interface DuoStreamIntegrationStatus {
+  current: boolean;
+  enabled: boolean;
+  eligibleGames: number;
+  folderLauncherName: string;
+  folderLaunchersWritten: number;
+  lastError?: string | null;
+  lastSyncedAt?: string | null;
+  steamAppIdFilesWritten: number;
+}
+
+export interface PlayniteManifestStatus {
+  current: boolean;
+  exists: boolean;
+  generatedAt?: string | null;
+  manifestPath: string;
+}
+
 export interface PlayniteSyncStatus {
   current: boolean;
   exportableGames: number;
@@ -259,10 +329,12 @@ export interface PlayniteSyncStatus {
 
 export interface PlayniteIntegrationStatus {
   bundledPluginVersion: string;
+  duoStream: DuoStreamIntegrationStatus;
   enabled: boolean;
   exportableGames: number;
   installed: boolean;
   installedPluginVersion?: string | null;
+  manifestStatus: PlayniteManifestStatus;
   manifestPath: string;
   pendingReviewCount: number;
   pendingReviews: Array<{
@@ -294,6 +366,7 @@ export interface SourceSnapshot {
   observedPatchDate?: string | null;
   observedPatchLink?: string | null;
   observedPatchTitle?: string | null;
+  onlineFix?: OnlineFixSourceInfo | null;
   patchSelectionSource?: PatchSelectionSource | null;
   checkedAt: string;
 }
@@ -353,6 +426,7 @@ export interface MatchedSourceView {
   updateStatus: SourceUpdateStatus;
   isUpdateSource: boolean;
   downloadMirrors: DownloadMirrorRecord[];
+  onlineFix?: OnlineFixSourceInfo | null;
 }
 
 export interface SourceCatalogEntry {
@@ -520,6 +594,10 @@ export interface SettingsRecord {
   onboarding?: OnboardingState | null;
   lastExtensionActivityAt?: string | null;
   pollDailyHourLocal?: number;
+  duoStreamCreateFolderLaunchers?: boolean;
+  duoStreamCreateSteamAppIdFiles?: boolean;
+  duoStreamIntegrationEnabled?: boolean;
+  duoStreamUsePlayniteLauncher?: boolean;
   playniteExtensionsPath?: string | null;
   playniteIntegrationEnabled?: boolean;
   playniteManifestPath?: string | null;
@@ -669,6 +747,7 @@ export interface TrackedItemView {
   versionsBehindLatestIsLowerBound?: boolean;
   currentDownload?: DownloadJobRecord | null;
   downloadMirrors: DownloadMirrorRecord[];
+  onlineFix?: OnlineFixLibraryState;
   selectedMirror?: DownloadMirrorRecord | null;
   status: TrackedItemStatus;
   trackingStatus: TrackedItemTrackingStatus;
@@ -692,7 +771,9 @@ export interface AddTrackedItemRequestPayload {
 }
 
 export interface CreateMatchedDraftPayload {
+  deferMetadata?: boolean;
   parsedSource: ParsedSourcePayload;
+  steamPatchEntries?: SteamPatchCandidate[] | null;
   steamMatch: ConfirmedSteamMatch;
 }
 

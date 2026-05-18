@@ -9,8 +9,10 @@ export function createWatchWindow(
 ): SourceWatch {
   const intervalHours = options.intervalHours ?? 8;
   const durationDays = options.durationDays ?? 5;
-  const nextCheck = new Date(now.getTime() + intervalHours * 60 * 60 * 1000);
   const endsAt = new Date(now.getTime() + durationDays * 24 * 60 * 60 * 1000);
+  const nextCheck = new Date(
+    Math.min(now.getTime() + intervalHours * 60 * 60 * 1000, endsAt.getTime()),
+  );
 
   return {
     endsAt: endsAt.toISOString(),

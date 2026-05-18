@@ -1,6 +1,10 @@
 import { load } from 'cheerio';
 import type { AnyNode } from 'domhandler';
-import type { ParsedSourcePayload, SourceSnapshot } from '@gamevault/shared-types';
+import type {
+  OnlineFixSourceInfo,
+  ParsedSourcePayload,
+  SourceSnapshot,
+} from '@gamevault/shared-types';
 
 import type { RefreshTrackedItemInput, SourceAdapter } from '../types.js';
 import { buildFingerprint, compactText, normalizeSlashDate, normalizeTitle } from '../utils.js';
@@ -165,6 +169,44 @@ function extractGameInfoText($: ReturnType<typeof load>): string {
   return compactText($('.entry-content, .post-entry').first().text());
 }
 
+function buildOnlineFixInfo(params: {
+  infoText: string;
+  rawTitle: string;
+}): OnlineFixSourceInfo | null {
+  const evidence: string[] = [];
+  if (/\b(?:co-?op|multiplayer|online|lan)\b/i.test(params.rawTitle)) {
+    evidence.push('SteamRIP page title online/multiplayer keyword');
+  }
+  if (/\bco-?op\s+by\s*:/i.test(params.infoText)) {
+    evidence.push('SteamRIP Game Info Co-op By label');
+  }
+  if (/\bmultiplayer\s+by\s*:/i.test(params.infoText)) {
+    evidence.push('SteamRIP Game Info Multiplayer By label');
+  }
+
+  const releasedByMatch = params.infoText.match(
+    /\breleased\s+by\s*:\s*(?<value>[^|]+?)(?=\s+(?:version|build|game size|genre|language)\s*:|$)/i,
+  );
+  const releasedByValue = releasedByMatch?.groups?.value ?? '';
+  if (
+    /\b(?:online\s*fix|online-?fix|ofme|onlinefix\.me)\b/i.test(
+      releasedByValue,
+    )
+  ) {
+    evidence.push('SteamRIP Game Info Released By online-fix value');
+  }
+
+  return evidence.length > 0
+    ? {
+        detected: true,
+        detectedAt: new Date().toISOString(),
+        downloadUrls: [],
+        evidence,
+        mode: 'included',
+      }
+    : null;
+}
+
 function collectDownloadAnchors(
   $: ReturnType<typeof load>,
   baseUrl: string,
@@ -241,8 +283,12 @@ export const steamRipAdapter: SourceAdapter = {
   },
   parsePage(url, html) {
     const $ = load(html);
+    const rawTitle =
+      compactText($('h1.entry-title, h1').first().text()) ||
+      compactText($('meta[property="og:title"]').attr('content') ?? '') ||
+      compactText($('title').text() || '');
     const title =
-      cleanSteamRipTitle($('h1.entry-title, h1').first().text()) ||
+      cleanSteamRipTitle(rawTitle) ||
       cleanSteamRipTitle($('meta[property="og:title"]').attr('content') ?? '') ||
       cleanSteamRipTitle($('title').text() || '');
     const normalizedTitle = normalizeTitle(title);
@@ -252,6 +298,7 @@ export const steamRipAdapter: SourceAdapter = {
       null;
     const infoText = extractGameInfoText($);
     const info = parseInfoSection(infoText);
+    const onlineFix = buildOnlineFixInfo({ infoText, rawTitle });
 
     if (!title || !info) {
       throw new Error('Failed to parse SteamRIP detail page');
@@ -275,10 +322,13 @@ export const steamRipAdapter: SourceAdapter = {
         info.version,
         info.buildId,
         fullDownloadUrls.map((entry) => entry.url).join('|'),
+        onlineFix?.mode ?? 'none',
+        onlineFix?.evidence.join('|') ?? '',
       ]),
       fullRelease: latestSourceRelease,
       latestSourceRelease,
       normalizedTitle,
+      onlineFix,
       patchDownloadUrls: [],
       sourceKind: 'steamrip',
       sourceUrl: url,
@@ -294,6 +344,7 @@ export const steamRipAdapter: SourceAdapter = {
       observedBuildId: parsed.latestSourceRelease.buildId ?? null,
       observedPatchDate: parsed.latestSourceRelease.patchDate ?? null,
       observedVersion: parsed.latestSourceRelease.version,
+      onlineFix: parsed.onlineFix ?? null,
       sourceKind: item.sourceKind,
       sourceUrl: item.sourceUrl,
       trackedItemId: item.trackedItemId,

@@ -821,6 +821,132 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe('GameVaultService online fix workflow', () => {
+  it('marks included online fix sources enabled in the library view', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const service = createService(database);
+      const source: ParsedSourcePayload = {
+        ...parsedSource,
+        fingerprint: 'ankergames-online-fix-included',
+        fullDownloadUrls: [
+          {
+            kind: 'full',
+            label: 'DataNodes',
+            url: 'https://ankergames.net/generate-download-url/full',
+          },
+        ],
+        onlineFix: {
+          detected: true,
+          detectedAt: '2026-05-16T12:00:00.000Z',
+          downloadUrls: [],
+          evidence: ['Multiplayer / Edition'],
+          mode: 'included',
+        },
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.net/game/mouse-p-i-for-hire',
+      };
+
+      const view = await service.addTrackedItem({
+        parsedSource: source,
+        queueDownload: false,
+        selectedDownloads: { fullUrl: source.fullDownloadUrls[0]!.url },
+        selectedSteamPatch: null,
+        steamMatch: null,
+      });
+
+      expect(view.onlineFix).toMatchObject({
+        iconColor: 'green',
+        mode: 'included',
+        sourceKind: 'ankergames',
+        sourceUrl: source.sourceUrl,
+        status: 'enabled',
+      });
+      expect(view.sourceSnapshot?.onlineFix).toMatchObject({
+        detected: true,
+        mode: 'included',
+      });
+      expect(view.sourceMatches[0]?.onlineFix).toMatchObject({
+        detected: true,
+        mode: 'included',
+      });
+      expect(database.getOnlineFixRecord(view.item.id)).toMatchObject({
+        status: 'enabled',
+        mode: 'included',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('shows separate AnkerGames online fixes as missing until the OnlineFix folder has files', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      const service = createService(database);
+      const source: ParsedSourcePayload = {
+        ...parsedSource,
+        fingerprint: 'ankergames-online-fix-separate',
+        fullDownloadUrls: [
+          {
+            kind: 'full',
+            label: 'DataNodes',
+            url: 'https://ankergames.net/generate-download-url/full',
+          },
+        ],
+        onlineFix: {
+          detected: true,
+          detectedAt: '2026-05-16T12:00:00.000Z',
+          downloadUrls: [
+            {
+              label: 'Online Fix',
+              url: 'https://ankergames.net/generate-download-url/online-fix',
+            },
+          ],
+          evidence: ['Online Fix download action'],
+          mode: 'separate',
+        },
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.net/game/mouse-p-i-for-hire',
+      };
+
+      const view = await service.addTrackedItem({
+        parsedSource: source,
+        queueDownload: false,
+        selectedDownloads: { fullUrl: source.fullDownloadUrls[0]!.url },
+        selectedSteamPatch: null,
+        steamMatch: null,
+      });
+
+      expect(view.onlineFix).toMatchObject({
+        downloadUrl: 'https://ankergames.net/generate-download-url/online-fix',
+        iconColor: 'red',
+        mode: 'separate',
+        status: 'available_missing',
+      });
+
+      const onlineFixFolder = join(view.fileState.finalPath!, 'OnlineFix');
+      await mkdir(onlineFixFolder, { recursive: true });
+      await writeFile(join(onlineFixFolder, 'OnlineFix.ini'), 'enabled');
+
+      const [refreshed] = await service.listTrackedItemsByIds([view.item.id]);
+
+      expect(refreshed?.onlineFix).toMatchObject({
+        folderPath: onlineFixFolder,
+        iconColor: 'green',
+        mode: 'separate',
+        status: 'enabled',
+      });
+      expect(database.getOnlineFixRecord(view.item.id)).toMatchObject({
+        folderPath: onlineFixFolder,
+        status: 'enabled',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+});
+
 describe('GameVaultService Steam wishlist workflow', () => {
   it('does not auto-queue wishlist syncs while building the view', async () => {
     const { database, tempRoot } = await openTestDatabase();
@@ -874,7 +1000,7 @@ describe('GameVaultService Steam wishlist workflow', () => {
       const tracked = database.upsertTrackedItem({
         coverUrl: null,
         normalizedTitle: 'terraria',
-        sourceKind: 'manual',
+        sourceKind: null,
         title: 'Terraria',
       });
       database.upsertSteamMatch(tracked.id, {
@@ -980,7 +1106,7 @@ describe('GameVaultService Steam wishlist workflow', () => {
       const tracked = database.upsertTrackedItem({
         coverUrl: null,
         normalizedTitle: 'terraria',
-        sourceKind: 'manual',
+        sourceKind: null,
         title: 'Terraria',
       });
       database.upsertSteamMatch(tracked.id, {
@@ -1058,7 +1184,7 @@ describe('GameVaultService import workflow', () => {
       });
       const service = createService(database);
 
-      const saved = service.saveSettings({
+      const saved = await service.saveSettings({
         jDownloaderEnabled: false,
         jDownloaderSourcePreferences: {
           elamigos: false,
@@ -1287,7 +1413,7 @@ describe('GameVaultService import workflow', () => {
         sourceWatchIntervalHours: 8,
       });
 
-      const saved = service.saveSettings({
+      const saved = await service.saveSettings({
         libraryRoots: [
           {
             id: 'root-a',
@@ -8079,6 +8205,120 @@ describe('GameVaultService SteamDB patch workflow', () => {
     }
   });
 
+  it('writes DuoStream launch assets for enabled Online Fix games during Playnite export', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootLibraryPath = join(tempRoot, 'Library');
+      const installPath = join(rootLibraryPath, 'Barony');
+      const executablePath = join(installPath, 'Barony.exe');
+      const launcherScriptPath = join(tempRoot, 'GameVaultDuoLauncher.ps1');
+      await mkdir(installPath, { recursive: true });
+      await writeFile(executablePath, Buffer.alloc(256 * 1024, 0));
+
+      database.setSetting('library.rootPath', rootLibraryPath);
+      database.setSetting('duostream.integrationEnabled', 'true');
+      database.setSetting('duostream.createSteamAppIdFiles', 'true');
+      database.setSetting('duostream.createFolderLaunchers', 'true');
+      database.setSetting('duostream.usePlayniteLauncher', 'true');
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'barony',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:barony',
+        title: 'Barony',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 371970,
+        coverUrl: null,
+        matchedAt: '2026-05-18T12:00:00.000Z',
+        normalizedTitle: 'barony',
+        title: 'Barony',
+      });
+      database.upsertInstallRecord({
+        installPath,
+        installedAt: '2026-05-18T12:00:00.000Z',
+        installedBuildId: null,
+        installedSourceKind: 'manual',
+        installedSourceUrl: 'manual:barony',
+        installedVersion: '1.0',
+        trackedItemId: item.id,
+        updatedAt: '2026-05-18T12:00:00.000Z',
+      });
+      database.upsertOnlineFixRecord(item.id, {
+        detectedAt: '2026-05-18T12:00:00.000Z',
+        evidence: ['Online Fix included'],
+        folderPath: installPath,
+        iconColor: 'green',
+        lastError: null,
+        mode: 'included',
+        sourceKind: null,
+        sourceUrl: 'manual:barony',
+        status: 'enabled',
+        updatedAt: '2026-05-18T12:00:00.000Z',
+      });
+
+      const service = createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        fetch,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        true,
+        undefined,
+        undefined,
+        {
+          appDataPath: join(tempRoot, 'GameVaultAppData'),
+          duoStreamLauncherScriptPath: launcherScriptPath,
+        },
+      );
+
+      const manifest = await service.exportPlayniteManifest({ rescan: true });
+
+      await expect(readFile(join(installPath, 'steam_appid.txt'), 'utf8'))
+        .resolves.toBe('371970');
+      const launcherContent = await readFile(
+        join(installPath, 'Launch with GameVault Duo.vbs'),
+        'utf8',
+      );
+      expect(launcherContent).toContain(launcherScriptPath);
+      expect(launcherContent).toContain('shell.Run command, 0, False');
+      expect(launcherContent).toContain('""-Mode"" ""Duo""');
+      expect(launcherContent).toContain(executablePath);
+      expect(manifest.games[0]?.launch).toMatchObject({
+        launcherScriptPath,
+        mode: 'duoSteamExe',
+        steamAppId: 371970,
+        workingDirectory: installPath,
+      });
+      const status = await service.getPlayniteStatus();
+      expect(status.duoStream).toMatchObject({
+        current: true,
+        eligibleGames: 1,
+        folderLauncherName: 'Launch with GameVault Duo.vbs',
+        folderLaunchersWritten: 1,
+        steamAppIdFilesWritten: 1,
+      });
+      expect(status.manifestStatus.current).toBe(true);
+      expect(status.manifestStatus.exists).toBe(true);
+
+      database.setSetting('playnite.integrationEnabled', 'true');
+      database.setSetting('duostream.usePlayniteLauncher', 'false');
+      const staleStatus = await service.getPlayniteStatus();
+      expect(staleStatus.duoStream.current).toBe(false);
+      expect(staleStatus.manifestStatus.current).toBe(false);
+
+      const refreshedStatus = await service.refreshDuoStreamIntegration();
+      expect(refreshedStatus.duoStream.current).toBe(true);
+      expect(refreshedStatus.manifestStatus.current).toBe(true);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('writes Playnite manifests beside a portable extensions folder', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -12168,6 +12408,106 @@ describe('GameVaultService SteamDB patch workflow', () => {
       expect(database.getSteamFeedCheck(secondItem.id)).toBeNull();
       expect(service.getLatestDailyPollAt()).toBeNull();
       expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('resumes SteamDB polling with only feeds still stale after a rate limit', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const firstItem = database.upsertTrackedItem({
+        normalizedTitle: 'first game',
+        sourceKind: 'manual',
+        sourceUrl: null,
+        title: 'First Game',
+      });
+      const secondItem = database.upsertTrackedItem({
+        normalizedTitle: 'second game',
+        sourceKind: 'manual',
+        sourceUrl: null,
+        title: 'Second Game',
+      });
+      database.upsertSteamMatch(firstItem.id, {
+        ...steamMatch,
+        appId: 111,
+        normalizedTitle: 'first game',
+        title: 'First Game',
+      });
+      database.upsertSteamMatch(secondItem.id, {
+        ...steamMatch,
+        appId: 222,
+        normalizedTitle: 'second game',
+        title: 'Second Game',
+      });
+
+      const requestedAppIds: string[] = [];
+      const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+        const url = new URL(String(input));
+        const appId = url.searchParams.get('appid') ?? '';
+        requestedAppIds.push(appId);
+        if (appId === '111') {
+          return new Response('', { status: 429 });
+        }
+        if (appId === '222') {
+          return new Response(
+            rss([
+              {
+                ...selectedPatch,
+                appId: 222,
+                buildId: '22200',
+                link: 'https://steamdb.info/patchnotes/22200/?utm_source=rss',
+                patchTitle: 'Second Game update',
+                title: 'Second Game update',
+              },
+            ]),
+            { status: 200 },
+          );
+        }
+        throw new Error(`Unexpected SteamDB app ${appId}`);
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const service = createService(database);
+      await service.pollSteamFeeds();
+      await service.pollSteamFeeds();
+
+      expect(requestedAppIds).toEqual(['111', '222']);
+      expect(database.getSteamFeedCheck(firstItem.id)).toMatchObject({
+        lastError: 'SteamDB RSS request failed: 429',
+      });
+      expect(database.getSteamFeedCheck(secondItem.id)).toMatchObject({
+        lastError: null,
+      });
+      expect(service.getLatestDailyPollAt()).toBeTruthy();
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('does not report a future source watch schedule as last source activity', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: parsedSource.normalizedTitle,
+        sourceKind: parsedSource.sourceKind,
+        sourceUrl: parsedSource.sourceUrl,
+        title: parsedSource.title,
+      });
+      database.upsertWatch({
+        endsAt: '2999-04-24T12:00:00.000Z',
+        lastCheckedAt: '2026-04-23T12:00:00.000Z',
+        nextCheckAt: '2999-04-23T12:00:00.000Z',
+        startedAt: '2026-04-20T12:00:00.000Z',
+        trackedItemId: item.id,
+      });
+
+      const sourceMaintenance = createService(database)
+        .getActivity()
+        .summary.find((card) => card.id === 'sourceMaintenance');
+
+      expect(sourceMaintenance?.detail).toContain('2026');
+      expect(sourceMaintenance?.detail).not.toContain('2999');
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }

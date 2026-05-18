@@ -14,6 +14,7 @@ import type {
   PlayniteExecutableConfidence,
   PlayniteExecutableSelectionRecord,
   PlayniteExecutableStatus,
+  PlayniteLaunchProfile,
   PlayniteManifest,
   PlayniteManifestGame,
   TrackedItemView,
@@ -24,6 +25,12 @@ import { buildSteamStoreAppUrl } from '@gamevault/steam-core';
 const GAMEVAULT_LIBRARY_NAME = 'GameVault';
 const STEAM_APP_ID_FILE = 'steam_appid.txt';
 const PLAYNITE_PLUGIN_FOLDER_NAME = 'GameVault';
+
+export interface PlayniteManifestLaunchOptions {
+  duoStreamIntegrationEnabled?: boolean;
+  duoStreamLauncherScriptPath?: string | null;
+  duoStreamUsePlayniteLauncher?: boolean;
+}
 
 const NON_GAME_NAME_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   { pattern: /^unins/i, reason: 'Uninstaller' },
@@ -737,6 +744,7 @@ export async function scanPlayniteExecutableSelection(params: {
 export function buildPlayniteManifest(
   items: TrackedItemView[],
   selections: PlayniteExecutableSelectionRecord[],
+  options: PlayniteManifestLaunchOptions = {},
 ): PlayniteManifest {
   const selectionsByItemId = new Map(
     selections.map((selection) => [selection.trackedItemId, selection]),
@@ -757,10 +765,18 @@ export function buildPlayniteManifest(
     ) {
       continue;
     }
+    const launch = buildPlayniteLaunchProfile({
+      executablePath,
+      installPath,
+      options,
+      steamAppId,
+      view,
+    });
     games.push({
       executablePath,
       executableRelativePath: relative(installPath, executablePath),
       installPath,
+      launch,
       source: GAMEVAULT_LIBRARY_NAME,
       steamAppId,
       steamStoreUrl: buildSteamStoreAppUrl(steamAppId),
@@ -777,5 +793,40 @@ export function buildPlayniteManifest(
     games,
     library: GAMEVAULT_LIBRARY_NAME,
     version: 1,
+  };
+}
+
+function buildPlayniteLaunchProfile(params: {
+  executablePath: string;
+  installPath: string;
+  options: PlayniteManifestLaunchOptions;
+  steamAppId: number;
+  view: TrackedItemView;
+}): PlayniteLaunchProfile {
+  const workingDirectory = dirname(params.executablePath);
+  const shouldUseDuoStream =
+    params.options.duoStreamIntegrationEnabled === true &&
+    params.options.duoStreamUsePlayniteLauncher !== false &&
+    params.view.onlineFix?.status === 'enabled' &&
+    Boolean(params.options.duoStreamLauncherScriptPath?.trim());
+
+  if (!shouldUseDuoStream) {
+    return {
+      executablePath: params.executablePath,
+      mode: 'directExe',
+      steamAppId: params.steamAppId,
+      workingDirectory,
+    };
+  }
+
+  return {
+    executablePath: params.executablePath,
+    launcherScriptPath: params.options.duoStreamLauncherScriptPath ?? null,
+    mirrorSteamActiveProcess: true,
+    mode: 'duoSteamExe',
+    steamAppId: params.steamAppId,
+    waitForGameExit: true,
+    workingDirectory: params.installPath,
+    writeSteamAppId: true,
   };
 }

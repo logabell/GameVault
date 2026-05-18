@@ -18,7 +18,7 @@ namespace GameVault.Playnite
     public class GameVaultLibraryPlugin : LibraryPlugin
     {
         private const string LibraryName = "GameVault";
-        private const string PluginVersion = "0.1.15";
+        private const string PluginVersion = "0.1.16";
         private const int ManifestSyncDebounceMs = 1500;
         private const int MetadataBackfillDebounceMs = 8000;
         private const int MetadataBackfillGameDelayMs = 750;
@@ -127,13 +127,7 @@ namespace GameVault.Playnite
                 GameId = game.SteamAppId.ToString(),
                 GameActions = new List<GameAction>
                 {
-                    new GameAction
-                    {
-                        Type = GameActionType.File,
-                        Path = game.ExecutablePath,
-                        WorkingDir = Path.GetDirectoryName(game.ExecutablePath),
-                        IsPlayAction = true
-                    }
+                    CreatePlayAction(game)
                 },
                 Icon = GetExecutableIconMetadata(game),
                 InstallDirectory = game.InstallPath,
@@ -535,6 +529,7 @@ namespace GameVault.Playnite
         private static bool ApplyManifestPlayAction(Game game, GameVaultManifestGame manifestGame)
         {
             var changed = false;
+            var desiredAction = CreatePlayAction(manifestGame);
             if (game.GameActions == null)
             {
                 game.GameActions = new ObservableCollection<GameAction>();
@@ -544,26 +539,43 @@ namespace GameVault.Playnite
             var playAction = game.GameActions.FirstOrDefault(action => action != null && action.IsPlayAction);
             if (playAction == null)
             {
-                game.GameActions.Add(CreatePlayAction(manifestGame));
+                game.GameActions.Add(desiredAction);
                 return true;
             }
 
-            if (playAction.Type != GameActionType.File)
+            if (playAction.Type != desiredAction.Type)
             {
-                playAction.Type = GameActionType.File;
+                playAction.Type = desiredAction.Type;
                 changed = true;
             }
 
-            if (!string.Equals(playAction.Path, manifestGame.ExecutablePath, StringComparison.OrdinalIgnoreCase))
+            if (!string.Equals(playAction.Path, desiredAction.Path, StringComparison.OrdinalIgnoreCase))
             {
-                playAction.Path = manifestGame.ExecutablePath;
+                playAction.Path = desiredAction.Path;
                 changed = true;
             }
 
-            var workingDirectory = Path.GetDirectoryName(manifestGame.ExecutablePath);
-            if (!string.Equals(playAction.WorkingDir, workingDirectory, StringComparison.OrdinalIgnoreCase))
+            if (!string.Equals(playAction.Arguments ?? string.Empty, desiredAction.Arguments ?? string.Empty, StringComparison.Ordinal))
             {
-                playAction.WorkingDir = workingDirectory;
+                playAction.Arguments = desiredAction.Arguments;
+                changed = true;
+            }
+
+            if (!string.Equals(playAction.WorkingDir, desiredAction.WorkingDir, StringComparison.OrdinalIgnoreCase))
+            {
+                playAction.WorkingDir = desiredAction.WorkingDir;
+                changed = true;
+            }
+
+            if (playAction.TrackingMode != desiredAction.TrackingMode)
+            {
+                playAction.TrackingMode = desiredAction.TrackingMode;
+                changed = true;
+            }
+
+            if (!string.Equals(playAction.TrackingPath, desiredAction.TrackingPath, StringComparison.OrdinalIgnoreCase))
+            {
+                playAction.TrackingPath = desiredAction.TrackingPath;
                 changed = true;
             }
 
@@ -578,13 +590,81 @@ namespace GameVault.Playnite
 
         private static GameAction CreatePlayAction(GameVaultManifestGame game)
         {
+            if (ShouldUseDuoSteamLauncher(game))
+            {
+                return new GameAction
+                {
+                    Type = GameActionType.File,
+                    Path = "powershell.exe",
+                    Arguments = BuildDuoSteamLauncherArguments(game),
+                    WorkingDir = game.InstallPath,
+                    TrackingMode = TrackingMode.Process,
+                    TrackingPath = game.ExecutablePath,
+                    IsPlayAction = true
+                };
+            }
+
             return new GameAction
             {
                 Type = GameActionType.File,
                 Path = game.ExecutablePath,
                 WorkingDir = Path.GetDirectoryName(game.ExecutablePath),
+                Arguments = null,
+                TrackingMode = TrackingMode.Default,
+                TrackingPath = null,
                 IsPlayAction = true
             };
+        }
+
+        private static bool ShouldUseDuoSteamLauncher(GameVaultManifestGame game)
+        {
+            return game != null &&
+                game.Launch != null &&
+                string.Equals(game.Launch.Mode, "duoSteamExe", StringComparison.OrdinalIgnoreCase) &&
+                !string.IsNullOrWhiteSpace(game.Launch.LauncherScriptPath);
+        }
+
+        private static string BuildDuoSteamLauncherArguments(GameVaultManifestGame game)
+        {
+            var launch = game.Launch;
+            var arguments = new List<string>
+            {
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                launch.LauncherScriptPath,
+                "-ExePath",
+                game.ExecutablePath,
+                "-WorkingDirectory",
+                string.IsNullOrWhiteSpace(launch.WorkingDirectory) ? game.InstallPath : launch.WorkingDirectory,
+                "-AppId",
+                game.SteamAppId.ToString(),
+                "-Mode",
+                "Duo"
+            };
+
+            if (launch.WriteSteamAppId)
+            {
+                arguments.Add("-WriteSteamAppId");
+            }
+
+            if (launch.MirrorSteamActiveProcess)
+            {
+                arguments.Add("-MirrorSteamActiveProcess");
+            }
+
+            if (launch.WaitForGameExit)
+            {
+                arguments.Add("-WaitForGameExit");
+            }
+
+            return string.Join(" ", arguments.Select(QuoteArgument));
+        }
+
+        private static string QuoteArgument(string value)
+        {
+            return "\"" + (value ?? string.Empty).Replace("\"", "\\\"") + "\"";
         }
 
         private void QueueMetadataBackfill()
@@ -1502,6 +1582,9 @@ namespace GameVault.Playnite
         [DataMember(Name = "installPath")]
         public string InstallPath { get; set; }
 
+        [DataMember(Name = "launch")]
+        public GameVaultLaunchProfile Launch { get; set; }
+
         [DataMember(Name = "steamAppId")]
         public int SteamAppId { get; set; }
 
@@ -1519,6 +1602,34 @@ namespace GameVault.Playnite
 
         [DataMember(Name = "version")]
         public string Version { get; set; }
+    }
+
+    [DataContract]
+    public class GameVaultLaunchProfile
+    {
+        [DataMember(Name = "executablePath")]
+        public string ExecutablePath { get; set; }
+
+        [DataMember(Name = "launcherScriptPath")]
+        public string LauncherScriptPath { get; set; }
+
+        [DataMember(Name = "mirrorSteamActiveProcess")]
+        public bool MirrorSteamActiveProcess { get; set; }
+
+        [DataMember(Name = "mode")]
+        public string Mode { get; set; }
+
+        [DataMember(Name = "steamAppId")]
+        public int SteamAppId { get; set; }
+
+        [DataMember(Name = "waitForGameExit")]
+        public bool WaitForGameExit { get; set; }
+
+        [DataMember(Name = "workingDirectory")]
+        public string WorkingDirectory { get; set; }
+
+        [DataMember(Name = "writeSteamAppId")]
+        public bool WriteSteamAppId { get; set; }
     }
 
     [DataContract]

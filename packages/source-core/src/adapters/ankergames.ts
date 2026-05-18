@@ -1,5 +1,6 @@
 import { load } from 'cheerio';
 import type {
+  OnlineFixSourceInfo,
   ParsedSourcePayload,
   SourceSnapshot,
 } from '@gamevault/shared-types';
@@ -155,8 +156,8 @@ function getDownloadAction(element: unknown): string {
 function collectDownloadUrls(
   $: ReturnType<typeof load>,
   baseUrl: string,
-): ParsedSourcePayload['fullDownloadUrls'] {
-  const downloadUrls: ParsedSourcePayload['fullDownloadUrls'] = [];
+): Array<{ label: string; url: string }> {
+  const downloadUrls: Array<{ label: string; url: string }> = [];
   const seenIds = new Set<string>();
 
   $('a, button').each((_, element) => {
@@ -187,18 +188,74 @@ function collectDownloadUrls(
       'DataNodes';
 
     const normalizedLabel = normalizeDownloadLabel(label, stableUrl);
-    if (!/^datanodes$/i.test(normalizedLabel)) {
-      return;
-    }
-
     downloadUrls.push({
-      kind: 'full',
       label: normalizedLabel,
       url: stableUrl,
     });
   });
 
   return downloadUrls;
+}
+
+function hasMultiplayerEditionTag($: ReturnType<typeof load>): boolean {
+  return $('body *')
+    .toArray()
+    .some((element) => {
+      const text = compactText($(element).text());
+      return /\bMultiplayer\s*(?:[|/:-]\s*)?Edition\b/i.test(text);
+    });
+}
+
+function getAnkerGamesOnlineFixEvidence($: ReturnType<typeof load>): string[] {
+  const evidence: string[] = [];
+  if (hasMultiplayerEditionTag($)) {
+    evidence.push('AnkerGames Multiplayer / Edition tag');
+  }
+
+  const bodyText = compactText($('body').text());
+  if (/(?:^|\s)\+\s*co-?op\b/i.test(bodyText)) {
+    evidence.push('AnkerGames Game Features + Co-Op text');
+  }
+  if (/\bOFME\b.{0,80}\b(?:fix|online|multiplayer)\b/i.test(bodyText)) {
+    evidence.push('AnkerGames Game Features OFME fix text');
+  }
+  if (
+    /\bfix\s+has\s+been\s+applied\b.{0,80}\b(?:online|multiplayer)\b/i.test(
+      bodyText,
+    )
+  ) {
+    evidence.push('AnkerGames applied online/multiplayer fix text');
+  }
+
+  return evidence;
+}
+
+function buildOnlineFixInfo(
+  $: ReturnType<typeof load>,
+  generatedDownloads: Array<{ label: string; url: string }>,
+): OnlineFixSourceInfo | null {
+  const onlineFixDownloads = generatedDownloads
+    .filter((download) => /\bonline\s*fix\b/i.test(download.label))
+    .map((download) => ({
+      label: download.label || 'Online Fix',
+      url: download.url,
+    }));
+
+  const evidence = getAnkerGamesOnlineFixEvidence($);
+  if (onlineFixDownloads.length > 0) {
+    evidence.push('AnkerGames Online Fix download action');
+  }
+  if (evidence.length === 0) {
+    return null;
+  }
+
+  return {
+    detected: true,
+    detectedAt: new Date().toISOString(),
+    downloadUrls: onlineFixDownloads,
+    evidence,
+    mode: onlineFixDownloads.length > 0 ? 'separate' : 'included',
+  };
 }
 
 export const ankerGamesAdapter: SourceAdapter = {
@@ -222,7 +279,16 @@ export const ankerGamesAdapter: SourceAdapter = {
       null;
     const version = findVisibleVersion($, html) ?? 'unknown';
     const buildId = findVisibleCurrentBuild($, html);
-    const fullDownloadUrls = collectDownloadUrls($, url);
+    const generatedDownloads = collectDownloadUrls($, url);
+    const fullDownloadUrls: ParsedSourcePayload['fullDownloadUrls'] =
+      generatedDownloads
+        .filter((download) => /^datanodes$/i.test(download.label))
+        .map((download) => ({
+          kind: 'full',
+          label: download.label,
+          url: download.url,
+        }));
+    const onlineFix = buildOnlineFixInfo($, generatedDownloads);
 
     if (!title || fullDownloadUrls.length === 0) {
       throw new Error('Failed to parse AnkerGames detail page');
@@ -246,10 +312,13 @@ export const ankerGamesAdapter: SourceAdapter = {
         version,
         buildId,
         fullDownloadUrls.map((entry) => entry.url).join('|'),
+        onlineFix?.mode ?? 'none',
+        onlineFix?.downloadUrls.map((entry) => entry.url).join('|') ?? '',
       ]),
       fullRelease: latestSourceRelease,
       latestSourceRelease,
       normalizedTitle,
+      onlineFix,
       patchDownloadUrls: [],
       sourceKind: 'ankergames',
       sourceUrl: url,
@@ -268,6 +337,7 @@ export const ankerGamesAdapter: SourceAdapter = {
       observedBuildId: parsed.latestSourceRelease.buildId ?? null,
       observedPatchDate: parsed.latestSourceRelease.patchDate ?? null,
       observedVersion: parsed.latestSourceRelease.version,
+      onlineFix: parsed.onlineFix ?? null,
       sourceKind: item.sourceKind,
       sourceUrl: item.sourceUrl,
       trackedItemId: item.trackedItemId,

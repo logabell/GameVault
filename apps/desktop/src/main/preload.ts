@@ -86,6 +86,8 @@ const api = {
     ipcRenderer.invoke('gamevault:retryDownloadWithSelection', payload),
   queueUpdateFromSource: (payload: unknown) =>
     ipcRenderer.invoke('gamevault:queueUpdateFromSource', payload),
+  queueOnlineFixDownload: (payload: unknown) =>
+    ipcRenderer.invoke('gamevault:queueOnlineFixDownload', payload),
   registerExtensionNativeHost: (payload: unknown) =>
     ipcRenderer.invoke('gamevault:registerExtensionNativeHost', payload),
   selectMyJDownloaderDevice: (deviceId: string) =>
@@ -102,6 +104,8 @@ const api = {
     ipcRenderer.invoke('gamevault:installPlaynitePlugin', payload),
   refreshPlayniteIntegration: (payload?: unknown) =>
     ipcRenderer.invoke('gamevault:refreshPlayniteIntegration', payload),
+  refreshDuoStreamIntegration: (payload?: unknown) =>
+    ipcRenderer.invoke('gamevault:refreshDuoStreamIntegration', payload),
   restoreImportFolder: (payload: unknown) =>
     ipcRenderer.invoke('gamevault:restoreImportFolder', payload),
   saveImportBatch: (payload: unknown) =>

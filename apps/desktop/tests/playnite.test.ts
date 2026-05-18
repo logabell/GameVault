@@ -589,9 +589,79 @@ describe('Playnite manifest', () => {
     expect(manifest.games).toEqual([
       expect.objectContaining({
         executablePath: 'D:\\High Seas\\Barony\\barony.exe',
+        launch: expect.objectContaining({
+          mode: 'directExe',
+          steamAppId: 371970,
+        }),
         source: 'GameVault',
         steamAppId: 371970,
       }),
     ]);
+  });
+
+  it('adds DuoStream launch profiles for enabled Online Fix games', () => {
+    const selection: PlayniteExecutableSelectionRecord = {
+      candidates: [],
+      confidence: 'high',
+      reviewedAt: null,
+      selectedExePath: 'D:\\High Seas\\Barony\\barony.exe',
+      status: 'auto_selected',
+      steamAppId: 371970,
+      trackedItemId: 'item-1',
+      updatedAt: '2026-05-10T12:00:00.000Z',
+    };
+    const view = {
+      activity: {},
+      currentDownload: null,
+      currentWatch: null,
+      downloadMirrors: [],
+      fileState: {
+        finalPath: 'D:\\High Seas\\Barony',
+        finalPathExists: true,
+      },
+      installRecord: {
+        installPath: 'D:\\High Seas\\Barony',
+        trackedItemId: 'item-1',
+        updatedAt: '2026-05-10T12:00:00.000Z',
+      },
+      item: {
+        createdAt: '2026-05-10T12:00:00.000Z',
+        id: 'item-1',
+        normalizedTitle: 'barony',
+        steamAppId: 371970,
+        title: 'Barony',
+        updatedAt: '2026-05-10T12:00:00.000Z',
+      },
+      onlineFix: {
+        iconColor: 'green',
+        mode: 'included',
+        status: 'enabled',
+        updatedAt: '2026-05-10T12:00:00.000Z',
+      },
+      patchMetadataStatus: 'unknown',
+      selectedMirror: null,
+      sourceMatches: [],
+      status: TrackedItemStatus.Installed,
+      trackingStatus: TrackedItemTrackingStatus.UpToDate,
+    } as TrackedItemView;
+
+    const manifest = buildPlayniteManifest([view], [selection], {
+      duoStreamIntegrationEnabled: true,
+      duoStreamLauncherScriptPath:
+        'C:\\GameVault\\duostream\\Launch-GameVaultDuoSteamExe.ps1',
+      duoStreamUsePlayniteLauncher: true,
+    });
+
+    expect(manifest.games[0]?.launch).toMatchObject({
+      executablePath: 'D:\\High Seas\\Barony\\barony.exe',
+      launcherScriptPath:
+        'C:\\GameVault\\duostream\\Launch-GameVaultDuoSteamExe.ps1',
+      mirrorSteamActiveProcess: true,
+      mode: 'duoSteamExe',
+      steamAppId: 371970,
+      waitForGameExit: true,
+      workingDirectory: 'D:\\High Seas\\Barony',
+      writeSteamAppId: true,
+    });
   });
 });

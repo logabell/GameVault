@@ -33,17 +33,24 @@ import {
 const CACHE_TTL_MS = 15 * 60 * 1000;
 const BRIDGE_URL = 'http://127.0.0.1:47615/native-message';
 const BRIDGE_HTTP_TIMEOUT_MS = 2500;
+const CONNECTION_HEALTH_QUICK_TIMEOUT_MS = 2000;
+const CONNECTION_HEALTH_FORCE_TIMEOUT_MS = 8000;
 const NATIVE_MESSAGE_TIMEOUT_MS = 75000;
 const ADD_TRACKED_ITEM_TIMEOUT_MS = 90000;
 const MYJD_AUTH_TIMEOUT_MS = 75000;
 const STEAM_PATCH_RESOLVE_TIMEOUT_MS = 45000;
 const PREPARE_DRAFT_HEALTH_TIMEOUT_MS = 1500;
+const DESKTOP_BOOTSTRAP_WAIT_MS = 2500;
 const NATIVE_HOST_NAME = 'com.gamevault.desktop';
 const AUTO_OPEN_PREFIX = 'autoOpen';
 const ACTIVE_DRAFT_KEY = 'activeDraft';
 const CLIPBOARD_DRAFT_KEY = 'clipboardDraft';
+const CONNECTION_HEALTH_CACHE_KEY = 'connectionHealth:lastKnown';
+const SETTINGS_CACHE_KEY = 'settings:lastKnown';
 const POPUP_REOPEN_PREFIX = 'popupReopen';
 const STATUS_CACHE_TTL_MS = 30 * 1000;
+const CONNECTION_HEALTH_CACHE_TTL_MS = 5 * 60 * 1000;
+const SETTINGS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const PARSE_CACHE_PREFIX = 'parsedPage:v4';
 const STATUS_CACHE_PREFIX = 'trackedStatus';
 const STEAMDB_SELECTION_CONTEXT_PREFIX = 'steamDbSelectionContext';
@@ -55,6 +62,8 @@ const STEAMDB_SELECTION_TTL_MS = 30 * 60 * 1000;
 const STEAMDB_BACKFILL_TIMEOUT_MS = 22000;
 const STEAMDB_MANUAL_BACKFILL_TIMEOUT_MS = 5 * 60 * 1000;
 const STEAMDB_BACKFILL_TTL_MS = 30 * 60 * 1000;
+const STEAM_MATCH_CACHE_TTL_MS = 10 * 60 * 1000;
+const STEAM_MATCH_CACHE_MAX_ENTRIES = 40;
 const DESKTOP_STEAMDB_LOOKUP_FAST_POLL_MS = 2500;
 const STEAMDB_RETRY_AFTER_HINT_TTL_MS = 10 * 60 * 1000;
 const STEAM_WISHLIST_SYNC_MIN_INTERVAL_MS = 5 * 60 * 1000;
@@ -100,11 +109,37 @@ interface CachedTrackedStatus {
   trackedStatus: TrackedItemView | null;
 }
 
+interface CachedConnectionHealth {
+  capturedAt: number;
+  expiresAt: number;
+  health: ConnectionHealthSummary;
+}
+
+interface CachedSettings {
+  capturedAt: number;
+  expiresAt: number;
+  settings: SettingsView;
+}
+
+interface SteamMatchResolution {
+  candidates: SteamCandidate[];
+  errorMessage: string | null;
+  queryTitle: string;
+  searchQueries: string[];
+}
+
+interface CachedSteamMatchResolution {
+  capturedAt: number;
+  expiresAt: number;
+  resolution: SteamMatchResolution;
+}
+
 interface DraftStatusContext {
   connectionHealth: ConnectionHealthSummary;
   connectionPending: boolean;
   parsedSource: ParsedSourcePayload | null;
   parsePending: boolean;
+  settings: SettingsView | null;
   sourceUrl: string | null;
   trackedStatus: TrackedItemView | null;
   trackedStatusPending: boolean;
@@ -159,6 +194,11 @@ const trackedStatusInFlight = new Map<
   string,
   Promise<TrackedItemView | null>
 >();
+const sourceContextWarmInFlight = new Map<string, Promise<void>>();
+const trackedContextWarmInFlight = new Map<string, Promise<void>>();
+const steamMatchHotCache = new Map<string, CachedSteamMatchResolution>();
+const steamMatchInFlight = new Map<string, Promise<SteamMatchResolution>>();
+let libraryListInFlight: Promise<NativeMessageResponse> | null = null;
 let desktopBootstrapPromise: Promise<ConnectionHealthSummary | null> | null =
   null;
 let lastKnownHealthSnapshot: {
@@ -177,6 +217,7 @@ const steamDbRetryAfterHints = new Map<
 function fallbackConnectionHealth(message: string): ConnectionHealthSummary {
   const desktopStarting =
     /timed out/i.test(message) || /starting/i.test(message);
+  const myJDownloaderChecking = desktopStarting;
   return {
     desktop: {
       color: desktopStarting ? 'yellow' : 'red',
@@ -185,10 +226,11 @@ function fallbackConnectionHealth(message: string): ConnectionHealthSummary {
     },
     devices: [],
     myJDownloader: {
-      color: 'red',
-      label: 'Unavailable',
-      message:
-        'Desktop bridge is unavailable, so MyJDownloader cannot be checked yet.',
+      color: myJDownloaderChecking ? 'yellow' : 'red',
+      label: myJDownloaderChecking ? 'Checking JDownloader' : 'Unavailable',
+      message: myJDownloaderChecking
+        ? 'Waiting for the desktop app to finish checking MyJDownloader.'
+        : 'Desktop bridge is unavailable, so MyJDownloader cannot be checked yet.',
     },
     selectedDeviceId: null,
   };
@@ -209,6 +251,58 @@ function getParseCacheStorageKey(url: string): string {
 
 function getStatusCacheStorageKey(url: string): string {
   return `${STATUS_CACHE_PREFIX}:${canonicalizeSupportedUrl(url)}`;
+}
+
+function getSteamMatchRequestedTitle(
+  parsedSource: ParsedSourcePayload,
+  queryTitle?: string | null,
+): string {
+  return queryTitle?.trim() || parsedSource.title;
+}
+
+function getSteamMatchCacheKey(
+  parsedSource: ParsedSourcePayload,
+  queryTitle?: string | null,
+): string {
+  return [
+    canonicalizeSupportedUrl(parsedSource.sourceUrl),
+    getSteamMatchRequestedTitle(parsedSource, queryTitle).toLowerCase(),
+  ].join('|');
+}
+
+function readSteamMatchCache(key: string): SteamMatchResolution | null {
+  const cached = steamMatchHotCache.get(key) ?? null;
+  if (!cached) {
+    return null;
+  }
+
+  if (cached.expiresAt <= Date.now()) {
+    steamMatchHotCache.delete(key);
+    return null;
+  }
+
+  return cached.resolution;
+}
+
+function writeSteamMatchCache(
+  key: string,
+  resolution: SteamMatchResolution,
+): void {
+  steamMatchHotCache.set(key, {
+    capturedAt: Date.now(),
+    expiresAt: Date.now() + STEAM_MATCH_CACHE_TTL_MS,
+    resolution,
+  });
+
+  while (steamMatchHotCache.size > STEAM_MATCH_CACHE_MAX_ENTRIES) {
+    const oldestKey = steamMatchHotCache.keys().next().value as
+      | string
+      | undefined;
+    if (!oldestKey) {
+      break;
+    }
+    steamMatchHotCache.delete(oldestKey);
+  }
 }
 
 function hasPlaceholderSourceVersion(value: string | null | undefined): boolean {
@@ -254,26 +348,82 @@ function isParsedCacheFresh(
 }
 
 function setLastKnownHealthSnapshot(health: ConnectionHealthSummary): void {
+  const now = Date.now();
   lastKnownHealthSnapshot = {
-    capturedAt: Date.now(),
+    capturedAt: now,
     value: health,
   };
+  void chrome.storage.session
+    .set({
+      [CONNECTION_HEALTH_CACHE_KEY]: {
+        capturedAt: now,
+        expiresAt: now + CONNECTION_HEALTH_CACHE_TTL_MS,
+        health,
+      } satisfies CachedConnectionHealth,
+    })
+    .catch(() => undefined);
 }
 
-function getBootstrapFallbackHealth(): ConnectionHealthSummary {
-  return (
-    lastKnownHealthSnapshot?.value ??
-    fallbackConnectionHealth('Starting desktop')
-  );
+async function getBootstrapFallbackHealth(): Promise<ConnectionHealthSummary> {
+  if (
+    lastKnownHealthSnapshot &&
+    Date.now() - lastKnownHealthSnapshot.capturedAt <=
+      CONNECTION_HEALTH_CACHE_TTL_MS
+  ) {
+    return lastKnownHealthSnapshot.value;
+  }
+
+  const cached = (
+    await chrome.storage.session.get(CONNECTION_HEALTH_CACHE_KEY)
+  )[CONNECTION_HEALTH_CACHE_KEY] as CachedConnectionHealth | undefined;
+  if (cached?.health && cached.expiresAt > Date.now()) {
+    lastKnownHealthSnapshot = {
+      capturedAt: cached.capturedAt,
+      value: cached.health,
+    };
+    return cached.health;
+  }
+  if (cached) {
+    await chrome.storage.session.remove(CONNECTION_HEALTH_CACHE_KEY);
+  }
+
+  return fallbackConnectionHealth('Starting desktop');
+}
+
+function cacheSettings(settings: SettingsView): void {
+  void chrome.storage.local
+    .set({
+      [SETTINGS_CACHE_KEY]: {
+        capturedAt: Date.now(),
+        expiresAt: Date.now() + SETTINGS_CACHE_TTL_MS,
+        settings,
+      } satisfies CachedSettings,
+    })
+    .catch(() => undefined);
+}
+
+async function getCachedSettings(): Promise<SettingsView | null> {
+  const cached = (await chrome.storage.local.get(SETTINGS_CACHE_KEY))[
+    SETTINGS_CACHE_KEY
+  ] as CachedSettings | undefined;
+  if (cached?.settings && cached.expiresAt > Date.now()) {
+    return cached.settings;
+  }
+  if (cached) {
+    await chrome.storage.local.remove(SETTINGS_CACHE_KEY);
+  }
+
+  return null;
 }
 
 async function sendNativeMessage(
   request: NativeMessageRequest,
+  timeoutMs = NATIVE_MESSAGE_TIMEOUT_MS,
 ): Promise<NativeMessageResponse> {
   return new Promise<NativeMessageResponse>((resolve, reject) => {
     const timer = setTimeout(() => {
       reject(new Error('GameVault desktop bridge timed out.'));
-    }, NATIVE_MESSAGE_TIMEOUT_MS);
+    }, timeoutMs);
 
     (
       chrome.runtime.sendNativeMessage(
@@ -323,6 +473,25 @@ function isAbortError(error: unknown): boolean {
     : error instanceof Error && error.name === 'AbortError';
 }
 
+async function readBridgeNativeMessageResponse(
+  response: Response,
+): Promise<NativeMessageResponse | null> {
+  try {
+    const payload = (await response.json()) as NativeMessageResponse;
+    if (
+      payload &&
+      typeof payload === 'object' &&
+      typeof (payload as { ok?: unknown }).ok === 'boolean'
+    ) {
+      return payload;
+    }
+  } catch {
+    // Non-JSON error bodies fall back to the HTTP status message below.
+  }
+
+  return null;
+}
+
 async function postBridgeRequest(
   request: NativeMessageRequest,
   timeoutMs = BRIDGE_HTTP_TIMEOUT_MS,
@@ -341,6 +510,12 @@ async function postBridgeRequest(
     });
 
     if (!response.ok) {
+      const nativeMessageResponse = await readBridgeNativeMessageResponse(
+        response.clone(),
+      );
+      if (nativeMessageResponse) {
+        return nativeMessageResponse;
+      }
       throw new Error(`GameVault desktop bridge returned ${response.status}.`);
     }
 
@@ -587,8 +762,24 @@ function getPopupReopenKey(tabId: number, url: string): string {
 }
 
 async function getActiveTab() {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  return tab ?? null;
+  const [lastFocusedTab] = await chrome.tabs.query({
+    active: true,
+    lastFocusedWindow: true,
+  });
+  if (lastFocusedTab) {
+    return lastFocusedTab;
+  }
+
+  const [currentTab] = await chrome.tabs.query({
+    active: true,
+    currentWindow: true,
+  });
+  return currentTab ?? null;
+}
+
+async function isCurrentActiveTab(tabId: number): Promise<boolean> {
+  const tab = await getActiveTab();
+  return tab?.id === tabId;
 }
 
 async function openActionPopupForTab(
@@ -772,6 +963,7 @@ async function parseAndCachePage(params: {
     fingerprint: params.fingerprint,
     parsedSource,
   });
+  void primeSteamCandidatesForSource(parsedSource);
   return parsedSource;
 }
 
@@ -832,32 +1024,26 @@ async function primeParsedSourceForTab(params: {
   url: string;
 }): Promise<void> {
   try {
-    await ensureParsedSourceForTab(params);
+    const parsedSource = await ensureParsedSourceForTab(params);
+    void primeSteamCandidatesForSource(parsedSource);
   } catch {
     // Ignore background warm failures and fall back to popup status polling.
   }
 }
 
 async function maybeAutoOpenDetectedPage(params: {
-  fingerprint: string;
   tabId: number;
   url: string;
-}) {
+}): Promise<boolean> {
   const alreadyOpened = await getSessionValue<boolean>(
-    getAutoOpenKey(
-      params.tabId,
-      `${canonicalizeSupportedUrl(params.url)}:${params.fingerprint}`,
-    ),
+    getAutoOpenKey(params.tabId, canonicalizeSupportedUrl(params.url)),
   );
   if (alreadyOpened) {
-    return;
+    return false;
   }
 
   await setSessionValue(
-    getAutoOpenKey(
-      params.tabId,
-      `${canonicalizeSupportedUrl(params.url)}:${params.fingerprint}`,
-    ),
+    getAutoOpenKey(params.tabId, canonicalizeSupportedUrl(params.url)),
     true,
   );
   await chrome.action.setTitle({
@@ -868,6 +1054,7 @@ async function maybeAutoOpenDetectedPage(params: {
   await openActionPopupForTab(params.tabId, {
     respectToolbarSetting: true,
   });
+  return true;
 }
 
 function cacheHealthFromResponse(response: NativeMessageResponse): void {
@@ -886,7 +1073,10 @@ function beginDesktopBootstrap(): Promise<ConnectionHealthSummary | null> {
     type: 'getConnectionHealth',
   };
 
-  desktopBootstrapPromise = sendNativeMessage(healthRequest)
+  desktopBootstrapPromise = sendNativeMessage(
+    healthRequest,
+    CONNECTION_HEALTH_FORCE_TIMEOUT_MS,
+  )
     .then((response) => {
       if (response.ok && response.type === 'getConnectionHealth') {
         setLastKnownHealthSnapshot(response.payload);
@@ -913,14 +1103,22 @@ function beginDesktopBootstrap(): Promise<ConnectionHealthSummary | null> {
   return desktopBootstrapPromise;
 }
 
-async function getConnectionHealth(): Promise<ConnectionHealthSummary> {
+async function getConnectionHealth(options: {
+  forceRefresh?: boolean;
+} = {}): Promise<ConnectionHealthSummary> {
+  const startedAt = Date.now();
   const healthRequest: NativeMessageRequest = {
-    payload: {},
+    payload: { forceRefresh: options.forceRefresh ?? false },
     type: 'getConnectionHealth',
   };
 
   try {
-    const response = await postBridgeRequest(healthRequest, 900);
+    const response = await postBridgeRequest(
+      healthRequest,
+      options.forceRefresh
+        ? CONNECTION_HEALTH_FORCE_TIMEOUT_MS
+        : CONNECTION_HEALTH_QUICK_TIMEOUT_MS,
+    );
     cacheHealthFromResponse(response);
     if (response.ok && response.type === 'getConnectionHealth') {
       return response.payload;
@@ -929,17 +1127,53 @@ async function getConnectionHealth(): Promise<ConnectionHealthSummary> {
     // Fall through to passive bootstrap.
   }
 
-  void beginDesktopBootstrap();
+  const bootstrap = beginDesktopBootstrap();
+  if (options.forceRefresh) {
+    const remainingMs = Math.max(
+      0,
+      CONNECTION_HEALTH_FORCE_TIMEOUT_MS - (Date.now() - startedAt),
+    );
+    const bootstrappedHealth =
+      remainingMs > 0
+        ? await withTimeout(
+            bootstrap,
+            remainingMs,
+            'GameVault desktop bridge timed out.',
+          ).catch(() => null)
+        : null;
+    if (bootstrappedHealth) {
+      return bootstrappedHealth;
+    }
+  }
   return getBootstrapFallbackHealth();
 }
 
 async function getSettings(): Promise<SettingsView> {
-  const response = await sendDesktopRequest({
-    payload: {},
-    type: 'getSettings',
-  });
+  let response: NativeMessageResponse;
+  try {
+    response = await sendDesktopRequest(
+      {
+        payload: {},
+        type: 'getSettings',
+      },
+      {
+        bridgeTimeoutMs: 1200,
+        retryBridgeTimeoutMs: 2500,
+      },
+    );
+  } catch (error) {
+    const cached = await getCachedSettings();
+    if (cached) {
+      return cached;
+    }
+    throw error;
+  }
 
   if (!response.ok || response.type !== 'getSettings') {
+    const cached = await getCachedSettings();
+    if (cached) {
+      return cached;
+    }
     throw new Error(
       response.ok
         ? 'Unable to load GameVault settings.'
@@ -947,6 +1181,7 @@ async function getSettings(): Promise<SettingsView> {
     );
   }
 
+  cacheSettings(response.payload);
   return response.payload;
 }
 
@@ -967,6 +1202,7 @@ async function saveSettings(payload: {
     );
   }
 
+  cacheSettings(response.payload);
   return response.payload;
 }
 
@@ -993,9 +1229,7 @@ async function getConnectionHealthForPrepareDraft(): Promise<ConnectionHealthSum
       getConnectionHealth(),
       new Promise<ConnectionHealthSummary>((resolve) => {
         setTimeout(() => {
-          resolve(
-            fallbackConnectionHealth('GameVault desktop bridge timed out.'),
-          );
+          void getBootstrapFallbackHealth().then(resolve);
         }, PREPARE_DRAFT_HEALTH_TIMEOUT_MS);
       }),
     ]);
@@ -1038,14 +1272,21 @@ async function sendDesktopRequest(
     // Fall through to single-flight desktop bootstrap.
   }
 
-  await beginDesktopBootstrap();
+  await withTimeout(
+    beginDesktopBootstrap(),
+    Math.min(DESKTOP_BOOTSTRAP_WAIT_MS, retryBridgeTimeoutMs),
+    'GameVault desktop bridge bootstrap timed out.',
+  ).catch(() => null);
 
   try {
     const response = await postBridgeRequest(request, retryBridgeTimeoutMs);
     cacheHealthFromResponse(response);
     return response;
   } catch {
-    const response = await sendNativeMessage(request);
+    const response = await sendNativeMessage(
+      request,
+      Math.max(retryBridgeTimeoutMs, bridgeTimeoutMs),
+    );
     cacheHealthFromResponse(response);
     return response;
   }
@@ -1454,13 +1695,8 @@ async function pollDesktopSteamWishlistActions(): Promise<void> {
 async function resolveSteamCandidates(
   parsedSource: ParsedSourcePayload,
   queryTitle?: string | null,
-): Promise<{
-  candidates: SteamCandidate[];
-  errorMessage: string | null;
-  queryTitle: string;
-  searchQueries: string[];
-}> {
-  const requestedTitle = queryTitle?.trim() || parsedSource.title;
+): Promise<SteamMatchResolution> {
+  const requestedTitle = getSteamMatchRequestedTitle(parsedSource, queryTitle);
   try {
     const response = await sendDesktopRequest({
       payload: {
@@ -1499,6 +1735,49 @@ async function resolveSteamCandidates(
       queryTitle: requestedTitle,
       searchQueries: [requestedTitle],
     };
+  }
+}
+
+async function resolveSteamCandidatesCached(
+  parsedSource: ParsedSourcePayload,
+  queryTitle?: string | null,
+): Promise<SteamMatchResolution> {
+  const cacheKey = getSteamMatchCacheKey(parsedSource, queryTitle);
+  const cached = readSteamMatchCache(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  const existing = steamMatchInFlight.get(cacheKey);
+  if (existing) {
+    return existing;
+  }
+
+  const request = (async () => {
+    const resolution = await resolveSteamCandidates(parsedSource, queryTitle);
+    if (!resolution.errorMessage || resolution.candidates.length > 0) {
+      writeSteamMatchCache(cacheKey, resolution);
+    }
+    return resolution;
+  })();
+
+  steamMatchInFlight.set(cacheKey, request);
+  try {
+    return await request;
+  } finally {
+    if (steamMatchInFlight.get(cacheKey) === request) {
+      steamMatchInFlight.delete(cacheKey);
+    }
+  }
+}
+
+async function primeSteamCandidatesForSource(
+  parsedSource: ParsedSourcePayload,
+): Promise<void> {
+  try {
+    await resolveSteamCandidatesCached(parsedSource);
+  } catch {
+    // Popup searches still surface any error if the warm lookup fails.
   }
 }
 
@@ -1904,6 +2183,41 @@ async function resolveDraftTarget(params: {
   tabId?: number;
   url: string | null;
 }> {
+  const readActiveDraftTarget = async (): Promise<{
+    tabId?: number;
+    url: string;
+  } | null> => {
+    const activeDraft = await getSessionValue<StoredDraftPointer>(
+      ACTIVE_DRAFT_KEY,
+    );
+    if (!activeDraft?.url || !isSupportedDetailPage(activeDraft.url)) {
+      return null;
+    }
+
+    if (typeof activeDraft.tabId === 'number') {
+      try {
+        const draftTab = await chrome.tabs.get(activeDraft.tabId);
+        if (
+          draftTab.url &&
+          canonicalizeSupportedUrl(draftTab.url) ===
+            canonicalizeSupportedUrl(activeDraft.url)
+        ) {
+          return {
+            tabId: activeDraft.tabId,
+            url: activeDraft.url,
+          };
+        }
+      } catch {
+        // The tab may have closed while the popup was opening.
+      }
+    }
+
+    return {
+      tabId: activeDraft.tabId,
+      url: activeDraft.url,
+    };
+  };
+
   let tabId: number | undefined;
   let url: string | undefined;
 
@@ -1926,6 +2240,16 @@ async function resolveDraftTarget(params: {
   }
 
   if (!url || !isSupportedDetailPage(url)) {
+    const activeDraft =
+      params.mode === 'active' ? await readActiveDraftTarget() : null;
+    if (activeDraft?.url) {
+      return {
+        mode: params.mode,
+        tabId: activeDraft.tabId,
+        url: canonicalizeSupportedUrl(activeDraft.url),
+      };
+    }
+
     return {
       mode: params.mode,
       tabId,
@@ -1943,18 +2267,67 @@ async function resolveDraftTarget(params: {
 async function refreshTrackedStatus(
   sourceUrl: string,
 ): Promise<TrackedItemView | null> {
-  const trackedResponse = await sendDesktopRequest({
-    payload: { sourceUrl },
-    type: 'getTrackedItemStatus',
-  });
-  if (trackedResponse.ok && trackedResponse.type === 'getTrackedItemStatus') {
-    const trackedStatus = (trackedResponse.payload ??
-      null) as TrackedItemView | null;
-    await writeTrackedStatusCache(sourceUrl, trackedStatus);
-    return trackedStatus;
+  const cacheKey = canonicalizeSupportedUrl(sourceUrl);
+  const existing = trackedStatusInFlight.get(cacheKey);
+  if (existing) {
+    return existing;
   }
 
-  return null;
+  const request = (async () => {
+    const trackedResponse = await sendDesktopRequest(
+      {
+        payload: { sourceUrl: cacheKey },
+        type: 'getTrackedItemStatus',
+      },
+      {
+        allowNativeFallback: false,
+      },
+    );
+    if (trackedResponse.ok && trackedResponse.type === 'getTrackedItemStatus') {
+      const trackedStatus = (trackedResponse.payload ??
+        null) as TrackedItemView | null;
+      await writeTrackedStatusCache(cacheKey, trackedStatus);
+      return trackedStatus;
+    }
+
+    return null;
+  })();
+
+  trackedStatusInFlight.set(cacheKey, request);
+  try {
+    return await request;
+  } finally {
+    if (trackedStatusInFlight.get(cacheKey) === request) {
+      trackedStatusInFlight.delete(cacheKey);
+    }
+  }
+}
+
+async function listTrackedItemsForPopup(options: {
+  allowNativeFallback?: boolean;
+} = {}): Promise<NativeMessageResponse> {
+  if (libraryListInFlight) {
+    return libraryListInFlight;
+  }
+
+  const request = sendDesktopRequest(
+    {
+      payload: {},
+      type: 'listTrackedItems',
+    },
+    {
+      allowNativeFallback: options.allowNativeFallback ?? true,
+    },
+  );
+  libraryListInFlight = request;
+
+  try {
+    return await request;
+  } finally {
+    if (libraryListInFlight === request) {
+      libraryListInFlight = null;
+    }
+  }
 }
 
 async function getDraftShell(params: {
@@ -1975,6 +2348,12 @@ async function getDraftShell(params: {
 
   const cachedParsedPage = await readParsedCache(target.url);
   const trackedStatus = await readTrackedStatusCache(target.url);
+  if (trackedStatus) {
+    void warmTrackedItemContext(trackedStatus);
+  }
+  if (cachedParsedPage?.parsedSource) {
+    void primeSteamCandidatesForSource(cachedParsedPage.parsedSource);
+  }
 
   if (!cachedParsedPage && target.tabId !== undefined) {
     void primeParsedSourceForTab({
@@ -1998,15 +2377,18 @@ async function getDraftStatus(params: {
   tabId?: number | null;
 }): Promise<DraftStatusContext> {
   const target = await resolveDraftTarget(params);
+  const settingsPromise = getSettings().catch(() => getCachedSettings());
   if (!target.url) {
-    const connectionHealth = await getConnectionHealthForPrepareDraft();
+    const [connectionHealth, settings] = await Promise.all([
+      getConnectionHealthForPrepareDraft(),
+      settingsPromise,
+    ]);
     return {
       connectionHealth,
-      connectionPending:
-        connectionHealth.desktop.color === 'yellow' &&
-        desktopBootstrapPromise != null,
+      connectionPending: desktopBootstrapPromise != null,
       parsedSource: null,
       parsePending: false,
+      settings,
       sourceUrl: null,
       trackedStatus: null,
       trackedStatusPending: false,
@@ -2035,16 +2417,24 @@ async function getDraftStatus(params: {
     }
   }
 
-  const connectionHealth = await getConnectionHealthForPrepareDraft();
+  const [connectionHealth, settings] = await Promise.all([
+    getConnectionHealthForPrepareDraft(),
+    settingsPromise,
+  ]);
   cachedParsedPage = await readParsedCache(target.url);
+  if (trackedStatus) {
+    void warmTrackedItemContext(trackedStatus);
+  }
+  if (cachedParsedPage?.parsedSource) {
+    void primeSteamCandidatesForSource(cachedParsedPage.parsedSource);
+  }
 
   return {
     connectionHealth,
-    connectionPending:
-      connectionHealth.desktop.color === 'yellow' &&
-      desktopBootstrapPromise != null,
+    connectionPending: desktopBootstrapPromise != null,
     parsedSource: cachedParsedPage?.parsedSource ?? null,
     parsePending: !cachedParsedPage,
+    settings,
     sourceUrl: target.url,
     trackedStatus,
     trackedStatusPending: trackedStatusInFlight.has(target.url),
@@ -2084,7 +2474,7 @@ async function completeDraft(params: {
       : null;
 
   if (!selectedCandidate && params.selectedAppId) {
-    const matchResolution = await resolveSteamCandidates(parsedSource);
+    const matchResolution = await resolveSteamCandidatesCached(parsedSource);
     selectedCandidate =
       matchResolution.candidates.find(
         (candidate) => candidate.appId === params.selectedAppId,
@@ -2150,6 +2540,7 @@ async function createMatchedDraft(params: {
   mode: 'active' | 'clipboard';
   selectedAppId?: number | null;
   selectedSteamCandidate?: SteamCandidate | null;
+  steamPatchEntries?: SteamPatchCandidate[] | null;
   sourceUrl?: string | null;
   tabId?: number | null;
 }) {
@@ -2173,7 +2564,7 @@ async function createMatchedDraft(params: {
       : null;
 
   if (!selectedCandidate && params.selectedAppId) {
-    const matchResolution = await resolveSteamCandidates(parsedSource);
+    const matchResolution = await resolveSteamCandidatesCached(parsedSource);
     selectedCandidate =
       matchResolution.candidates.find(
         (candidate) => candidate.appId === params.selectedAppId,
@@ -2194,7 +2585,11 @@ async function createMatchedDraft(params: {
   const response = await sendDesktopRequest(
     {
       payload: {
+        deferMetadata: true,
         parsedSource,
+        steamPatchEntries: (params.steamPatchEntries ?? []).filter(
+          (patch) => patch.appId === selectedCandidate.appId,
+        ),
         steamMatch,
       },
       type: 'createMatchedDraft',
@@ -2206,10 +2601,16 @@ async function createMatchedDraft(params: {
   );
 
   if (response.ok) {
+    const trackedItem = (response.payload ?? null) as TrackedItemView | null;
     await writeTrackedStatusCache(
       parsedSource.sourceUrl,
-      (response.payload ?? null) as TrackedItemView | null,
+      trackedItem,
     );
+    if (trackedItem) {
+      void warmTrackedItemContext(trackedItem, {
+        bypassBackoff: true,
+      });
+    }
   }
 
   return response;
@@ -2256,6 +2657,115 @@ async function syncTrackedSteamPatchEntries(params: {
     payload: params,
     type: 'syncTrackedSteamPatchEntries',
   });
+}
+
+function hasSteamDbBuildTableRows(patches: SteamPatchCandidate[]): boolean {
+  return patches.some((patch) => patch.selectionSource === 'steamdb_builds');
+}
+
+async function cacheTrackedItemForKnownSourceUrls(
+  item: TrackedItemView,
+): Promise<void> {
+  const urls = new Set<string>();
+  if (item.item.sourceUrl) {
+    urls.add(item.item.sourceUrl);
+  }
+  if (item.sourceSnapshot?.sourceUrl) {
+    urls.add(item.sourceSnapshot.sourceUrl);
+  }
+  for (const source of item.sourceMatches) {
+    if (source.match.sourceUrl) {
+      urls.add(source.match.sourceUrl);
+    }
+    if (source.snapshot?.sourceUrl) {
+      urls.add(source.snapshot.sourceUrl);
+    }
+  }
+
+  await Promise.allSettled(
+    [...urls].map((url) => writeTrackedStatusCache(url, item)),
+  );
+}
+
+async function warmTrackedItemContext(
+  item: TrackedItemView,
+  options: { bypassBackoff?: boolean } = {},
+): Promise<void> {
+  const trackedItemId = item.item.id;
+  const existing = trackedContextWarmInFlight.get(trackedItemId);
+  if (existing) {
+    return existing;
+  }
+
+  const task = (async () => {
+    await cacheTrackedItemForKnownSourceUrls(item);
+    const sourceRefresh = discoverSourceMatches(trackedItemId, {
+      bypassBackoff: options.bypassBackoff,
+      forceCatalog: true,
+    })
+      .then(async (response) => {
+        if (response.ok) {
+          await cacheTrackedItemForKnownSourceUrls(
+            response.payload as TrackedItemView,
+          );
+        }
+      })
+      .catch(() => undefined);
+
+    const appId = item.item.steamAppId ?? null;
+    const patchWarm =
+      appId == null
+        ? Promise.resolve()
+        : (async () => {
+            const persistedPatches = await listSteamPatchEntries(trackedItemId);
+            if (!hasSteamDbBuildTableRows(persistedPatches)) {
+              void startSteamDbBackfill(appId, { trackedItemId });
+            }
+            if (persistedPatches.length === 0) {
+              const resolved = await resolveSteamPatches(appId);
+              if (resolved.patches.length > 0) {
+                await syncTrackedSteamPatchEntries({
+                  appId,
+                  patches: resolved.patches,
+                  trackedItemId,
+                });
+              }
+            }
+          })().catch(() => undefined);
+
+    await Promise.allSettled([sourceRefresh, patchWarm]);
+  })().finally(() => {
+    if (trackedContextWarmInFlight.get(trackedItemId) === task) {
+      trackedContextWarmInFlight.delete(trackedItemId);
+    }
+  });
+
+  trackedContextWarmInFlight.set(trackedItemId, task);
+  return task;
+}
+
+async function warmTrackedContextForSource(
+  parsedSource: ParsedSourcePayload,
+): Promise<void> {
+  const sourceUrl = canonicalizeSupportedUrl(parsedSource.sourceUrl);
+  const existing = sourceContextWarmInFlight.get(sourceUrl);
+  if (existing) {
+    return existing;
+  }
+
+  const task = (async () => {
+    const trackedStatus = await refreshTrackedStatus(sourceUrl);
+    if (trackedStatus) {
+      await warmTrackedItemContext(trackedStatus);
+    }
+  })().finally(() => {
+    if (sourceContextWarmInFlight.get(sourceUrl) === task) {
+      sourceContextWarmInFlight.delete(sourceUrl);
+    }
+  });
+
+  sourceContextWarmInFlight.set(sourceUrl, task);
+  return task;
 }
 
 async function queueDraftDownload(params: {
@@ -2326,6 +2836,8 @@ async function warmSupportedTab(params: {
         tabId: params.tabId,
         url: params.url,
       });
+  void warmTrackedContextForSource(parsedSource);
+  void primeSteamCandidatesForSource(parsedSource);
 
   if (params.isActive) {
     await setActiveDraft(params.tabId, params.url);
@@ -2338,7 +2850,6 @@ async function warmSupportedTab(params: {
     });
     if (!reopened) {
       await maybeAutoOpenDetectedPage({
-        fingerprint: params.fingerprint,
         tabId: params.tabId,
         url: params.url,
       });
@@ -2371,13 +2882,14 @@ async function handleSupportedTab(
       : false;
 
     if (isParsedCacheFresh(cached, pageProbe.fingerprint)) {
+      void warmTrackedContextForSource(cached.parsedSource);
+      void primeSteamCandidatesForSource(cached.parsedSource);
       if (isActive) {
         await setActiveDraft(tabId, pageProbe.url);
       }
       await setReadyBadge(tabId);
       if (isActive && !reopened) {
         await maybeAutoOpenDetectedPage({
-          fingerprint: pageProbe.fingerprint,
           tabId,
           url: pageProbe.url,
         });
@@ -2386,10 +2898,17 @@ async function handleSupportedTab(
     }
 
     await setLoadingBadge(tabId);
+    const autoOpened =
+      isActive && !reopened
+        ? await maybeAutoOpenDetectedPage({
+            tabId,
+            url: pageProbe.url,
+          })
+        : false;
     void warmSupportedTab({
       fingerprint: pageProbe.fingerprint,
       isActive,
-      skipOpen: reopened,
+      skipOpen: reopened || autoOpened,
       tabId,
       url: pageProbe.url,
     }).catch(() => clearBadge(tabId));
@@ -2413,6 +2932,41 @@ async function primeCurrentTab(): Promise<void> {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   void (async () => {
+    if (message.type === 'gamevault:page-detected') {
+      const tabId = sender.tab?.id;
+      const url =
+        typeof message.url === 'string'
+          ? (message.url as string)
+          : sender.tab?.url;
+
+      if (typeof tabId === 'number' && url && isSupportedDetailPage(url)) {
+        const canonicalUrl = canonicalizeSupportedUrl(url);
+        const cached = await readParsedCache(canonicalUrl);
+        const isCurrent = await isCurrentActiveTab(tabId);
+        if (isCurrent) {
+          await setActiveDraft(tabId, canonicalUrl);
+        }
+
+        if (cached) {
+          void warmTrackedContextForSource(cached.parsedSource);
+          void primeSteamCandidatesForSource(cached.parsedSource);
+          await setReadyBadge(tabId);
+        } else {
+          await setLoadingBadge(tabId);
+        }
+
+        if (isCurrent) {
+          await maybeAutoOpenDetectedPage({
+            tabId,
+            url: canonicalUrl,
+          });
+        }
+      }
+
+      sendResponse({ ok: true });
+      return;
+    }
+
     if (message.type === 'gamevault:page-ready') {
       const tabId = sender.tab?.id;
       const url =
@@ -2424,33 +2978,41 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           ? (message.fingerprint as string)
           : null;
 
-      if (tabId && url && fingerprint) {
-        const cached = await readParsedCache(url);
-        const reopened = sender.tab?.active
+      if (typeof tabId === 'number' && url && fingerprint) {
+        const canonicalUrl = canonicalizeSupportedUrl(url);
+        const isCurrent = await isCurrentActiveTab(tabId);
+        const cached = await readParsedCache(canonicalUrl);
+        const reopened = isCurrent
           ? await maybeReopenPopupAfterNavigation({
               tabId,
-              url,
+              url: canonicalUrl,
             })
           : false;
         if (isParsedCacheFresh(cached, fingerprint)) {
-          if (sender.tab?.active) {
-            await setActiveDraft(tabId, url);
+          void warmTrackedContextForSource(cached.parsedSource);
+          void primeSteamCandidatesForSource(cached.parsedSource);
+          if (isCurrent) {
+            await setActiveDraft(tabId, canonicalUrl);
           }
           await setReadyBadge(tabId);
-          if (sender.tab?.active && !reopened) {
-            await maybeAutoOpenDetectedPage({ fingerprint, tabId, url });
+          if (isCurrent && !reopened) {
+            await maybeAutoOpenDetectedPage({ tabId, url: canonicalUrl });
           }
           sendResponse({ ok: true, payload: cached.parsedSource });
           return;
         }
 
         await setLoadingBadge(tabId);
+        const autoOpened =
+          isCurrent && !reopened
+            ? await maybeAutoOpenDetectedPage({ tabId, url: canonicalUrl })
+            : false;
         const parsedSource = await warmSupportedTab({
           fingerprint,
-          isActive: Boolean(sender.tab?.active),
-          skipOpen: reopened,
+          isActive: isCurrent,
+          skipOpen: reopened || autoOpened,
           tabId,
-          url,
+          url: canonicalUrl,
         });
         sendResponse({ ok: true, payload: parsedSource });
         return;
@@ -2554,7 +3116,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     if (message.type === 'gamevault:get-connection-health') {
-      sendResponse({ ok: true, payload: await getConnectionHealth() });
+      sendResponse({
+        ok: true,
+        payload: await getConnectionHealth({
+          forceRefresh: message.forceRefresh === true,
+        }),
+      });
       return;
     }
 
@@ -2717,7 +3284,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               message.manualQuery.trim()
             ? message.manualQuery.trim()
             : null;
-      const result = await resolveSteamCandidates(
+      const result = await resolveSteamCandidatesCached(
         shell.parsedSource,
         queryTitle,
       );
@@ -3160,6 +3727,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           message.selectedSteamCandidate !== null
             ? (message.selectedSteamCandidate as SteamCandidate)
             : null,
+        steamPatchEntries: Array.isArray(message.steamPatchEntries)
+          ? (message.steamPatchEntries as SteamPatchCandidate[])
+          : null,
         sourceUrl:
           typeof message.sourceUrl === 'string'
             ? (message.sourceUrl as string)
@@ -3310,9 +3880,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (message.type === 'gamevault:list-library') {
       try {
-        const response = await sendDesktopRequest({
-          payload: {},
-          type: 'listTrackedItems',
+        const response = await listTrackedItemsForPopup({
+          allowNativeFallback: message.allowNativeFallback !== false,
         });
         sendResponse(
           response.ok ? { ok: true, payload: response.payload } : response,
@@ -3517,6 +4086,36 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             error instanceof Error
               ? error.message
               : 'Unable to clear failed status.',
+          ok: false,
+        });
+      }
+      return;
+    }
+
+    if (message.type === 'gamevault:queue-online-fix-download') {
+      try {
+        const sourceKind =
+          message.sourceKind === 'ankergames' ||
+          message.sourceKind === 'steamrip' ||
+          message.sourceKind === 'elamigos'
+            ? message.sourceKind
+            : null;
+        const response = await sendDesktopRequest({
+          payload: {
+            sourceKind,
+            trackedItemId: String(message.trackedItemId ?? ''),
+          },
+          type: 'queueOnlineFixDownload',
+        });
+        sendResponse(
+          response.ok ? { ok: true, payload: response.payload } : response,
+        );
+      } catch (error) {
+        sendResponse({
+          message:
+            error instanceof Error
+              ? error.message
+              : 'Unable to queue Online Fix download.',
           ok: false,
         });
       }

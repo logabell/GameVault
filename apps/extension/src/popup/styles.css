@@ -702,6 +702,22 @@ select option {
   margin-bottom: 7px;
 }
 
+.library-card__badges .status-chip,
+.library-card__badges .online-fix-badge,
+.library-row__chips .status-chip,
+.library-row__chips .online-fix-badge {
+  box-sizing: border-box;
+  flex: 0 0 82px;
+  width: 82px;
+  min-width: 82px;
+  max-width: 82px;
+  justify-content: center;
+  overflow: hidden;
+  text-align: center;
+  line-height: 1.08;
+  white-space: nowrap;
+}
+
 .library-card strong,
 .library-row strong {
   min-width: 0;
@@ -801,6 +817,7 @@ select option {
 }
 
 .status-chip,
+.online-fix-badge,
 .mini-chip,
 .step-chip,
 .library-presence-chip,
@@ -808,6 +825,7 @@ select option {
 .likely-match-chip {
   display: inline-flex;
   align-items: center;
+  gap: 4px;
   width: fit-content;
   min-height: 18px;
   padding: 2px 6px;
@@ -823,6 +841,8 @@ select option {
 
 .status-chip.installed,
 .status-chip.up_to_date,
+.online-fix-badge.is-green,
+.online-fix-mini-chip,
 .library-presence-chip,
 .primary-button.is-confirmed {
   color: color-mix(in srgb, var(--success) 72%, var(--ink));
@@ -831,6 +851,7 @@ select option {
 }
 
 .status-chip.discovered,
+.online-fix-badge.is-neutral,
 .library-presence-chip.is-discovered {
   color: var(--muted-strong);
   border-color: color-mix(in srgb, var(--muted) 28%, var(--border));
@@ -839,6 +860,7 @@ select option {
 
 .status-chip.failed,
 .status-chip.folder_missing,
+.online-fix-badge.is-red,
 .mini-chip.is-danger {
   color: color-mix(in srgb, var(--danger) 72%, var(--ink));
   border-color: color-mix(in srgb, var(--danger) 30%, var(--border));
@@ -1127,7 +1149,8 @@ select option {
 }
 
 .source-row__select span,
-.source-row__error {
+.source-row__error,
+.source-row__notice {
   color: var(--muted);
   font-size: 12px;
 }
@@ -1150,7 +1173,8 @@ select option {
   animation: spin 0.9s linear infinite;
 }
 
-.source-row__error {
+.source-row__error,
+.source-row__notice {
   grid-column: 1 / -1;
   margin: 0;
 }
