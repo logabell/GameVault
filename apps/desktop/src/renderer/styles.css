@@ -1459,6 +1459,17 @@ code {
   white-space: nowrap;
 }
 
+.detail-grid__action {
+  width: fit-content;
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 4px;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
 .metadata-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   margin-top: 4px;
@@ -1650,6 +1661,7 @@ code {
 .activity-summary-card,
 .activity-issue-card,
 .activity-log-row,
+.activity-queue-row,
 .activity-active-strip {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -1764,9 +1776,71 @@ code {
 }
 
 .activity-issue-list,
+.activity-queue-list,
 .activity-log-list {
   display: grid;
   gap: 10px;
+}
+
+.activity-queue-row {
+  display: grid;
+  grid-template-columns: minmax(96px, auto) minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 12px;
+}
+
+.activity-queue-row--running,
+.activity-queue-row--queued {
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
+}
+
+.activity-queue-row--cooldown {
+  border-color: color-mix(in srgb, var(--warning) 28%, var(--border));
+}
+
+.activity-queue-row--failed {
+  border-color: color-mix(in srgb, var(--danger) 34%, var(--border));
+}
+
+.activity-queue-row__kind,
+.activity-queue-row__meta span {
+  width: fit-content;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-soft);
+  color: var(--muted-strong);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.activity-queue-row__main {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.activity-queue-row__main strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.activity-queue-row__main p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.activity-queue-row__meta {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+  max-width: 260px;
 }
 
 .activity-issue-card {
@@ -4204,8 +4278,14 @@ code {
 
   .activity-section__heading,
   .activity-section__heading--logs,
+  .activity-queue-row,
   .activity-issue-card {
     grid-template-columns: 1fr;
+  }
+
+  .activity-queue-row__meta {
+    justify-content: flex-start;
+    max-width: none;
   }
 
   .activity-issue__action .muted-text {

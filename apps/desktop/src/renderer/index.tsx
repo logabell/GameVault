@@ -74,6 +74,7 @@ import type {
   JDownloaderInstallStatus,
   LibraryRootRecord,
   MatchedSourceView,
+  MaintenanceJobView,
   MyJDownloaderDeviceSummary,
   NativeHostRegistrationMetadata,
   NativeHostRegistrationResult,
@@ -103,8 +104,8 @@ import type {
 } from '@gamevault/shared-types';
 import {
   FIREFOX_EXTENSION_ID,
+  compactSteamPatchHistory,
   getPatchHistoryKey,
-  mergePatchHistory,
   sortSteamPatchesByRecency,
 } from '@gamevault/shared-types';
 
@@ -286,6 +287,8 @@ type AppErrorBoundaryState = {
 };
 
 const DESKTOP_LIBRARY_VIEW_STORAGE_KEY = 'gamevault:desktop:library-view';
+const ACTIVE_PROGRESS_RENDER_INTERVAL_MS = 500;
+const LIVE_PROGRESS_ESTIMATE_MAX_AGE_MS = 5_000;
 const PATCH_EDITOR_BACKFILL_POLL_INTERVAL_MS = 750;
 const PATCH_EDITOR_BACKFILL_POLL_TIMEOUT_MS = 26000;
 const STEAM_LEGACY_APP_ART_BASE =
@@ -347,6 +350,13 @@ type DownloadProgressPayload = {
 
 type ActivityChangePayload = {
   activity: ActivityView;
+};
+
+type PlayniteReviewState = {
+  executablePath: string;
+  queue: boolean;
+  selection: PlayniteExecutableSelectionRecord;
+  title: string;
 };
 
 declare global {
@@ -488,6 +498,9 @@ declare global {
         extensionsPath?: string | null;
         manifestPath?: string | null;
       }): Promise<PlayniteIntegrationStatus>;
+      refreshPlayniteExecutableSelection(payload: {
+        trackedItemId: string;
+      }): Promise<PlayniteExecutableSelectionRecord>;
       restoreImportFolder(payload: {
         id: string;
       }): Promise<IgnoredImportFolderRecord[]>;
@@ -556,11 +569,56 @@ function isReviewablePlayniteCandidate(
   return !candidate.excluded && candidate.score > 0;
 }
 
-function progressPercent(item: TrackedItemView): number | null {
-  const stage = item.currentDownload?.stage;
-  const loaded = item.currentDownload?.bytesLoaded ?? null;
-  const total = item.currentDownload?.bytesTotal ?? null;
-  if (!loaded || !total || total <= 0) return null;
+function playnitePathsEqual(
+  left: string | null | undefined,
+  right: string,
+): boolean {
+  return (left ?? '').toLowerCase() === right.toLowerCase();
+}
+
+function timestampMs(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const parsed = new Date(value).getTime();
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+function estimateDownloadBytesLoaded(
+  download: NonNullable<TrackedItemView['currentDownload']>,
+  now = Date.now(),
+): number | null {
+  const loaded = download.bytesLoaded ?? null;
+  if (loaded == null) return null;
+
+  const speed = download.speed ?? null;
+  const total = download.bytesTotal ?? null;
+  const updatedAt = timestampMs(download.updatedAt);
+  if (
+    speed == null ||
+    speed <= 0 ||
+    updatedAt == null ||
+    (download.stage !== 'downloading' && download.stage !== 'extracting')
+  ) {
+    return loaded;
+  }
+
+  const ageMs = now - updatedAt;
+  if (ageMs <= 0 || ageMs > LIVE_PROGRESS_ESTIMATE_MAX_AGE_MS) {
+    return loaded;
+  }
+
+  const estimated = loaded + speed * (ageMs / 1000);
+  return total != null && total > 0 ? Math.min(total, estimated) : estimated;
+}
+
+function progressPercent(
+  item: TrackedItemView,
+  now = Date.now(),
+): number | null {
+  const download = item.currentDownload;
+  const stage = download?.stage;
+  const loaded = download ? estimateDownloadBytesLoaded(download, now) : null;
+  const total = download?.bytesTotal ?? null;
+  if (loaded == null || loaded <= 0 || !total || total <= 0) return null;
   if (stage === 'queued' && loaded >= total) return null;
   return Math.max(0, Math.min(100, (loaded / total) * 100));
 }
@@ -572,6 +630,7 @@ function formatProgressPercent(progress: number): string {
 function formatProgressAmount(
   item: TrackedItemView,
   progress: number | null,
+  now = Date.now(),
 ): string {
   const download = item.currentDownload;
   if (!download) return 'Size unknown';
@@ -581,7 +640,7 @@ function formatProgressAmount(
       : 'Size unknown';
   }
 
-  return `${formatBytes(download.bytesLoaded)} / ${formatBytes(download.bytesTotal)}`;
+  return `${formatBytes(estimateDownloadBytesLoaded(download, now))} / ${formatBytes(download.bytesTotal)}`;
 }
 
 function formatDownloadSummary(
@@ -698,8 +757,9 @@ function patchCandidateKey(patch: SteamPatchCandidate): string {
 
 function mergePatchCandidates(
   patches: SteamPatchCandidate[],
+  requiredPatches: SteamPatchCandidate[] = [],
 ): SteamPatchCandidate[] {
-  return mergePatchHistory(patches);
+  return compactSteamPatchHistory(patches, { requiredPatches });
 }
 
 function hasSteamDbBuildTableRows(patches: SteamPatchCandidate[]): boolean {
@@ -1404,6 +1464,70 @@ function formatRelativeFuture(value: string | null | undefined): string {
   return `In ${days} days`;
 }
 
+function getMaintenanceJobKindLabel(kind: MaintenanceJobView['kind']): string {
+  switch (kind) {
+    case 'download_poll':
+      return 'Download poll';
+    case 'source_watch':
+      return 'Source watch';
+    case 'steamdb_rss':
+      return 'SteamDB RSS';
+  }
+}
+
+function getMaintenanceJobTitle(job: MaintenanceJobView): string {
+  return (
+    job.gameTitle ??
+    (job.sourceKind ? formatTrackedSourceKind(job.sourceKind) : null) ??
+    job.host ??
+    getMaintenanceJobKindLabel(job.kind)
+  );
+}
+
+function getMaintenanceJobStatusLabel(job: MaintenanceJobView): string {
+  if (job.status === 'cooldown') {
+    return job.retryInMs && job.retryInMs > 0
+      ? `Retry in ${formatDurationShort(job.retryInMs)}`
+      : 'Cooling down';
+  }
+  switch (job.status) {
+    case 'failed':
+      return 'Failed';
+    case 'queued':
+      return 'Queued';
+    case 'running':
+      return 'Running';
+    case 'succeeded':
+      return 'Current';
+  }
+}
+
+function getMaintenanceJobDetail(job: MaintenanceJobView): string {
+  const detailParts = [
+    job.detail,
+    job.lastError ? `Last error: ${job.lastError}` : null,
+    job.nextAttemptAt && job.status === 'cooldown'
+      ? `Next attempt ${formatRelativeFuture(job.nextAttemptAt)}`
+      : null,
+    job.lastAttemptAt ? `Last attempt ${formatRelativeTime(job.lastAttemptAt)}` : null,
+  ];
+  return detailParts.filter(Boolean).join(' | ') || 'Waiting for maintenance.';
+}
+
+function shouldShowMaintenanceJobAttempts(job: MaintenanceJobView): boolean {
+  return job.kind !== 'download_poll' && job.attemptCount > 0;
+}
+
+function getMaintenanceJobAttemptLabel(
+  job: MaintenanceJobView,
+): string | null {
+  if (!shouldShowMaintenanceJobAttempts(job)) {
+    return null;
+  }
+  const unit = job.kind === 'source_watch' ? 'check' : 'attempt';
+  return `${job.attemptCount} ${unit}${job.attemptCount === 1 ? '' : 's'}`;
+}
+
 function hasActiveProgress(item: TrackedItemView): boolean {
   return Boolean(
     item.currentDownload &&
@@ -1844,6 +1968,18 @@ function getSourcePatchComparison(
     return { label: 'Not matched', rank: 900, tone: 'not_matched' };
   }
 
+  if (!source.match.usable) {
+    if (source.match.status === 'not_found') {
+      return { label: 'Not available', rank: 880, tone: 'not_matched' };
+    }
+    if (isTransientSourceIssue(source.match.lastError)) {
+      return { label: 'Unable to verify', rank: 840, tone: 'failed' };
+    }
+    if (source.match.status === 'candidate') {
+      return { label: 'Needs review', rank: 700, tone: 'unknown' };
+    }
+  }
+
   const snapshot = source.snapshot;
   if (source.updateStatus === 'not_matched') {
     return { label: 'Not matched', rank: 900, tone: 'not_matched' };
@@ -1976,10 +2112,14 @@ function getSourceOfferTags(
   if (source.match.method === 'manual') {
     tags.push('Manual');
   }
-  if (
-    source.match.status === 'candidate' ||
-    source.match.status === 'not_found'
+  if (source.match.status === 'not_found') {
+    tags.push('Not available');
+  } else if (
+    source.match.status === 'candidate' &&
+    isTransientSourceIssue(source.match.lastError)
   ) {
+    tags.push('Unable to verify');
+  } else if (source.match.status === 'candidate') {
     tags.push('Not matched');
   }
   if (source.match.status === 'failed' || source.match.status === 'blocked') {
@@ -2092,6 +2232,9 @@ function sourceOnlineFixWarning(
   item: TrackedItemView,
   source?: TrackedItemView['sourceMatches'][number],
 ): string | null {
+  if (!source?.match.usable) {
+    return null;
+  }
   if (!item.onlineFix || item.onlineFix.status === 'none') {
     return null;
   }
@@ -2116,7 +2259,33 @@ function isSubduedSourceIssue(
   return Boolean(
     source?.snapshot &&
     source.match.lastError &&
-    /rate limited|retrying later/i.test(source.match.lastError),
+      /rate limited|retrying later/i.test(source.match.lastError),
+  );
+}
+
+function formatSourceOfferIssue(
+  sourceKind: SupportedSourceKind,
+  match: TrackedItemView['sourceMatches'][number]['match'],
+): string | null {
+  const sourceLabel = formatTrackedSourceKind(sourceKind);
+  if (match.status === 'not_found') {
+    return `${sourceLabel} does not list this title yet.`;
+  }
+  if (match.status === 'candidate' && !match.lastError) {
+    return `No confident ${sourceLabel} title match was found.`;
+  }
+  if (isTransientSourceIssue(match.lastError)) {
+    return `Unable to verify ${sourceLabel} right now; the host blocked the app request.`;
+  }
+  return match.lastError ?? null;
+}
+
+function isTransientSourceIssue(message: string | null | undefined): boolean {
+  return Boolean(
+    message &&
+      /backing off|catalog unavailable|catalog request failed|temporarily blocked|rate limited|retrying later|403|429/i.test(
+        message,
+      ),
   );
 }
 
@@ -2305,6 +2474,7 @@ function App() {
   const [wishlistMessage, setWishlistMessage] = useState<string | null>(null);
   const [detailsItemId, setDetailsItemId] = useState<string | null>(null);
   const [items, setItems] = useState<TrackedItemView[]>([]);
+  const [progressClock, setProgressClock] = useState(() => Date.now());
   const [activity, setActivity] = useState<ActivityView | null>(null);
   const [activityActionBusy, setActivityActionBusy] = useState<string | null>(
     null,
@@ -2391,11 +2561,8 @@ function App() {
   const [duoStreamMessage, setDuoStreamMessage] = useState<string | null>(null);
   const [duoStreamSyncPhase, setDuoStreamSyncPhase] =
     useState<DuoStreamSyncPhase>('idle');
-  const [playniteReview, setPlayniteReview] = useState<{
-    executablePath: string;
-    selection: PlayniteExecutableSelectionRecord;
-    title: string;
-  } | null>(null);
+  const [playniteReview, setPlayniteReview] =
+    useState<PlayniteReviewState | null>(null);
   const [browserExtensionStatus, setBrowserExtensionStatus] =
     useState<BrowserExtensionInstallStatus | null>(null);
   const [extensionSetupInfo, setExtensionSetupInfo] =
@@ -2476,6 +2643,10 @@ function App() {
       librarySortDirection,
       libraryStatusFilter,
     ],
+  );
+  const hasLiveProgressItems = useMemo(
+    () => items.some(hasActiveProgress),
+    [items],
   );
   const wishlistFilterCounts = useMemo(() => {
     const base = steamWishlist.items.filter((item) =>
@@ -2996,10 +3167,12 @@ function App() {
   async function savePlayniteReviewSelection() {
     if (!playniteReview) return;
     const currentReviewIndex =
-      playniteStatus?.pendingReviews.findIndex(
-        (review) =>
-          review.trackedItemId === playniteReview.selection.trackedItemId,
-      ) ?? -1;
+      playniteReview.queue
+        ? (playniteStatus?.pendingReviews.findIndex(
+            (review) =>
+              review.trackedItemId === playniteReview.selection.trackedItemId,
+          ) ?? -1)
+        : -1;
     setPlayniteBusy(true);
     setPlayniteMessage(null);
     try {
@@ -3009,15 +3182,20 @@ function App() {
           trackedItemId: playniteReview.selection.trackedItemId,
         });
       setPlayniteStatus(nextStatus);
-      const nextReview =
-        nextStatus.pendingReviews[currentReviewIndex] ??
-        nextStatus.pendingReviews[currentReviewIndex - 1] ??
-        nextStatus.pendingReviews[0] ??
-        null;
-      setPlayniteReview(
-        nextReview ? createPlayniteReviewState(nextReview) : null,
-      );
-      setPlayniteMessage('Playnite launch executable saved.');
+      await refreshItems();
+      if (playniteReview.queue) {
+        const nextReview =
+          nextStatus.pendingReviews[currentReviewIndex] ??
+          nextStatus.pendingReviews[currentReviewIndex - 1] ??
+          nextStatus.pendingReviews[0] ??
+          null;
+        setPlayniteReview(
+          nextReview ? createPlayniteReviewState(nextReview, true) : null,
+        );
+      } else {
+        setPlayniteReview(null);
+      }
+      setPlayniteMessage('Playnite launch executable saved. Manifest refreshed.');
     } catch (error) {
       setPlayniteMessage(
         error instanceof Error
@@ -3030,18 +3208,19 @@ function App() {
   }
 
   function createPlayniteReviewState(
-    review: PlayniteIntegrationStatus['pendingReviews'][number],
-  ): {
-    executablePath: string;
-    selection: PlayniteExecutableSelectionRecord;
-    title: string;
-  } {
+    review: Pick<
+      PlayniteIntegrationStatus['pendingReviews'][number],
+      'gameTitle' | 'selection'
+    >,
+    queue: boolean,
+  ): PlayniteReviewState {
     const firstViable =
       review.selection.candidates.find(isReviewablePlayniteCandidate) ??
       null;
     return {
       executablePath:
         review.selection.selectedExePath ?? firstViable?.fullPath ?? '',
+      queue,
       selection: review.selection,
       title: review.gameTitle,
     };
@@ -3052,7 +3231,7 @@ function App() {
   ) {
     if (!review) return;
     setPlayniteMessage(null);
-    setPlayniteReview(createPlayniteReviewState(review));
+    setPlayniteReview(createPlayniteReviewState(review, true));
   }
 
   function openPlayniteReviewAtIndex(index: number) {
@@ -3069,6 +3248,69 @@ function App() {
       (review) => review.trackedItemId === playniteReview.selection.trackedItemId,
     );
     openPlayniteReviewAtIndex((currentIndex >= 0 ? currentIndex : 0) + offset);
+  }
+
+  function canChangePlayniteExecutable(item: TrackedItemView): boolean {
+    const installPath =
+      item.installRecord?.installPath ?? item.fileState.finalPath;
+    return Boolean(
+      item.item.steamAppId &&
+        installPath &&
+        item.fileState.finalPathExists,
+    );
+  }
+
+  async function openPlayniteSelectionForItem(item: TrackedItemView) {
+    if (!canChangePlayniteExecutable(item)) return;
+    const now = new Date().toISOString();
+    const selection: PlayniteExecutableSelectionRecord =
+      item.playniteExecutableSelection ?? {
+        candidates: [],
+        confidence: 'none',
+        reviewedAt: null,
+        selectedExePath: null,
+        status: 'needs_review',
+        steamAppId: item.item.steamAppId ?? null,
+        trackedItemId: item.item.id,
+        updatedAt: now,
+      };
+    setPlayniteMessage(null);
+    setPlayniteReview(
+      createPlayniteReviewState(
+        {
+          gameTitle: item.item.steamTitle ?? item.item.title,
+          selection,
+        },
+        false,
+      ),
+    );
+    setPlayniteBusy(true);
+    setPlayniteMessage('Refreshing executable candidates...');
+    try {
+      const refreshedSelection =
+        await window.gameVaultApi.refreshPlayniteExecutableSelection({
+          trackedItemId: item.item.id,
+        });
+      setPlayniteReview(
+        createPlayniteReviewState(
+          {
+            gameTitle: item.item.steamTitle ?? item.item.title,
+            selection: refreshedSelection,
+          },
+          false,
+        ),
+      );
+      await refreshItems();
+      setPlayniteMessage(null);
+    } catch (error) {
+      setPlayniteMessage(
+        error instanceof Error
+          ? error.message
+          : 'Unable to refresh executable candidates.',
+      );
+    } finally {
+      setPlayniteBusy(false);
+    }
   }
 
   async function refreshSteamWishlist() {
@@ -4796,6 +5038,15 @@ function App() {
   }, [mergeTrackedItemViews]);
 
   useEffect(() => {
+    if (!hasLiveProgressItems) return undefined;
+    const timer = window.setInterval(
+      () => setProgressClock(Date.now()),
+      ACTIVE_PROGRESS_RENDER_INTERVAL_MS,
+    );
+    return () => window.clearInterval(timer);
+  }, [hasLiveProgressItems]);
+
+  useEffect(() => {
     return window.gameVaultApi.onActivityChange((payload) => {
       setActivity(payload.activity);
     });
@@ -5116,15 +5367,14 @@ function App() {
       params.item.selectedPatch,
       params.item.latestPatch,
     ];
-    const seedPatches = mergePatchCandidates(
-      seedCandidates.filter((patch): patch is SteamPatchCandidate =>
-        Boolean(patch),
-      ),
+    const seedPatches = seedCandidates.filter(
+      (patch): patch is SteamPatchCandidate => Boolean(patch),
     );
+    const patchChoices = mergePatchCandidates(seedPatches, seedPatches);
     const patchSelection = getUpdatePatchSelection(
       params.item,
       params.source,
-      seedPatches,
+      patchChoices,
     );
     return {
       error: null,
@@ -5132,7 +5382,7 @@ function App() {
       likelyPatch: patchSelection.likelyPatch,
       loadingPatches: false,
       mirrorPlan: params.mirrorPlan,
-      patches: seedPatches,
+      patches: patchChoices,
       phase: params.phase,
       selectedPatchKey: patchSelection.selectedPatchKey,
       source: params.source,
@@ -5242,6 +5492,23 @@ function App() {
     }
   }
 
+  async function runActivityToolbarAction(
+    payload: ActivityActionPayload,
+    busyKey: string,
+  ) {
+    setActivityActionBusy(busyKey);
+    try {
+      const nextActivity = await window.gameVaultApi.runActivityAction(payload);
+      const trackedItems = await window.gameVaultApi.listTrackedItems();
+      startTransition(() => {
+        setActivity(nextActivity);
+        setItems(trackedItems);
+      });
+    } finally {
+      setActivityActionBusy(null);
+    }
+  }
+
   async function clearActivityIssue(issue: ActivityIssue) {
     if (!issue.dismissalKey) {
       return;
@@ -5281,11 +5548,21 @@ function App() {
     setBusyAction('updatePatch');
     setSourceBusyKind(flow.sourceKind);
     let patches = flow.patches;
+    const requiredPatches: SteamPatchCandidate[] = [];
+    if (flow.item.selectedPatch) {
+      requiredPatches.push(flow.item.selectedPatch);
+    }
+    if (flow.source.matchedPatch) {
+      requiredPatches.push(flow.source.matchedPatch);
+    }
     try {
       const persistedPatches = await window.gameVaultApi.listSteamPatchEntries(
         flow.item.item.id,
       );
-      patches = mergePatchCandidates([...patches, ...persistedPatches]);
+      patches = mergePatchCandidates(
+        [...patches, ...persistedPatches],
+        requiredPatches,
+      );
       let selection = getUpdatePatchSelection(flow.item, flow.source, patches);
       setUpdateFlow((current) =>
         current
@@ -5301,7 +5578,10 @@ function App() {
       const resolvedPatches = await window.gameVaultApi.resolveSteamPatches({
         appId: flow.item.item.steamAppId,
       });
-      patches = mergePatchCandidates([...patches, ...resolvedPatches.patches]);
+      patches = mergePatchCandidates(
+        [...patches, ...resolvedPatches.patches],
+        requiredPatches,
+      );
       selection = getUpdatePatchSelection(flow.item, flow.source, patches);
       setUpdateFlow((current) =>
         current
@@ -5660,10 +5940,10 @@ function App() {
         return current;
       }
 
-      const merged = mergePatchCandidates([
-        ...current.patches,
-        ...normalizedPatches,
-      ]);
+      const merged = mergePatchCandidates(
+        [...current.patches, ...normalizedPatches],
+        current.item.selectedPatch ? [current.item.selectedPatch] : [],
+      );
       const selectedKey =
         current.selectedKey &&
         merged.some((patch) => patchCandidateKey(patch) === current.selectedKey)
@@ -5750,6 +6030,7 @@ function App() {
     const seedPatches: SteamPatchCandidate[] = item.selectedPatch
       ? [item.selectedPatch]
       : [];
+    const requiredPatches = seedPatches;
     const requestId = ++patchEditorRequestIdRef.current;
     setPatchEditor({
       backfillStatus: hasSteamDbBuildTableRows(seedPatches) ? 'loaded' : 'idle',
@@ -5769,7 +6050,10 @@ function App() {
       if (patchEditorRequestIdRef.current !== requestId) {
         return;
       }
-      patches = mergePatchCandidates([...patches, ...persistedPatches]);
+      patches = mergePatchCandidates(
+        [...patches, ...persistedPatches],
+        requiredPatches,
+      );
       setPatchEditor((current) =>
         current
           ? {
@@ -5792,7 +6076,10 @@ function App() {
       const result = await window.gameVaultApi.resolveSteamPatches({
         appId: item.item.steamAppId,
       });
-      patches = mergePatchCandidates([...patches, ...result.patches]);
+      patches = mergePatchCandidates(
+        [...patches, ...result.patches],
+        requiredPatches,
+      );
       if (patchEditorRequestIdRef.current !== requestId) {
         return;
       }
@@ -6011,6 +6298,16 @@ function App() {
           <strong>Launch EXE</strong>
           <span>{launchExecutableStatus}</span>
           <span>{launchExecutablePathLabel}</span>
+          {variant === 'modal' && canChangePlayniteExecutable(item) ? (
+            <button
+              className="ghost-button detail-grid__action"
+              onClick={() => void openPlayniteSelectionForItem(item)}
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faGamepad} />
+              <span>Change EXE</span>
+            </button>
+          ) : null}
         </div>
       </div>
     );
@@ -6062,7 +6359,7 @@ function App() {
         </div>
         <div className="progress-meta">
           <span>{formatDownloadSummary(item, progress)}</span>
-          <span>{formatProgressAmount(item, progress)}</span>
+          <span>{formatProgressAmount(item, progress, progressClock)}</span>
           <span>
             {item.currentDownload.speed
               ? `${formatBytes(item.currentDownload.speed)}/s`
@@ -6183,10 +6480,10 @@ function App() {
 
   function runItemMenuAction(
     event: MouseEvent<HTMLElement>,
-    action: () => void,
+    action: () => void | Promise<void>,
   ) {
     closeItemActionMenu(event);
-    action();
+    void action();
   }
 
   function renderLibraryActionMenu(item: TrackedItemView) {
@@ -6244,6 +6541,21 @@ function App() {
                   ? 'Saving Source...'
                   : 'Edit Imported Source'}
               </span>
+            </button>
+          ) : null}
+          {canChangePlayniteExecutable(item) ? (
+            <button
+              disabled={itemBusy}
+              onClick={(event) =>
+                runItemMenuAction(event, () =>
+                  openPlayniteSelectionForItem(item),
+                )
+              }
+              role="menuitem"
+              type="button"
+            >
+              <FontAwesomeIcon aria-hidden="true" icon={faGamepad} />
+              <span>Change Launch EXE</span>
             </button>
           ) : null}
           {item.item.steamAppId ? (
@@ -6706,13 +7018,16 @@ function App() {
                   (mirror) => mirror.kind === 'full' || mirror.kind === 'patch',
                 );
                 const tags = getSourceOfferTags(item, sourceKind, source);
-                const sourceIssue = match?.lastError;
+                const sourceIssue = match
+                  ? formatSourceOfferIssue(sourceKind, match)
+                  : null;
                 const issueIsSubdued = isSubduedSourceIssue(source);
                 const onlineFixLabel = formatSourceOnlineFixLabel(source);
                 const onlineFixNotice = sourceOnlineFixWarning(item, source);
                 const scanTime =
                   snapshot?.checkedAt ?? match?.lastCheckedAt ?? null;
                 const isRefreshing = sourceBusyKind === sourceKind;
+                const sourceActionBusy = sourceBusyKind != null;
                 const canDownloadSource = canQueueSourceUpdate({
                   connectionHealth,
                   jDownloaderEnabled: settings.jDownloaderEnabled,
@@ -6809,24 +7124,20 @@ function App() {
                             <span>Open</span>
                           </button>
                         ) : null}
-                        {match?.sourceUrl ? (
-                          <button
-                            aria-busy={isRefreshing}
-                            disabled={isRefreshing}
-                            onClick={() =>
-                              void refreshOneMatchedSource(sourceKind)
-                            }
-                            type="button"
-                          >
-                            <FontAwesomeIcon
-                              aria-hidden="true"
-                              icon={faRotateRight}
-                            />
-                            <span>
-                              {isRefreshing ? 'Refreshing...' : 'Refresh'}
-                            </span>
-                          </button>
-                        ) : null}
+                        <button
+                          aria-busy={isRefreshing}
+                          disabled={sourceActionBusy}
+                          onClick={() => void refreshOneMatchedSource(sourceKind)}
+                          type="button"
+                        >
+                          <FontAwesomeIcon
+                            aria-hidden="true"
+                            icon={faRotateRight}
+                          />
+                          <span>
+                            {isRefreshing ? 'Refreshing...' : 'Refresh'}
+                          </span>
+                        </button>
                         {source?.isUpdateSource && hasDownloadMirror ? (
                           <button
                             disabled={isRefreshing || !canDownloadSource}
@@ -7683,7 +7994,7 @@ function App() {
   }
 
   function renderLibraryItem(item: TrackedItemView) {
-    const progress = progressPercent(item);
+    const progress = progressPercent(item, progressClock);
     const activity = getItemActivity(item);
     const fileState = getItemFileState(item);
     const details = renderLibraryDetailGrid({
@@ -8409,9 +8720,7 @@ function App() {
 
   function renderPlayniteReviewModal() {
     if (!playniteReview) return null;
-    const candidates = playniteReview.selection.candidates.filter(
-      isReviewablePlayniteCandidate,
-    );
+    const candidates = playniteReview.selection.candidates;
     const reviewCount = playniteStatus?.pendingReviews.length ?? 0;
     const reviewIndex =
       playniteStatus?.pendingReviews.findIndex(
@@ -8419,7 +8728,7 @@ function App() {
           review.trackedItemId === playniteReview.selection.trackedItemId,
       ) ?? -1;
     const reviewPosition = reviewIndex >= 0 ? reviewIndex + 1 : 1;
-    const canNavigateReviews = reviewCount > 1;
+    const canNavigateReviews = playniteReview.queue && reviewCount > 1;
     return (
       <div className="modal-backdrop modal-backdrop--stacked" role="presentation">
         <div
@@ -8435,31 +8744,33 @@ function App() {
                 {formatPlayniteConfidence(playniteReview.selection)}
               </p>
             </div>
-            <div className="playnite-review-modal__nav">
-              <button
-                aria-label="Previous Playnite executable review"
-                className="ghost-button playnite-review-modal__nav-button"
-                disabled={!canNavigateReviews}
-                onClick={() => navigatePlayniteReview(-1)}
-                type="button"
-              >
-                <FontAwesomeIcon aria-hidden="true" icon={faChevronLeft} />
-                Back
-              </button>
-              <span className="playnite-review-modal__count">
-                {reviewPosition} / {Math.max(reviewCount, 1)}
-              </span>
-              <button
-                aria-label="Next Playnite executable review"
-                className="ghost-button playnite-review-modal__nav-button"
-                disabled={!canNavigateReviews}
-                onClick={() => navigatePlayniteReview(1)}
-                type="button"
-              >
-                Next
-                <FontAwesomeIcon aria-hidden="true" icon={faChevronRight} />
-              </button>
-            </div>
+            {playniteReview.queue ? (
+              <div className="playnite-review-modal__nav">
+                <button
+                  aria-label="Previous Playnite executable review"
+                  className="ghost-button playnite-review-modal__nav-button"
+                  disabled={!canNavigateReviews}
+                  onClick={() => navigatePlayniteReview(-1)}
+                  type="button"
+                >
+                  <FontAwesomeIcon aria-hidden="true" icon={faChevronLeft} />
+                  Back
+                </button>
+                <span className="playnite-review-modal__count">
+                  {reviewPosition} / {Math.max(reviewCount, 1)}
+                </span>
+                <button
+                  aria-label="Next Playnite executable review"
+                  className="ghost-button playnite-review-modal__nav-button"
+                  disabled={!canNavigateReviews}
+                  onClick={() => navigatePlayniteReview(1)}
+                  type="button"
+                >
+                  Next
+                  <FontAwesomeIcon aria-hidden="true" icon={faChevronRight} />
+                </button>
+              </div>
+            ) : null}
             <button
               aria-label="Close Playnite executable review"
               className="modal-close-button"
@@ -8472,8 +8783,10 @@ function App() {
           <div className="playnite-candidate-list" role="listbox">
             {candidates.length ? (
               candidates.map((candidate) => {
-                const selected =
-                  candidate.fullPath === playniteReview.executablePath;
+                const selected = playnitePathsEqual(
+                  playniteReview.executablePath,
+                  candidate.fullPath,
+                );
                 return (
                   <button
                     aria-selected={selected}
@@ -8516,8 +8829,7 @@ function App() {
               })
             ) : (
               <p className="muted-text">
-                No positive-scoring executable candidates were found in this
-                install folder.
+                No executable candidates were found in this install folder.
               </p>
             )}
           </div>
@@ -8992,6 +9304,13 @@ function App() {
 
   function renderActivityPage() {
     const summary = activity?.summary ?? [];
+    const maintenanceJobs = activity?.maintenanceJobs ?? [];
+    const visibleMaintenanceJobs = maintenanceJobs.slice(0, 12);
+    const activeMaintenanceJobCount = maintenanceJobs.filter(
+      (job) => job.status !== 'succeeded',
+    ).length;
+    const retryTransientBusy = activityActionBusy === 'retry-transient';
+    const runSteamDbBusy = activityActionBusy === 'run-steamdb-rss';
     return (
       <section className="surface-panel activity-page">
         <div className="panel-heading">
@@ -9002,6 +9321,32 @@ function App() {
             </p>
           </div>
           <div className="activity-toolbar">
+            <button
+              className="ghost-button"
+              disabled={!activity || retryTransientBusy}
+              onClick={() =>
+                void runActivityToolbarAction(
+                  { type: 'retryTransientMaintenance' },
+                  'retry-transient',
+                )
+              }
+              type="button"
+            >
+              {retryTransientBusy ? 'Retrying...' : 'Retry transient'}
+            </button>
+            <button
+              className="ghost-button"
+              disabled={!activity || runSteamDbBusy}
+              onClick={() =>
+                void runActivityToolbarAction(
+                  { type: 'refreshSteamFeeds' },
+                  'run-steamdb-rss',
+                )
+              }
+              type="button"
+            >
+              {runSteamDbBusy ? 'Checking...' : 'Run SteamDB RSS'}
+            </button>
             <button
               className="ghost-button"
               disabled={!activity}
@@ -9058,6 +9403,47 @@ function App() {
           ))}
         </div>
 
+        {visibleMaintenanceJobs.length > 0 ? (
+          <section className="activity-section">
+            <div className="activity-section__heading">
+              <div>
+                <h2>Maintenance Checks</h2>
+                <p className="muted-text">
+                  Recent SteamDB, source, and download checks with retry state.
+                </p>
+              </div>
+              <span className="activity-count">
+                {activeMaintenanceJobCount}
+              </span>
+            </div>
+            <div className="activity-queue-list">
+              {visibleMaintenanceJobs.map((job) => (
+                <article
+                  className={`activity-queue-row activity-queue-row--${job.status}`}
+                  key={job.id}
+                >
+                  <span className="activity-queue-row__kind">
+                    {getMaintenanceJobKindLabel(job.kind)}
+                  </span>
+                  <div className="activity-queue-row__main">
+                    <strong>{getMaintenanceJobTitle(job)}</strong>
+                    <p>{getMaintenanceJobDetail(job)}</p>
+                  </div>
+                  <div className="activity-queue-row__meta">
+                    <span>{getMaintenanceJobStatusLabel(job)}</span>
+                    {getMaintenanceJobAttemptLabel(job) ? (
+                      <span>{getMaintenanceJobAttemptLabel(job)}</span>
+                    ) : null}
+                    {job.sourceKind ? (
+                      <span>{formatTrackedSourceKind(job.sourceKind)}</span>
+                    ) : null}
+                  </div>
+                </article>
+              ))}
+            </div>
+          </section>
+        ) : null}
+
         <section className="activity-section">
           <div className="activity-section__heading">
             <div>
@@ -9090,12 +9476,18 @@ function App() {
                     </div>
                     <p>{issue.detail}</p>
                     <div className="activity-issue-meta">
+                      {issue.groupCount && issue.groupCount > 1 ? (
+                        <span>{issue.groupCount} checks</span>
+                      ) : null}
                       {issue.gameTitle ? <span>{issue.gameTitle}</span> : null}
                       {issue.sourceKind ? (
                         <span>{formatTrackedSourceKind(issue.sourceKind)}</span>
                       ) : null}
                       {issue.createdAt ? (
                         <span>{formatRelativeTime(issue.createdAt)}</span>
+                      ) : null}
+                      {issue.relatedGameTitles?.length ? (
+                        <span>{issue.relatedGameTitles.join(', ')}</span>
                       ) : null}
                     </div>
                   </div>

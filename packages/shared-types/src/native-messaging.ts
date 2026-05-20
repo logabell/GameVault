@@ -7,12 +7,14 @@ import type {
   ConnectionHealthSummary,
   CreateMatchedDraftPayload,
   PendingSteamWishlistAction,
+  ParsedSourcePayload,
   RemoveTrackedItemPayload,
   RemoveTrackedItemResult,
   QueueDraftDownloadPayload,
   RefreshResult,
   SelectedDownloads,
   SettingsView,
+  SourceCatalogEntry,
   SyncTrackedSteamPatchEntriesPayload,
   SteamDbBuildLookupState,
   SteamWishlistRemovalRecord,
@@ -29,6 +31,14 @@ import type {
 } from './models.js';
 
 type EmptyPayload = Record<string, never>;
+
+type DiscoverSourceMatchesOptions = {
+  bypassBackoff?: boolean;
+  forceCatalog?: boolean;
+  parsedSourceCandidates?: ParsedSourcePayload[];
+  sourceCatalogLookupCompleted?: SupportedSourceKind[];
+  sourceCatalogEntries?: SourceCatalogEntry[];
+};
 
 export type NativeMessageRequest =
   | {
@@ -108,16 +118,17 @@ export type NativeMessageRequest =
   | {
       type: 'discoverSourceMatches';
       payload: {
-        options?: {
-          bypassBackoff?: boolean;
-          forceCatalog?: boolean;
-        };
+        options?: DiscoverSourceMatchesOptions;
         trackedItemId: string;
       };
     }
   | {
       type: 'refreshMatchedSource';
-      payload: { sourceKind: SupportedSourceKind; trackedItemId: string };
+      payload: {
+        parsedSource?: ParsedSourcePayload | null;
+        sourceKind: SupportedSourceKind;
+        trackedItemId: string;
+      };
     }
   | {
       type: 'setManualSourceMatch';

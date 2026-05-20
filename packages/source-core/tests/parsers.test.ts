@@ -11,6 +11,7 @@ import {
 } from '../src/adapters/ankergames-client.js';
 import {
   buildAnkerGamesSlugCandidates,
+  buildSteamRipSlugCandidates,
   parseAnkerGamesRecentUpdates,
   parseElAmigosCatalog,
   rankSourceTitleMatch,
@@ -327,6 +328,12 @@ describe('source parsers', () => {
     ).toContain('clair-obscur-expedition-33');
     expect(buildAnkerGamesSlugCandidates('MOUSE: P.I. For Hire')).toContain(
       'mouse-p-i-for-hire',
+    );
+    expect(buildSteamRipSlugCandidates('Black Jacket')).toContain(
+      'black-jacket-free-download',
+    );
+    expect(buildSteamRipSlugCandidates('MOUSE: P.I. For Hire')).toContain(
+      'mouse-p-i-for-hire-free-download',
     );
     expect(
       scoreSourceTitleMatch('MOUSE: P.I. For Hire', 'Mouse PI for Hire'),
@@ -664,6 +671,42 @@ describe('source parsers', () => {
       </html>`,
     );
 
+    expect(parsed.onlineFix).toMatchObject({
+      detected: true,
+      evidence: [
+        'AnkerGames Game Features + Co-Op text',
+        'AnkerGames Game Features OFME fix text',
+        'AnkerGames applied online/multiplayer fix text',
+      ],
+      mode: 'included',
+    });
+  });
+
+  it('detects bundled Ankergames Online Fix from encoded feature modal state', () => {
+    const featureState = JSON.stringify({
+      body: `Game's version is V 20029r + Co-Op. OFME fix has been applied for online/multiplayer functionality.`,
+    })
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#039;');
+    const parsed = parseSupportedPage(
+      'https://ankergames.net/game/escape-simulator-2',
+      `<html>
+        <head><title>Escape Simulator 2 Free Download - AnkerGames</title></head>
+        <body>
+          <h1>Escape Simulator 2</h1>
+          <span>V 20029r</span>
+          <div x-data="${featureState}">
+            <button type="button">Game Features</button>
+          </div>
+          <div>
+            <div>DataNodes</div>
+            <a href="#" @click.prevent="generateDownloadUrl(3200)">Download</a>
+          </div>
+        </body>
+      </html>`,
+    );
+
+    expect(parsed.fullDownloadUrls).toHaveLength(1);
     expect(parsed.onlineFix).toMatchObject({
       detected: true,
       evidence: [

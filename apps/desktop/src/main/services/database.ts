@@ -16,6 +16,7 @@ import type {
   IgnoredImportFolderRecord,
   InstallRecord,
   LibraryRootRecord,
+  MaintenanceJobRecord,
   OnlineFixLibraryState,
   OnlineFixSourceInfo,
   OnboardingState,
@@ -41,7 +42,11 @@ import type {
   ThemeMode,
   TrackedItemRecord,
 } from '@gamevault/shared-types';
-import { mergePatchHistory } from '@gamevault/shared-types';
+import {
+  STEAM_PATCH_HISTORY_LIMIT,
+  compactSteamPatchHistory,
+  mergePatchHistory,
+} from '@gamevault/shared-types';
 import initSqlJs, {
   type Database as SqlJsDatabase,
   type Statement as SqlJsStatement,
@@ -129,6 +134,8 @@ ON steam_patch_entries (tracked_item_id, COALESCE(build_id, ''), patch_date, lin
 CREATE TABLE IF NOT EXISTS steam_feed_checks (
   tracked_item_id TEXT PRIMARY KEY,
   feed_url TEXT,
+  feed_etag TEXT,
+  feed_last_modified TEXT,
   last_checked_at TEXT,
   last_successful_at TEXT,
   last_error TEXT,
@@ -285,6 +292,26 @@ CREATE TABLE IF NOT EXISTS event_log (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS maintenance_jobs (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  status TEXT NOT NULL,
+  tracked_item_id TEXT,
+  source_kind TEXT,
+  host TEXT,
+  game_title TEXT,
+  detail TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at TEXT,
+  last_success_at TEXT,
+  next_attempt_at TEXT,
+  last_error TEXT,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_maintenance_jobs_status
+ON maintenance_jobs (status, next_attempt_at, updated_at);
+
 CREATE TABLE IF NOT EXISTS activity_issue_dismissals (
   issue_key TEXT PRIMARY KEY,
   issue_id TEXT NOT NULL,
@@ -295,6 +322,103 @@ CREATE TABLE IF NOT EXISTS activity_issue_dismissals (
 
 function randomId(): string {
   return crypto.randomUUID();
+}
+
+const STEAM_PATCH_HISTORY_STORAGE_LIMIT = STEAM_PATCH_HISTORY_LIMIT * 2;
+const EVENT_LOG_RETENTION_LIMIT = 2_000;
+
+function normalizePatchEntryLimit(limit: number | null | undefined): number {
+  if (limit == null || !Number.isFinite(limit)) {
+    return STEAM_PATCH_HISTORY_LIMIT;
+  }
+  return Math.max(0, Math.trunc(limit));
+}
+
+function pruneSteamPatchEntryHistory(
+  db: SqlJsDatabase,
+  trackedItemId?: string,
+): void {
+  const scopedWhere = trackedItemId ? `WHERE tracked_item_id = ?` : '';
+  const params: SqlScalar[] = trackedItemId
+    ? [trackedItemId, STEAM_PATCH_HISTORY_STORAGE_LIMIT]
+    : [STEAM_PATCH_HISTORY_STORAGE_LIMIT];
+  db.run(
+    `DELETE FROM steam_patch_entries
+      WHERE id IN (
+        SELECT id
+          FROM (
+            SELECT id,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY tracked_item_id
+                     ORDER BY COALESCE(published_at, patch_date) DESC,
+                              patch_date DESC,
+                              COALESCE(build_id, '') DESC,
+                              id DESC
+                   ) AS history_rank
+              FROM steam_patch_entries
+              ${scopedWhere}
+          )
+         WHERE history_rank > ?
+      )
+      AND COALESCE(selection_source, '') NOT IN ('manual', 'older_than_available')
+      AND NOT EXISTS (
+        SELECT 1
+          FROM source_snapshots
+         WHERE source_snapshots.tracked_item_id = steam_patch_entries.tracked_item_id
+           AND (
+             (
+               source_snapshots.observed_build_id IS NOT NULL
+               AND source_snapshots.observed_build_id != ''
+               AND source_snapshots.observed_build_id = steam_patch_entries.build_id
+             )
+             OR (
+               source_snapshots.observed_patch_link IS NOT NULL
+               AND source_snapshots.observed_patch_link != ''
+               AND source_snapshots.observed_patch_link = steam_patch_entries.link
+             )
+             OR (
+               source_snapshots.observed_patch_date IS NOT NULL
+               AND source_snapshots.observed_patch_title IS NOT NULL
+               AND source_snapshots.observed_patch_date = steam_patch_entries.patch_date
+               AND source_snapshots.observed_patch_title = steam_patch_entries.patch_title
+             )
+           )
+      )
+      AND NOT EXISTS (
+        SELECT 1
+          FROM install_records
+         WHERE install_records.tracked_item_id = steam_patch_entries.tracked_item_id
+           AND (
+             (
+               install_records.installed_build_id IS NOT NULL
+               AND install_records.installed_build_id != ''
+               AND install_records.installed_build_id = steam_patch_entries.build_id
+             )
+             OR (
+               install_records.installed_at IS NOT NULL
+               AND install_records.installed_at = steam_patch_entries.patch_date
+               AND (
+                 install_records.installed_version = steam_patch_entries.version
+                 OR install_records.installed_version = steam_patch_entries.patch_title
+               )
+             )
+           )
+      )`,
+    params,
+  );
+}
+
+function pruneEventLog(db: SqlJsDatabase): void {
+  db.run(
+    `DELETE FROM event_log
+      WHERE id NOT IN (
+        SELECT id
+          FROM event_log
+         ORDER BY created_at DESC, id DESC
+         LIMIT ?
+      )`,
+    [EVENT_LOG_RETENTION_LIMIT],
+  );
 }
 
 function databaseError(error: unknown): Error {
@@ -568,6 +692,8 @@ function applyMigrations(db: SqlJsDatabase): void {
     `ALTER TABLE steam_patch_entries ADD COLUMN description TEXT`,
     `ALTER TABLE steam_patch_entries ADD COLUMN selection_source TEXT`,
     `ALTER TABLE steam_feed_checks ADD COLUMN feed_url TEXT`,
+    `ALTER TABLE steam_feed_checks ADD COLUMN feed_etag TEXT`,
+    `ALTER TABLE steam_feed_checks ADD COLUMN feed_last_modified TEXT`,
     `ALTER TABLE install_records ADD COLUMN install_path TEXT`,
     `ALTER TABLE install_records ADD COLUMN installed_source_kind TEXT`,
     `ALTER TABLE install_records ADD COLUMN installed_source_url TEXT`,
@@ -587,6 +713,11 @@ function applyMigrations(db: SqlJsDatabase): void {
     }
   }
 
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_patch_entries_recency
+    ON steam_patch_entries (tracked_item_id, COALESCE(published_at, patch_date) DESC);
+  `);
+
   migrateSourceSnapshotsPrimaryKey(db);
   migrateSourceMatches(db);
   migrateDownloadMirrorsPrimaryKey(db);
@@ -594,6 +725,8 @@ function applyMigrations(db: SqlJsDatabase): void {
   repairTransientSourceMatchState(db);
   repairSourceSnapshotsFromRawPayload(db);
   repairDownloadJobProviderAndSourceKind(db);
+  pruneSteamPatchEntryHistory(db);
+  pruneEventLog(db);
 }
 
 function repairDownloadJobProviderAndSourceKind(db: SqlJsDatabase): void {
@@ -1094,27 +1227,38 @@ function writeValidatedDatabaseFileSync(
   SQL: SqlJsStatic,
   filePath: string,
   binary: Uint8Array,
+  options: { validate?: boolean } = {},
 ): void {
-  validateDatabaseBytes(SQL, binary);
-  writeBinaryFileSync(filePath, binary, {
+  const validate = options.validate ?? true;
+  if (validate) {
+    validateDatabaseBytes(SQL, binary);
+  }
+  const writeOptions: NonNullable<Parameters<typeof writeBinaryFileSync>[2]> = {
     beforeReplace: () => {
       if (!existsSync(filePath)) {
         return;
       }
 
       const current = readFileSync(filePath);
-      if (!isValidDatabaseBytes(SQL, current)) {
+      if (validate && !isValidDatabaseBytes(SQL, current)) {
         return;
       }
 
-      writeBinaryFileSync(getLastGoodDatabasePath(filePath), current, {
-        validateWrittenFile: (tempFilePath) =>
-          validateDatabaseBytes(SQL, readFileSync(tempFilePath)),
-      });
+      const backupOptions: NonNullable<
+        Parameters<typeof writeBinaryFileSync>[2]
+      > = {};
+      if (validate) {
+        backupOptions.validateWrittenFile = (tempFilePath) =>
+          validateDatabaseBytes(SQL, readFileSync(tempFilePath));
+      }
+      writeBinaryFileSync(getLastGoodDatabasePath(filePath), current, backupOptions);
     },
-    validateWrittenFile: (tempFilePath) =>
-      validateDatabaseBytes(SQL, readFileSync(tempFilePath)),
-  });
+  };
+  if (validate) {
+    writeOptions.validateWrittenFile = (tempFilePath) =>
+      validateDatabaseBytes(SQL, readFileSync(tempFilePath));
+  }
+  writeBinaryFileSync(filePath, binary, writeOptions);
 }
 
 async function readOrRecoverPersistedDatabase(
@@ -1225,7 +1369,9 @@ export class GameVaultDatabase {
 
   private save(): void {
     const binary = this.db.export();
-    writeValidatedDatabaseFileSync(this.SQL, this.filePath, binary);
+    writeValidatedDatabaseFileSync(this.SQL, this.filePath, binary, {
+      validate: false,
+    });
   }
 
   private exec(sql: string, params: SqlScalar[] = []): void {
@@ -1880,7 +2026,19 @@ export class GameVaultDatabase {
     );
   }
 
-  listPatchEntries(trackedItemId: string): SteamPatchEntry[] {
+  listPatchEntries(
+    trackedItemId: string,
+    options: { limit?: number | null } = {},
+  ): SteamPatchEntry[] {
+    const limit =
+      options.limit === null ? null : normalizePatchEntryLimit(options.limit);
+    if (limit === 0) {
+      return [];
+    }
+    const params: SqlScalar[] = [trackedItemId];
+    if (limit != null) {
+      params.push(limit);
+    }
     const rows = this.queryAll<{
       tracked_item_id: string;
       app_id: number;
@@ -1896,70 +2054,90 @@ export class GameVaultDatabase {
       `SELECT tracked_item_id, app_id, patch_title, build_id, patch_date, published_at, link,
               version, description, selection_source
        FROM steam_patch_entries WHERE tracked_item_id = ?
-       ORDER BY COALESCE(published_at, patch_date) DESC`,
-      [trackedItemId],
+       ORDER BY COALESCE(published_at, patch_date) DESC,
+                patch_date DESC,
+                COALESCE(build_id, '') DESC
+       ${limit == null ? '' : 'LIMIT ?'}`,
+      params,
     );
-    return mergePatchHistory(
-      rows.map((row) => ({
-        appId: Number(row.app_id),
-        buildId: row.build_id,
-        description: row.description,
-        link: row.link,
-        patchDate: row.patch_date,
-        patchTitle: row.patch_title,
-        publishedAt: normalizePublishedAt(row.published_at, row.patch_date),
-        selectionSource: row.selection_source,
-        title: row.patch_title,
-        trackedItemId: row.tracked_item_id,
-        version: row.version,
-      })),
-    );
+    const entries = rows.map((row) => ({
+      appId: Number(row.app_id),
+      buildId: row.build_id,
+      description: row.description,
+      link: row.link,
+      patchDate: row.patch_date,
+      patchTitle: row.patch_title,
+      publishedAt: normalizePublishedAt(row.published_at, row.patch_date),
+      selectionSource: row.selection_source,
+      title: row.patch_title,
+      trackedItemId: row.tracked_item_id,
+      version: row.version,
+    }));
+    return limit == null
+      ? mergePatchHistory(entries)
+      : compactSteamPatchHistory(entries, { limit });
   }
 
   upsertPatchEntries(entries: SteamPatchEntry[]): void {
-    for (const entry of entries) {
-      this.exec(
-        `INSERT OR IGNORE INTO steam_patch_entries (
+    if (entries.length === 0) {
+      return;
+    }
+
+    try {
+      this.db.run('BEGIN');
+      for (const entry of entries) {
+        this.db.run(
+          `INSERT OR IGNORE INTO steam_patch_entries (
            id, tracked_item_id, app_id, patch_title, build_id, patch_date, published_at,
            link, version, description, selection_source
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          randomId(),
-          entry.trackedItemId,
-          entry.appId,
-          entry.patchTitle,
-          entry.buildId ?? null,
-          entry.patchDate,
-          entry.publishedAt,
-          entry.link,
-          entry.version ?? null,
-          entry.description ?? null,
-          entry.selectionSource ?? 'rss',
-        ],
-      );
-      this.exec(
-        `UPDATE steam_patch_entries
+          [
+            randomId(),
+            entry.trackedItemId,
+            entry.appId,
+            entry.patchTitle,
+            entry.buildId ?? null,
+            entry.patchDate,
+            entry.publishedAt,
+            entry.link,
+            entry.version ?? null,
+            entry.description ?? null,
+            entry.selectionSource ?? 'rss',
+          ],
+        );
+        this.db.run(
+          `UPDATE steam_patch_entries
          SET app_id = ?, patch_title = ?, build_id = ?, patch_date = ?, published_at = ?,
              version = ?, description = ?, selection_source = ?
           WHERE tracked_item_id = ?
             AND COALESCE(build_id, '') = ?
             AND patch_date = ?
             AND link = ?`,
-        [
-          entry.appId,
-          entry.patchTitle,
-          entry.buildId ?? null,
-          entry.patchDate,
-          entry.publishedAt,
-          entry.version ?? null,
-          entry.description ?? null,
-          entry.selectionSource ?? 'rss',
-          entry.trackedItemId,
-          entry.buildId ?? '',
-          entry.patchDate,
-          entry.link,
-        ],
-      );
+          [
+            entry.appId,
+            entry.patchTitle,
+            entry.buildId ?? null,
+            entry.patchDate,
+            entry.publishedAt,
+            entry.version ?? null,
+            entry.description ?? null,
+            entry.selectionSource ?? 'rss',
+            entry.trackedItemId,
+            entry.buildId ?? '',
+            entry.patchDate,
+            entry.link,
+          ],
+        );
+      }
+      this.db.run('COMMIT');
+      this.save();
+    } catch (error) {
+      try {
+        this.db.run('ROLLBACK');
+      } catch {
+        // Ignore rollback failures so the original database error is surfaced.
+      }
+      throw databaseError(error);
     }
   }
 
@@ -2194,6 +2372,8 @@ export class GameVaultDatabase {
     const row = this.queryOne<{
       tracked_item_id: string;
       feed_url: string | null;
+      feed_etag: string | null;
+      feed_last_modified: string | null;
       last_checked_at: string | null;
       last_successful_at: string | null;
       last_error: string | null;
@@ -2203,6 +2383,8 @@ export class GameVaultDatabase {
     ]);
     return row
       ? {
+          feedEtag: row.feed_etag,
+          feedLastModified: row.feed_last_modified,
           feedUrl: row.feed_url,
           lastCheckedAt: row.last_checked_at,
           lastError: row.last_error,
@@ -2217,10 +2399,13 @@ export class GameVaultDatabase {
     const existing = this.getSteamFeedCheck(record.trackedItemId);
     this.exec(
       `INSERT INTO steam_feed_checks (
-         tracked_item_id, feed_url, last_checked_at, last_successful_at, last_error, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?)
+         tracked_item_id, feed_url, feed_etag, feed_last_modified,
+         last_checked_at, last_successful_at, last_error, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(tracked_item_id) DO UPDATE SET
          feed_url = COALESCE(excluded.feed_url, steam_feed_checks.feed_url),
+         feed_etag = COALESCE(excluded.feed_etag, steam_feed_checks.feed_etag),
+         feed_last_modified = COALESCE(excluded.feed_last_modified, steam_feed_checks.feed_last_modified),
          last_checked_at = excluded.last_checked_at,
          last_successful_at = excluded.last_successful_at,
          last_error = excluded.last_error,
@@ -2228,6 +2413,8 @@ export class GameVaultDatabase {
       [
         record.trackedItemId,
         record.feedUrl ?? existing?.feedUrl ?? null,
+        record.feedEtag ?? existing?.feedEtag ?? null,
+        record.feedLastModified ?? existing?.feedLastModified ?? null,
         record.lastCheckedAt ?? null,
         record.lastSuccessfulAt ?? existing?.lastSuccessfulAt ?? null,
         record.lastError ?? null,
@@ -2518,7 +2705,8 @@ export class GameVaultDatabase {
     }>(
       `SELECT * FROM source_watches
        WHERE (next_check_at <= ? OR (expired_at IS NULL AND ends_at <= ?))
-         AND (? = 1 OR expired_at IS NULL)`,
+         AND (? = 1 OR expired_at IS NULL)
+       ORDER BY next_check_at ASC, tracked_item_id ASC`,
       [nowIso, nowIso, options.includeExpired ? 1 : 0],
     ).map((row) => ({
       endsAt: row.ends_at,
@@ -2999,18 +3187,158 @@ export class GameVaultDatabase {
     );
   }
 
-  appendEvent(event: Omit<EventLogRecord, 'id' | 'createdAt'>): void {
+  getMaintenanceJob(id: string): MaintenanceJobRecord | null {
+    const row = this.queryOne<{
+      id: string;
+      kind: MaintenanceJobRecord['kind'];
+      status: MaintenanceJobRecord['status'];
+      tracked_item_id: string | null;
+      source_kind: SupportedSourceKind | null;
+      host: string | null;
+      game_title: string | null;
+      detail: string | null;
+      attempt_count: number;
+      last_attempt_at: string | null;
+      last_success_at: string | null;
+      next_attempt_at: string | null;
+      last_error: string | null;
+      updated_at: string;
+    }>(`SELECT * FROM maintenance_jobs WHERE id = ?`, [id]);
+    return row
+      ? {
+          attemptCount: Number(row.attempt_count ?? 0),
+          detail: row.detail,
+          gameTitle: row.game_title,
+          host: row.host,
+          id: row.id,
+          kind: row.kind,
+          lastAttemptAt: row.last_attempt_at,
+          lastError: row.last_error,
+          lastSuccessAt: row.last_success_at,
+          nextAttemptAt: row.next_attempt_at,
+          sourceKind: row.source_kind,
+          status: row.status,
+          trackedItemId: row.tracked_item_id,
+          updatedAt: row.updated_at,
+        }
+      : null;
+  }
+
+  listMaintenanceJobs(limit = 100): MaintenanceJobRecord[] {
+    return this.queryAll<{
+      id: string;
+      kind: MaintenanceJobRecord['kind'];
+      status: MaintenanceJobRecord['status'];
+      tracked_item_id: string | null;
+      source_kind: SupportedSourceKind | null;
+      host: string | null;
+      game_title: string | null;
+      detail: string | null;
+      attempt_count: number;
+      last_attempt_at: string | null;
+      last_success_at: string | null;
+      next_attempt_at: string | null;
+      last_error: string | null;
+      updated_at: string;
+    }>(
+      `SELECT * FROM maintenance_jobs
+       WHERE status != 'succeeded'
+          OR last_success_at IS NULL
+          OR last_success_at >= datetime('now', '-24 hours')
+       ORDER BY
+         CASE status
+           WHEN 'running' THEN 0
+           WHEN 'queued' THEN 1
+           WHEN 'cooldown' THEN 2
+           WHEN 'failed' THEN 3
+           ELSE 4
+         END,
+         COALESCE(next_attempt_at, updated_at) ASC
+       LIMIT ?`,
+      [limit],
+    ).map((row) => ({
+      attemptCount: Number(row.attempt_count ?? 0),
+      detail: row.detail,
+      gameTitle: row.game_title,
+      host: row.host,
+      id: row.id,
+      kind: row.kind,
+      lastAttemptAt: row.last_attempt_at,
+      lastError: row.last_error,
+      lastSuccessAt: row.last_success_at,
+      nextAttemptAt: row.next_attempt_at,
+      sourceKind: row.source_kind,
+      status: row.status,
+      trackedItemId: row.tracked_item_id,
+      updatedAt: row.updated_at,
+    }));
+  }
+
+  upsertMaintenanceJob(record: MaintenanceJobRecord): void {
     this.exec(
-      `INSERT INTO event_log (id, level, message, context_json, created_at)
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO maintenance_jobs (
+         id, kind, status, tracked_item_id, source_kind, host, game_title,
+         detail, attempt_count, last_attempt_at, last_success_at,
+         next_attempt_at, last_error, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         kind = excluded.kind,
+         status = excluded.status,
+         tracked_item_id = excluded.tracked_item_id,
+         source_kind = excluded.source_kind,
+         host = excluded.host,
+         game_title = excluded.game_title,
+         detail = excluded.detail,
+         attempt_count = excluded.attempt_count,
+         last_attempt_at = excluded.last_attempt_at,
+         last_success_at = excluded.last_success_at,
+         next_attempt_at = excluded.next_attempt_at,
+         last_error = excluded.last_error,
+         updated_at = excluded.updated_at`,
       [
-        randomId(),
-        event.level,
-        event.message,
-        JSON.stringify(event.context ?? null),
-        new Date().toISOString(),
+        record.id,
+        record.kind,
+        record.status,
+        record.trackedItemId ?? null,
+        record.sourceKind ?? null,
+        record.host ?? null,
+        record.gameTitle ?? null,
+        record.detail ?? null,
+        record.attemptCount,
+        record.lastAttemptAt ?? null,
+        record.lastSuccessAt ?? null,
+        record.nextAttemptAt ?? null,
+        record.lastError ?? null,
+        record.updatedAt,
       ],
     );
+  }
+
+  appendEvent(event: Omit<EventLogRecord, 'id' | 'createdAt'>): void {
+    try {
+      this.db.run('BEGIN');
+      this.db.run(
+        `INSERT INTO event_log (id, level, message, context_json, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+        [
+          randomId(),
+          event.level,
+          event.message,
+          JSON.stringify(event.context ?? null),
+          new Date().toISOString(),
+        ],
+      );
+      pruneEventLog(this.db);
+      this.db.run('COMMIT');
+      this.save();
+    } catch (error) {
+      try {
+        this.db.run('ROLLBACK');
+      } catch {
+        // Ignore rollback failures so the original database error is surfaced.
+      }
+      throw databaseError(error);
+    }
   }
 
   listEvents(limit = 100): EventLogRecord[] {

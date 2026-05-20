@@ -184,6 +184,38 @@ describe('Playnite executable selection', () => {
     }
   });
 
+  it('prefers a title-matching loader over the raw game executable', async () => {
+    const installPath = await makeTempInstall('Forza Horizon 6');
+    const loaderPath = join(installPath, 'forzahorizon6_loader.exe');
+    try {
+      await touch(join(installPath, 'forzahorizon6.exe'), 175 * 1024 * 1024);
+      await touch(loaderPath, 124 * 1024);
+      await touch(join(installPath, 'forzaprotocolselector.exe'), 56 * 1024);
+      await writeText(join(installPath, 'steam_appid.txt'), '1234560');
+
+      const selection = await scanPlayniteExecutableSelection({
+        installPath,
+        steamAppId: 1234560,
+        steamTitle: 'Forza Horizon 6',
+        title: 'Forza Horizon 6',
+        trackedItemId: 'item-1',
+      });
+
+      expect(selection.status).toBe('auto_selected');
+      expect(selection.confidence).toBe('high');
+      expect(selection.selectedExePath).toBe(loaderPath);
+      expect(selection.candidates[0]).toMatchObject({
+        excluded: false,
+        fullPath: loaderPath,
+      });
+      expect(selection.candidates[0]?.reasons).toContain(
+        'Title-matching loader executable',
+      );
+    } finally {
+      await cleanupInstall(installPath);
+    }
+  });
+
   it('auto-selects one positive candidate when only zero-score utilities remain', async () => {
     const installPath = await makeTempInstall('theHunter Call of the Wild');
     try {
@@ -257,16 +289,6 @@ describe('Playnite executable selection', () => {
 
       const selection = await scanPlayniteExecutableSelection({
         installPath,
-        previousSelection: {
-          candidates: [],
-          confidence: 'high',
-          reviewedAt: '2026-05-10T12:00:00.000Z',
-          selectedExePath: guidePath,
-          status: 'reviewed',
-          steamAppId: 1245620,
-          trackedItemId: 'item-1',
-          updatedAt: '2026-05-10T12:00:00.000Z',
-        },
         steamAppId: 1245620,
         steamTitle: 'ELDEN RING',
         title: 'ELDEN RING',
@@ -368,16 +390,6 @@ describe('Playnite executable selection', () => {
 
       const selection = await scanPlayniteExecutableSelection({
         installPath,
-        previousSelection: {
-          candidates: [],
-          confidence: 'low',
-          reviewedAt: '2026-05-10T12:00:00.000Z',
-          selectedExePath: dx11Path,
-          status: 'reviewed',
-          steamAppId: 1086940,
-          trackedItemId: 'item-1',
-          updatedAt: '2026-05-10T12:00:00.000Z',
-        },
         steamAppId: 1086940,
         steamTitle: "Baldur's Gate 3",
         title: "Baldur's Gate 3",
@@ -398,6 +410,45 @@ describe('Playnite executable selection', () => {
         selection.candidates.find((candidate) => candidate.fullPath === dx11Path)
           ?.excluded,
       ).toBe(true);
+    } finally {
+      await cleanupInstall(installPath);
+    }
+  });
+
+  it('preserves a manually reviewed executable even when auto rules would exclude it', async () => {
+    const installPath = await makeTempInstall("Baldur's Gate 3");
+    const selectedPath = join(installPath, 'bin', 'bg3.exe');
+    const dx11Path = join(installPath, 'bin', 'bg3_dx11.exe');
+    try {
+      await touch(selectedPath, 102 * 1024 * 1024);
+      await touch(dx11Path, 99 * 1024 * 1024);
+      await writeText(join(installPath, 'bin', 'steam_appid.txt'), '1086940');
+
+      const selection = await scanPlayniteExecutableSelection({
+        installPath,
+        previousSelection: {
+          candidates: [],
+          confidence: 'high',
+          reviewedAt: '2026-05-10T12:00:00.000Z',
+          selectedExePath: dx11Path,
+          status: 'reviewed',
+          steamAppId: 1086940,
+          trackedItemId: 'item-1',
+          updatedAt: '2026-05-10T12:00:00.000Z',
+        },
+        steamAppId: 1086940,
+        steamTitle: "Baldur's Gate 3",
+        title: "Baldur's Gate 3",
+        trackedItemId: 'item-1',
+      });
+
+      expect(selection.status).toBe('reviewed');
+      expect(selection.selectedExePath).toBe(dx11Path);
+      expect(selection.candidates[0]).toMatchObject({
+        excluded: false,
+        fullPath: dx11Path,
+      });
+      expect(selection.candidates[0]?.reasons).toContain('Selected manually');
     } finally {
       await cleanupInstall(installPath);
     }

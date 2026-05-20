@@ -494,6 +494,29 @@ export function buildAnkerGamesSlugCandidates(title: string): string[] {
   );
 }
 
+export function buildSteamRipSlugCandidates(title: string): string[] {
+  const normalized = title
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/(?:['`\u2018\u2019\u201a\u201b\u00b4]|\u00e2\u20ac\u2122)/g, '')
+    .replace(/\bfree\s+download\b.*$/i, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .replace(/-{2,}/g, '-');
+  const withoutEdition = normalizeTitle(title)
+    .replace(/&/g, ' and ')
+    .replace(/\bfree\s+download\b.*$/i, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .replace(/-{2,}/g, '-');
+
+  return Array.from(
+    new Set([normalized, withoutEdition].filter(Boolean)),
+  ).map((slug) =>
+    slug.endsWith('-free-download') ? slug : `${slug}-free-download`,
+  );
+}
+
 function levenshtein(left: string, right: string): number {
   if (left === right) {
     return 0;

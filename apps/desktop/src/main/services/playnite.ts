@@ -270,6 +270,12 @@ function rendererVariantBaseStem(stem: string): string | null {
   return baseStem ? baseStem : null;
 }
 
+function loaderVariantBaseStem(stem: string): string | null {
+  const match = stem.match(/^(.*?)[_-]loader$/i);
+  const baseStem = match?.[1]?.trim() ?? '';
+  return baseStem ? baseStem : null;
+}
+
 async function pathExists(path: string): Promise<boolean> {
   try {
     await stat(path);
@@ -431,10 +437,18 @@ function scoreTitleMatch(
   const stem = basename(candidate.fileName, extname(candidate.fileName));
   const stemCompact = compactText(stem);
   const stemNormalized = normalizeText(stem);
+  const loaderBaseStem = loaderVariantBaseStem(stem);
+  const loaderBaseStemCompact = loaderBaseStem
+    ? compactText(loaderBaseStem)
+    : null;
   for (const title of titles) {
     const titleCompact = compactText(title);
     if (!titleCompact) {
       continue;
+    }
+    if (loaderBaseStemCompact && loaderBaseStemCompact === titleCompact) {
+      addScore(candidate, 115, 'Title-matching loader executable');
+      return;
     }
     if (stemCompact === titleCompact) {
       addScore(candidate, 75, 'Executable name matches game title');
@@ -619,6 +633,10 @@ function statusForConfidence(
       : 'needs_review';
 }
 
+function pathsEqual(left: string, right: string): boolean {
+  return resolve(left).toLowerCase() === resolve(right).toLowerCase();
+}
+
 export async function scanPlayniteExecutableSelection(params: {
   installPath: string;
   previousSelection?: PlayniteExecutableSelectionRecord | null;
@@ -700,19 +718,63 @@ export async function scanPlayniteExecutableSelection(params: {
     return left.relativePath.localeCompare(right.relativePath);
   });
 
+  const previous = params.previousSelection;
+  const previousReviewedPath =
+    previous?.status === 'reviewed' && previous.selectedExePath
+      ? previous.selectedExePath
+      : null;
+  const previousReviewedCandidate = previousReviewedPath
+    ? (candidates.find((candidate) =>
+        pathsEqual(candidate.fullPath, previousReviewedPath),
+      ) ?? null)
+    : null;
+  if (previous && previousReviewedPath && previousReviewedCandidate) {
+    previousReviewedCandidate.excluded = false;
+    previousReviewedCandidate.reasons = [
+      ...new Set(['Selected manually', ...previousReviewedCandidate.reasons]),
+    ];
+    previousReviewedCandidate.score = Math.max(
+      previousReviewedCandidate.score,
+      1,
+    );
+    candidates.sort((left, right) => {
+      if (pathsEqual(left.fullPath, previousReviewedCandidate.fullPath)) {
+        return -1;
+      }
+      if (pathsEqual(right.fullPath, previousReviewedCandidate.fullPath)) {
+        return 1;
+      }
+      if (left.excluded !== right.excluded) {
+        return left.excluded ? 1 : -1;
+      }
+      if (right.score !== left.score) {
+        return right.score - left.score;
+      }
+      return left.relativePath.localeCompare(right.relativePath);
+    });
+    return {
+      candidates,
+      confidence: previous.confidence,
+      reviewedAt: previous.reviewedAt ?? now,
+      selectedExePath: resolve(previousReviewedPath),
+      status: 'reviewed',
+      steamAppId: params.steamAppId ?? null,
+      trackedItemId: params.trackedItemId,
+      updatedAt: now,
+    };
+  }
+
   const selected =
     candidates.find((candidate) => !candidate.excluded && candidate.score > 0) ??
     null;
   const confidence = confidenceForCandidates(selected, candidates);
   const status = statusForConfidence(confidence, Boolean(selected));
-  const previous = params.previousSelection;
   if (
     previous?.status === 'reviewed' &&
     previous.selectedExePath &&
     candidates.some(
       (candidate) =>
-        resolve(candidate.fullPath).toLowerCase() ===
-          resolve(previous.selectedExePath!).toLowerCase() &&
+        pathsEqual(candidate.fullPath, previous.selectedExePath!) &&
         !candidate.excluded &&
         candidate.score > 0,
     )

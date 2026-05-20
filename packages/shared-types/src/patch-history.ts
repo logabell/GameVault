@@ -1,5 +1,7 @@
 import type { SteamPatchCandidate } from './models.js';
 
+export const STEAM_PATCH_HISTORY_LIMIT = 120;
+
 function normalizePatchLink(link: string | null | undefined): string | null {
   const trimmed = link?.trim();
   if (!trimmed) return null;
@@ -187,4 +189,39 @@ export function mergePatchHistory<T extends SteamPatchCandidate>(
   }
 
   return Array.from(byKey.values());
+}
+
+function normalizePatchHistoryLimit(limit: number | null | undefined): number {
+  if (limit == null || !Number.isFinite(limit)) {
+    return STEAM_PATCH_HISTORY_LIMIT;
+  }
+  return Math.max(0, Math.trunc(limit));
+}
+
+export function compactSteamPatchHistory<T extends SteamPatchCandidate>(
+  patches: T[],
+  options: {
+    limit?: number | null;
+    requiredPatches?: T[];
+  } = {},
+): T[] {
+  const limit = normalizePatchHistoryLimit(options.limit);
+  const requiredPatches = sortSteamPatchesByRecency(
+    mergePatchHistory(options.requiredPatches ?? []),
+  );
+  const merged = sortSteamPatchesByRecency(
+    mergePatchHistory([...requiredPatches, ...patches]),
+  );
+  const compacted = limit === 0 ? [] : merged.slice(0, limit);
+  const compactedKeys = new Set(compacted.map(getPatchHistoryKey));
+
+  for (const requiredPatch of requiredPatches) {
+    const key = getPatchHistoryKey(requiredPatch);
+    if (!compactedKeys.has(key)) {
+      compacted.push(requiredPatch);
+      compactedKeys.add(key);
+    }
+  }
+
+  return sortSteamPatchesByRecency(compacted);
 }

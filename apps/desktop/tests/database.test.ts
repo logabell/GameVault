@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { GameVaultDatabase } from '../src/main/services/database.js';
+import { STEAM_PATCH_HISTORY_LIMIT } from '@gamevault/shared-types';
 import type {
   DownloadJobRecord,
   DownloadJobPartRecord,
@@ -162,6 +163,49 @@ describe('GameVaultDatabase cleanup metadata', () => {
           title: 'Barony',
         }),
       ).toThrow(/already tracked/);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('limits patch entry reads to the compact history window', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'barony',
+        sourceKind: 'manual',
+        title: 'Barony',
+      });
+      const entries = Array.from(
+        { length: STEAM_PATCH_HISTORY_LIMIT + 5 },
+        (_, index) => {
+          const publishedAt = new Date(
+            Date.UTC(2026, 0, index + 1, 12),
+          ).toISOString();
+          return {
+            appId: 371970,
+            buildId: String(100000 + index),
+            link: `https://steamdb.info/patchnotes/${100000 + index}/`,
+            patchDate: publishedAt.slice(0, 10),
+            patchTitle: `Patch ${index}`,
+            publishedAt,
+            title: `Patch ${index}`,
+            trackedItemId: item.id,
+          };
+        },
+      );
+
+      database.upsertPatchEntries(entries);
+
+      const compacted = database.listPatchEntries(item.id);
+      expect(compacted).toHaveLength(STEAM_PATCH_HISTORY_LIMIT);
+      expect(compacted[0]?.buildId).toBe(
+        String(100000 + STEAM_PATCH_HISTORY_LIMIT + 4),
+      );
+      expect(compacted.at(-1)?.buildId).toBe('100005');
+      expect(database.listPatchEntries(item.id, { limit: null })).toHaveLength(
+        STEAM_PATCH_HISTORY_LIMIT + 5,
+      );
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }

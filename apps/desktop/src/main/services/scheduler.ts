@@ -1,5 +1,7 @@
 import { GameVaultService } from './gamevault-service.js';
 
+const LIVE_DOWNLOAD_PROGRESS_POLL_INTERVAL_MS = 750;
+
 function getLatestExpectedDailyPollAt(
   now: Date,
   pollHourLocal: number,
@@ -29,37 +31,49 @@ export function shouldRunStartupSteamFeedCatchUp(params: {
 }
 
 export class GameVaultScheduler {
-  private timer: NodeJS.Timeout | null = null;
-  private tickPromise: Promise<void> | null = null;
+  private steamTimer: NodeJS.Timeout | null = null;
+  private sourceTimer: NodeJS.Timeout | null = null;
+  private downloadMaintenanceTimer: NodeJS.Timeout | null = null;
+  private startupPromise: Promise<void> | null = null;
+  private steamTickPromise: Promise<void> | null = null;
+  private sourceTickPromise: Promise<void> | null = null;
+  private downloadMaintenanceTickPromise: Promise<void> | null = null;
   private downloadProgressTimer: NodeJS.Timeout | null = null;
   private downloadProgressTickPromise: Promise<void> | null = null;
   private lastDownloadProgressPollingWarningAt = 0;
+  private lastMaintenanceTickWarningAt = 0;
 
   constructor(private readonly service: GameVaultService) {}
 
   start(): void {
-    if (this.timer) {
+    if (this.steamTimer || this.sourceTimer || this.downloadMaintenanceTimer) {
       return;
     }
 
-    const runTick = (startup: boolean) => {
-      if (this.tickPromise) {
-        return this.tickPromise;
-      }
-
-      this.tickPromise = this.tick(startup).finally(() => {
-        this.tickPromise = null;
+    this.startupPromise = this.runStartupCatchUp().finally(() => {
+      this.startupPromise = null;
+    });
+    void this.startupPromise.catch((error) => {
+      this.recordMaintenanceTickWarning(error);
+    });
+    this.steamTimer = setInterval(() => {
+      void this.runSteamMaintenanceTick().catch((error) => {
+        this.recordMaintenanceTickWarning(error);
       });
-      return this.tickPromise;
-    };
-
-    void runTick(true);
-    this.timer = setInterval(() => {
-      void runTick(false);
+    }, 60_000);
+    this.sourceTimer = setInterval(() => {
+      void this.runSourceMaintenanceTick(new Date(), false).catch((error) => {
+        this.recordMaintenanceTickWarning(error);
+      });
+    }, 60_000);
+    this.downloadMaintenanceTimer = setInterval(() => {
+      void this.runDownloadMaintenanceTick().catch((error) => {
+        this.recordMaintenanceTickWarning(error);
+      });
     }, 60_000);
     this.downloadProgressTimer = setInterval(() => {
       void this.runDownloadProgressTick();
-    }, 1_000);
+    }, LIVE_DOWNLOAD_PROGRESS_POLL_INTERVAL_MS);
   }
 
   private async runDownloadProgressTick(): Promise<void> {
@@ -125,15 +139,136 @@ export class GameVaultScheduler {
     }
   }
 
-  private async tick(startup: boolean): Promise<void> {
+  private recordMaintenanceTickWarning(error: unknown): void {
+    const now = Date.now();
+    if (now - this.lastMaintenanceTickWarningAt < 60_000) {
+      return;
+    }
+    this.lastMaintenanceTickWarningAt = now;
+
+    try {
+      this.service.recordActivityEvent('warn', 'Maintenance tick failed', {
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Unknown maintenance tick error',
+      });
+    } catch {
+      // If the database is unavailable, avoid an unhandled rejection loop.
+    }
+  }
+
+  private recordHeartbeat(
+    scope: 'download' | 'scheduler' | 'source' | 'steamdb',
+    status: 'error' | 'ok' | 'running' | 'warning',
+    detail?: string | null,
+    error?: unknown,
+  ): void {
+    try {
+      this.service.recordMaintenanceHeartbeat(
+        scope,
+        status,
+        detail,
+        error instanceof Error ? error.message : error ? String(error) : null,
+      );
+    } catch {
+      // If persistence is unavailable, the warning path above will catch up.
+    }
+  }
+
+  private runSteamMaintenanceTick(now = new Date()): Promise<void> {
+    if (this.steamTickPromise) {
+      return this.steamTickPromise;
+    }
+    this.steamTickPromise = this.runSteamMaintenance(now).finally(() => {
+      this.steamTickPromise = null;
+    });
+    return this.steamTickPromise;
+  }
+
+  private async runSteamMaintenance(now: Date): Promise<void> {
+    this.recordHeartbeat('scheduler', 'running', 'SteamDB maintenance tick');
+    this.recordHeartbeat('steamdb', 'running', 'Checking SteamDB maintenance');
+    try {
+      if (this.service.shouldRunSteamFeedMaintenance(now)) {
+        await this.service.pollSteamFeeds();
+      }
+      this.recordHeartbeat('steamdb', 'ok', 'SteamDB maintenance checked');
+      this.recordHeartbeat('scheduler', 'ok', 'SteamDB maintenance tick done');
+    } catch (error) {
+      this.recordHeartbeat('steamdb', 'error', 'SteamDB maintenance failed', error);
+      this.recordHeartbeat('scheduler', 'warning', 'SteamDB maintenance tick failed', error);
+      throw error;
+    }
+  }
+
+  private runSourceMaintenanceTick(
+    now = new Date(),
+    includeExpired = false,
+  ): Promise<void> {
+    if (this.sourceTickPromise) {
+      return this.sourceTickPromise;
+    }
+    this.sourceTickPromise = this.runSourceMaintenance(
+      now,
+      includeExpired,
+    ).finally(() => {
+      this.sourceTickPromise = null;
+    });
+    return this.sourceTickPromise;
+  }
+
+  private async runSourceMaintenance(
+    now: Date,
+    includeExpired: boolean,
+  ): Promise<void> {
+    this.recordHeartbeat('scheduler', 'running', 'Source maintenance tick');
+    this.recordHeartbeat('source', 'running', 'Checking watched sources');
+    try {
+      await this.service.processDueWatches(now, { includeExpired });
+      this.recordHeartbeat('source', 'ok', 'Source maintenance checked');
+      this.recordHeartbeat('scheduler', 'ok', 'Source maintenance tick done');
+    } catch (error) {
+      this.recordHeartbeat('source', 'error', 'Source maintenance failed', error);
+      this.recordHeartbeat('scheduler', 'warning', 'Source maintenance tick failed', error);
+      throw error;
+    }
+  }
+
+  private runDownloadMaintenanceTick(): Promise<void> {
+    if (this.downloadMaintenanceTickPromise) {
+      return this.downloadMaintenanceTickPromise;
+    }
+    this.downloadMaintenanceTickPromise = this.runDownloadMaintenance().finally(
+      () => {
+        this.downloadMaintenanceTickPromise = null;
+      },
+    );
+    return this.downloadMaintenanceTickPromise;
+  }
+
+  private async runDownloadMaintenance(): Promise<void> {
+    this.recordHeartbeat('scheduler', 'running', 'Download maintenance tick');
+    this.recordHeartbeat('download', 'running', 'Checking downloads');
+    try {
+      await this.service.pollDownloadJobs();
+      this.recordHeartbeat('download', 'ok', 'Download maintenance checked');
+      this.recordHeartbeat('scheduler', 'ok', 'Download maintenance tick done');
+    } catch (error) {
+      this.recordHeartbeat('download', 'error', 'Download maintenance failed', error);
+      this.recordHeartbeat('scheduler', 'warning', 'Download maintenance tick failed', error);
+      throw error;
+    }
+  }
+
+  private async runStartupCatchUp(): Promise<void> {
     const now = new Date();
-    const endStartupTask = startup
-      ? this.service.beginActivityTask({
+    const endStartupTask =
+      this.service.beginActivityTask({
           detail: 'Checking missed SteamDB, source, and download maintenance.',
           id: 'startup-catch-up',
           title: 'Starting maintenance',
-        })
-      : null;
+        });
     const failures: string[] = [];
 
     const runMaintenanceStep = async (
@@ -156,51 +291,43 @@ export class GameVaultScheduler {
     try {
       const steamDbMaintenanceDue =
         this.service.shouldRunSteamFeedMaintenance(now);
-      if (startup) {
-        this.service.recordActivityEvent('info', 'Startup maintenance started', {
-          steamDbMaintenanceDue,
-        });
-      }
+      this.service.recordActivityEvent('info', 'Startup maintenance started', {
+        steamDbMaintenanceDue,
+      });
 
       if (steamDbMaintenanceDue) {
         await runMaintenanceStep('SteamDB maintenance failed', () =>
-          this.service.pollSteamFeeds(),
+          this.runSteamMaintenanceTick(now),
         );
       }
 
       await runMaintenanceStep('Source watch maintenance failed', () =>
-        this.service.processDueWatches(now, { includeExpired: true }),
+        this.runSourceMaintenanceTick(now, false),
       );
-      if (startup) {
-        await runMaintenanceStep('Online Fix startup true-up failed', () =>
-          this.service.trueUpOnlineFixStatuses(),
-        );
-      }
+      await runMaintenanceStep('Online Fix startup true-up failed', () =>
+        this.service.trueUpOnlineFixStatuses(),
+      );
       await runMaintenanceStep('Download maintenance failed', () =>
-        this.service.pollDownloadJobs(),
+        this.runDownloadMaintenanceTick(),
       );
 
-      if (startup) {
-        this.service.recordActivityEvent(
-          failures.length > 0 ? 'warn' : 'info',
-          failures.length > 0
-            ? 'Startup maintenance completed with warnings'
-            : 'Startup maintenance completed',
-          {
-            failures,
-            steamDbMaintenanceDue,
-          },
-        );
-      }
+      this.service.recordActivityEvent(
+        failures.length > 0 ? 'warn' : 'info',
+        failures.length > 0
+          ? 'Startup maintenance completed with warnings'
+          : 'Startup maintenance completed',
+        {
+          failures,
+          steamDbMaintenanceDue,
+        },
+      );
     } catch (error) {
-      if (startup) {
-        this.service.recordActivityEvent('warn', 'Startup maintenance failed', {
-          error:
-            error instanceof Error
-              ? error.message
-              : 'Unknown startup catch-up error',
-        });
-      }
+      this.service.recordActivityEvent('warn', 'Startup maintenance failed', {
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Unknown startup catch-up error',
+      });
       throw error;
     } finally {
       endStartupTask?.();
@@ -208,9 +335,17 @@ export class GameVaultScheduler {
   }
 
   stop(): void {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
+    if (this.steamTimer) {
+      clearInterval(this.steamTimer);
+      this.steamTimer = null;
+    }
+    if (this.sourceTimer) {
+      clearInterval(this.sourceTimer);
+      this.sourceTimer = null;
+    }
+    if (this.downloadMaintenanceTimer) {
+      clearInterval(this.downloadMaintenanceTimer);
+      this.downloadMaintenanceTimer = null;
     }
     if (this.downloadProgressTimer) {
       clearInterval(this.downloadProgressTimer);

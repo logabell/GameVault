@@ -106,6 +106,8 @@ const api = {
     ipcRenderer.invoke('gamevault:refreshPlayniteIntegration', payload),
   refreshDuoStreamIntegration: (payload?: unknown) =>
     ipcRenderer.invoke('gamevault:refreshDuoStreamIntegration', payload),
+  refreshPlayniteExecutableSelection: (payload: unknown) =>
+    ipcRenderer.invoke('gamevault:refreshPlayniteExecutableSelection', payload),
   restoreImportFolder: (payload: unknown) =>
     ipcRenderer.invoke('gamevault:restoreImportFolder', payload),
   saveImportBatch: (payload: unknown) =>

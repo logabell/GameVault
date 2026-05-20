@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  compactSteamPatchHistory,
   sortSteamPatchesByRecency,
   type SteamPatchCandidate,
 } from '../src/index.js';
@@ -50,5 +51,24 @@ describe('Steam patch history helpers', () => {
         (entry) => entry.buildId,
       ),
     ).toEqual(['23116996', '23104388', '23066429']);
+  });
+
+  it('compacts patch history while preserving required older patches', () => {
+    const patches = Array.from({ length: 6 }, (_, index) =>
+      patch(
+        String(23100000 + index),
+        `05/${String(index + 1).padStart(2, '0')}/2026`,
+        `2026-05-${String(index + 1).padStart(2, '0')}T12:00:00.000Z`,
+        `Patch ${index + 1}`,
+      ),
+    );
+    const requiredPatch = patches[0]!;
+
+    expect(
+      compactSteamPatchHistory(patches, {
+        limit: 3,
+        requiredPatches: [requiredPatch],
+      }).map((entry) => entry.buildId),
+    ).toEqual(['23100005', '23100004', '23100003', '23100000']);
   });
 });

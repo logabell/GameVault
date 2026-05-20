@@ -475,12 +475,16 @@ export interface SteamPatchFeedResult {
   appId: number;
   feedUrl: string;
   fetchedAt: string;
+  feedEtag?: string | null;
+  feedLastModified?: string | null;
   patches: SteamPatchCandidate[];
 }
 
 export interface SteamFeedCheckRecord {
   trackedItemId: string;
   feedUrl?: string | null;
+  feedEtag?: string | null;
+  feedLastModified?: string | null;
   lastCheckedAt?: string | null;
   lastSuccessfulAt?: string | null;
   lastError?: string | null;
@@ -628,11 +632,62 @@ export type ActivityIssueKind =
   | 'recent_errors'
   | 'scheduler_stale'
   | 'source_error'
+  | 'source_error_group'
   | 'source_watch_expired'
   | 'source_watch_overdue'
   | 'steamdb_error'
+  | 'steamdb_error_group'
   | 'steamdb_rate_limited'
   | 'steamdb_stale';
+
+export type MaintenanceJobKind =
+  | 'download_poll'
+  | 'source_watch'
+  | 'steamdb_rss';
+
+export type MaintenanceJobStatus =
+  | 'cooldown'
+  | 'failed'
+  | 'queued'
+  | 'running'
+  | 'succeeded';
+
+export type MaintenanceHeartbeatScope =
+  | 'download'
+  | 'scheduler'
+  | 'source'
+  | 'steamdb';
+
+export interface MaintenanceJobRecord {
+  id: string;
+  kind: MaintenanceJobKind;
+  status: MaintenanceJobStatus;
+  trackedItemId?: string | null;
+  sourceKind?: SupportedSourceKind | null;
+  host?: string | null;
+  gameTitle?: string | null;
+  detail?: string | null;
+  attemptCount: number;
+  lastAttemptAt?: string | null;
+  lastSuccessAt?: string | null;
+  nextAttemptAt?: string | null;
+  lastError?: string | null;
+  updatedAt: string;
+}
+
+export interface MaintenanceJobView extends MaintenanceJobRecord {
+  retryInMs?: number | null;
+}
+
+export interface MaintenanceHeartbeat {
+  completedAt?: string | null;
+  detail?: string | null;
+  error?: string | null;
+  scope: MaintenanceHeartbeatScope;
+  startedAt?: string | null;
+  status: 'error' | 'ok' | 'running' | 'warning';
+  updatedAt: string;
+}
 
 export type ActivityActionPayload =
   | {
@@ -641,8 +696,10 @@ export type ActivityActionPayload =
       trackedItemId?: string | null;
       type: 'dismissActivityIssue';
     }
+  | { type: 'pauseSourceKind'; sourceKind: SupportedSourceKind; durationMs: number }
   | { type: 'pollDownloadJobs' }
   | { type: 'processSourceWatches' }
+  | { type: 'retryTransientMaintenance' }
   | {
       type: 'refreshMatchedSource';
       trackedItemId: string;
@@ -666,6 +723,8 @@ export interface ActivityIssue {
   dismissalKey?: string;
   gameTitle?: string | null;
   kind: ActivityIssueKind;
+  groupCount?: number | null;
+  relatedGameTitles?: string[] | null;
   severity: ActivitySeverity;
   sourceKind?: SupportedSourceKind | null;
   title: string;
@@ -699,8 +758,10 @@ export interface ActivityTask {
 export interface ActivityView {
   activeTasks: ActivityTask[];
   generatedAt: string;
+  heartbeats?: MaintenanceHeartbeat[];
   issues: ActivityIssue[];
   logs: EventLogRecord[];
+  maintenanceJobs?: MaintenanceJobView[];
   summary: ActivitySummaryCard[];
 }
 

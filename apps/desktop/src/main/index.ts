@@ -61,6 +61,7 @@ const backgroundLaunch = process.argv.includes('--background');
 const DATABASE_FILE_NAME = 'gamevault.sqlite';
 const GAMEVAULT_APP_USER_MODEL_ID = 'com.gamevault.desktop';
 const LEGACY_DATABASE_FILE_NAME = 'vaulttrack.sqlite';
+const DIRECT_HTTP_PROGRESS_SAMPLE_INTERVAL_MS = 500;
 
 function getAsarUnpackedPath(filePath: string) {
   return filePath.replace(/([/\\])app\.asar([/\\])/, '$1app.asar.unpacked$2');
@@ -322,7 +323,17 @@ const BROWSER_RESOLVED_DOWNLOAD_HOSTS = new Set([
   'bzzhr.to',
 ]);
 const BROWSER_DOWNLOAD_RESOLVE_TIMEOUT_MS = 30000;
+const STEAMRIP_BROWSER_SOURCE_PARTITION = 'persist:gamevault-steamrip-source';
+const STEAMRIP_BROWSER_SOURCE_TIMEOUT_MS = 120000;
+const STEAMRIP_BROWSER_SOURCE_POLL_MS = 1000;
+const STEAMRIP_BROWSER_SOURCE_SHOW_AFTER_MS = 6000;
 let browserDownloadPartitionCounter = 0;
+
+interface BrowserSourcePageState {
+  challenge: boolean;
+  html: string;
+  title: string;
+}
 
 const BROWSER_DOWNLOAD_TRIGGER_SCRIPT = `
 (async () => {
@@ -397,9 +408,179 @@ const BROWSER_DOWNLOAD_TRIGGER_SCRIPT = `
 })()
 `;
 
+const STEAMRIP_BROWSER_SOURCE_STATE_SCRIPT = `
+(() => {
+  const html = document.documentElement?.outerHTML ?? '';
+  const title = document.title ?? '';
+  const text = document.body?.innerText ?? '';
+  const combined = title + '\\n' + text + '\\n' + html.slice(0, 12000);
+  const challenge =
+    /just a moment|checking your browser|verify you are human|needs to review the security|cf-chl|cf-turnstile|challenge-platform/i.test(combined) ||
+    Boolean(document.querySelector('#challenge-running, .cf-turnstile, [class*="cf-chl"]'));
+  return { challenge, html, title };
+})()
+`;
 function getBrowserDownloadPartition(): string {
   browserDownloadPartitionCounter += 1;
   return `gamevault-download-${Date.now().toString(36)}-${browserDownloadPartitionCounter.toString(36)}`;
+}
+
+function fetchSteamRipSourceInBrowser(
+  input: string,
+  init?: RequestInit,
+): Promise<Response> {
+  const method = init?.method?.toUpperCase() ?? 'GET';
+  if (method !== 'GET' && method !== 'HEAD') {
+    return Promise.reject(
+      new Error('SteamRIP browser source fetch only supports GET requests.'),
+    );
+  }
+
+  return new Promise((resolveSource, rejectSource) => {
+    const sourceUrl = input.trim();
+    let settled = false;
+    let verificationShown = false;
+    let pollTimer: NodeJS.Timeout | null = null;
+    let timeout: NodeJS.Timeout | null = null;
+    const startedAt = Date.now();
+    const sourceWindow = new BrowserWindow({
+      height: 760,
+      show: false,
+      title: 'SteamRIP verification - GameVault',
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        partition: STEAMRIP_BROWSER_SOURCE_PARTITION,
+        sandbox: true,
+      },
+      width: 1080,
+    });
+    applyWindowShellDetails(sourceWindow);
+    sourceWindow.setMenu(null);
+
+    const clearTimers = () => {
+      if (pollTimer) {
+        clearTimeout(pollTimer);
+        pollTimer = null;
+      }
+      if (timeout) {
+        clearTimeout(timeout);
+        timeout = null;
+      }
+    };
+
+    const finish = (error: Error | null, html?: string) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimers();
+      if (!sourceWindow.isDestroyed()) {
+        sourceWindow.destroy();
+      }
+      if (error) {
+        rejectSource(error);
+        return;
+      }
+      resolveSource(
+        new Response(html ?? '', {
+          headers: { 'content-type': 'text/html; charset=utf-8' },
+          status: 200,
+        }),
+      );
+    };
+
+    const pollPage = async () => {
+      if (settled || sourceWindow.isDestroyed()) {
+        return;
+      }
+      try {
+        const state =
+          (await sourceWindow.webContents.executeJavaScript(
+            STEAMRIP_BROWSER_SOURCE_STATE_SCRIPT,
+            true,
+          )) as BrowserSourcePageState;
+        if (state.html && !state.challenge) {
+          finish(null, state.html);
+          return;
+        }
+        if (
+          state.challenge &&
+          !verificationShown &&
+          Date.now() - startedAt >= STEAMRIP_BROWSER_SOURCE_SHOW_AFTER_MS
+        ) {
+          verificationShown = true;
+          sourceWindow.setTitle('Complete SteamRIP verification - GameVault');
+          sourceWindow.show();
+          sourceWindow.focus();
+        }
+      } catch {
+        // Keep polling while the page navigates or the renderer reloads.
+      }
+
+      pollTimer = setTimeout(pollPage, STEAMRIP_BROWSER_SOURCE_POLL_MS);
+    };
+
+    const schedulePoll = () => {
+      if (settled || sourceWindow.isDestroyed()) {
+        return;
+      }
+      if (pollTimer) {
+        clearTimeout(pollTimer);
+      }
+      pollTimer = setTimeout(pollPage, 250);
+    };
+
+    timeout = setTimeout(() => {
+      finish(
+        new Error(
+          'Timed out while verifying SteamRIP in the embedded browser.',
+        ),
+      );
+    }, STEAMRIP_BROWSER_SOURCE_TIMEOUT_MS);
+
+    sourceWindow.once('closed', () => {
+      finish(
+        new Error('SteamRIP browser verification window was closed.'),
+      );
+    });
+    sourceWindow.webContents.setWindowOpenHandler(({ url }) => {
+      void sourceWindow.loadURL(url).catch((error) => {
+        finish(
+          error instanceof Error
+            ? error
+            : new Error('SteamRIP browser verification could not open a popup.'),
+        );
+      });
+      return { action: 'deny' };
+    });
+    sourceWindow.webContents.on('did-finish-load', schedulePoll);
+    sourceWindow.webContents.on('did-stop-loading', schedulePoll);
+    sourceWindow.webContents.on(
+      'did-fail-load',
+      (_event, errorCode, errorDescription, validatedUrl, isMainFrame) => {
+        if (!isMainFrame || errorCode === -3) {
+          return;
+        }
+        finish(
+          new Error(
+            `SteamRIP browser verification failed to load ${validatedUrl}: ${errorDescription}`,
+          ),
+        );
+      },
+    );
+
+    void sourceWindow
+      .loadURL(sourceUrl)
+      .then(schedulePoll)
+      .catch((error) => {
+        finish(
+          error instanceof Error
+            ? error
+            : new Error('SteamRIP browser verification could not open the page.'),
+        );
+      });
+  });
 }
 
 function shouldResolveDownloadUrlInBrowser(params: {
@@ -890,7 +1071,7 @@ function startDirectHttpDownload(params: StartDirectHttpDownloadParams) {
 
         activeCurlProgressTimer = setInterval(() => {
           void updateFileProgress();
-        }, 1000);
+        }, DIRECT_HTTP_PROGRESS_SAMPLE_INTERVAL_MS);
 
         curl.stderr.on('data', (chunk) => {
           stderr += chunk.toString();
@@ -1037,6 +1218,7 @@ async function bootstrap() {
     showWindow: () => {
       showMainWindow();
     },
+    browserSourceFetch: fetchSteamRipSourceInBrowser,
     sourceFetch: (input, init) => net.fetch(input, init),
     startDirectHttpDownload,
     steamFetch: (input, init) =>
@@ -1154,6 +1336,9 @@ async function bootstrap() {
   );
   ipcMain.handle('gamevault:refreshDuoStreamIntegration', (_event, payload) =>
     service.refreshDuoStreamIntegration(payload),
+  );
+  ipcMain.handle('gamevault:refreshPlayniteExecutableSelection', (_event, payload) =>
+    service.refreshPlayniteExecutableSelection(payload),
   );
   ipcMain.handle('gamevault:savePlayniteExecutableSelection', (_event, payload) =>
     service.savePlayniteExecutableSelection(payload),

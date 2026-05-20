@@ -28,11 +28,16 @@ import type {
   ImportCandidate,
   ImportScanPayload,
   LibraryRootRecord,
+  MaintenanceHeartbeat,
+  MaintenanceHeartbeatScope,
+  MaintenanceJobRecord,
+  MaintenanceJobView,
   OnlineFixLibraryState,
   OnlineFixSourceInfo,
   OnboardingState,
   ParsedSourcePayload,
   DuoStreamIntegrationStatus,
+  PlayniteExecutableCandidate,
   PlayniteExecutableSelectionRecord,
   PlayniteIntegrationStatus,
   PlayniteManifest,
@@ -59,6 +64,7 @@ import type {
   SupportedSourceKind,
   SyncTrackedSteamPatchEntriesPayload,
   SteamDbBuildLookupState,
+  SteamFeedCheckRecord,
   SteamWishlistCachedItem,
   SteamWishlistLibraryMatch,
   SteamWishlistRemovalRecord,
@@ -85,7 +91,9 @@ import {
   findSteamPatchByDateAndVersion,
   findUniqueSteamPatchByTitleVersion,
   compareNumericSourceVersions,
+  compactSteamPatchHistory,
   extractSteamPatchTitleVersion,
+  getPatchHistoryKey,
   getSteamPatchIdentityKey,
   inferSourceComparisonRows,
   normalizeSourceComparisonVersion,
@@ -97,6 +105,7 @@ import {
   isAnkerGamesProxyDownloadUrl,
   resolveAnkerGamesBrowserDownloadUrl,
   buildAnkerGamesSlugCandidates,
+  buildSteamRipSlugCandidates,
   parseAnkerGamesCatalog,
   parseAnkerGamesRecentUpdates,
   parseElAmigosCatalog,
@@ -135,7 +144,15 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import {
+  basename,
+  dirname,
+  extname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+} from 'node:path';
 import { promisify } from 'node:util';
 
 import { GameVaultDatabase } from './database.js';
@@ -182,6 +199,7 @@ const STEAMDB_RSS_RATE_LIMIT_BACKOFF_MS = IS_TEST_ENV ? 0 : 60 * 60 * 1000;
 const ANKERGAMES_MIN_DELAY_MS = IS_TEST_ENV ? 0 : 1500;
 const ANKERGAMES_RATE_LIMIT_BACKOFF_MS = IS_TEST_ENV ? 0 : 30 * 60 * 1000;
 const SOURCE_DEFAULT_MIN_DELAY_MS = IS_TEST_ENV ? 0 : 250;
+const SOURCE_RATE_LIMIT_BACKOFF_MS = IS_TEST_ENV ? 0 : 30 * 60 * 1000;
 const IMPORT_STEAM_MATCH_CONCURRENCY = 3;
 const STEAMDB_BUILD_LOOKUP_TTL_MS = 60 * 60 * 1000;
 const SOURCE_CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
@@ -200,11 +218,15 @@ const ACTIVITY_RECENT_ERROR_WINDOW_MS = 24 * 60 * 60 * 1000;
 const ACTIVITY_STALE_DOWNLOAD_MS = 2 * 60 * 60 * 1000;
 const ACTIVITY_STALE_GRACE_MS = 5 * 60 * 1000;
 const STEAMDB_BACKOFF_EVENT_INTERVAL_MS = 30 * 60 * 1000;
+const STEAMDB_RSS_FAILURE_RETRY_MS = IS_TEST_ENV ? 0 : 30 * 60 * 1000;
+const TRANSIENT_FAILURE_WARNING_ATTEMPTS = 3;
+const MAINTENANCE_HEARTBEAT_STALE_MS = 5 * 60 * 1000;
 const EXTENSION_ACTIVITY_RECENT_MS = 30 * 60 * 1000;
 const FILE_CLEANUP_RETRY_ATTEMPTS = IS_TEST_ENV ? 2 : 8;
 const FILE_CLEANUP_RETRY_DELAY_MS = IS_TEST_ENV ? 1 : 1000;
 const EXTENSION_ACTIVITY_SETTING_KEY = 'extension.lastNativeMessageAt';
 const ONLINE_FIX_TRUE_UP_SETTING_KEY = 'onlineFix.trueUpCompletedAt.v2';
+const MAINTENANCE_HEARTBEAT_SETTING_KEY = 'maintenance.heartbeats';
 const PLAYNITE_PLUGIN_FOLDER_NAME = 'GameVault';
 const PLAYNITE_PLUGIN_VERSION = '0.1.16';
 const DUOSTREAM_LAUNCHER_FILE_NAME = 'Launch with GameVault Duo.vbs';
@@ -251,6 +273,15 @@ interface RequestPacingOptions {
 interface SourceDiscoveryOptions {
   bypassBackoff?: boolean;
   forceCatalog?: boolean;
+  parsedSourceCandidates?: ParsedSourcePayload[];
+  parsedSourceOverride?: ParsedSourcePayload | null;
+  skipIfBackoff?: boolean;
+  sourceCatalogLookupCompleted?: SupportedSourceKind[];
+  sourceCatalogEntries?: SourceCatalogEntry[];
+}
+
+interface SourceWatchRefreshResult {
+  retryAfterMs: number | null;
 }
 
 interface AppendEventOptions {
@@ -273,6 +304,16 @@ class SourceCatalogUnavailableError extends Error {
   ) {
     super(message);
     this.name = 'SourceCatalogUnavailableError';
+  }
+}
+
+class TransientSourceRequestError extends Error {
+  constructor(
+    message: string,
+    readonly retryAfterMs: number | null = null,
+  ) {
+    super(message);
+    this.name = 'TransientSourceRequestError';
   }
 }
 
@@ -345,11 +386,24 @@ function sourcePacingOptions(url: string): RequestPacingOptions {
   }
 
   return {
-    defaultBackoffMs: SOURCE_DEFAULT_MIN_DELAY_MS,
+    defaultBackoffMs: SOURCE_RATE_LIMIT_BACKOFF_MS,
     key: host,
     minDelayMs: SOURCE_DEFAULT_MIN_DELAY_MS,
-    rateLimitStatuses: new Set([429]),
+    rateLimitStatuses: new Set([403, 429]),
   };
+}
+
+function shouldUseBrowserSourceFetch(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.replace(/^www\./i, '').toLowerCase();
+    return host === 'steamrip.com';
+  } catch {
+    return false;
+  }
+}
+
+function sourceHostForKind(sourceKind: SupportedSourceKind): string {
+  return new URL(SOURCE_CATALOG_URLS[sourceKind][0]!).hostname.toLowerCase();
 }
 
 function transientSourceErrorMessage(status: number): string {
@@ -359,10 +413,58 @@ function transientSourceErrorMessage(status: number): string {
 }
 
 function isTransientSourceResponse(
-  sourceKind: SupportedSourceKind,
+  _sourceKind: SupportedSourceKind,
   status: number,
 ): boolean {
-  return status === 429 || (sourceKind === 'ankergames' && status === 403);
+  return status === 429 || status === 403;
+}
+
+function transientSourceRetryAfterMs(error: unknown): number | null {
+  return error instanceof TransientSourceRequestError
+    ? error.retryAfterMs
+    : null;
+}
+
+function isTransientMaintenanceError(message: string | null | undefined): boolean {
+  return Boolean(
+    message &&
+      /backing off|temporarily blocked|rate limited|retrying later|timed out|timeout|429|403/i.test(
+        message,
+      ),
+  );
+}
+
+function isTransientSourceMaintenanceLog(log: EventLogRecord): boolean {
+  const error =
+    typeof log.context?.error === 'string' ? log.context.error : null;
+  return (
+    /source/i.test(log.message) &&
+    isTransientMaintenanceError(error ?? log.message)
+  );
+}
+
+function parseMaintenanceHeartbeats(
+  value: string | null,
+): MaintenanceHeartbeat[] {
+  if (!value) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed.filter(
+      (entry): entry is MaintenanceHeartbeat =>
+        Boolean(entry) &&
+        typeof entry === 'object' &&
+        typeof (entry as MaintenanceHeartbeat).scope === 'string' &&
+        typeof (entry as MaintenanceHeartbeat).status === 'string' &&
+        typeof (entry as MaintenanceHeartbeat).updatedAt === 'string',
+    );
+  } catch {
+    return [];
+  }
 }
 
 function dateStamp(): string {
@@ -634,6 +736,17 @@ function formatDurationMs(value: number): string {
   return `${Math.round(hours / 24)} days`;
 }
 
+function formatSourceKind(sourceKind: SupportedSourceKind): string {
+  switch (sourceKind) {
+    case 'ankergames':
+      return 'AnkerGames';
+    case 'elamigos':
+      return 'ElAmigos';
+    case 'steamrip':
+      return 'SteamRIP';
+  }
+}
+
 function activityIssueRank(issue: ActivityIssue): number {
   if (issue.severity === 'error') return 0;
   if (issue.severity === 'warning') return 1;
@@ -664,7 +777,87 @@ function countActivityIssues(
   kinds: ActivityIssue['kind'][],
 ): number {
   const kindSet = new Set(kinds);
-  return issues.filter((issue) => kindSet.has(issue.kind)).length;
+  return issues
+    .filter((issue) => kindSet.has(issue.kind))
+    .reduce((sum, issue) => sum + (issue.groupCount ?? 1), 0);
+}
+
+function countFilteredActivityIssues(
+  issues: ActivityIssue[],
+  predicate: (issue: ActivityIssue) => boolean,
+): number {
+  return issues
+    .filter(predicate)
+    .reduce((sum, issue) => sum + (issue.groupCount ?? 1), 0);
+}
+
+function groupTransientActivityIssues(issues: ActivityIssue[]): ActivityIssue[] {
+  const grouped = new Map<string, ActivityIssue[]>();
+  const passthrough: ActivityIssue[] = [];
+  for (const issue of issues) {
+    const canGroup =
+      (issue.kind === 'source_error' || issue.kind === 'steamdb_error') &&
+      isTransientMaintenanceError(issue.detail);
+    if (!canGroup) {
+      passthrough.push(issue);
+      continue;
+    }
+    const groupTarget =
+      issue.kind === 'source_error'
+        ? (issue.sourceKind ?? 'source')
+        : 'steamdb';
+    const key = `${issue.kind}:${groupTarget}:${issue.detail}`;
+    grouped.set(key, [...(grouped.get(key) ?? []), issue]);
+  }
+
+  for (const entries of grouped.values()) {
+    if (entries.length === 1) {
+      passthrough.push(entries[0]!);
+      continue;
+    }
+    const first = entries[0]!;
+    const sourceLabel = first.sourceKind
+      ? formatSourceKind(first.sourceKind)
+      : first.kind === 'steamdb_error'
+        ? 'SteamDB'
+        : 'source';
+    passthrough.push({
+      action:
+        first.kind === 'source_error' && first.sourceKind
+          ? {
+              label: `Pause ${formatSourceKind(first.sourceKind)} 30 min`,
+              payload: {
+                durationMs: 30 * 60 * 1000,
+                sourceKind: first.sourceKind,
+                type: 'pauseSourceKind',
+              },
+            }
+          : first.action,
+      createdAt: latestIsoTimestamp(entries.map((entry) => entry.createdAt)),
+      detail: `${entries.length} ${sourceLabel} checks are temporarily blocked. The app will retry after the current cooldown.`,
+      gameTitle: null,
+      groupCount: entries.length,
+      id: `${first.kind}:group:${sourceLabel}:${first.detail}`,
+      kind:
+        first.kind === 'source_error'
+          ? 'source_error_group'
+          : 'steamdb_error_group',
+      relatedGameTitles: entries
+        .map((entry) => entry.gameTitle)
+        .filter((title): title is string => Boolean(title))
+        .slice(0, 8),
+      severity: entries.some((entry) => entry.severity === 'error')
+        ? 'error'
+        : 'warning',
+      sourceKind: first.sourceKind,
+      title:
+        first.kind === 'source_error'
+          ? `${sourceLabel} source checks are cooling down`
+          : 'SteamDB feed checks are cooling down',
+    });
+  }
+
+  return passthrough;
 }
 
 function worstActivitySeverityForKinds(
@@ -1966,6 +2159,7 @@ export class GameVaultService {
     private readonly steamFetch: typeof fetch = (input, init) =>
       fetch(input, init),
     private readonly playnitePaths: PlayniteIntegrationPaths = {},
+    private readonly browserSourceFetch?: SourceFetch,
   ) {}
 
   onDownloadProgressChange(
@@ -2105,15 +2299,109 @@ export class GameVaultService {
   private fetchSource(
     input: string,
     init?: RequestInit,
-    options: { bypassBackoff?: boolean } = {},
+    options: { bypassBackoff?: boolean; skipIfBackoff?: boolean } = {},
   ): Promise<Response> {
+    const pacingOptions = sourcePacingOptions(input);
+    const canUseBrowserSourceFetch = Boolean(
+      this.browserSourceFetch && shouldUseBrowserSourceFetch(input),
+    );
+    if (
+      options.skipIfBackoff &&
+      !options.bypassBackoff &&
+      !canUseBrowserSourceFetch
+    ) {
+      const retryAfterMs = this.sourceBackoffRemainingMs(input);
+      if (retryAfterMs > 0) {
+        throw new TransientSourceRequestError(
+          `Source host is backing off; retry in ${formatDurationMs(
+            retryAfterMs,
+          )}.`,
+          retryAfterMs,
+        );
+      }
+    }
+
     return this.pacedFetch(
       input,
       init,
       this.sourceFetch,
-      sourcePacingOptions(input),
+      pacingOptions,
       options.bypassBackoff,
+    )
+      .then(async (response) => {
+        if (
+          response.ok ||
+          !this.browserSourceFetch ||
+          !canUseBrowserSourceFetch ||
+          !isTransientSourceResponse('steamrip', response.status)
+        ) {
+          return response;
+        }
+
+        try {
+          const browserResponse = await this.browserSourceFetch(input, init);
+          return browserResponse.ok ? browserResponse : response;
+        } catch {
+          return response;
+        }
+      })
+      .catch(async (error) => {
+        if (!this.browserSourceFetch || !canUseBrowserSourceFetch) {
+          throw error;
+        }
+        return this.browserSourceFetch(input, init);
+      });
+  }
+
+  private sourceBackoffRemainingMs(input: string): number {
+    const key = sourcePacingOptions(input).key;
+    const nextAllowedAt = this.requestPacingStates.get(key)?.nextAllowedAt ?? 0;
+    const pausedUntil = timestampMs(
+      this.database.getSetting(`sourcePause.${key}.until`),
     );
+    return Math.max(
+      0,
+      nextAllowedAt - Date.now(),
+      pausedUntil == null ? 0 : pausedUntil - Date.now(),
+    );
+  }
+
+  private persistSourceCooldown(input: string, durationMs: number): void {
+    const key = sourcePacingOptions(input).key;
+    const until = Date.now() + Math.max(0, durationMs);
+    this.database.setSetting(
+      `sourcePause.${key}.until`,
+      new Date(until).toISOString(),
+    );
+    const existing =
+      this.requestPacingStates.get(key) ??
+      ({
+        nextAllowedAt: 0,
+        queue: Promise.resolve(),
+      } satisfies RequestPacingState);
+    existing.nextAllowedAt = Math.max(existing.nextAllowedAt, until);
+    this.requestPacingStates.set(key, existing);
+  }
+
+  private pauseSourceKind(
+    sourceKind: SupportedSourceKind,
+    durationMs: number,
+  ): void {
+    const host = sourceHostForKind(sourceKind);
+    const until = new Date(Date.now() + Math.max(0, durationMs)).toISOString();
+    this.database.setSetting(`sourcePause.${host}.until`, until);
+    const existing =
+      this.requestPacingStates.get(host) ??
+      ({
+        nextAllowedAt: 0,
+        queue: Promise.resolve(),
+      } satisfies RequestPacingState);
+    existing.nextAllowedAt = Math.max(existing.nextAllowedAt, Date.parse(until));
+    this.requestPacingStates.set(host, existing);
+    this.appendEvent('warn', `${sourceKind} source checks paused`, {
+      retryAt: until,
+      sourceKind,
+    });
   }
 
   private fetchSteamDbRss(
@@ -2141,12 +2429,165 @@ export class GameVaultService {
     this.emitActivityChange();
   }
 
+  private appendSourceWatchFailureEvent(params: {
+    context: Record<string, unknown>;
+    fallbackMessage: string;
+    message: string;
+  }): void {
+    const transient = isTransientMaintenanceError(params.message);
+    this.appendEvent(
+      transient ? 'info' : 'warn',
+      transient ? 'Source watch cooling down' : params.fallbackMessage,
+      params.context,
+      { notify: !transient },
+    );
+  }
+
   recordActivityEvent(
     level: EventLogRecord['level'],
     message: string,
     context?: Record<string, unknown>,
   ): void {
     this.appendEvent(level, message, context);
+  }
+
+  recordMaintenanceHeartbeat(
+    scope: MaintenanceHeartbeatScope,
+    status: MaintenanceHeartbeat['status'],
+    detail?: string | null,
+    error?: string | null,
+  ): void {
+    const now = new Date().toISOString();
+    const existing = parseMaintenanceHeartbeats(
+      this.database.getSetting(MAINTENANCE_HEARTBEAT_SETTING_KEY),
+    );
+    const previous = existing.find((entry) => entry.scope === scope);
+    const next: MaintenanceHeartbeat = {
+      completedAt:
+        status === 'running' ? (previous?.completedAt ?? null) : now,
+      detail: detail ?? null,
+      error: error ?? null,
+      scope,
+      startedAt: status === 'running' ? now : (previous?.startedAt ?? now),
+      status,
+      updatedAt: now,
+    };
+    this.database.setSetting(
+      MAINTENANCE_HEARTBEAT_SETTING_KEY,
+      JSON.stringify([
+        ...existing.filter((entry) => entry.scope !== scope),
+        next,
+      ]),
+    );
+  }
+
+  private getMaintenanceHeartbeats(): MaintenanceHeartbeat[] {
+    return parseMaintenanceHeartbeats(
+      this.database.getSetting(MAINTENANCE_HEARTBEAT_SETTING_KEY),
+    );
+  }
+
+  private upsertMaintenanceJob(
+    patch: Omit<
+      MaintenanceJobRecord,
+      'attemptCount' | 'id' | 'updatedAt'
+    > & {
+      attemptCount?: number;
+      id: string;
+      updatedAt?: string;
+    },
+  ): MaintenanceJobRecord {
+    const existing = this.database.getMaintenanceJob(patch.id);
+    const next: MaintenanceJobRecord = {
+      attemptCount: patch.attemptCount ?? existing?.attemptCount ?? 0,
+      detail: patch.detail ?? null,
+      gameTitle: patch.gameTitle ?? existing?.gameTitle ?? null,
+      host: patch.host ?? existing?.host ?? null,
+      id: patch.id,
+      kind: patch.kind,
+      lastAttemptAt: patch.lastAttemptAt ?? existing?.lastAttemptAt ?? null,
+      lastError: patch.lastError ?? null,
+      lastSuccessAt: patch.lastSuccessAt ?? existing?.lastSuccessAt ?? null,
+      nextAttemptAt: patch.nextAttemptAt ?? null,
+      sourceKind: patch.sourceKind ?? existing?.sourceKind ?? null,
+      status: patch.status,
+      trackedItemId: patch.trackedItemId ?? existing?.trackedItemId ?? null,
+      updatedAt: patch.updatedAt ?? new Date().toISOString(),
+    };
+    this.database.upsertMaintenanceJob(next);
+    return next;
+  }
+
+  private queueMaintenanceJob(
+    patch: Omit<
+      MaintenanceJobRecord,
+      | 'attemptCount'
+      | 'id'
+      | 'lastAttemptAt'
+      | 'lastError'
+      | 'lastSuccessAt'
+      | 'status'
+      | 'updatedAt'
+    > & {
+      id: string;
+      nextAttemptAt?: string | null;
+    },
+  ): void {
+    const existing = this.database.getMaintenanceJob(patch.id);
+    if (existing?.status === 'running') {
+      return;
+    }
+    this.upsertMaintenanceJob({
+      ...patch,
+      attemptCount: existing?.attemptCount ?? 0,
+      lastAttemptAt: existing?.lastAttemptAt ?? null,
+      lastError: existing?.lastError ?? null,
+      lastSuccessAt: existing?.lastSuccessAt ?? null,
+      status: 'queued',
+    });
+  }
+
+  private beginMaintenanceJob(id: string, detail?: string | null): void {
+    const existing = this.database.getMaintenanceJob(id);
+    if (!existing) {
+      return;
+    }
+    const now = new Date().toISOString();
+    this.upsertMaintenanceJob({
+      ...existing,
+      attemptCount: existing.attemptCount + 1,
+      detail: detail ?? existing.detail ?? null,
+      lastAttemptAt: now,
+      lastError: null,
+      nextAttemptAt: null,
+      status: 'running',
+      updatedAt: now,
+    });
+  }
+
+  private finishMaintenanceJob(
+    id: string,
+    status: MaintenanceJobRecord['status'],
+    params: {
+      detail?: string | null;
+      error?: string | null;
+      nextAttemptAt?: string | null;
+    } = {},
+  ): void {
+    const existing = this.database.getMaintenanceJob(id);
+    if (!existing) {
+      return;
+    }
+    const now = new Date().toISOString();
+    this.upsertMaintenanceJob({
+      ...existing,
+      detail: params.detail ?? existing.detail ?? null,
+      lastError: params.error ?? null,
+      lastSuccessAt: status === 'succeeded' ? now : existing.lastSuccessAt,
+      nextAttemptAt: params.nextAttemptAt ?? null,
+      status,
+      updatedAt: now,
+    });
   }
 
   beginActivityTask(params: {
@@ -5035,6 +5476,18 @@ export class GameVaultService {
       const selectedPathExists = selection?.selectedExePath
         ? await pathExists(selection.selectedExePath)
         : false;
+      const selectedPathInside =
+        selection?.selectedExePath && installPath
+          ? pathIsInsideOrEqual(installPath, selection.selectedExePath)
+          : false;
+      if (
+        selection?.status === 'reviewed' &&
+        selection.selectedExePath &&
+        selectedPathExists &&
+        selectedPathInside
+      ) {
+        continue;
+      }
       const selectedPathExcluded =
         selection?.selectedExePath && selectedPathExists
           ? getPlayniteExecutableExclusionReason(
@@ -5391,6 +5844,29 @@ export class GameVaultService {
     return this.getPlayniteStatus(params);
   }
 
+  async refreshPlayniteExecutableSelection(payload: {
+    trackedItemId: string;
+  }): Promise<PlayniteExecutableSelectionRecord> {
+    const trackedItemId = payload?.trackedItemId?.trim();
+    if (!trackedItemId) {
+      throw new Error('Tracked item is required to refresh launch executables.');
+    }
+    const selection = await this.refreshPlayniteExecutableSelectionForTrackedItem(
+      trackedItemId,
+    );
+    if (!selection) {
+      throw new Error('This game does not have an install path to scan.');
+    }
+    if (this.database.getSettings().playniteIntegrationEnabled) {
+      await this.exportPlayniteManifest({ rescan: false });
+    }
+    this.appendEvent('info', 'Refreshed Playnite executable candidates', {
+      trackedItemId,
+    });
+    this.emitActivityChange();
+    return selection;
+  }
+
   async savePlayniteExecutableSelection(
     payload: SavePlayniteExecutableSelectionPayload,
   ): Promise<PlayniteIntegrationStatus> {
@@ -5404,39 +5880,72 @@ export class GameVaultService {
     if (!installPath) {
       throw new Error('This game does not have an install path to review.');
     }
-    if (!pathIsInsideOrEqual(installPath, payload.executablePath)) {
+    const executablePath = resolve(payload.executablePath);
+    if (extname(executablePath).toLowerCase() !== '.exe') {
+      throw new Error('Selected executable must be a .exe file.');
+    }
+    if (!pathIsInsideOrEqual(installPath, executablePath)) {
       throw new Error(
         'Selected executable must be inside the game install folder.',
       );
     }
-    if (!(await pathExists(payload.executablePath))) {
+    let executableStats;
+    try {
+      executableStats = await stat(executablePath);
+    } catch {
       throw new Error('Selected executable does not exist.');
     }
+    if (!executableStats.isFile()) {
+      throw new Error('Selected executable must be a file.');
+    }
     const previous = this.database.getPlayniteExecutableSelection(item.id);
-    const candidates =
-      previous?.candidates.map((candidate) =>
+    const manualCandidate: PlayniteExecutableCandidate = {
+      excluded: false,
+      fileName: basename(executablePath),
+      fullPath: executablePath,
+      penalties: [],
+      reasons: ['Selected manually'],
+      relativePath: relative(installPath, executablePath),
+      score: 1,
+      sizeBytes: executableStats.size,
+    };
+    const existingCandidates = previous?.candidates ?? [];
+    const selectedCandidateIndex = existingCandidates.findIndex(
+      (candidate) =>
         resolve(candidate.fullPath).toLowerCase() ===
-        resolve(payload.executablePath).toLowerCase()
-          ? {
-              ...candidate,
-              excluded: false,
-              reasons: [...new Set([...candidate.reasons, 'Selected manually'])],
-            }
-          : candidate,
-      ) ?? [];
+        executablePath.toLowerCase(),
+    );
+    const candidates =
+      selectedCandidateIndex >= 0
+        ? existingCandidates.map((candidate, index) =>
+            index === selectedCandidateIndex
+              ? {
+                  ...candidate,
+                  excluded: false,
+                  fullPath: executablePath,
+                  penalties: candidate.penalties,
+                  reasons: [
+                    ...new Set(['Selected manually', ...candidate.reasons]),
+                  ],
+                  score: Math.max(candidate.score, 1),
+                }
+              : candidate,
+          )
+        : [manualCandidate, ...existingCandidates];
+    const now = new Date().toISOString();
     this.database.upsertPlayniteExecutableSelection({
       candidates,
       confidence: 'high',
-      reviewedAt: new Date().toISOString(),
-      selectedExePath: resolve(payload.executablePath),
+      reviewedAt: now,
+      selectedExePath: executablePath,
       status: 'reviewed',
       steamAppId: view.item.steamAppId ?? null,
       trackedItemId: item.id,
-      updatedAt: new Date().toISOString(),
+      updatedAt: now,
     });
     await this.exportPlayniteManifest({ rescan: false });
     this.appendEvent('info', 'Saved Playnite executable selection', {
-      executablePath: payload.executablePath,
+      executablePath,
       trackedItemId: item.id,
     });
     this.emitActivityChange();
@@ -5973,6 +6482,25 @@ export class GameVaultService {
     sourceKind: SupportedSourceKind,
     options: SourceDiscoveryOptions = {},
   ): Promise<SourceCatalogEntry[]> {
+    const providedEntries = (options.sourceCatalogEntries ?? []).filter(
+      (entry) => entry.sourceKind === sourceKind,
+    );
+    const providedLookupCompleted =
+      options.sourceCatalogLookupCompleted?.includes(sourceKind) ?? false;
+    if (providedEntries.length > 0 || providedLookupCompleted) {
+      const normalizedEntries =
+        sourceKind === 'steamrip'
+          ? this.mergeSteamRipCatalogEntries(providedEntries)
+          : providedEntries;
+      if (normalizedEntries.length > 0) {
+        this.sourceCatalogCache.set(sourceKind, {
+          capturedAt: Date.now(),
+          entries: normalizedEntries,
+        });
+      }
+      return normalizedEntries;
+    }
+
     const cached = this.sourceCatalogCache.get(sourceKind);
     if (
       cached &&
@@ -5989,6 +6517,7 @@ export class GameVaultService {
       try {
         const response = await this.fetchSource(url, undefined, {
           bypassBackoff: options.bypassBackoff,
+          skipIfBackoff: options.skipIfBackoff,
         });
         if (!response.ok) {
           lastError = `Catalog request failed with ${response.status}`;
@@ -6096,6 +6625,7 @@ export class GameVaultService {
     candidateIndex: number;
     expectedTitle: string;
     isPrimary?: boolean;
+    skipIfBackoff?: boolean;
     steamAppId?: number | null;
     trackedItemId: string;
   }): Promise<SourceCandidateProbe> {
@@ -6109,6 +6639,7 @@ export class GameVaultService {
       undefined,
       {
         bypassBackoff: params.bypassBackoff,
+        skipIfBackoff: params.skipIfBackoff,
       },
     );
     if (!response.ok) {
@@ -6161,6 +6692,7 @@ export class GameVaultService {
       (input, init) =>
         this.fetchSource(input, init, {
           bypassBackoff: params.bypassBackoff,
+          skipIfBackoff: params.skipIfBackoff,
         }),
     );
     const parsedSourceWithCatalogMetadata: ParsedSourcePayload =
@@ -6687,6 +7219,51 @@ export class GameVaultService {
     );
   }
 
+  private probeProvidedParsedSource(params: {
+    expectedTitle: string;
+    isPrimary?: boolean;
+    parsedSource: ParsedSourcePayload;
+    trackedItemId: string;
+  }): SourceCandidateProbe {
+    const now = new Date().toISOString();
+    const rank = rankSourceTitleMatch(
+      params.expectedTitle,
+      params.parsedSource.title,
+    );
+    const status: SourceMatchStatus =
+      rank.score >= SOURCE_MATCH_PROBABLE_SCORE
+        ? 'probable'
+        : rank.score >= SOURCE_MATCH_CANDIDATE_SCORE
+          ? 'candidate'
+          : 'not_found';
+    const method: SourceMatchMethod =
+      params.parsedSource.catalogMetadata?.method ?? 'fuzzy_title';
+    return {
+      catalogRank: rank,
+      candidateIndex: 0,
+      detailRank: rank,
+      exactSteamAppId: false,
+      match: {
+        confidence: rank.score,
+        createdAt: now,
+        isPrimary: Boolean(params.isPrimary),
+        lastCheckedAt: now,
+        lastError: null,
+        method,
+        normalizedTitle: params.parsedSource.normalizedTitle,
+        score: rank.score,
+        sourceKind: params.parsedSource.sourceKind,
+        sourceTitle: params.parsedSource.title,
+        sourceUrl: params.parsedSource.sourceUrl,
+        status,
+        trackedItemId: params.trackedItemId,
+        updatedAt: now,
+        usable: status === 'probable',
+      },
+      parsedSource: params.parsedSource,
+    };
+  }
+
   private async findBestSourceMatch(params: {
     item: TrackedItemRecord;
     options?: SourceDiscoveryOptions;
@@ -6697,6 +7274,35 @@ export class GameVaultService {
     const now = new Date().toISOString();
     const slugCandidates: SourceCatalogEntry[] = [];
     let catalogUnavailable: SourceCatalogUnavailableError | null = null;
+    const catalogLookupCompleted =
+      params.options?.sourceCatalogLookupCompleted?.includes(
+        params.sourceKind,
+      ) ?? false;
+    const providedParsedSourceProbe = this.selectBestSourceCandidateProbe(
+      (params.options?.parsedSourceCandidates ?? [])
+        .filter((parsedSource) => parsedSource.sourceKind === params.sourceKind)
+        .map((parsedSource, candidateIndex) => ({
+          ...this.probeProvidedParsedSource({
+            expectedTitle,
+            parsedSource,
+            trackedItemId: params.item.id,
+          }),
+          candidateIndex,
+        })),
+    );
+    if (providedParsedSourceProbe) {
+      if (
+        providedParsedSourceProbe.parsedSource &&
+        providedParsedSourceProbe.match.status !== 'not_found'
+      ) {
+        this.persistParsedSource(
+          params.item.id,
+          providedParsedSourceProbe.parsedSource,
+        );
+      }
+      return providedParsedSourceProbe.match;
+    }
+
     const confirmCandidates = async (
       candidates: SourceCatalogEntry[],
     ): Promise<SourceCandidateProbe | null> => {
@@ -6708,6 +7314,7 @@ export class GameVaultService {
             candidate,
             candidateIndex,
             expectedTitle,
+            skipIfBackoff: params.options?.skipIfBackoff,
             steamAppId: params.steamMatch?.appId ?? null,
             trackedItemId: params.item.id,
           });
@@ -6770,6 +7377,31 @@ export class GameVaultService {
             params.steamMatch?.normalizedTitle ?? params.item.normalizedTitle,
           sourceKind: 'ankergames',
           sourceUrl: `https://ankergames.net/game/${slug}`,
+          title: expectedTitle,
+        });
+      }
+
+      const slugProbe = await confirmCandidates(slugCandidates);
+      if (slugProbe) {
+        if (slugProbe.parsedSource && slugProbe.match.status !== 'not_found') {
+          this.persistParsedSource(params.item.id, slugProbe.parsedSource);
+        }
+        return slugProbe.match;
+      }
+    }
+
+    if (
+      params.sourceKind === 'steamrip' &&
+      !catalogLookupCompleted &&
+      !(params.item.sourceKind === 'steamrip' && params.item.sourceUrl)
+    ) {
+      for (const slug of buildSteamRipSlugCandidates(expectedTitle)) {
+        slugCandidates.push({
+          method: 'slug',
+          normalizedTitle:
+            params.steamMatch?.normalizedTitle ?? params.item.normalizedTitle,
+          sourceKind: 'steamrip',
+          sourceUrl: `https://steamrip.com/${slug}/`,
           title: expectedTitle,
         });
       }
@@ -6869,7 +7501,7 @@ export class GameVaultService {
       !existing.usable ||
       incoming.usable ||
       !incoming.lastError ||
-      !/rate limited|retrying later|catalog unavailable|catalog returned no entries/i.test(
+      !/backing off|rate limited|retrying later|catalog unavailable|catalog returned no entries/i.test(
         incoming.lastError,
       )
     ) {
@@ -7316,20 +7948,38 @@ export class GameVaultService {
 
   private async fetchSteamPatchFeed(
     appId: number,
+    previousCheck?: SteamFeedCheckRecord | null,
   ): Promise<SteamPatchFeedResult> {
     const feedUrl = buildSteamDbPatchFeedUrl(appId);
+    const conditionalHeaders: Record<string, string> = {};
+    if (previousCheck?.feedEtag) {
+      conditionalHeaders['If-None-Match'] = previousCheck.feedEtag;
+    }
+    if (previousCheck?.feedLastModified) {
+      conditionalHeaders['If-Modified-Since'] = previousCheck.feedLastModified;
+    }
     const response = await fetchWithTimeout(
       feedUrl,
       {
         headers: {
           Accept:
             'application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8',
+          ...conditionalHeaders,
           'User-Agent': 'GameVault/0.1 (+https://example.invalid/gamevault)',
         },
       },
       STEAMDB_RSS_TIMEOUT_MS,
       (input, init) => this.fetchSteamDbRss(input, init),
     );
+
+    if (response.status === 304) {
+      return {
+        appId,
+        feedUrl,
+        fetchedAt: new Date().toISOString(),
+        patches: [],
+      };
+    }
 
     if (!response.ok) {
       throw new Error(`SteamDB RSS request failed: ${response.status}`);
@@ -7340,6 +7990,8 @@ export class GameVaultService {
       appId,
       feedUrl,
       fetchedAt: new Date().toISOString(),
+      feedEtag: response.headers.get('etag'),
+      feedLastModified: response.headers.get('last-modified'),
       patches: parseSteamDbPatchCandidates(appId, xml),
     };
   }
@@ -7348,18 +8000,41 @@ export class GameVaultService {
     return this.fetchSteamPatchFeed(appId);
   }
 
+  private compactPatchEntriesForStorage(params: {
+    appId: number;
+    patches: SteamPatchCandidate[] | null | undefined;
+    selectedPatch?: SteamPatchCandidate | null;
+    selectedSelectionSource?: SteamPatchCandidate['selectionSource'] | null;
+    trackedItemId: string;
+  }): SteamPatchEntry[] {
+    const selectedPatches =
+      params.selectedPatch?.appId === params.appId ? [params.selectedPatch] : [];
+    const selectedKey = selectedPatches[0]
+      ? getPatchHistoryKey(selectedPatches[0])
+      : null;
+    return compactSteamPatchHistory(
+      (params.patches ?? []).filter((entry) => entry.appId === params.appId),
+      { requiredPatches: selectedPatches },
+    ).map((entry) => ({
+      ...entry,
+      selectionSource:
+        selectedKey && getPatchHistoryKey(entry) === selectedKey
+          ? (params.selectedSelectionSource ?? entry.selectionSource ?? 'rss')
+          : (entry.selectionSource ?? 'rss'),
+      trackedItemId: params.trackedItemId,
+    }));
+  }
+
   private persistSteamPatchCandidates(
     trackedItemId: string,
     appId: number,
     patches: SteamPatchCandidate[] | null | undefined,
   ): void {
-    const entries = (patches ?? [])
-      .filter((entry) => entry.appId === appId)
-      .map((entry) => ({
-        ...entry,
-        selectionSource: entry.selectionSource ?? 'rss',
-        trackedItemId,
-      }));
+    const entries = this.compactPatchEntriesForStorage({
+      appId,
+      patches,
+      trackedItemId,
+    });
     if (entries.length === 0) {
       return;
     }
@@ -7539,19 +8214,14 @@ export class GameVaultService {
       ),
       trackedItemId: payload.trackedItemId,
     });
-    const patchEntries = [
-      ...(payload.steamPatchEntries ?? []),
-      payload.selectedSteamPatch,
-    ].filter((entry) => entry.appId === steamMatch.appId);
     this.database.upsertPatchEntries(
-      patchEntries.map((entry) => ({
-        ...entry,
-        selectionSource:
-          entry === payload.selectedSteamPatch
-            ? selectionSource
-            : (entry.selectionSource ?? 'rss'),
+      this.compactPatchEntriesForStorage({
+        appId: steamMatch.appId,
+        patches: payload.steamPatchEntries,
+        selectedPatch: payload.selectedSteamPatch,
+        selectedSelectionSource: selectionSource,
         trackedItemId: payload.trackedItemId,
-      })),
+      }),
     );
 
     this.database.updateTrackedItemPrimarySource(payload.trackedItemId, {
@@ -7730,7 +8400,9 @@ export class GameVaultService {
     appId: number,
     patches: SteamPatchCandidate[] | null | undefined,
   ): SteamPatchCandidate[] {
-    return (patches ?? []).filter((patch) => patch.appId === appId);
+    return compactSteamPatchHistory(
+      (patches ?? []).filter((patch) => patch.appId === appId),
+    );
   }
 
   private upsertSteamDbBuildCache(
@@ -7933,6 +8605,55 @@ export class GameVaultService {
     const installRecord = this.database.getInstallRecord(trackedItemId);
     const matchedSources = this.database.listSourceMatches(trackedItemId);
     const sourceSnapshots = this.database.listSourceSnapshots(trackedItemId);
+    const normalizePatchLinkForWatch = (
+      value: string | null | undefined,
+    ): string | null => {
+      const trimmed = value?.trim();
+      if (!trimmed) {
+        return null;
+      }
+      try {
+        const parsed = new URL(trimmed);
+        parsed.hash = '';
+        parsed.search = '';
+        return parsed.toString().replace(/\/$/, '');
+      } catch {
+        return trimmed.replace(/[?#].*$/, '').replace(/\/$/, '');
+      }
+    };
+    const snapshotMatchesLatestPatch = (
+      snapshot: SourceSnapshot | null,
+    ): boolean => {
+      if (!snapshot || !latestPatch) {
+        return false;
+      }
+      if (latestPatch.buildId) {
+        if (snapshot.observedBuildId) {
+          return snapshot.observedBuildId === latestPatch.buildId;
+        }
+        const latestLink = normalizePatchLinkForWatch(latestPatch.link);
+        const snapshotLink = normalizePatchLinkForWatch(
+          snapshot.observedPatchLink,
+        );
+        return Boolean(
+          latestLink && snapshotLink && latestLink === snapshotLink,
+        );
+      }
+
+      const latestLink = normalizePatchLinkForWatch(latestPatch.link);
+      const snapshotLink = normalizePatchLinkForWatch(
+        snapshot.observedPatchLink,
+      );
+      if (latestLink && snapshotLink && latestLink === snapshotLink) {
+        return true;
+      }
+      return Boolean(
+        latestPatch.patchDate &&
+          snapshot.observedPatchDate === latestPatch.patchDate &&
+          latestPatch.patchTitle &&
+          snapshot.observedPatchTitle === latestPatch.patchTitle,
+      );
+    };
     const anyMatchedSourceNeedsWatch =
       latestPatch != null &&
       matchedSources.some((match) => {
@@ -7943,6 +8664,12 @@ export class GameVaultService {
           sourceSnapshots.find(
             (candidate) => candidate.sourceKind === match.sourceKind,
           ) ?? null;
+        if (snapshotMatchesLatestPatch(snapshot)) {
+          return false;
+        }
+        if (latestPatch.buildId) {
+          return true;
+        }
         const status = this.getSourceUpdateStatus({
           installRecord,
           latestPatch,
@@ -8006,15 +8733,21 @@ export class GameVaultService {
   ): Promise<SteamPatchEntry[]> {
     const checkedAt = new Date().toISOString();
     const feedUrl = buildSteamDbPatchFeedUrl(steamMatch.appId);
+    const previousCheck = this.database.getSteamFeedCheck(trackedItemId);
     try {
-      const feed = await this.fetchSteamPatchFeed(steamMatch.appId);
-      const entries = feed.patches.map((entry) => ({
-        ...entry,
-        selectionSource: entry.selectionSource ?? 'rss',
+      const feed = await this.fetchSteamPatchFeed(
+        steamMatch.appId,
+        previousCheck,
+      );
+      const entries = this.compactPatchEntriesForStorage({
+        appId: steamMatch.appId,
+        patches: feed.patches,
         trackedItemId,
-      }));
+      });
       this.database.upsertPatchEntries(entries);
       this.database.upsertSteamFeedCheck({
+        feedEtag: feed.feedEtag ?? null,
+        feedLastModified: feed.feedLastModified ?? null,
         feedUrl: feed.feedUrl,
         lastCheckedAt: checkedAt,
         lastError: null,
@@ -8678,15 +9411,19 @@ export class GameVaultService {
       payload.parsedSource,
       previousParsedSource,
     );
-    if (payload.steamPatchEntries?.length) {
+    if (payload.steamPatchEntries?.length && payload.selectedSteamPatch) {
       this.database.upsertPatchEntries(
-        payload.steamPatchEntries
-          .filter((entry) => entry.appId === payload.selectedSteamPatch?.appId)
-          .map((entry) => ({
+        this.compactPatchEntriesForStorage({
+          appId: payload.selectedSteamPatch.appId,
+          patches: payload.steamPatchEntries.map((entry) => ({
             ...entry,
             selectionSource: entry.selectionSource ?? 'steamdb_builds',
-            trackedItemId: item.id,
           })),
+          selectedPatch: payload.selectedSteamPatch,
+          selectedSelectionSource:
+            payload.selectedSteamPatch.selectionSource ?? 'rss',
+          trackedItemId: item.id,
+        }),
       );
     }
     this.upsertSelectedSteamPatch(item.id, payload.selectedSteamPatch);
@@ -8865,29 +9602,103 @@ export class GameVaultService {
     },
   ): Promise<TrackedItemView> {
     const match = this.database.getSourceMatch(trackedItemId, sourceKind);
-    if (!match?.sourceUrl) {
-      throw new Error(`No matched ${sourceKind} source is available.`);
-    }
-    const item = this.database.findTrackedItemById(trackedItemId);
+    let item = this.database.findTrackedItemById(trackedItemId);
     if (!item) {
       throw new Error(`Tracked item ${trackedItemId} not found`);
     }
     const steamMatch = this.database.getSteamMatch(trackedItemId);
+    item = this.syncTrackedItemSteamIdentity(item, steamMatch);
+    if (!match?.sourceUrl) {
+      const discoveredMatch = await this.findBestSourceMatch({
+        item,
+        options,
+        sourceKind,
+        steamMatch,
+      });
+      this.database.upsertSourceMatch(
+        this.preserveExistingMatchDuringTransientFailure(
+          match,
+          discoveredMatch,
+        ),
+      );
+      this.appendEvent('info', `Refreshed ${sourceKind} source`, {
+        trackedItemId,
+      });
+      return this.buildTrackedItemView(trackedItemId);
+    }
+
+    if (
+      options.parsedSourceOverride?.sourceKind === sourceKind &&
+      sourceUrlsMatch(options.parsedSourceOverride.sourceUrl, match.sourceUrl)
+    ) {
+      const now = new Date().toISOString();
+      const parsedSource = await this.hydrateAnkerGamesBrowserDownloadUrls(
+        options.parsedSourceOverride,
+        trackedItemId,
+      );
+      const latestPatch = this.getLatestPatch(trackedItemId);
+      const matchedPatch = this.findPatchForSourceRelease(
+        parsedSource,
+        this.database.listPatchEntries(trackedItemId),
+      );
+      this.persistParsedSource(trackedItemId, parsedSource, matchedPatch);
+      this.database.upsertSourceMatch(
+        this.refreshedSourceMatchFromParsedSource({
+          exactSteamAppId: false,
+          expectedTitle: steamMatch?.title ?? item.title,
+          existing: match,
+          now,
+          parsedSource,
+        }),
+      );
+      this.appendEvent('info', `Refreshed ${sourceKind} source`, {
+        trackedItemId,
+      });
+
+      if (latestPatch) {
+        this.reconcileSteamPatchWatch(trackedItemId);
+      }
+      return this.buildTrackedItemView(trackedItemId);
+    }
 
     const bypassBackoff = options.bypassBackoff ?? true;
     const forceCatalog = options.forceCatalog ?? true;
-    const response = await this.fetchSource(match.sourceUrl, undefined, {
-      bypassBackoff,
-    });
     const now = new Date().toISOString();
+    let response: Response;
+    try {
+      response = await this.fetchSource(match.sourceUrl, undefined, {
+        bypassBackoff,
+        skipIfBackoff: options.skipIfBackoff,
+      });
+    } catch (error) {
+      if (error instanceof TransientSourceRequestError) {
+        this.database.upsertSourceMatch({
+          ...match,
+          lastCheckedAt: now,
+          lastError: error.message,
+          status: match.status,
+          updatedAt: now,
+          usable: match.usable,
+        });
+      }
+      throw error;
+    }
     if (!response.ok) {
       const transient = isTransientSourceResponse(sourceKind, response.status);
+      const retryDelayMs = transient
+        ? (this.sourceBackoffRemainingMs(match.sourceUrl) ||
+          retryAfterMs(response, SOURCE_RATE_LIMIT_BACKOFF_MS))
+        : null;
+      if (transient && retryDelayMs != null) {
+        this.persistSourceCooldown(match.sourceUrl, retryDelayMs);
+      }
+      const lastError = transient
+        ? transientSourceErrorMessage(response.status)
+        : `Source refresh failed with ${response.status}`;
       this.database.upsertSourceMatch({
         ...match,
         lastCheckedAt: now,
-        lastError: transient
-          ? transientSourceErrorMessage(response.status)
-          : `Source refresh failed with ${response.status}`,
+        lastError,
         status: transient
           ? match.status
           : response.status === 403
@@ -8896,7 +9707,9 @@ export class GameVaultService {
         updatedAt: now,
         usable: transient ? match.usable : false,
       });
-      throw new Error(`Source refresh failed with ${response.status}`);
+      throw transient
+        ? new TransientSourceRequestError(lastError, retryDelayMs)
+        : new Error(`Source refresh failed with ${response.status}`);
     }
 
     const html = await response.text();
@@ -8910,6 +9723,7 @@ export class GameVaultService {
       (input, init) =>
         this.fetchSource(input, init, {
           bypassBackoff,
+          skipIfBackoff: options.skipIfBackoff,
         }),
     );
     parsedSource = await this.enrichSteamRipParsedSourceWithCatalogMetadata(
@@ -8917,6 +9731,7 @@ export class GameVaultService {
       {
         bypassBackoff,
         forceCatalog,
+        skipIfBackoff: options.skipIfBackoff,
       },
     );
     parsedSource = await this.hydrateAnkerGamesBrowserDownloadUrls(
@@ -9115,6 +9930,7 @@ export class GameVaultService {
       },
       { force: true },
     );
+    this.clearFailedStateForSelectedMirrors(trackedItemId);
     return this.buildTrackedItemView(trackedItemId);
   }
 
@@ -9143,7 +9959,7 @@ export class GameVaultService {
           params.selectedDownloads,
         )
       : null;
-    const selectedFull = explicitSelectedDownloads
+    let selectedFull = explicitSelectedDownloads
       ? explicitSelectedDownloads.fullUrl
       : (mirrors.find((mirror) => mirror.kind === 'full' && mirror.selectedAt)
           ?.url ?? mirrors.find((mirror) => mirror.kind === 'full')?.url);
@@ -9151,6 +9967,29 @@ export class GameVaultService {
       throw new Error(
         'Select a full download mirror before queueing this update.',
       );
+    }
+    let queueParsedSource = parsedSource;
+    if (params.sourceKind === 'ankergames') {
+      const previousSelectedFull = selectedFull;
+      const stableDownloadUrl = findAnkerGamesGeneratedDownloadUrlForSelection({
+        parsedSource,
+        requestedUrl: selectedFull,
+      });
+      if (stableDownloadUrl) {
+        queueParsedSource = clearAnkerGamesBrowserDownloadUrlForSelection({
+          parsedSource,
+          stableDownloadUrl,
+        });
+        selectedFull = stableDownloadUrl;
+        if (!mirrorUrlMatches(previousSelectedFull, stableDownloadUrl)) {
+          this.appendEvent(
+            'info',
+            'Refreshing AnkerGames direct mirror before queueing update',
+            { trackedItemId: params.trackedItemId },
+            { notify: false },
+          );
+        }
+      }
     }
     const selectedPatch = explicitSelectedDownloads
       ? explicitSelectedDownloads.patchUrl
@@ -9162,7 +10001,7 @@ export class GameVaultService {
         null);
 
     const plannedDownloads = this.planUpdateSelectedDownloads({
-      parsedSource,
+      parsedSource: queueParsedSource,
       selectedDownloads: {
         fullUrl: selectedFull ?? '',
         patchUrl: selectedPatch,
@@ -9190,10 +10029,11 @@ export class GameVaultService {
 
     await this.queueDownload(
       params.trackedItemId,
-      parsedSource,
+      queueParsedSource,
       plannedDownloads,
       { force: true },
     );
+    this.clearFailedStateForSelectedMirrors(params.trackedItemId);
     return this.buildTrackedItemView(params.trackedItemId);
   }
 
@@ -9945,10 +10785,36 @@ export class GameVaultService {
   private async pollDownloadJobsInternal(
     options: PollDownloadJobsOptions,
   ): Promise<void> {
-    await this.cleanupCompletedPortableArchiveStaging();
+    const jobId = 'download-poll:active';
+    const trackMaintenanceJob = options.lightweight !== true;
+    if (trackMaintenanceJob) {
+      this.queueMaintenanceJob({
+        detail: 'Waiting for download automation poll.',
+        id: jobId,
+        kind: 'download_poll',
+      });
+      this.beginMaintenanceJob(jobId, 'Polling download automation.');
+      try {
+        await this.cleanupCompletedPortableArchiveStaging();
+      } catch (error) {
+        this.finishMaintenanceJob(jobId, 'failed', {
+          detail: 'Download staging cleanup failed.',
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Unknown archive cleanup error',
+        });
+        throw error;
+      }
+    }
 
     const activeJobs = this.listActiveDownloadJobs();
     if (activeJobs.length === 0) {
+      if (trackMaintenanceJob) {
+        this.finishMaintenanceJob(jobId, 'succeeded', {
+          detail: 'No active downloads need polling.',
+        });
+      }
       return;
     }
     const activeJobItemIds = new Set(
@@ -9957,7 +10823,7 @@ export class GameVaultService {
 
     const pollJobs = async () => {
       let processed = 0;
-      await this.withDownloadProgressBatch(async () => {
+      const processJobs = async () => {
         for (const item of this.database.listTrackedItems()) {
           const job = this.database.getDownloadJob(item.id);
           const jobSourceKind =
@@ -10241,24 +11107,61 @@ export class GameVaultService {
             });
           }
         }
-      });
+      };
+
+      if (options.lightweight === true) {
+        await processJobs();
+      } else {
+        await this.withDownloadProgressBatch(processJobs);
+      }
     };
 
     if (options.activity === false) {
-      await pollJobs();
+      try {
+        await pollJobs();
+      } catch (error) {
+        if (trackMaintenanceJob) {
+          this.finishMaintenanceJob(jobId, 'failed', {
+            detail: 'Download automation poll failed.',
+            error:
+              error instanceof Error
+                ? error.message
+                : 'Unknown download poll error',
+          });
+        }
+        throw error;
+      }
+      if (trackMaintenanceJob) {
+        this.finishMaintenanceJob(jobId, 'succeeded', {
+          detail: 'Download automation poll completed.',
+        });
+      }
       return;
     }
 
-    await this.withActivityTask(
-      {
-        detail: `Checking 0/${activeJobs.length} active download job${activeJobs.length === 1 ? '' : 's'}.`,
-        id: 'download-jobs',
-        progressCurrent: 0,
-        progressTotal: activeJobs.length,
-        title: 'Checking download jobs',
-      },
-      pollJobs,
-    );
+    try {
+      await this.withActivityTask(
+        {
+          detail: `Checking 0/${activeJobs.length} active download job${activeJobs.length === 1 ? '' : 's'}.`,
+          id: 'download-jobs',
+          progressCurrent: 0,
+          progressTotal: activeJobs.length,
+          title: 'Checking download jobs',
+        },
+        pollJobs,
+      );
+      this.finishMaintenanceJob(jobId, 'succeeded', {
+        detail: 'Download automation poll completed.',
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Unknown download poll error';
+      this.finishMaintenanceJob(jobId, 'failed', {
+        detail: 'Download automation poll failed.',
+        error: message,
+      });
+      throw error;
+    }
   }
 
   private steamDbRssBackoffRemainingMs(): number {
@@ -10293,12 +11196,24 @@ export class GameVaultService {
     matches: SteamFeedMaintenanceMatch[] = this.database.listSteamMatches(),
   ): SteamFeedMaintenanceMatch[] {
     const expectedPollAt = this.latestExpectedSteamFeedPollAt(now);
-    return matches.filter((match) =>
-      isBeforeWithGrace(
-        this.database.getSteamFeedCheck(match.trackedItemId)?.lastCheckedAt,
-        expectedPollAt,
-      ),
-    );
+    return matches.filter((match) => {
+      const feedCheck = this.database.getSteamFeedCheck(match.trackedItemId);
+      if (isBeforeWithGrace(feedCheck?.lastCheckedAt, expectedPollAt)) {
+        return true;
+      }
+
+      if (feedCheck?.lastError && !/429|rate/i.test(feedCheck.lastError)) {
+        const checkedAt = timestampMs(
+          feedCheck.lastCheckedAt ?? feedCheck.updatedAt,
+        );
+        return (
+          checkedAt == null ||
+          checkedAt + STEAMDB_RSS_FAILURE_RETRY_MS <= now.getTime()
+        );
+      }
+
+      return false;
+    });
   }
 
   shouldRunSteamFeedMaintenance(now = new Date()): boolean {
@@ -10359,19 +11274,47 @@ export class GameVaultService {
 
   private async pollSteamFeedsInternal(): Promise<void> {
     const allMatches = this.database.listSteamMatches();
-    const matches = this.listDueSteamFeedMatches(new Date(), allMatches);
+    const now = new Date();
+    const matches = this.listDueSteamFeedMatches(now, allMatches);
+    for (const match of matches) {
+      this.queueMaintenanceJob({
+        detail: 'Waiting for SteamDB RSS feed check.',
+        gameTitle: match.title,
+        host: 'steamdb.info',
+        id: `steamdb-rss:${match.trackedItemId}`,
+        kind: 'steamdb_rss',
+        trackedItemId: match.trackedItemId,
+      });
+    }
     let checked = 0;
     let failed = 0;
     let processed = 0;
     let stoppedByRateLimit = false;
     for (const match of matches) {
+      const jobId = `steamdb-rss:${match.trackedItemId}`;
       try {
+        this.beginMaintenanceJob(jobId, 'Checking SteamDB RSS feed.');
         await this.syncSteamPatchFeed(match.trackedItemId, match);
+        this.finishMaintenanceJob(jobId, 'succeeded', {
+          detail: 'SteamDB RSS feed is current.',
+        });
         checked += 1;
       } catch (error) {
         failed += 1;
         const message =
           error instanceof Error ? error.message : 'Unknown SteamDB RSS error';
+        const retryMs = /SteamDB RSS request failed:\s*429/i.test(message)
+          ? this.steamDbRssBackoffRemainingMs()
+          : STEAMDB_RSS_FAILURE_RETRY_MS;
+        this.finishMaintenanceJob(
+          jobId,
+          isTransientMaintenanceError(message) ? 'cooldown' : 'failed',
+          {
+            detail: 'SteamDB RSS feed check needs retry.',
+            error: message,
+            nextAttemptAt: new Date(Date.now() + retryMs).toISOString(),
+          },
+        );
         this.appendEvent(
           'warn',
           `SteamDB feed check failed for ${match.title}`,
@@ -10571,12 +11514,36 @@ export class GameVaultService {
     );
   }
 
-  private async refreshWatchedSources(watch: SourceWatch): Promise<void> {
-    await this.discoverSourceMatches(watch.trackedItemId).catch((error) => {
-      this.appendEvent('warn', 'Source match discovery failed during watch', {
-        error:
-          error instanceof Error ? error.message : 'Unknown discovery error',
-        trackedItemId: watch.trackedItemId,
+  private async refreshWatchedSources(
+    watch: SourceWatch,
+  ): Promise<SourceWatchRefreshResult> {
+    const result: SourceWatchRefreshResult = { retryAfterMs: null };
+    const recordRetryAfter = (error: unknown) => {
+      const retryAfter = transientSourceRetryAfterMs(error);
+      if (retryAfter == null) {
+        return;
+      }
+      result.retryAfterMs = Math.max(
+        result.retryAfterMs ?? 0,
+        retryAfter,
+      );
+    };
+
+    await this.discoverSourceMatches(watch.trackedItemId, {
+      bypassBackoff: false,
+      forceCatalog: false,
+      skipIfBackoff: true,
+    }).catch((error) => {
+      recordRetryAfter(error);
+      const message =
+        error instanceof Error ? error.message : 'Unknown discovery error';
+      this.appendSourceWatchFailureEvent({
+        context: {
+          error: message,
+          trackedItemId: watch.trackedItemId,
+        },
+        fallbackMessage: 'Source match discovery failed during watch',
+        message,
       });
     });
 
@@ -10587,43 +11554,72 @@ export class GameVaultService {
       const item = this.database.findTrackedItemById(watch.trackedItemId);
       if (item?.sourceKind && item.sourceKind !== 'manual' && item.sourceUrl) {
         await this.refreshTrackedItem(watch.trackedItemId).catch((error) => {
-          this.appendEvent('warn', 'Primary source refresh failed during watch', {
-            error:
-              error instanceof Error
-                ? error.message
-                : 'Unknown source refresh error',
-            trackedItemId: watch.trackedItemId,
+          recordRetryAfter(error);
+          const message =
+            error instanceof Error
+              ? error.message
+              : 'Unknown source refresh error';
+          this.appendSourceWatchFailureEvent({
+            context: {
+              error: message,
+              trackedItemId: watch.trackedItemId,
+            },
+            fallbackMessage: 'Primary source refresh failed during watch',
+            message,
           });
         });
       }
-      return;
+      return result;
     }
 
     for (const match of matches) {
       await this.refreshMatchedSource(watch.trackedItemId, match.sourceKind, {
         bypassBackoff: false,
         forceCatalog: false,
+        skipIfBackoff: true,
       }).catch((error) => {
-        this.appendEvent('warn', 'Matched source refresh failed', {
-          error:
-            error instanceof Error
-              ? error.message
-              : 'Unknown source refresh error',
-          sourceKind: match.sourceKind,
-          trackedItemId: watch.trackedItemId,
+        recordRetryAfter(error);
+        const message =
+          error instanceof Error
+            ? error.message
+            : 'Unknown source refresh error';
+        this.appendSourceWatchFailureEvent({
+          context: {
+            error: message,
+            sourceKind: match.sourceKind,
+            trackedItemId: watch.trackedItemId,
+          },
+          fallbackMessage: 'Matched source refresh failed',
+          message,
         });
       });
     }
+    return result;
   }
 
   async processDueWatches(
     now = new Date(),
     options: { includeExpired?: boolean } = {},
   ): Promise<void> {
+    this.restoreMissingSourcePatchWatches();
+    this.normalizeSourceWatchCadence(now);
     const nowIso = now.toISOString();
     const dueWatches = this.database.listDueWatches(nowIso, {
       includeExpired: options.includeExpired ?? false,
     });
+    const itemsById = new Map(
+      this.database.listTrackedItems().map((item) => [item.id, item]),
+    );
+    for (const watch of dueWatches) {
+      this.queueMaintenanceJob({
+        detail: 'Waiting for watched source check.',
+        gameTitle: itemsById.get(watch.trackedItemId)?.title ?? null,
+        id: `source-watch:${watch.trackedItemId}`,
+        kind: 'source_watch',
+        nextAttemptAt: watch.nextCheckAt,
+        trackedItemId: watch.trackedItemId,
+      });
+    }
     if (dueWatches.length === 0) {
       return;
     }
@@ -10643,16 +11639,19 @@ export class GameVaultService {
           1,
           72,
         );
+        const intervalMs = intervalHours * 60 * 60 * 1000;
         let expired = 0;
         let processed = 0;
         let recovered = 0;
         let refreshed = 0;
         for (const watch of dueWatches) {
+          const jobId = `source-watch:${watch.trackedItemId}`;
           try {
+            this.beginMaintenanceJob(jobId, 'Checking watched sources.');
             const watchEndsAt = timestampMs(watch.endsAt);
             const watchWindowEnded =
               watchEndsAt != null && watchEndsAt <= now.getTime();
-            await this.refreshWatchedSources(watch);
+            const refreshResult = await this.refreshWatchedSources(watch);
             refreshed += 1;
 
             const currentWatch = this.database.getWatch(watch.trackedItemId);
@@ -10660,6 +11659,9 @@ export class GameVaultService {
               if (watch.expiredAt || watchWindowEnded) {
                 recovered += 1;
               }
+              this.finishMaintenanceJob(jobId, 'succeeded', {
+                detail: 'Watched source check completed.',
+              });
               continue;
             }
 
@@ -10667,13 +11669,17 @@ export class GameVaultService {
               currentWatch.expiredAt ||
               (timestampMs(currentWatch.endsAt) ?? Number.POSITIVE_INFINITY) <=
                 now.getTime();
-            const nextCheckAt = new Date(
-              now.getTime() + intervalHours * 60 * 60 * 1000,
-            ).toISOString();
             if (!currentWatch.expiredAt && shouldExpire) {
               expired += 1;
             }
 
+            const nextDelayMs =
+              refreshResult.retryAfterMs != null
+                ? Math.max(intervalMs, refreshResult.retryAfterMs)
+                : intervalMs;
+            const nextCheckAt = shouldExpire
+              ? currentWatch.nextCheckAt
+              : new Date(now.getTime() + nextDelayMs).toISOString();
             this.database.upsertWatch({
               ...currentWatch,
               expiredAt: shouldExpire
@@ -10681,6 +11687,62 @@ export class GameVaultService {
                 : null,
               lastCheckedAt: nowIso,
               nextCheckAt,
+            });
+            this.finishMaintenanceJob(
+              jobId,
+              shouldExpire || refreshResult.retryAfterMs == null
+                ? 'succeeded'
+                : 'cooldown',
+              {
+                detail: shouldExpire
+                  ? 'Source watch window expired.'
+                  : refreshResult.retryAfterMs != null
+                    ? 'Watched source check is cooling down.'
+                    : 'Watched source check completed.',
+                nextAttemptAt: shouldExpire ? null : nextCheckAt,
+              },
+            );
+          } catch (error) {
+            const message =
+              error instanceof Error
+                ? error.message
+                : 'Unknown source watch error';
+            const currentWatch =
+              this.database.getWatch(watch.trackedItemId) ?? watch;
+            const shouldExpire =
+              (timestampMs(currentWatch.endsAt) ?? Number.POSITIVE_INFINITY) <=
+              now.getTime();
+            const retryAt = new Date(now.getTime() + intervalMs).toISOString();
+            this.database.upsertWatch({
+              ...currentWatch,
+              expiredAt: shouldExpire
+                ? (currentWatch.expiredAt ?? nowIso)
+                : null,
+              lastCheckedAt: nowIso,
+              nextCheckAt: shouldExpire ? currentWatch.nextCheckAt : retryAt,
+            });
+            this.finishMaintenanceJob(
+              jobId,
+              shouldExpire
+                ? 'succeeded'
+                : isTransientMaintenanceError(message)
+                  ? 'cooldown'
+                  : 'failed',
+              {
+                detail: shouldExpire
+                  ? 'Source watch window expired.'
+                  : 'Watched source check needs retry.',
+                error: message,
+                nextAttemptAt: shouldExpire ? null : retryAt,
+              },
+            );
+            this.appendSourceWatchFailureEvent({
+              context: {
+                error: message,
+                trackedItemId: watch.trackedItemId,
+              },
+              fallbackMessage: 'Source watch processing failed',
+              message,
             });
           } finally {
             processed += 1;
@@ -10699,6 +11761,65 @@ export class GameVaultService {
         });
       },
     );
+  }
+
+  private restoreMissingSourcePatchWatches(): void {
+    for (const item of this.database.listTrackedItems()) {
+      if (!this.database.getWatch(item.id)) {
+        this.reconcileSteamPatchWatch(item.id);
+      }
+    }
+  }
+
+  private normalizeSourceWatchCadence(now = new Date()): void {
+    const settings = this.database.getSettings();
+    const intervalMs =
+      clampNumber(settings.sourceWatchIntervalHours ?? 8, 1, 72) *
+      60 *
+      60 *
+      1000;
+    const nowMs = now.getTime();
+    const updatedAt = now.toISOString();
+    for (const item of this.database.listTrackedItems()) {
+      const watch = this.database.getWatch(item.id);
+      if (!watch?.lastCheckedAt || watch.expiredAt) {
+        continue;
+      }
+      const lastCheckedAt = timestampMs(watch.lastCheckedAt);
+      const nextCheckAt = timestampMs(watch.nextCheckAt);
+      if (lastCheckedAt == null || nextCheckAt == null) {
+        continue;
+      }
+      const earliestNextCheckAt = lastCheckedAt + intervalMs;
+      if (earliestNextCheckAt <= nowMs || nextCheckAt >= earliestNextCheckAt) {
+        continue;
+      }
+      const endsAt = timestampMs(watch.endsAt);
+      const normalizedNextCheckAt =
+        endsAt != null && endsAt < earliestNextCheckAt
+          ? endsAt
+          : earliestNextCheckAt;
+      if (normalizedNextCheckAt <= nextCheckAt) {
+        continue;
+      }
+      const normalizedNextCheckAtIso = new Date(
+        normalizedNextCheckAt,
+      ).toISOString();
+      this.database.upsertWatch({
+        ...watch,
+        nextCheckAt: normalizedNextCheckAtIso,
+      });
+
+      const jobId = `source-watch:${item.id}`;
+      const job = this.database.getMaintenanceJob(jobId);
+      if (job && job.status !== 'running') {
+        this.upsertMaintenanceJob({
+          ...job,
+          nextAttemptAt: normalizedNextCheckAtIso,
+          updatedAt,
+        });
+      }
+    }
   }
 
   getSettings(): RendererSettingsView {
@@ -11330,19 +12451,14 @@ export class GameVaultService {
         selectedPatch.buildId ||
         'unknown';
       this.database.upsertSteamMatch(item.id, row.steamMatch);
-      const patchEntries = [
-        ...(row.steamPatchEntries ?? []),
-        selectedPatch,
-      ].filter((entry) => entry.appId === row.steamMatch.appId);
       this.database.upsertPatchEntries(
-        patchEntries.map((entry) => ({
-          ...entry,
-          selectionSource:
-            entry === selectedPatch
-              ? (selectedPatch.selectionSource ?? 'rss')
-              : (entry.selectionSource ?? 'rss'),
+        this.compactPatchEntriesForStorage({
+          appId: row.steamMatch.appId,
+          patches: row.steamPatchEntries,
+          selectedPatch,
+          selectedSelectionSource: selectedPatch.selectionSource ?? 'rss',
           trackedItemId: item.id,
-        })),
+        }),
       );
       this.database.upsertSourceSnapshot({
         checkedAt: now.toISOString(),
@@ -11444,19 +12560,14 @@ export class GameVaultService {
     }
 
     const selectionSource = params.selectedSteamPatch.selectionSource ?? 'rss';
-    const patchEntries = [
-      ...(params.steamPatchEntries ?? []),
-      params.selectedSteamPatch,
-    ].filter((entry) => entry.appId === steamMatch.appId);
     this.database.upsertPatchEntries(
-      patchEntries.map((entry) => ({
-        ...entry,
-        selectionSource:
-          entry === params.selectedSteamPatch
-            ? selectionSource
-            : (entry.selectionSource ?? 'rss'),
+      this.compactPatchEntriesForStorage({
+        appId: steamMatch.appId,
+        patches: params.steamPatchEntries,
+        selectedPatch: params.selectedSteamPatch,
+        selectedSelectionSource: selectionSource,
         trackedItemId: params.trackedItemId,
-      })),
+      }),
     );
     this.database.upsertSourceSnapshot({
       ...sourceSnapshot,
@@ -11912,6 +13023,9 @@ export class GameVaultService {
         generatedAt.getTime() - createdAt <= ACTIVITY_RECENT_ERROR_WINDOW_MS
       );
     });
+    const recentAutomationLogs = recentLogs.filter(
+      (log) => !isTransientSourceMaintenanceLog(log),
+    );
     const items = this.database.listTrackedItems();
     const itemsById = new Map(items.map((item) => [item.id, item]));
     const steamMatches = this.database.listSteamMatches();
@@ -11919,6 +13033,21 @@ export class GameVaultService {
     const issues: ActivityIssue[] = [];
     const steamFeedCheckTimes: Array<string | null | undefined> = [];
     const sourceCheckTimes: Array<string | null | undefined> = [];
+    const maintenanceJobs = this.database
+      .listMaintenanceJobs(100)
+      .map((job): MaintenanceJobView => ({
+        ...job,
+        retryInMs: job.nextAttemptAt
+          ? Math.max(0, (timestampMs(job.nextAttemptAt) ?? 0) - Date.now())
+          : null,
+      }));
+    const maintenanceJobsById = new Map(
+      maintenanceJobs.map((job) => [job.id, job]),
+    );
+    const activeSourceCooldownCount = maintenanceJobs.filter(
+      (job) => job.kind === 'source_watch' && job.status === 'cooldown',
+    ).length;
+    const heartbeats = this.getMaintenanceHeartbeats();
 
     const steamRefreshAction =
       backoffMs > 0
@@ -11949,6 +13078,27 @@ export class GameVaultService {
       });
     }
 
+    const schedulerHeartbeat = heartbeats.find(
+      (heartbeat) => heartbeat.scope === 'scheduler',
+    );
+    const schedulerHeartbeatAt = timestampMs(schedulerHeartbeat?.updatedAt);
+    if (
+      schedulerHeartbeatAt != null &&
+      generatedAt.getTime() - schedulerHeartbeatAt >
+        MAINTENANCE_HEARTBEAT_STALE_MS
+    ) {
+      issues.push({
+        createdAt: schedulerHeartbeat?.updatedAt ?? null,
+        detail: `The maintenance scheduler has not reported a heartbeat for ${formatDurationMs(
+          generatedAt.getTime() - schedulerHeartbeatAt,
+        )}.`,
+        id: 'scheduler:heartbeat-stale',
+        kind: 'scheduler_stale',
+        severity: 'warning',
+        title: 'Maintenance scheduler heartbeat is stale',
+      });
+    }
+
     if (backoffMs > 0) {
       issues.push({
         action: steamRefreshAction,
@@ -11966,8 +13116,14 @@ export class GameVaultService {
     for (const match of steamMatches) {
       const item = itemsById.get(match.trackedItemId);
       const feedCheck = this.database.getSteamFeedCheck(match.trackedItemId);
+      const feedJob = maintenanceJobsById.get(
+        `steamdb-rss:${match.trackedItemId}`,
+      );
       steamFeedCheckTimes.push(feedCheck?.lastCheckedAt);
       if (feedCheck?.lastError) {
+        const transientFeedError = isTransientMaintenanceError(
+          feedCheck.lastError,
+        );
         issues.push({
           action: steamRefreshAction,
           createdAt: feedCheck.lastCheckedAt ?? feedCheck.updatedAt,
@@ -11975,7 +13131,13 @@ export class GameVaultService {
           gameTitle: item?.title ?? match.title,
           id: `steamdb:error:${match.trackedItemId}`,
           kind: 'steamdb_error',
-          severity: /429|rate/i.test(feedCheck.lastError) ? 'warning' : 'error',
+          severity:
+            transientFeedError &&
+            (feedJob?.attemptCount ?? 0) < TRANSIENT_FAILURE_WARNING_ATTEMPTS
+              ? 'warning'
+              : /429|rate/i.test(feedCheck.lastError)
+                ? 'warning'
+                : 'error',
           title: `SteamDB feed failed for ${item?.title ?? match.title}`,
           trackedItemId: match.trackedItemId,
         });
@@ -12034,7 +13196,7 @@ export class GameVaultService {
             id: `source-watch:due:${item.id}`,
             kind: 'source_watch_overdue',
             severity: 'warning',
-            title: `Source watch is overdue for ${item.title}`,
+            title: `Source check is waiting to run for ${item.title}`,
             trackedItemId: item.id,
           });
         }
@@ -12049,6 +13211,17 @@ export class GameVaultService {
       );
       for (const match of sourceMatches) {
         if (!match.lastError || match.status === 'not_found') {
+          continue;
+        }
+        const sourceJob = maintenanceJobsById.get(
+          `source-watch:${item.id}`,
+        );
+        const transientSourceError = isTransientMaintenanceError(
+          match.lastError,
+        );
+        const sourceCoolingDown =
+          transientSourceError && sourceJob?.status === 'cooldown';
+        if (transientSourceError && !sourceCoolingDown) {
           continue;
         }
         issues.push({
@@ -12071,11 +13244,18 @@ export class GameVaultService {
           id: `source:error:${item.id}:${match.sourceKind}`,
           kind: 'source_error',
           severity:
-            match.status === 'failed' || match.status === 'blocked'
+            sourceCoolingDown ||
+            (transientSourceError &&
+            (sourceJob?.attemptCount ?? 0) < TRANSIENT_FAILURE_WARNING_ATTEMPTS
+            )
+              ? 'warning'
+              : match.status === 'failed' || match.status === 'blocked'
               ? 'error'
               : 'warning',
           sourceKind: match.sourceKind,
-          title: `${match.sourceKind} source check failed for ${item.title}`,
+          title: sourceCoolingDown
+            ? `${formatSourceKind(match.sourceKind)} source check is cooling down for ${item.title}`
+            : `${formatSourceKind(match.sourceKind)} source check failed for ${item.title}`,
           trackedItemId: item.id,
         });
       }
@@ -12135,12 +13315,12 @@ export class GameVaultService {
       }
     }
 
-    const errorLogCount = recentLogs.filter(
+    const errorLogCount = recentAutomationLogs.filter(
       (log) => log.level === 'error',
     ).length;
     if (errorLogCount > 0) {
       issues.push({
-        createdAt: recentLogs[0]?.createdAt ?? generatedAtIso,
+        createdAt: recentAutomationLogs[0]?.createdAt ?? generatedAtIso,
         detail: `${errorLogCount} error log${errorLogCount === 1 ? '' : 's'} recorded in the last 24 hours.`,
         id: 'logs:recent-errors',
         kind: 'recent_errors',
@@ -12151,7 +13331,13 @@ export class GameVaultService {
 
     const dismissedIssueKeys =
       this.database.listDismissedActivityIssueKeys();
-    const visibleIssues = issues
+    const undismissedIssues = issues
+      .map((issue) => {
+        const dismissalKey = getActivityIssueDismissalKey(issue);
+        return { ...issue, dismissalKey };
+      })
+      .filter((issue) => !dismissedIssueKeys.has(issue.dismissalKey));
+    const visibleIssues = groupTransientActivityIssues(undismissedIssues)
       .map((issue) => {
         const dismissalKey = getActivityIssueDismissalKey(issue);
         return { ...issue, dismissalKey };
@@ -12159,11 +13345,30 @@ export class GameVaultService {
       .filter((issue) => !dismissedIssueKeys.has(issue.dismissalKey));
     const failedSteamFeeds = countActivityIssues(visibleIssues, [
       'steamdb_error',
+      'steamdb_error_group',
     ]);
     const staleSteamFeeds = countActivityIssues(visibleIssues, [
       'steamdb_stale',
     ]);
-    const sourceErrors = countActivityIssues(visibleIssues, ['source_error']);
+    const sourceErrorKinds: ActivityIssue['kind'][] = [
+      'source_error',
+      'source_error_group',
+    ];
+    const sourceCooldowns = Math.max(
+      activeSourceCooldownCount,
+      countFilteredActivityIssues(
+        visibleIssues,
+        (issue) =>
+          sourceErrorKinds.includes(issue.kind) &&
+          isTransientMaintenanceError(issue.detail),
+      ),
+    );
+    const sourceErrors = countFilteredActivityIssues(
+      visibleIssues,
+      (issue) =>
+        sourceErrorKinds.includes(issue.kind) &&
+        !isTransientMaintenanceError(issue.detail),
+    );
     const sourceWatchesExpired = countActivityIssues(visibleIssues, [
       'source_watch_expired',
     ]);
@@ -12183,8 +13388,8 @@ export class GameVaultService {
       : 0;
     const visibleRecentLogCount =
       visibleRecentErrorCount > 0
-        ? recentLogs.length
-        : recentLogs.filter((log) => log.level === 'warn').length;
+        ? recentAutomationLogs.length
+        : recentAutomationLogs.filter((log) => log.level === 'warn').length;
     const activeTasks = Array.from(this.activeActivityTasks.values());
     const startupTask = activeTasks.find(
       (task) => task.id === 'startup-catch-up',
@@ -12195,14 +13400,19 @@ export class GameVaultService {
     const steamDbWorstSeverity = worstActivitySeverityForKinds(visibleIssues, [
       'scheduler_stale',
       'steamdb_error',
+      'steamdb_error_group',
       'steamdb_rate_limited',
       'steamdb_stale',
     ]);
     const sourceWorstSeverity = worstActivitySeverityForKinds(visibleIssues, [
       'source_error',
+      'source_error_group',
       'source_watch_expired',
       'source_watch_overdue',
     ]);
+    const sourceMaintenanceSeverity =
+      sourceWorstSeverity ??
+      (sourceCooldowns > 0 ? ('warning' as ActivitySeverity) : null);
     const automationWorstSeverity =
       failedDownloads > 0 || visibleRecentErrorCount > 0
         ? 'error'
@@ -12213,8 +13423,10 @@ export class GameVaultService {
     return {
       activeTasks,
       generatedAt: generatedAtIso,
+      heartbeats,
       issues: sortActivityIssues(visibleIssues),
       logs,
+      maintenanceJobs,
       summary: [
         {
           detail: startupTask
@@ -12253,20 +13465,25 @@ export class GameVaultService {
                   : 'Current',
         },
         {
-          detail: latestIsoTimestamp(sourceCheckTimes)
-            ? `Last source activity ${new Date(
-                latestIsoTimestamp(sourceCheckTimes)!,
-              ).toLocaleString()}.`
-            : 'No source maintenance activity has been recorded yet.',
+          detail:
+            sourceCooldowns > 0
+              ? `${sourceCooldowns} source watch${sourceCooldowns === 1 ? ' is' : 'es are'} cooling down after temporary source blocking.`
+              : latestIsoTimestamp(sourceCheckTimes)
+                ? `Last source activity ${new Date(
+                    latestIsoTimestamp(sourceCheckTimes)!,
+                  ).toLocaleString()}.`
+                : 'No source maintenance activity has been recorded yet.',
           id: 'sourceMaintenance',
           label: 'Source Maintenance',
           status: activeTasks.some((task) => task.id === 'source-watches')
             ? 'running'
-            : activityStatusFromSeverity(sourceWorstSeverity),
+            : activityStatusFromSeverity(sourceMaintenanceSeverity),
           value:
             sourceErrors > 0
               ? `${sourceErrors} errors`
-              : sourceWatchesOverdue > 0
+              : sourceCooldowns > 0
+                ? `${sourceCooldowns} cooling down`
+                : sourceWatchesOverdue > 0
                 ? `${sourceWatchesOverdue} due`
                 : sourceWatchesExpired > 0
                   ? `${sourceWatchesExpired} expired`
@@ -12307,11 +13524,18 @@ export class GameVaultService {
           trackedItemId: payload.trackedItemId ?? null,
         });
         break;
+      case 'pauseSourceKind':
+        this.pauseSourceKind(payload.sourceKind, payload.durationMs);
+        break;
       case 'pollDownloadJobs':
         await this.pollDownloadJobs();
         break;
       case 'processSourceWatches':
-        await this.processDueWatches(new Date(), { includeExpired: true });
+        await this.processDueWatches(new Date(), { includeExpired: false });
+        break;
+      case 'retryTransientMaintenance':
+        await this.pollSteamFeeds();
+        await this.processDueWatches(new Date(), { includeExpired: false });
         break;
       case 'refreshMatchedSource':
         await this.refreshMatchedSource(

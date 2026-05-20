@@ -14,6 +14,7 @@ function createSchedulerService(overrides: Partial<{
   pollSteamFeeds: () => Promise<void>;
   processDueWatches: (now?: Date, options?: unknown) => Promise<void>;
   recordActivityEvent: () => void;
+  recordMaintenanceHeartbeat: () => void;
   beginActivityTask: () => () => void;
   shouldRunSteamFeedMaintenance: (now?: Date) => boolean;
   trueUpOnlineFixStatuses: () => Promise<void>;
@@ -27,6 +28,7 @@ function createSchedulerService(overrides: Partial<{
     pollSteamFeeds: vi.fn(async () => undefined),
     processDueWatches: vi.fn(async () => undefined),
     recordActivityEvent: vi.fn(),
+    recordMaintenanceHeartbeat: vi.fn(),
     shouldRunSteamFeedMaintenance: vi.fn(() => false),
     trueUpOnlineFixStatuses: vi.fn(async () => undefined),
     ...overrides,
@@ -38,7 +40,7 @@ afterEach(() => {
 });
 
 async function flushStartupTick(): Promise<void> {
-  for (let index = 0; index < 8; index += 1) {
+  for (let index = 0; index < 24; index += 1) {
     await Promise.resolve();
   }
 }
@@ -76,7 +78,7 @@ describe('GameVaultScheduler', () => {
 
     expect(service.processDueWatches).toHaveBeenCalledTimes(1);
     expect(service.processDueWatches).toHaveBeenCalledWith(expect.any(Date), {
-      includeExpired: true,
+      includeExpired: false,
     });
     expect(service.trueUpOnlineFixStatuses).toHaveBeenCalledTimes(1);
     expect(service.pollDownloadJobs).toHaveBeenCalledTimes(1);
@@ -155,7 +157,7 @@ describe('GameVaultScheduler', () => {
     scheduler.stop();
   });
 
-  it('polls active download progress every second without activity chrome', async () => {
+  it('polls active download progress on the live cadence without activity chrome', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(2026, 3, 24, 8));
     const service = createSchedulerService({
@@ -167,7 +169,7 @@ describe('GameVaultScheduler', () => {
     await flushStartupTick();
     vi.mocked(service.pollDownloadJobs).mockClear();
 
-    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(750);
 
     expect(service.pollDownloadJobs).toHaveBeenCalledWith({
       activity: false,
@@ -189,7 +191,7 @@ describe('GameVaultScheduler', () => {
     await flushStartupTick();
     vi.mocked(service.pollDownloadJobs).mockClear();
 
-    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(750);
 
     expect(service.pollDownloadJobs).not.toHaveBeenCalled();
     scheduler.stop();
@@ -210,8 +212,8 @@ describe('GameVaultScheduler', () => {
     vi.mocked(service.pollDownloadJobs).mockClear();
     vi.mocked(service.recordActivityEvent).mockClear();
 
-    await vi.advanceTimersByTimeAsync(1_000);
-    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(750);
+    await vi.advanceTimersByTimeAsync(750);
 
     expect(service.pollDownloadJobs).not.toHaveBeenCalled();
     expect(service.recordActivityEvent).toHaveBeenCalledTimes(1);
@@ -241,8 +243,8 @@ describe('GameVaultScheduler', () => {
     await Promise.resolve();
     vi.mocked(service.pollDownloadJobs).mockClear();
 
-    await vi.advanceTimersByTimeAsync(1_000);
-    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(750);
+    await vi.advanceTimersByTimeAsync(750);
 
     expect(service.pollDownloadJobs).toHaveBeenCalledTimes(1);
     releasePoll();

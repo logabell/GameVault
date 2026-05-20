@@ -238,6 +238,9 @@ export class NativeBridgeServer {
             payload: await this.service.refreshMatchedSource(
               request.payload.trackedItemId,
               request.payload.sourceKind,
+              {
+                parsedSourceOverride: request.payload.parsedSource ?? null,
+              },
             ),
             type: request.type,
           };

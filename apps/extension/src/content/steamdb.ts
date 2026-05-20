@@ -3,6 +3,10 @@ import {
   parseSteamDbBuildRowText,
   parseSteamDbBuildRowsFromDocument,
 } from '@gamevault/steam-core';
+import {
+  compactSteamPatchHistory,
+  type SteamPatchCandidate,
+} from '@gamevault/shared-types';
 import { icon } from '@fortawesome/fontawesome-svg-core';
 import { faCheck } from '@fortawesome/free-solid-svg-icons';
 
@@ -23,6 +27,16 @@ type SteamDbBackfillFailure = {
 type SteamDbBackfillChallenge = {
   message: string;
 };
+
+function parseSteamDbBuildPatches(
+  appId: number,
+  requiredPatches: SteamPatchCandidate[] = [],
+): SteamPatchCandidate[] {
+  return compactSteamPatchHistory(
+    parseSteamDbBuildRowsFromDocument(document, appId),
+    { requiredPatches },
+  );
+}
 
 function injectStyles(): void {
   if (document.getElementById(STYLE_ID)) {
@@ -121,7 +135,7 @@ function ensureActionButton(row: HTMLTableRowElement, appId: number): void {
     event.stopPropagation();
     void chrome.runtime.sendMessage({
       appId,
-      patches: parseSteamDbBuildRowsFromDocument(document, appId),
+      patches: parseSteamDbBuildPatches(appId, [patch]),
       selectedPatch: patch,
       type: 'gamevault:steamdb-patch-selected',
     });
@@ -183,7 +197,7 @@ function observeBuildBackfill(appId: number): void {
   let challengeSent = false;
   let observer: MutationObserver | null = null;
   let timer: number | null = null;
-  let latestPatches = parseSteamDbBuildRowsFromDocument(document, appId);
+  let latestPatches = parseSteamDbBuildPatches(appId);
 
   const sendBackfill = () => {
     if (sent || latestPatches.length === 0) {
@@ -250,7 +264,7 @@ function observeBuildBackfill(appId: number): void {
       return;
     }
 
-    const patches = parseSteamDbBuildRowsFromDocument(document, appId);
+    const patches = parseSteamDbBuildPatches(appId);
     if (patches.length === 0) {
       return;
     }

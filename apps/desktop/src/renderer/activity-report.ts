@@ -155,6 +155,32 @@ export function buildActivityReport(params: {
         `- ${card.label}: ${card.value} (${formatLabel(card.status)}) - ${card.detail}`,
     ),
     '',
+    'Maintenance Heartbeats',
+    ...(activity.heartbeats?.length
+      ? activity.heartbeats.map(
+          (heartbeat) =>
+            `- ${formatLabel(heartbeat.scope)}: ${formatLabel(heartbeat.status)} - ${heartbeat.detail ?? 'No detail'}${heartbeat.error ? ` (${heartbeat.error})` : ''}`,
+        )
+      : ['- None']),
+    '',
+    'Maintenance Jobs',
+    ...(activity.maintenanceJobs?.length
+      ? activity.maintenanceJobs.slice(0, 25).map((job) => {
+          const target =
+            job.gameTitle ?? job.sourceKind ?? job.host ?? 'unscoped';
+          const retry =
+            job.retryInMs && job.retryInMs > 0
+              ? `; retryInMs: ${job.retryInMs}`
+              : '';
+          const error = job.lastError ? `; error: ${job.lastError}` : '';
+          const attempts =
+            job.kind === 'download_poll'
+              ? ''
+              : `; attempts: ${job.attemptCount}`;
+          return `- [${formatLabel(job.status)}] ${formatLabel(job.kind)} ${target}${attempts}${retry}${error}`;
+        })
+      : ['- None']),
+    '',
     'Issues',
     ...(activity.issues.length
       ? sortActivityIssues(activity.issues).map(

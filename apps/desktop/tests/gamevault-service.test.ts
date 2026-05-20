@@ -747,6 +747,7 @@ function createService(
     message: 'Ready',
   },
   playnitePaths: PlayniteIntegrationPaths = {},
+  browserSourceFetch?: SourceFetch,
 ): GameVaultService {
   database.setSetting(
     'download.jdownloader.enabled',
@@ -776,6 +777,7 @@ function createService(
     extractStagedZipArchive,
     (input, init) => fetch(input, init),
     playnitePaths,
+    browserSourceFetch,
   );
 }
 
@@ -5383,6 +5385,221 @@ describe('GameVaultService SteamDB patch workflow', () => {
     }
   });
 
+  it('refreshes direct-ready Ankergames mirrors before queueing source updates', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const refreshedProxyUrl =
+        'https://tunnel5.dlproxy.uk/download/update-token?sig=update-signature';
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const sourceFetch = vi.fn(async (input: string, init?: RequestInit) => {
+        if (input === 'https://ankergames.net/csrf-token') {
+          return new Response(JSON.stringify({ token: 'csrf-token' }), {
+            status: 200,
+          });
+        }
+
+        if (input === 'https://ankergames.net/generate-download-url/2557') {
+          expect(init?.method).toBe('POST');
+          return new Response(
+            JSON.stringify({
+              download_url: 'https://ankergames.net/download/update',
+              success: true,
+            }),
+            { status: 200 },
+          );
+        }
+
+        expect(input).toBe('https://ankergames.net/download/update');
+        return new Response(
+          `<button data-clipboard-text="${refreshedProxyUrl}">Copy Link</button>`,
+          { status: 200 },
+        );
+      });
+      const startEmbeddedBrowserDownload = createEmbeddedBrowserRunner();
+      const service = createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+        undefined,
+        undefined,
+        undefined,
+        startEmbeddedBrowserDownload,
+      );
+
+      const view = await service.addTrackedItem({
+        parsedSource: ankergamesDirectReadySource,
+        queueDownload: false,
+        selectedDownloads: {
+          fullUrl: 'https://ankergames.net/generate-download-url/2557',
+        },
+        selectedSteamPatch: {
+          ...selectedPatch,
+          appId: 2444750,
+          buildId: '22630308',
+        },
+        steamMatch: {
+          ...steamMatch,
+          appId: 2444750,
+          normalizedTitle: 'shape of dreams',
+          title: 'Shape of Dreams',
+        },
+      });
+      database.upsertInstallRecord({
+        installedAt: '05/13/2026',
+        installedBuildId: '22500000',
+        installedSourceKind: 'ankergames',
+        installedSourceUrl: ankergamesDirectReadySource.sourceUrl,
+        installedVersion: 'V 1.2.1.6',
+        trackedItemId: view.item.id,
+        updatedAt: '2026-05-20T12:00:00.000Z',
+      });
+
+      expect(database.listDownloadMirrors(view.item.id, 'ankergames')).toEqual([
+        expect.objectContaining({
+          kind: 'full',
+          selectedAt: expect.any(String),
+          url: ankergamesProxyUrl,
+        }),
+      ]);
+
+      await service.queueUpdateFromSource({
+        sourceKind: 'ankergames',
+        trackedItemId: view.item.id,
+      });
+
+      expect(startEmbeddedBrowserDownload).toHaveBeenCalledWith(
+        expect.objectContaining({
+          url: refreshedProxyUrl,
+        }),
+      );
+      expect(database.getDownloadJob(view.item.id)).toMatchObject({
+        provider: 'direct_http',
+        selectedMirrorUrl: refreshedProxyUrl,
+        stage: 'queued',
+      });
+      expect(
+        database.getRawParsedSourcePayload(view.item.id, 'ankergames'),
+      ).toMatchObject({
+        fullDownloadUrls: [
+          expect.objectContaining({
+            browserDownloadUrl: refreshedProxyUrl,
+            url: 'https://ankergames.net/generate-download-url/2557',
+          }),
+        ],
+      });
+      expect(database.listDownloadMirrors(view.item.id, 'ankergames')).toEqual([
+        expect.objectContaining({
+          kind: 'full',
+          selectedAt: expect.any(String),
+          url: refreshedProxyUrl,
+        }),
+      ]);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('clears a failed Ankergames mirror flag when queueing an update reuses the same resolved URL', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const sourceFetch = vi.fn(async (input: string, init?: RequestInit) => {
+        if (input === 'https://ankergames.net/csrf-token') {
+          return new Response(JSON.stringify({ token: 'csrf-token' }), {
+            status: 200,
+          });
+        }
+        if (input === 'https://ankergames.net/generate-download-url/2557') {
+          expect(init?.method).toBe('POST');
+          return new Response(
+            JSON.stringify({
+              download_url: 'https://ankergames.net/download/update',
+              success: true,
+            }),
+            { status: 200 },
+          );
+        }
+        expect(input).toBe('https://ankergames.net/download/update');
+        return new Response(
+          `<button data-clipboard-text="${ankergamesProxyUrl}">Copy Link</button>`,
+          { status: 200 },
+        );
+      });
+      const service = createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+        undefined,
+        undefined,
+        undefined,
+        createEmbeddedBrowserRunner(),
+      );
+
+      const view = await service.addTrackedItem({
+        parsedSource: ankergamesDirectReadySource,
+        queueDownload: false,
+        selectedDownloads: {
+          fullUrl: 'https://ankergames.net/generate-download-url/2557',
+        },
+        selectedSteamPatch: {
+          ...selectedPatch,
+          appId: 2444750,
+          buildId: '22630308',
+        },
+        steamMatch: {
+          ...steamMatch,
+          appId: 2444750,
+          normalizedTitle: 'shape of dreams',
+          title: 'Shape of Dreams',
+        },
+      });
+      await service.markDownloadMirrorFailed(
+        view.item.id,
+        ankergamesProxyUrl,
+        true,
+      );
+      expect(
+        database
+          .listDownloadMirrors(view.item.id, 'ankergames')
+          .find((mirror) => mirror.url === ankergamesProxyUrl)
+          ?.manuallyFailedAt,
+      ).toEqual(expect.any(String));
+
+      await service.queueUpdateFromSource({
+        sourceKind: 'ankergames',
+        trackedItemId: view.item.id,
+      });
+
+      expect(
+        database
+          .listDownloadMirrors(view.item.id, 'ankergames')
+          .find((mirror) => mirror.url === ankergamesProxyUrl)
+          ?.manuallyFailedAt,
+      ).toBeNull();
+      expect(database.getDownloadJob(view.item.id)).toMatchObject({
+        provider: 'direct_http',
+        selectedMirrorUrl: ankergamesProxyUrl,
+        stage: 'queued',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('refreshes failed Ankergames direct-ready mirrors before retrying curl downloads', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -6079,6 +6296,94 @@ describe('GameVaultService SteamDB patch workflow', () => {
       expect(database.getDownloadJob(queued.item.id)).toMatchObject({
         provider: 'direct_http',
         selectedMirrorUrl: refreshedProxyUrl,
+        stage: 'queued',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('clears a failed Ankergames mirror flag when retry reuses the same resolved URL', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('library.rootPath', join(tempRoot, 'Library'));
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response('', { status: 503 })),
+      );
+      const sourceFetch = vi.fn(async (input: string, init?: RequestInit) => {
+        if (input === 'https://ankergames.net/csrf-token') {
+          return new Response(JSON.stringify({ token: 'csrf-token' }), {
+            status: 200,
+          });
+        }
+        if (input === 'https://ankergames.net/generate-download-url/2557') {
+          expect(init?.method).toBe('POST');
+          return new Response(
+            JSON.stringify({
+              download_url: 'https://ankergames.net/download/retry',
+              success: true,
+            }),
+            { status: 200 },
+          );
+        }
+        expect(input).toBe('https://ankergames.net/download/retry');
+        return new Response(
+          `<button data-clipboard-text="${ankergamesProxyUrl}">Copy Link</button>`,
+          { status: 200 },
+        );
+      });
+      const startEmbeddedBrowserDownload = createEmbeddedBrowserRunner();
+      const service = createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+        undefined,
+        undefined,
+        undefined,
+        startEmbeddedBrowserDownload,
+      );
+
+      const queued = await service.addTrackedItem({
+        parsedSource: ankergamesDirectReadySource,
+        queueDownload: true,
+        selectedDownloads: {
+          fullUrl: 'https://ankergames.net/generate-download-url/2557',
+        },
+        selectedSteamPatch: {
+          ...selectedPatch,
+          appId: 2444750,
+          buildId: '22630308',
+        },
+        steamMatch: {
+          ...steamMatch,
+          appId: 2444750,
+          normalizedTitle: 'shape of dreams',
+          title: 'Shape of Dreams',
+        },
+      });
+      await service.markDownloadFailed(queued.item.id);
+      expect(
+        database
+          .listDownloadMirrors(queued.item.id, 'ankergames')
+          .find((mirror) => mirror.url === ankergamesProxyUrl)
+          ?.manuallyFailedAt,
+      ).toEqual(expect.any(String));
+
+      await service.retryDownload(queued.item.id);
+
+      expect(
+        database
+          .listDownloadMirrors(queued.item.id, 'ankergames')
+          .find((mirror) => mirror.url === ankergamesProxyUrl)
+          ?.manuallyFailedAt,
+      ).toBeNull();
+      expect(database.getDownloadJob(queued.item.id)).toMatchObject({
+        provider: 'direct_http',
+        selectedMirrorUrl: ankergamesProxyUrl,
         stage: 'queued',
       });
     } finally {
@@ -7690,6 +7995,33 @@ describe('GameVaultService SteamDB patch workflow', () => {
     }
   });
 
+  it('does not count lightweight live download progress polling as maintenance attempts', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const service = createService(database);
+
+      await service.pollDownloadJobs();
+      const firstJob = database.getMaintenanceJob('download-poll:active');
+      expect(firstJob).toMatchObject({
+        attemptCount: 1,
+        status: 'succeeded',
+      });
+
+      await service.pollDownloadJobs({
+        activity: false,
+        lightweight: true,
+        skipIfRunning: true,
+      });
+
+      expect(database.getMaintenanceJob('download-poll:active')).toMatchObject({
+        attemptCount: firstJob?.attemptCount,
+        status: 'succeeded',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('promotes and cleans up completed SteamRIP extraction during polling', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
@@ -8200,6 +8532,95 @@ describe('GameVaultService SteamDB patch workflow', () => {
           title: 'A Little to the Left',
         }),
       ]);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('saves manual Playnite executable selections into the manifest', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const rootLibraryPath = join(tempRoot, 'Library');
+      const playniteAppDataPath = join(tempRoot, 'PlayniteAppData');
+      const manifestPath = join(playniteAppDataPath, 'playnite-library.json');
+      const installPath = join(rootLibraryPath, "Baldur's Gate 3");
+      const defaultExecutablePath = join(installPath, 'bin', 'bg3.exe');
+      const manualExecutablePath = join(installPath, 'bin', 'bg3_dx11.exe');
+      await mkdir(join(installPath, 'bin'), { recursive: true });
+      await writeFile(defaultExecutablePath, Buffer.alloc(1024 * 1024, 0));
+      await writeFile(manualExecutablePath, Buffer.alloc(1024 * 1024, 0));
+      await writeFile(join(installPath, 'bin', 'steam_appid.txt'), '1086940');
+      database.setSetting('library.rootPath', rootLibraryPath);
+      database.setSetting('playnite.integrationEnabled', 'true');
+
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'baldurs gate 3',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:bg3',
+        title: "Baldur's Gate 3",
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 1086940,
+        coverUrl: null,
+        matchedAt: '2026-05-18T12:00:00.000Z',
+        normalizedTitle: 'baldurs gate 3',
+        title: "Baldur's Gate 3",
+      });
+      database.upsertInstallRecord({
+        installPath,
+        installedAt: '2026-05-18T12:00:00.000Z',
+        installedBuildId: null,
+        installedSourceKind: 'manual',
+        installedSourceUrl: 'manual:bg3',
+        installedVersion: '1.0',
+        trackedItemId: item.id,
+        updatedAt: '2026-05-18T12:00:00.000Z',
+      });
+      const service = createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        fetch,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        true,
+        undefined,
+        undefined,
+        { appDataPath: playniteAppDataPath },
+      );
+
+      const initialManifest = await service.exportPlayniteManifest({
+        rescan: true,
+      });
+      expect(initialManifest.games[0]?.executablePath).toBe(
+        defaultExecutablePath,
+      );
+
+      const status = await service.savePlayniteExecutableSelection({
+        executablePath: manualExecutablePath,
+        trackedItemId: item.id,
+      });
+      const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as {
+        games: Array<{ executablePath: string }>;
+      };
+
+      expect(database.getPlayniteExecutableSelection(item.id)).toMatchObject({
+        selectedExePath: manualExecutablePath,
+        status: 'reviewed',
+      });
+      expect(manifest.games[0]?.executablePath).toBe(manualExecutablePath);
+      expect(status.manifestStatus.current).toBe(true);
+
+      const rescannedManifest = await service.exportPlayniteManifest({
+        rescan: true,
+      });
+      expect(rescannedManifest.games[0]?.executablePath).toBe(
+        manualExecutablePath,
+      );
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
@@ -9774,7 +10195,7 @@ describe('GameVaultService SteamDB patch workflow', () => {
     }
   });
 
-  it('keeps an expired watch scheduled when a fresh source check is still behind upstream', async () => {
+  it('leaves an expired watch expired when a fresh source check is still behind upstream', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {
       const item = database.upsertTrackedItem({
@@ -9850,10 +10271,376 @@ describe('GameVaultService SteamDB patch workflow', () => {
         (candidate) => candidate.item.id === item.id,
       );
       expect(watch?.expiredAt).toBeTruthy();
-      expect(new Date(watch!.nextCheckAt).getTime()).toBeGreaterThan(
-        new Date('2026-04-24T12:00:00.000Z').getTime(),
-      );
+      expect(watch?.nextCheckAt).toBe('2026-04-23T20:00:00.000Z');
       expect(view?.trackingStatus).toBe('watch_window_expired');
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('keeps a source watch when only one matched source has caught upstream', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'shape of dreams',
+        sourceKind: 'manual',
+        sourceUrl: 'manual:shape-of-dreams',
+        title: 'Shape of Dreams',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 1234,
+        coverUrl: null,
+        matchedAt: '2026-04-22T12:00:00.000Z',
+        normalizedTitle: 'shape of dreams',
+        title: 'Shape of Dreams',
+      });
+      database.upsertPatchEntries([
+        {
+          appId: 1234,
+          buildId: '22630308',
+          link: 'https://steamdb.info/patchnotes/22630308/',
+          patchDate: '04/22/2026',
+          patchTitle: 'Shape of Dreams update for 22 April 2026',
+          publishedAt: '2026-04-22T12:00:00.000Z',
+          title: 'Shape of Dreams update for 22 April 2026',
+          trackedItemId: item.id,
+        },
+        {
+          appId: 1234,
+          buildId: '100',
+          link: 'https://steamdb.info/patchnotes/100/',
+          patchDate: '04/20/2026',
+          patchTitle: 'Shape of Dreams update for 20 April 2026',
+          publishedAt: '2026-04-20T12:00:00.000Z',
+          title: 'Shape of Dreams update for 20 April 2026',
+          trackedItemId: item.id,
+        },
+      ]);
+      database.upsertInstallRecord({
+        installedAt: '2026-04-22T12:00:00.000Z',
+        installedBuildId: '22630308',
+        installedSourceKind: 'ankergames',
+        installedSourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+        installedVersion: 'V 1.2.1.7',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-22T12:00:00.000Z',
+      });
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-04-20T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-04-20T12:00:00.000Z',
+        lastError: null,
+        method: 'slug',
+        normalizedTitle: 'shape of dreams',
+        score: 1,
+        sourceKind: 'ankergames',
+        sourceTitle: 'Shape of Dreams',
+        sourceUrl: 'https://ankergames.net/game/shape-of-dreams',
+        status: 'probable',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-20T12:00:00.000Z',
+        usable: true,
+      });
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-04-20T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-04-20T12:00:00.000Z',
+        lastError: 'Source host is backing off; retry in 30 min.',
+        method: 'slug',
+        normalizedTitle: 'shape of dreams',
+        score: 1,
+        sourceKind: 'steamrip',
+        sourceTitle: 'Shape of Dreams',
+        sourceUrl: 'https://steamrip.com/shape-of-dreams-free-download/',
+        status: 'probable',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-20T12:00:00.000Z',
+        usable: true,
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-04-20T12:00:00.000Z',
+        fingerprint: 'steamrip-shape-of-dreams',
+        observedBuildId: '100',
+        observedPatchDate: '04/20/2026',
+        observedPatchLink: 'https://steamdb.info/patchnotes/100/',
+        observedPatchTitle: 'Shape of Dreams update for 20 April 2026',
+        observedVersion: 'V 1.2.0.0',
+        patchSelectionSource: 'rss',
+        sourceKind: 'steamrip',
+        sourceUrl: 'https://steamrip.com/shape-of-dreams-free-download/',
+        trackedItemId: item.id,
+      });
+      database.upsertWatch({
+        endsAt: '2026-04-25T12:00:00.000Z',
+        lastCheckedAt: '2026-04-22T12:00:00.000Z',
+        nextCheckAt: '2026-04-23T12:00:00.000Z',
+        startedAt: '2026-04-20T12:00:00.000Z',
+        trackedItemId: item.id,
+      });
+
+      const sourceFetch = vi.fn(async (input: string, init?: RequestInit) => {
+        if (input === 'https://ankergames.net/game/shape-of-dreams') {
+          return new Response(ankergamesSourceHtml(), { status: 200 });
+        }
+        if (input === 'https://ankergames.net/csrf-token') {
+          return new Response(JSON.stringify({ token: 'csrf-token' }), {
+            status: 200,
+          });
+        }
+
+        expect(input).toBe('https://ankergames.net/livewire/update');
+        expect(init?.method).toBe('POST');
+        return new Response(
+          JSON.stringify({
+            components: [
+              {
+                snapshot: JSON.stringify({
+                  data: {
+                    versionData: [
+                      {
+                        current_build: '22630308',
+                        current_version: 'V 1.2.1.7',
+                      },
+                      { s: 'arr' },
+                    ],
+                  },
+                }),
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      });
+
+      await createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      ).refreshMatchedSource(item.id, 'ankergames');
+
+      expect(database.getWatch(item.id)).toMatchObject({
+        expiredAt: null,
+        trackedItemId: item.id,
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('restores a missing source watch when a usable source is still behind upstream', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-20T12:00:00.000Z'));
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'far far west',
+        sourceKind: 'manual',
+        sourceUrl: null,
+        title: 'Far Far West',
+      });
+      database.upsertPatchEntries([
+        {
+          appId: 12345,
+          buildId: '23227470',
+          link: 'https://steamdb.info/patchnotes/23227470/',
+          patchDate: '05/20/2026',
+          patchTitle: 'Far Far West update for 20 May 2026',
+          publishedAt: '2026-05-20T12:00:00.000Z',
+          title: 'Far Far West update for 20 May 2026',
+          trackedItemId: item.id,
+        },
+      ]);
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-05-19T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-05-19T12:00:00.000Z',
+        lastError: null,
+        method: 'slug',
+        normalizedTitle: 'far far west',
+        score: 1,
+        sourceKind: 'steamrip',
+        sourceTitle: 'Far Far West',
+        sourceUrl: 'https://steamrip.com/far-far-west-free-download/',
+        status: 'probable',
+        trackedItemId: item.id,
+        updatedAt: '2026-05-19T12:00:00.000Z',
+        usable: true,
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-05-19T12:00:00.000Z',
+        fingerprint: 'steamrip-far-far-west',
+        observedBuildId: '23100000',
+        observedPatchDate: '05/19/2026',
+        observedPatchLink: 'https://steamdb.info/patchnotes/23100000/',
+        observedPatchTitle: 'Far Far West update for 19 May 2026',
+        observedVersion: '1.0.0',
+        patchSelectionSource: 'rss',
+        sourceKind: 'steamrip',
+        sourceUrl: 'https://steamrip.com/far-far-west-free-download/',
+        trackedItemId: item.id,
+      });
+
+      await createService(database).processDueWatches();
+
+      expect(database.getWatch(item.id)).toMatchObject({
+        endsAt: '2026-05-25T12:00:00.000Z',
+        nextCheckAt: '2026-05-20T20:00:00.000Z',
+        startedAt: '2026-05-20T12:00:00.000Z',
+        trackedItemId: item.id,
+      });
+    } finally {
+      vi.useRealTimers();
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('schedules transient source watch cooldowns on the configured source interval', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('sourceWatch.intervalHours', '6');
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'subnautica 2',
+        sourceKind: 'manual',
+        sourceUrl: null,
+        title: 'Subnautica 2',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 1962700,
+        coverUrl: null,
+        matchedAt: '2026-04-22T12:00:00.000Z',
+        normalizedTitle: 'subnautica 2',
+        title: 'Subnautica 2',
+      });
+      database.upsertPatchEntries([
+        {
+          appId: 1962700,
+          buildId: '23281399',
+          link: 'https://steamdb.info/patchnotes/23281399/',
+          patchDate: '05/19/2026',
+          patchTitle: 'Subnautica 2 Early Access Hotfix 1',
+          publishedAt: '2026-05-19T12:00:00.000Z',
+          title: 'Subnautica 2 Early Access Hotfix 1',
+          trackedItemId: item.id,
+        },
+      ]);
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-05-19T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-05-19T12:00:00.000Z',
+        lastError: null,
+        method: 'slug',
+        normalizedTitle: 'subnautica 2',
+        score: 1,
+        sourceKind: 'steamrip',
+        sourceTitle: 'Subnautica 2',
+        sourceUrl: 'https://steamrip.com/subnautica-2-free-download/',
+        status: 'probable',
+        trackedItemId: item.id,
+        updatedAt: '2026-05-19T12:00:00.000Z',
+        usable: true,
+      });
+      database.upsertSourceSnapshot({
+        checkedAt: '2026-05-19T12:00:00.000Z',
+        fingerprint: 'steamrip-subnautica-2',
+        observedBuildId: '23165626',
+        observedPatchDate: '05/12/2026',
+        observedPatchLink: 'https://steamdb.info/patchnotes/23165626/',
+        observedPatchTitle: 'Subnautica 2 Early Access Update',
+        observedVersion: '1.0.0',
+        patchSelectionSource: 'rss',
+        sourceKind: 'steamrip',
+        sourceUrl: 'https://steamrip.com/subnautica-2-free-download/',
+        trackedItemId: item.id,
+      });
+      database.upsertWatch({
+        endsAt: '2026-05-24T12:00:00.000Z',
+        lastCheckedAt: '2026-05-19T12:00:00.000Z',
+        nextCheckAt: '2026-05-20T12:00:00.000Z',
+        startedAt: '2026-05-19T12:00:00.000Z',
+        trackedItemId: item.id,
+      });
+
+      const service = createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        vi.fn(async () => new Response('', { status: 403 })),
+      );
+
+      await service.processDueWatches(
+        new Date('2026-05-20T12:00:00.000Z'),
+      );
+
+      expect(database.getWatch(item.id)).toMatchObject({
+        lastCheckedAt: '2026-05-20T12:00:00.000Z',
+        nextCheckAt: '2026-05-20T18:00:00.000Z',
+        trackedItemId: item.id,
+      });
+      expect(
+        database.getMaintenanceJob(`source-watch:${item.id}`),
+      ).toMatchObject({
+        nextAttemptAt: '2026-05-20T18:00:00.000Z',
+        status: 'cooldown',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('normalizes existing short source watch cooldowns to the configured interval', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('sourceWatch.intervalHours', '8');
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'far far west',
+        sourceKind: 'manual',
+        sourceUrl: null,
+        title: 'Far Far West',
+      });
+      database.upsertWatch({
+        endsAt: '2026-05-25T12:00:00.000Z',
+        lastCheckedAt: '2026-05-20T12:00:00.000Z',
+        nextCheckAt: '2026-05-20T12:30:00.000Z',
+        startedAt: '2026-05-20T02:00:00.000Z',
+        trackedItemId: item.id,
+      });
+      database.upsertMaintenanceJob({
+        attemptCount: 18,
+        detail: 'Watched source check is cooling down.',
+        gameTitle: 'Far Far West',
+        id: `source-watch:${item.id}`,
+        kind: 'source_watch',
+        lastAttemptAt: '2026-05-20T12:00:00.000Z',
+        nextAttemptAt: '2026-05-20T12:30:00.000Z',
+        status: 'cooldown',
+        trackedItemId: item.id,
+        updatedAt: '2026-05-20T12:00:00.000Z',
+      });
+
+      await createService(database).processDueWatches(
+        new Date('2026-05-20T13:00:00.000Z'),
+      );
+
+      expect(database.getWatch(item.id)).toMatchObject({
+        nextCheckAt: '2026-05-20T20:00:00.000Z',
+        trackedItemId: item.id,
+      });
+      expect(
+        database.getMaintenanceJob(`source-watch:${item.id}`),
+      ).toMatchObject({
+        attemptCount: 18,
+        nextAttemptAt: '2026-05-20T20:00:00.000Z',
+        status: 'cooldown',
+      });
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
@@ -9925,6 +10712,650 @@ describe('GameVaultService SteamDB patch workflow', () => {
       expect(database.listDownloadMirrors(item.id, 'steamrip')).toEqual([
         expect.objectContaining({ url: 'https://gofile.io/d/newer' }),
       ]);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('discovers SteamRIP from the predictable detail slug before using the catalog', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'black jacket',
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.net/game/black-jacket',
+        title: 'Black Jacket',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 2129170,
+        coverUrl: null,
+        matchedAt: '2026-05-20T12:00:00.000Z',
+        normalizedTitle: 'black jacket',
+        title: 'Black Jacket',
+      });
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-05-20T12:00:00.000Z',
+        isPrimary: true,
+        lastCheckedAt: '2026-05-20T12:00:00.000Z',
+        lastError: null,
+        method: 'primary_source',
+        normalizedTitle: 'black jacket',
+        score: 1,
+        sourceKind: 'ankergames',
+        sourceTitle: 'Black Jacket',
+        sourceUrl: item.sourceUrl,
+        status: 'verified',
+        trackedItemId: item.id,
+        updatedAt: '2026-05-20T12:00:00.000Z',
+        usable: true,
+      });
+
+      const sourceFetch = vi.fn(async (input: string) => {
+        if (input === 'https://steamrip.com/black-jacket-free-download/') {
+          return new Response(
+            steamRipSourceHtml({
+              buildId: '23306404',
+              mirrorUrl: 'https://gofile.io/d/black-jacket',
+              title: 'Black Jacket',
+              version: '0.1.0.209',
+            }),
+            { status: 200 },
+          );
+        }
+        if (
+          input === 'https://steamrip.com/games-list-page/' ||
+          input === 'https://steamrip.com/updated-games/'
+        ) {
+          throw new Error('SteamRIP catalog should not be needed');
+        }
+        return new Response('', { status: 200 });
+      });
+
+      const view = await createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      ).discoverSourceMatches(item.id, {
+        bypassBackoff: true,
+        forceCatalog: true,
+      });
+
+      const steamrip = view.sourceMatches.find(
+        (source) => source.match.sourceKind === 'steamrip',
+      );
+      expect(steamrip).toMatchObject({
+        match: {
+          lastError: null,
+          sourceTitle: 'Black Jacket',
+          sourceUrl: 'https://steamrip.com/black-jacket-free-download/',
+          status: 'probable',
+          usable: true,
+        },
+        snapshot: {
+          observedBuildId: '23306404',
+          observedVersion: '0.1.0.209',
+        },
+      });
+      expect(database.listDownloadMirrors(item.id, 'steamrip')).toEqual([
+        expect.objectContaining({ url: 'https://gofile.io/d/black-jacket' }),
+      ]);
+      expect(sourceFetch.mock.calls.map(([input]) => input)).not.toContain(
+        'https://steamrip.com/games-list-page/',
+      );
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('discovers a single source when refreshing an unmatched source card', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'black jacket',
+        sourceKind: 'manual',
+        sourceUrl: null,
+        title: 'Black Jacket',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 2129170,
+        coverUrl: null,
+        matchedAt: '2026-05-20T12:00:00.000Z',
+        normalizedTitle: 'black jacket',
+        title: 'Black Jacket',
+      });
+      database.upsertSourceMatch({
+        confidence: 0,
+        createdAt: '2026-05-20T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-05-20T12:00:00.000Z',
+        lastError: null,
+        method: 'fuzzy_title',
+        normalizedTitle: 'black jacket',
+        score: 0,
+        sourceKind: 'steamrip',
+        sourceTitle: null,
+        sourceUrl: null,
+        status: 'not_found',
+        trackedItemId: item.id,
+        updatedAt: '2026-05-20T12:00:00.000Z',
+        usable: false,
+      });
+
+      const sourceFetch = vi.fn(async (input: string) => {
+        if (input === 'https://steamrip.com/black-jacket-free-download/') {
+          return new Response(
+            steamRipSourceHtml({
+              buildId: '23306404',
+              mirrorUrl: 'https://gofile.io/d/black-jacket-refresh',
+              title: 'Black Jacket',
+              version: '0.1.0.209',
+            }),
+            { status: 200 },
+          );
+        }
+        if (
+          input === 'https://steamrip.com/games-list-page/' ||
+          input === 'https://steamrip.com/updated-games/'
+        ) {
+          throw new Error('SteamRIP catalog should not be needed');
+        }
+        return new Response('', { status: 404 });
+      });
+
+      const view = await createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      ).refreshMatchedSource(item.id, 'steamrip');
+
+      const steamrip = view.sourceMatches.find(
+        (source) => source.match.sourceKind === 'steamrip',
+      );
+      expect(steamrip).toMatchObject({
+        match: {
+          lastError: null,
+          sourceTitle: 'Black Jacket',
+          sourceUrl: 'https://steamrip.com/black-jacket-free-download/',
+          status: 'probable',
+          usable: true,
+        },
+        snapshot: {
+          observedBuildId: '23306404',
+          observedVersion: '0.1.0.209',
+        },
+      });
+      expect(database.listDownloadMirrors(item.id, 'steamrip')).toEqual([
+        expect.objectContaining({
+          url: 'https://gofile.io/d/black-jacket-refresh',
+        }),
+      ]);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('keeps a guessed SteamRIP detail URL reviewable when the host blocks verification', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'black jacket',
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.net/game/black-jacket',
+        title: 'Black Jacket',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 2129170,
+        coverUrl: null,
+        matchedAt: '2026-05-20T12:00:00.000Z',
+        normalizedTitle: 'black jacket',
+        title: 'Black Jacket',
+      });
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-05-20T12:00:00.000Z',
+        isPrimary: true,
+        lastCheckedAt: '2026-05-20T12:00:00.000Z',
+        lastError: null,
+        method: 'primary_source',
+        normalizedTitle: 'black jacket',
+        score: 1,
+        sourceKind: 'ankergames',
+        sourceTitle: 'Black Jacket',
+        sourceUrl: item.sourceUrl,
+        status: 'verified',
+        trackedItemId: item.id,
+        updatedAt: '2026-05-20T12:00:00.000Z',
+        usable: true,
+      });
+
+      const sourceFetch = vi.fn(async (input: string) => {
+        if (input === 'https://steamrip.com/black-jacket-free-download/') {
+          return new Response('', { status: 403 });
+        }
+        if (
+          input === 'https://steamrip.com/games-list-page/' ||
+          input === 'https://steamrip.com/updated-games/'
+        ) {
+          throw new Error('SteamRIP catalog should not be needed');
+        }
+        return new Response('', { status: 200 });
+      });
+
+      const view = await createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      ).discoverSourceMatches(item.id, {
+        bypassBackoff: true,
+        forceCatalog: true,
+      });
+
+      const steamrip = view.sourceMatches.find(
+        (source) => source.match.sourceKind === 'steamrip',
+      );
+      expect(steamrip).toMatchObject({
+        match: {
+          lastError: 'Source temporarily blocked the request; retrying later.',
+          sourceTitle: 'Black Jacket',
+          sourceUrl: 'https://steamrip.com/black-jacket-free-download/',
+          status: 'candidate',
+          usable: false,
+        },
+      });
+      expect(sourceFetch.mock.calls.map(([input]) => input)).not.toContain(
+        'https://steamrip.com/games-list-page/',
+      );
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('uses the embedded browser source fetch when SteamRIP blocks desktop fetch', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'black jacket',
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.net/game/black-jacket',
+        title: 'Black Jacket',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 2129170,
+        coverUrl: null,
+        matchedAt: '2026-05-20T12:00:00.000Z',
+        normalizedTitle: 'black jacket',
+        title: 'Black Jacket',
+      });
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-05-20T12:00:00.000Z',
+        isPrimary: true,
+        lastCheckedAt: '2026-05-20T12:00:00.000Z',
+        lastError: null,
+        method: 'primary_source',
+        normalizedTitle: 'black jacket',
+        score: 1,
+        sourceKind: 'ankergames',
+        sourceTitle: 'Black Jacket',
+        sourceUrl: item.sourceUrl,
+        status: 'verified',
+        trackedItemId: item.id,
+        updatedAt: '2026-05-20T12:00:00.000Z',
+        usable: true,
+      });
+
+      const sourceFetch = vi.fn(async (input: string) => {
+        if (input.includes('steamrip.com')) {
+          return new Response('<title>Just a moment...</title>', {
+            status: 403,
+          });
+        }
+        return new Response('', { status: 200 });
+      });
+      const browserSourceFetch = vi.fn(async (input: string) => {
+        if (input === 'https://steamrip.com/black-jacket-free-download/') {
+          return new Response(
+            steamRipSourceHtml({
+              buildId: '23306404',
+              mirrorUrl: 'https://gofile.io/d/browser-black-jacket',
+              title: 'Black Jacket',
+              version: '0.1.0.209',
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response('', { status: 404 });
+      });
+
+      const view = await createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        true,
+        undefined,
+        undefined,
+        {},
+        browserSourceFetch,
+      ).discoverSourceMatches(item.id, {
+        bypassBackoff: true,
+        forceCatalog: true,
+      });
+
+      const steamrip = view.sourceMatches.find(
+        (source) => source.match.sourceKind === 'steamrip',
+      );
+      expect(steamrip).toMatchObject({
+        match: {
+          lastError: null,
+          sourceTitle: 'Black Jacket',
+          sourceUrl: 'https://steamrip.com/black-jacket-free-download/',
+          status: 'probable',
+          usable: true,
+        },
+        snapshot: {
+          observedBuildId: '23306404',
+          observedVersion: '0.1.0.209',
+        },
+      });
+      expect(browserSourceFetch).toHaveBeenCalledWith(
+        'https://steamrip.com/black-jacket-free-download/',
+        undefined,
+      );
+      expect(database.listDownloadMirrors(item.id, 'steamrip')).toEqual([
+        expect.objectContaining({
+          url: 'https://gofile.io/d/browser-black-jacket',
+        }),
+      ]);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('uses browser-provided SteamRIP parsing when desktop catalog fetches are blocked', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'mouse pi for hire deluxe',
+        sourceKind: 'elamigos',
+        sourceUrl:
+          'https://elamigos.site/data/Mouse_PI_for_Hire_MULTi14_-_ElAmigos.html',
+        title: 'Mouse PI for Hire Deluxe Edition',
+      });
+      database.upsertSteamMatch(item.id, steamMatch);
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-04-22T12:00:00.000Z',
+        isPrimary: true,
+        lastCheckedAt: '2026-04-22T12:00:00.000Z',
+        lastError: null,
+        method: 'primary_source',
+        normalizedTitle: 'mouse pi for hire deluxe',
+        score: 1,
+        sourceKind: 'elamigos',
+        sourceTitle: 'Mouse PI for Hire Deluxe Edition',
+        sourceUrl: item.sourceUrl,
+        status: 'verified',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-22T12:00:00.000Z',
+        usable: true,
+      });
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-04-22T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-04-22T12:00:00.000Z',
+        lastError: null,
+        method: 'manual',
+        normalizedTitle: 'mouse p i for hire',
+        score: 1,
+        sourceKind: 'ankergames',
+        sourceTitle: 'MOUSE: P.I. For Hire',
+        sourceUrl: 'https://ankergames.net/game/mouse-p-i-for-hire',
+        status: 'verified',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-22T12:00:00.000Z',
+        usable: true,
+      });
+
+      const browserParsedSource: ParsedSourcePayload = {
+        ...parsedSource,
+        catalogMetadata: {
+          listedBuildId: '22862861',
+          listedDate: '04/22/2026',
+          listedVersion: '1.0.5',
+          method: 'recent_updates',
+        },
+        fingerprint: 'browser-steamrip-mouse',
+        fullDownloadUrls: [
+          {
+            kind: 'full',
+            label: 'GOFILE',
+            url: 'https://gofile.io/d/browser-steamrip',
+          },
+        ],
+        latestSourceRelease: {
+          buildId: '22862861',
+          isPatch: false,
+          label: 'Version 1.0.5',
+          patchDate: '04/22/2026',
+          version: '1.0.5',
+        },
+      };
+      const sourceFetch = vi.fn(async () => {
+        throw new Error('SteamRIP should be supplied by browser parsing');
+      });
+
+      const view = await createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      ).discoverSourceMatches(item.id, {
+        parsedSourceCandidates: [browserParsedSource],
+      });
+
+      const steamrip = view.sourceMatches.find(
+        (source) => source.match.sourceKind === 'steamrip',
+      );
+      expect(steamrip).toMatchObject({
+        match: {
+          lastError: null,
+          sourceUrl: parsedSource.sourceUrl,
+          status: 'probable',
+          usable: true,
+        },
+        snapshot: {
+          observedBuildId: '22862861',
+          observedVersion: '1.0.5',
+        },
+      });
+      expect(database.listDownloadMirrors(item.id, 'steamrip')).toEqual([
+        expect.objectContaining({
+          kind: 'full',
+          url: 'https://gofile.io/d/browser-steamrip',
+        }),
+      ]);
+      expect(sourceFetch).not.toHaveBeenCalled();
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('marks SteamRIP unavailable when browser catalog lookup completes without a title match', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'deep rock galactic rogue core',
+        sourceKind: 'ankergames',
+        sourceUrl: 'https://ankergames.net/game/deep-rock-galactic-rogue-core',
+        title: 'Deep Rock Galactic: Rogue Core',
+      });
+      database.upsertSteamMatch(item.id, {
+        appId: 2605790,
+        coverUrl: null,
+        matchedAt: '2026-05-20T12:00:00.000Z',
+        normalizedTitle: 'deep rock galactic rogue core',
+        title: 'Deep Rock Galactic: Rogue Core',
+      });
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-05-20T12:00:00.000Z',
+        isPrimary: true,
+        lastCheckedAt: '2026-05-20T12:00:00.000Z',
+        lastError: null,
+        method: 'primary_source',
+        normalizedTitle: 'deep rock galactic rogue core',
+        score: 1,
+        sourceKind: 'ankergames',
+        sourceTitle: 'Deep Rock Galactic: Rogue Core',
+        sourceUrl: item.sourceUrl,
+        status: 'verified',
+        trackedItemId: item.id,
+        updatedAt: '2026-05-20T12:00:00.000Z',
+        usable: true,
+      });
+      const sourceFetch = vi.fn(async (input: string) => {
+        if (input.includes('steamrip.com')) {
+          throw new Error('Desktop SteamRIP catalog fetch should be skipped');
+        }
+        return new Response('', { status: 200 });
+      });
+
+      const view = await createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      ).discoverSourceMatches(item.id, {
+        sourceCatalogLookupCompleted: ['steamrip'],
+        sourceCatalogEntries: [
+          {
+            listedBuildId: null,
+            listedDate: null,
+            listedVersion: null,
+            method: 'catalog_title',
+            normalizedTitle: 'another game',
+            sourceKind: 'steamrip',
+            sourceUrl: 'https://steamrip.com/another-game-free-download/',
+            title: 'Another Game',
+          },
+        ],
+      });
+
+      expect(
+        view.sourceMatches.find(
+          (source) => source.match.sourceKind === 'steamrip',
+        ),
+      ).toMatchObject({
+        match: {
+          lastError: null,
+          sourceUrl: null,
+          status: 'not_found',
+          usable: false,
+        },
+      });
+      expect(
+        sourceFetch.mock.calls.some(([input]) =>
+          String(input).includes('steamrip.com'),
+        ),
+      ).toBe(false);
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('refreshes a SteamRIP match from a browser-provided parsed source', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: parsedSource.normalizedTitle,
+        sourceKind: parsedSource.sourceKind,
+        sourceUrl: parsedSource.sourceUrl,
+        title: parsedSource.title,
+      });
+      database.upsertSteamMatch(item.id, steamMatch);
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-04-22T12:00:00.000Z',
+        isPrimary: true,
+        lastCheckedAt: '2026-04-22T12:00:00.000Z',
+        lastError: null,
+        method: 'primary_source',
+        normalizedTitle: parsedSource.normalizedTitle,
+        score: 1,
+        sourceKind: 'steamrip',
+        sourceTitle: parsedSource.title,
+        sourceUrl: parsedSource.sourceUrl,
+        status: 'verified',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-22T12:00:00.000Z',
+        usable: true,
+      });
+      const browserParsedSource: ParsedSourcePayload = {
+        ...parsedSource,
+        fingerprint: 'browser-refresh-steamrip',
+        fullDownloadUrls: [
+          {
+            kind: 'full',
+            label: 'GOFILE',
+            url: 'https://gofile.io/d/refreshed-browser-steamrip',
+          },
+        ],
+        latestSourceRelease: {
+          buildId: '22870000',
+          isPatch: false,
+          label: 'Version 1.0.6',
+          patchDate: '04/23/2026',
+          version: '1.0.6',
+        },
+      };
+      const sourceFetch = vi.fn(async () => {
+        throw new Error('SteamRIP refresh should use browser parsing');
+      });
+
+      const view = await createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      ).refreshMatchedSource(item.id, 'steamrip', {
+        parsedSourceOverride: browserParsedSource,
+      });
+
+      expect(view.sourceSnapshot).toMatchObject({
+        observedBuildId: '22870000',
+        observedVersion: '1.0.6',
+      });
+      expect(database.listDownloadMirrors(item.id, 'steamrip')).toEqual([
+        expect.objectContaining({
+          kind: 'full',
+          url: 'https://gofile.io/d/refreshed-browser-steamrip',
+        }),
+      ]);
+      expect(sourceFetch).not.toHaveBeenCalled();
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }
@@ -12007,7 +13438,7 @@ describe('GameVaultService SteamDB patch workflow', () => {
 
       await expect(
         service.refreshMatchedSource(item.id, 'ankergames'),
-      ).rejects.toThrow('Source refresh failed with 429');
+      ).rejects.toThrow('Rate limited by source; retrying later.');
 
       expect(database.getSourceMatch(item.id, 'ankergames')).toMatchObject({
         lastError: 'Rate limited by source; retrying later.',
@@ -12017,6 +13448,57 @@ describe('GameVaultService SteamDB patch workflow', () => {
       });
       expect(database.getSourceSnapshot(item.id, 'ankergames')).toMatchObject({
         observedBuildId: '22630308',
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('keeps a usable SteamRIP match when a refresh is temporarily blocked', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'way of the hunter',
+        sourceKind: 'manual',
+        sourceUrl: null,
+        title: 'Way of the Hunter',
+      });
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-04-20T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-04-20T12:00:00.000Z',
+        lastError: null,
+        method: 'slug',
+        normalizedTitle: 'way of the hunter',
+        score: 1,
+        sourceKind: 'steamrip',
+        sourceTitle: 'Way of the Hunter',
+        sourceUrl: 'https://steamrip.com/way-of-the-hunter-free-download/',
+        status: 'probable',
+        trackedItemId: item.id,
+        updatedAt: '2026-04-20T12:00:00.000Z',
+        usable: true,
+      });
+
+      const service = createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        vi.fn(async () => new Response('', { status: 403 })),
+      );
+
+      await expect(
+        service.refreshMatchedSource(item.id, 'steamrip'),
+      ).rejects.toThrow('Source temporarily blocked the request');
+
+      expect(database.getSourceMatch(item.id, 'steamrip')).toMatchObject({
+        lastError: 'Source temporarily blocked the request; retrying later.',
+        sourceUrl: 'https://steamrip.com/way-of-the-hunter-free-download/',
+        status: 'probable',
+        usable: true,
       });
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
@@ -12544,7 +14026,7 @@ describe('GameVaultService SteamDB patch workflow', () => {
         createdAt: '2026-04-22T12:00:00.000Z',
         isPrimary: false,
         lastCheckedAt: '2026-04-23T12:00:00.000Z',
-        lastError: 'Source temporarily blocked the request; retrying later.',
+        lastError: 'Source refresh failed with 500',
         method: 'slug',
         normalizedTitle: parsedSource.normalizedTitle,
         score: 0,
@@ -12583,6 +14065,88 @@ describe('GameVaultService SteamDB patch workflow', () => {
       );
       expect(activity.summary.find((card) => card.id === 'automationErrors'))
         .toMatchObject({ status: 'error' });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('reports active source cooldowns without counting stale transient errors', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      const coolingDownItem = database.upsertTrackedItem({
+        normalizedTitle: 'subnautica 2',
+        sourceKind: 'manual',
+        title: 'Subnautica 2',
+      });
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-04-22T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-04-24T12:00:00.000Z',
+        lastError: 'Source host is backing off; retry in 30 min.',
+        method: 'slug',
+        normalizedTitle: 'subnautica 2',
+        score: 1,
+        sourceKind: 'steamrip',
+        sourceTitle: 'Subnautica 2',
+        sourceUrl: 'https://steamrip.com/subnautica-2-free-download/',
+        status: 'probable',
+        trackedItemId: coolingDownItem.id,
+        updatedAt: '2026-04-24T12:00:00.000Z',
+        usable: true,
+      });
+      database.upsertMaintenanceJob({
+        attemptCount: 8,
+        detail: 'Watched source check is cooling down.',
+        gameTitle: 'Subnautica 2',
+        id: `source-watch:${coolingDownItem.id}`,
+        kind: 'source_watch',
+        lastAttemptAt: '2026-04-24T12:00:00.000Z',
+        nextAttemptAt: '2026-04-24T13:00:00.000Z',
+        status: 'cooldown',
+        trackedItemId: coolingDownItem.id,
+        updatedAt: '2026-04-24T12:00:00.000Z',
+      });
+
+      const staleItem = database.upsertTrackedItem({
+        normalizedTitle: 'old blocked game',
+        sourceKind: 'manual',
+        title: 'Old Blocked Game',
+      });
+      database.upsertSourceMatch({
+        confidence: 1,
+        createdAt: '2026-04-22T12:00:00.000Z',
+        isPrimary: false,
+        lastCheckedAt: '2026-04-23T12:00:00.000Z',
+        lastError: 'Source refresh failed with 403',
+        method: 'slug',
+        normalizedTitle: 'old blocked game',
+        score: 1,
+        sourceKind: 'steamrip',
+        sourceTitle: 'Old Blocked Game',
+        sourceUrl: 'https://steamrip.com/old-blocked-game-free-download/',
+        status: 'blocked',
+        trackedItemId: staleItem.id,
+        updatedAt: '2026-04-23T12:00:00.000Z',
+        usable: true,
+      });
+
+      const activity = createService(database).getActivity();
+      const sourceMaintenance = activity.summary.find(
+        (card) => card.id === 'sourceMaintenance',
+      );
+
+      expect(sourceMaintenance).toMatchObject({
+        status: 'warning',
+        value: '1 cooling down',
+      });
+      expect(
+        activity.issues.some(
+          (issue) =>
+            issue.gameTitle === 'Old Blocked Game' &&
+            issue.kind === 'source_error',
+        ),
+      ).toBe(false);
     } finally {
       await removeTempRootAfterPendingSave(tempRoot);
     }

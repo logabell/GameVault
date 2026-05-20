@@ -11,6 +11,50 @@ import { buildFingerprint, compactText, normalizeTitle } from '../utils.js';
 const DOWNLOAD_ACTION_RE = /generateDownloadUrl\((?<id>\d+)\)/i;
 const VERSION_TOKEN_RE = /^[vV]\s*[0-9][0-9a-z._-]*(?:\s*[+][^<]+)?$/i;
 
+function decodeAnkerGamesText(value: string): string {
+  return value
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;|&#x27;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_match, hex: string) =>
+      String.fromCharCode(Number.parseInt(hex, 16)),
+    )
+    .replace(/\\x([0-9a-fA-F]{2})/g, (_match, hex: string) =>
+      String.fromCharCode(Number.parseInt(hex, 16)),
+    )
+    .replace(/\\\//g, '/')
+    .replace(/\\"/g, '"')
+    .replace(/\\'/g, "'");
+}
+
+function safeDecodeAnkerGamesUri(value: string): string | null {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return null;
+  }
+}
+
+function addAnkerGamesTextVariant(variants: Set<string>, value: string): void {
+  if (!value.trim()) {
+    return;
+  }
+
+  const decoded = decodeAnkerGamesText(value);
+  variants.add(value);
+  variants.add(decoded);
+
+  if (decoded.includes('%')) {
+    const uriDecoded = safeDecodeAnkerGamesUri(decoded);
+    if (uriDecoded) {
+      variants.add(uriDecoded);
+      variants.add(decodeAnkerGamesText(uriDecoded));
+    }
+  }
+}
+
 function isAnkerGamesDetailPage(url: string): boolean {
   try {
     const parsedUrl = new URL(url);
@@ -206,22 +250,47 @@ function hasMultiplayerEditionTag($: ReturnType<typeof load>): boolean {
     });
 }
 
-function getAnkerGamesOnlineFixEvidence($: ReturnType<typeof load>): string[] {
+function getAnkerGamesEvidenceText(
+  $: ReturnType<typeof load>,
+  html: string,
+): string {
+  const variants = new Set<string>();
+  addAnkerGamesTextVariant(variants, $('body').text());
+  addAnkerGamesTextVariant(variants, html);
+
+  $('body *').each((_, element) => {
+    const attribs =
+      (element as { attribs?: Record<string, string | undefined> }).attribs ??
+      {};
+    for (const value of Object.values(attribs)) {
+      if (typeof value === 'string') {
+        addAnkerGamesTextVariant(variants, value);
+      }
+    }
+  });
+
+  return compactText(Array.from(variants).join(' '));
+}
+
+function getAnkerGamesOnlineFixEvidence(
+  $: ReturnType<typeof load>,
+  html: string,
+): string[] {
   const evidence: string[] = [];
   if (hasMultiplayerEditionTag($)) {
     evidence.push('AnkerGames Multiplayer / Edition tag');
   }
 
-  const bodyText = compactText($('body').text());
-  if (/(?:^|\s)\+\s*co-?op\b/i.test(bodyText)) {
+  const evidenceText = getAnkerGamesEvidenceText($, html);
+  if (/(?:^|\s)\+\s*co-?op\b/i.test(evidenceText)) {
     evidence.push('AnkerGames Game Features + Co-Op text');
   }
-  if (/\bOFME\b.{0,80}\b(?:fix|online|multiplayer)\b/i.test(bodyText)) {
+  if (/\bOFME\b.{0,80}\b(?:fix|online|multiplayer)\b/i.test(evidenceText)) {
     evidence.push('AnkerGames Game Features OFME fix text');
   }
   if (
     /\bfix\s+has\s+been\s+applied\b.{0,80}\b(?:online|multiplayer)\b/i.test(
-      bodyText,
+      evidenceText,
     )
   ) {
     evidence.push('AnkerGames applied online/multiplayer fix text');
@@ -232,6 +301,7 @@ function getAnkerGamesOnlineFixEvidence($: ReturnType<typeof load>): string[] {
 
 function buildOnlineFixInfo(
   $: ReturnType<typeof load>,
+  html: string,
   generatedDownloads: Array<{ label: string; url: string }>,
 ): OnlineFixSourceInfo | null {
   const onlineFixDownloads = generatedDownloads
@@ -241,7 +311,7 @@ function buildOnlineFixInfo(
       url: download.url,
     }));
 
-  const evidence = getAnkerGamesOnlineFixEvidence($);
+  const evidence = getAnkerGamesOnlineFixEvidence($, html);
   if (onlineFixDownloads.length > 0) {
     evidence.push('AnkerGames Online Fix download action');
   }
@@ -288,7 +358,7 @@ export const ankerGamesAdapter: SourceAdapter = {
           label: download.label,
           url: download.url,
         }));
-    const onlineFix = buildOnlineFixInfo($, generatedDownloads);
+    const onlineFix = buildOnlineFixInfo($, html, generatedDownloads);
 
     if (!title || fullDownloadUrls.length === 0) {
       throw new Error('Failed to parse AnkerGames detail page');

@@ -120,6 +120,9 @@ const STEAM_PATCH_MESSAGE_TIMEOUT_MS = 50000;
 const QUEUE_DOWNLOAD_MESSAGE_TIMEOUT_MS = 120000;
 const STATUS_REFRESH_MESSAGE_TIMEOUT_MS = 10000;
 const LIBRARY_REFRESH_STALE_MS = 30000;
+const ACTIVE_DOWNLOAD_LIBRARY_REFRESH_MS = 1000;
+const ACTIVE_PROGRESS_RENDER_INTERVAL_MS = 500;
+const LIVE_PROGRESS_ESTIMATE_MAX_AGE_MS = 5_000;
 const STEAMDB_BACKFILL_POLL_INTERVAL_MS = 750;
 const STEAMDB_BACKFILL_POLL_TIMEOUT_MS = 26000;
 const EXTENSION_ACTIVE_TAB_STORAGE_KEY = 'gamevault:extension:active-tab';
@@ -368,11 +371,49 @@ function waitForMs(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-function progressPercent(item: TrackedItemView): number | null {
-  const stage = item.currentDownload?.stage;
-  const loaded = item.currentDownload?.bytesLoaded ?? null;
-  const total = item.currentDownload?.bytesTotal ?? null;
-  if (!loaded || !total || total <= 0) return null;
+function timestampMs(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const parsed = new Date(value).getTime();
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+function estimateDownloadBytesLoaded(
+  download: NonNullable<TrackedItemView['currentDownload']>,
+  now = Date.now(),
+): number | null {
+  const loaded = download.bytesLoaded ?? null;
+  if (loaded == null) return null;
+
+  const speed = download.speed ?? null;
+  const total = download.bytesTotal ?? null;
+  const updatedAt = timestampMs(download.updatedAt);
+  if (
+    speed == null ||
+    speed <= 0 ||
+    updatedAt == null ||
+    (download.stage !== 'downloading' && download.stage !== 'extracting')
+  ) {
+    return loaded;
+  }
+
+  const ageMs = now - updatedAt;
+  if (ageMs <= 0 || ageMs > LIVE_PROGRESS_ESTIMATE_MAX_AGE_MS) {
+    return loaded;
+  }
+
+  const estimated = loaded + speed * (ageMs / 1000);
+  return total != null && total > 0 ? Math.min(total, estimated) : estimated;
+}
+
+function progressPercent(
+  item: TrackedItemView,
+  now = Date.now(),
+): number | null {
+  const download = item.currentDownload;
+  const stage = download?.stage;
+  const loaded = download ? estimateDownloadBytesLoaded(download, now) : null;
+  const total = download?.bytesTotal ?? null;
+  if (loaded == null || loaded <= 0 || !total || total <= 0) return null;
   if (stage === 'queued' && loaded >= total) return null;
   return Math.max(0, Math.min(100, Math.round((loaded / total) * 100)));
 }
@@ -380,6 +421,7 @@ function progressPercent(item: TrackedItemView): number | null {
 function formatProgressAmount(
   item: TrackedItemView,
   progress: number | null,
+  now = Date.now(),
 ): string {
   const download = item.currentDownload;
   if (!download) return 'Size unknown';
@@ -389,7 +431,7 @@ function formatProgressAmount(
       : 'Size unknown';
   }
 
-  return `${formatBytes(download.bytesLoaded)} / ${formatBytes(download.bytesTotal)}`;
+  return `${formatBytes(estimateDownloadBytesLoaded(download, now))} / ${formatBytes(download.bytesTotal)}`;
 }
 
 function formatDownloadSummary(
@@ -535,10 +577,69 @@ function formatSourceOnlineFixLabel(source: MatchedSourceView): string | null {
     : 'Online Fix separate';
 }
 
+function getSourceUnavailableLabel(source: MatchedSourceView): string | null {
+  if (source.match.usable) {
+    return null;
+  }
+  if (source.match.status === 'not_found') {
+    return 'Not available';
+  }
+  if (source.match.status === 'candidate') {
+    return 'No match';
+  }
+  if (source.match.status === 'blocked') {
+    return 'Blocked';
+  }
+  if (source.match.status === 'failed') {
+    return 'Check failed';
+  }
+  return formatLabel(source.match.status);
+}
+
+function getSourceRowStatusLabel(
+  source: MatchedSourceView,
+  item: TrackedItemView,
+): string {
+  return (
+    getSourceUnavailableLabel(source) ??
+    getSourceComparisonLabel(source, item)
+  );
+}
+
+function isSourceUnavailableError(source: MatchedSourceView): boolean {
+  return (
+    !source.match.usable &&
+    source.match.status !== 'not_found' &&
+    source.match.status !== 'candidate'
+  );
+}
+
+function formatSourceStatusMessage(
+  source: MatchedSourceView,
+  sourceLabel: string,
+): string | null {
+  if (source.match.status === 'not_found') {
+    return `${sourceLabel} does not list this title yet.`;
+  }
+  if (source.match.status === 'candidate') {
+    return `No confident ${sourceLabel} title match was found.`;
+  }
+  if (
+    source.match.lastError &&
+    /catalog unavailable|catalog request failed/i.test(source.match.lastError)
+  ) {
+    return `Unable to verify ${sourceLabel} right now.`;
+  }
+  return source.match.lastError ?? null;
+}
+
 function sourceOnlineFixWarning(
   item: TrackedItemView,
   source: MatchedSourceView,
 ): string | null {
+  if (!source.match.usable) {
+    return null;
+  }
   if (!item.onlineFix || item.onlineFix.status === 'none') {
     return null;
   }
@@ -1257,6 +1358,7 @@ function App() {
   const [draftShell, setDraftShell] = useState<DraftShellPayload | null>(null);
   const [health, setHealth] = useState<ConnectionHealthSummary | null>(null);
   const [libraryItems, setLibraryItems] = useState<TrackedItemView[]>([]);
+  const [progressClock, setProgressClock] = useState(() => Date.now());
   const [steamCandidates, setSteamCandidates] = useState<SteamCandidate[]>([]);
   const [steamSearchQuery, setSteamSearchQuery] = useState('');
   const [steamPatches, setSteamPatches] = useState<SteamPatchCandidate[]>([]);
@@ -1433,6 +1535,10 @@ function App() {
       librarySortDirection,
       libraryStatusFilter,
     ],
+  );
+  const hasLiveProgressItems = useMemo(
+    () => libraryItems.some(hasActiveProgress),
+    [libraryItems],
   );
   const isLibraryUpdateFlow = Boolean(libraryUpdateItem);
   const baseActiveDraftItem = useMemo(
@@ -2776,6 +2882,15 @@ function App() {
   ]);
 
   useEffect(() => {
+    if (!hasLiveProgressItems) return undefined;
+    const timer = window.setInterval(
+      () => setProgressClock(Date.now()),
+      ACTIVE_PROGRESS_RENDER_INTERVAL_MS,
+    );
+    return () => window.clearInterval(timer);
+  }, [hasLiveProgressItems]);
+
+  useEffect(() => {
     if (
       activeTab !== 'library' ||
       !libraryItems.some((item) =>
@@ -2789,7 +2904,7 @@ function App() {
 
     const timer = window.setInterval(
       () => void refreshLibrary({ force: true }),
-      5000,
+      ACTIVE_DOWNLOAD_LIBRARY_REFRESH_MS,
     );
     return () => window.clearInterval(timer);
   }, [activeTab, libraryItems]);
@@ -3173,10 +3288,14 @@ function App() {
       : [];
   }
 
-  async function refreshSourceMatches(trackedItemId: string) {
+  async function refreshSourceMatches(
+    trackedItemId: string,
+    expectedTitle?: string | null,
+  ) {
     setSourceDiscoveryLoading(true);
     try {
       const response = await chrome.runtime.sendMessage({
+        expectedTitle: expectedTitle ?? activeDraftItem?.item.title ?? null,
         trackedItemId,
         type: 'gamevault:discover-source-matches',
       });
@@ -3227,6 +3346,7 @@ function App() {
 
       const response = await chrome.runtime.sendMessage({
         sourceKind,
+        sourceUrl: source.match.sourceUrl,
         trackedItemId,
         type: 'gamevault:refresh-matched-source',
       });
@@ -3291,7 +3411,7 @@ function App() {
       }
       setStep('game');
       setMessage(null);
-      void refreshSourceMatches(updated.item.id);
+      void refreshSourceMatches(updated.item.id, updated.item.title);
       if (preloadedSteamPatches.length > 0) {
         void syncTrackedSteamPatches(
           updated.item.id,
@@ -4494,7 +4614,7 @@ function App() {
   }
 
   function renderLibraryItem(item: TrackedItemView) {
-    const progress = progressPercent(item);
+    const progress = progressPercent(item, progressClock);
     const showProgress = hasActiveProgress(item);
     const trackingStatus = getTrackingStatus(item);
     const lifecycleStatus = getLifecycleStatus(item);
@@ -4513,7 +4633,7 @@ function App() {
           </div>
           <div className="progress-meta">
             <span>{formatDownloadSummary(item, progress)}</span>
-            <span>{formatProgressAmount(item, progress)}</span>
+            <span>{formatProgressAmount(item, progress, progressClock)}</span>
             <span>{formatSpeed(item.currentDownload.speed)}</span>
             <span>{formatEta(item.currentDownload.etaSeconds)}</span>
           </div>
@@ -4990,20 +5110,17 @@ function App() {
                             sourceDownloadSelection.fullMirrors.length > 0 ||
                             sourceDownloadSelection.patchMirrors.length > 0;
                           const canSelect = sourceDownloadSelection.canSelect;
-                          const unavailableLabel = !source.match.usable
-                            ? formatLabel(
-                                source.match.status === 'candidate'
-                                  ? 'not_matched'
-                                  : source.match.status,
-                              )
-                            : !hasAnyMirror
+                          const sourceLabel = formatSourceKind(sourceKind);
+                          const unavailableLabel =
+                            source.match.usable && !hasAnyMirror
                               ? 'No Mirrors'
                               : null;
-                          const lagLabel = getSourceComparisonLabel(
+                          const lagLabel = getSourceRowStatusLabel(
                             source,
                             activeDraftItem,
                           );
-                          const sourceLabel = formatSourceKind(sourceKind);
+                          const sourceStatusMessage =
+                            formatSourceStatusMessage(source, sourceLabel);
                           const onlineFixLabel =
                             formatSourceOnlineFixLabel(source);
                           const onlineFixNotice = sourceOnlineFixWarning(
@@ -5060,7 +5177,15 @@ function App() {
                                 </button>
                               </div>
                               <div className="source-row__status">
-                                <span className="mini-chip">{lagLabel}</span>
+                                <span
+                                  className={`mini-chip ${
+                                    isSourceUnavailableError(source)
+                                      ? 'is-danger'
+                                      : ''
+                                  }`}
+                                >
+                                  {lagLabel}
+                                </span>
                                 {isCurrentInstallSource ? (
                                   <span className="mini-chip">Current</span>
                                 ) : null}
@@ -5103,9 +5228,15 @@ function App() {
                                   icon={faRotateRight}
                                 />
                               </button>
-                              {source.match.lastError ? (
-                                <p className="source-row__error">
-                                  {source.match.lastError}
+                              {sourceStatusMessage ? (
+                                <p
+                                  className={
+                                    isSourceUnavailableError(source)
+                                      ? 'source-row__error'
+                                      : 'source-row__notice'
+                                  }
+                                >
+                                  {sourceStatusMessage}
                                 </p>
                               ) : null}
                               {onlineFixNotice ? (

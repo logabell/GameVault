@@ -20,6 +20,7 @@ interface CreateGameVaultServiceParams {
   playnitePaths?: PlayniteIntegrationPaths;
   secrets: SecureValueProvider;
   showWindow: (trackedItemId?: string) => void;
+  browserSourceFetch?: SourceFetch;
   sourceFetch?: SourceFetch;
   startDirectHttpDownload?: DirectHttpDownloadRunner;
   steamFetch?: typeof fetch;
@@ -41,5 +42,6 @@ export function createGameVaultService(
     extractSingleStagedZipArchive,
     params.steamFetch,
     params.playnitePaths,
+    params.browserSourceFetch,
   );
 }

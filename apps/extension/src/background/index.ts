@@ -7,6 +7,7 @@ import type {
   ParsedSourcePayload,
   SelectedDownloads,
   SettingsView,
+  SourceCatalogEntry,
   SteamCandidate,
   SteamDbBuildLookupAttentionKind,
   SteamDbBuildLookupFailureKind,
@@ -19,7 +20,13 @@ import type {
   ThemeMode,
   TrackedItemView,
 } from '@gamevault/shared-types';
-import { parseSupportedPageWithNetwork } from '@gamevault/source-core';
+import { compactSteamPatchHistory } from '@gamevault/shared-types';
+import {
+  parseSteamRipCatalog,
+  parseSteamRipUpdatedGames,
+  parseSupportedPageWithNetwork,
+  rankSourceTitleMatch,
+} from '@gamevault/source-core';
 
 import { isSupportedDetailPage } from '../support.js';
 import { enrichParsedSourceWithAnkergamesBrowserDownloads } from './ankergames-parse.js';
@@ -49,6 +56,8 @@ const CONNECTION_HEALTH_CACHE_KEY = 'connectionHealth:lastKnown';
 const SETTINGS_CACHE_KEY = 'settings:lastKnown';
 const POPUP_REOPEN_PREFIX = 'popupReopen';
 const STATUS_CACHE_TTL_MS = 30 * 1000;
+const BROWSER_SOURCE_FETCH_TIMEOUT_MS = 15000;
+const SOURCE_MATCH_CANDIDATE_SCORE = 0.84;
 const CONNECTION_HEALTH_CACHE_TTL_MS = 5 * 60 * 1000;
 const SETTINGS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const PARSE_CACHE_PREFIX = 'parsedPage:v4';
@@ -71,6 +80,25 @@ const STEAM_WISHLIST_SIGN_IN_MESSAGE =
   'Steam did not return a signed-in wishlist. Open Steam Wishlist in this browser, sign in, then run Sync again.';
 const STEAM_WISHLIST_ACCOUNT_MISMATCH_MESSAGE =
   'Steam is signed in as a different account than the saved wishlist URL. Open the saved Steam Wishlist, sign in as that account, then run Sync again.';
+const STEAMRIP_CATALOG_URLS = [
+  'https://steamrip.com/games-list-page/',
+  'https://steamrip.com/updated-games/',
+];
+
+function compactSteamPatchMessageEntries(params: {
+  appId: number;
+  patches: SteamPatchCandidate[] | null | undefined;
+  requiredPatches?: SteamPatchCandidate[];
+}): SteamPatchCandidate[] {
+  return compactSteamPatchHistory(
+    (params.patches ?? []).filter((patch) => patch.appId === params.appId),
+    {
+      requiredPatches: (params.requiredPatches ?? []).filter(
+        (patch) => patch.appId === params.appId,
+      ),
+    },
+  );
+}
 
 interface CachedParsedPage {
   canonicalUrl: string;
@@ -929,9 +957,9 @@ async function writeParsedCache(entry: CachedParsedPage): Promise<void> {
   });
 }
 
-async function readTrackedStatusCache(
+async function readTrackedStatusCacheEntry(
   url: string,
-): Promise<TrackedItemView | null> {
+): Promise<CachedTrackedStatus | null> {
   const storageKey = getStatusCacheStorageKey(url);
   const cached = (await chrome.storage.session.get(storageKey))[storageKey] as
     | CachedTrackedStatus
@@ -943,7 +971,13 @@ async function readTrackedStatusCache(
     return null;
   }
 
-  return cached.trackedStatus;
+  return cached;
+}
+
+async function readTrackedStatusCache(
+  url: string,
+): Promise<TrackedItemView | null> {
+  return (await readTrackedStatusCacheEntry(url))?.trackedStatus ?? null;
 }
 
 async function writeTrackedStatusCache(
@@ -1005,6 +1039,182 @@ async function parseAndCachePage(params: {
   }
   void primeSteamCandidatesForSource(parsedSource);
   return parsedSource;
+}
+
+function normalizedSourceCatalogUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    url.hash = '';
+    return url.toString().replace(/\/$/, '').toLowerCase();
+  } catch {
+    return value.trim().replace(/\/$/, '').toLowerCase();
+  }
+}
+
+function mergeBrowserCatalogEntries(
+  entries: SourceCatalogEntry[],
+): SourceCatalogEntry[] {
+  const merged = new Map<string, SourceCatalogEntry>();
+  const order: string[] = [];
+  for (const entry of entries) {
+    const key = `${entry.sourceKind}:${normalizedSourceCatalogUrl(
+      entry.sourceUrl,
+    )}`;
+    const existing = merged.get(key);
+    if (!existing) {
+      merged.set(key, entry);
+      order.push(key);
+      continue;
+    }
+
+    const incomingIsRecent = entry.method === 'recent_updates';
+    const existingIsRecent = existing.method === 'recent_updates';
+    merged.set(key, {
+      ...existing,
+      listedBuildId:
+        incomingIsRecent && entry.listedBuildId
+          ? entry.listedBuildId
+          : (existing.listedBuildId ?? entry.listedBuildId ?? null),
+      listedDate:
+        incomingIsRecent && entry.listedDate
+          ? entry.listedDate
+          : (existing.listedDate ?? entry.listedDate ?? null),
+      listedVersion:
+        incomingIsRecent && entry.listedVersion
+          ? entry.listedVersion
+          : (existing.listedVersion ?? entry.listedVersion ?? null),
+      method:
+        existingIsRecent || incomingIsRecent
+          ? 'recent_updates'
+          : existing.method,
+    });
+  }
+
+  return order.map((key) => merged.get(key)!);
+}
+
+async function fetchSourceHtmlInBrowser(url: string): Promise<string> {
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(),
+    BROWSER_SOURCE_FETCH_TIMEOUT_MS,
+  );
+  try {
+    const response = await fetch(url, {
+      cache: 'no-store',
+      credentials: 'include',
+      headers: {
+        Accept:
+          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+      redirect: 'follow',
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`Browser source request failed with ${response.status}`);
+    }
+    return response.text();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function parseBrowserSteamRipCatalog(
+  url: string,
+  html: string,
+): SourceCatalogEntry[] {
+  return url.includes('updated-games')
+    ? parseSteamRipUpdatedGames(html)
+    : parseSteamRipCatalog(html);
+}
+
+function withCatalogMetadata(
+  parsedSource: ParsedSourcePayload,
+  entry: SourceCatalogEntry,
+): ParsedSourcePayload {
+  return {
+    ...parsedSource,
+    catalogMetadata: {
+      listedBuildId: entry.listedBuildId ?? null,
+      listedDate: entry.listedDate ?? null,
+      listedVersion: entry.listedVersion ?? null,
+      method: entry.method,
+    },
+  };
+}
+
+async function parseSteamRipDetailInBrowser(
+  sourceUrl: string,
+  catalogEntry?: SourceCatalogEntry | null,
+): Promise<ParsedSourcePayload | null> {
+  try {
+    const html = await fetchSourceHtmlInBrowser(sourceUrl);
+    const parsedSource = await parseSupportedPageWithNetwork(
+      sourceUrl,
+      html,
+      fetch,
+    );
+    if (parsedSource.sourceKind !== 'steamrip') {
+      return null;
+    }
+    return catalogEntry
+      ? withCatalogMetadata(parsedSource, catalogEntry)
+      : parsedSource;
+  } catch {
+    return null;
+  }
+}
+
+async function getBrowserSteamRipDiscovery(
+  expectedTitle?: string | null,
+): Promise<{
+  catalogAvailable: boolean;
+  catalogEntries: SourceCatalogEntry[];
+  parsedSourceCandidates: ParsedSourcePayload[];
+}> {
+  const catalogResults = await Promise.allSettled(
+    STEAMRIP_CATALOG_URLS.map(async (url) =>
+      parseBrowserSteamRipCatalog(url, await fetchSourceHtmlInBrowser(url)),
+    ),
+  );
+  const catalogEntries = mergeBrowserCatalogEntries(
+    catalogResults.flatMap((result) =>
+      result.status === 'fulfilled' ? result.value : [],
+    ),
+  );
+  const catalogAvailable = catalogResults.some(
+    (result) => result.status === 'fulfilled',
+  );
+  const requestedTitle = expectedTitle?.trim();
+  if (!requestedTitle || catalogEntries.length === 0) {
+    return { catalogAvailable, catalogEntries, parsedSourceCandidates: [] };
+  }
+
+  const candidates = catalogEntries
+    .map((entry) => ({
+      entry,
+      rank: rankSourceTitleMatch(requestedTitle, entry.title),
+    }))
+    .filter(({ rank }) => rank.score >= SOURCE_MATCH_CANDIDATE_SCORE)
+    .sort(
+      (left, right) =>
+        right.rank.score - left.rank.score ||
+        left.rank.unmatchedSignificantTokens -
+          right.rank.unmatchedSignificantTokens ||
+        left.rank.normalizedLength - right.rank.normalizedLength,
+    )
+    .slice(0, 5)
+    .map(({ entry }) => entry);
+  const parsedResults = await Promise.allSettled(
+    candidates.map((entry) => parseSteamRipDetailInBrowser(entry.sourceUrl, entry)),
+  );
+  return {
+    catalogAvailable,
+    catalogEntries,
+    parsedSourceCandidates: parsedResults.flatMap((result) =>
+      result.status === 'fulfilled' && result.value ? [result.value] : [],
+    ),
+  };
 }
 
 async function parseAndCachePageFromTab(params: {
@@ -2455,11 +2665,12 @@ async function getDraftStatus(params: {
     });
   }
 
-  let trackedStatus = await readTrackedStatusCache(target.url);
+  const cachedTrackedStatus = await readTrackedStatusCacheEntry(target.url);
+  const trackedStatus = cachedTrackedStatus?.trackedStatus ?? null;
   let trackedStatusRequestStarted = false;
   if (
     cachedParsedPage?.parsedSource.sourceUrl &&
-    !trackedStatus &&
+    !cachedTrackedStatus &&
     !trackedStatusInFlight.has(
       canonicalizeSupportedUrl(cachedParsedPage.parsedSource.sourceUrl),
     )
@@ -2677,11 +2888,29 @@ async function createMatchedDraft(params: {
 
 async function discoverSourceMatches(
   trackedItemId: string,
-  options: { bypassBackoff?: boolean; forceCatalog?: boolean } = {},
+  options: {
+    bypassBackoff?: boolean;
+    expectedTitle?: string | null;
+    forceCatalog?: boolean;
+  } = {},
 ) {
+  const steamRipDiscovery = options.expectedTitle
+    ? await getBrowserSteamRipDiscovery(options.expectedTitle)
+    : { catalogAvailable: false, catalogEntries: [], parsedSourceCandidates: [] };
   return sendDesktopRequest(
     {
-      payload: { options, trackedItemId },
+      payload: {
+        options: {
+          bypassBackoff: options.bypassBackoff,
+          forceCatalog: options.forceCatalog,
+          parsedSourceCandidates: steamRipDiscovery.parsedSourceCandidates,
+          sourceCatalogLookupCompleted: steamRipDiscovery.catalogAvailable
+            ? (['steamrip'] satisfies SupportedSourceKind[])
+            : [],
+          sourceCatalogEntries: steamRipDiscovery.catalogEntries,
+        },
+        trackedItemId,
+      },
       type: 'discoverSourceMatches',
     },
     {
@@ -2694,10 +2923,15 @@ async function discoverSourceMatches(
 async function refreshMatchedSource(
   trackedItemId: string,
   sourceKind: SupportedSourceKind,
+  sourceUrl?: string | null,
 ) {
+  const parsedSource =
+    sourceKind === 'steamrip' && sourceUrl
+      ? await parseSteamRipDetailInBrowser(sourceUrl)
+      : null;
   return sendDesktopRequest(
     {
-      payload: { sourceKind, trackedItemId },
+      payload: { parsedSource, sourceKind, trackedItemId },
       type: 'refreshMatchedSource',
     },
     {
@@ -3549,11 +3783,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
 
-      const patches = Array.isArray(message.patches)
-        ? (message.patches as SteamPatchCandidate[]).filter(
-            (patch) => patch.appId === appId,
-          )
-        : [];
+      const patches = compactSteamPatchHistory(
+        Array.isArray(message.patches)
+          ? (message.patches as SteamPatchCandidate[]).filter(
+              (patch) => patch.appId === appId,
+            )
+          : [],
+        { requiredPatches: [selectedPatch] },
+      );
       await setSessionValue(STEAMDB_PENDING_CONFIRMATION_KEY, {
         context: context!,
         createdAt: Date.now(),
@@ -3602,11 +3839,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
 
-      const patches = Array.isArray(message.patches)
-        ? (message.patches as SteamPatchCandidate[]).filter(
-            (patch) => patch.appId === appId,
-          )
-        : [];
+      const patches = compactSteamPatchHistory(
+        Array.isArray(message.patches)
+          ? (message.patches as SteamPatchCandidate[]).filter(
+              (patch) => patch.appId === appId,
+            )
+          : [],
+      );
       const completedState: SteamDbBackfillState = {
         appId,
         createdAt: context.createdAt,
@@ -3775,20 +4014,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     if (message.type === 'gamevault:create-matched-draft') {
+      const selectedAppId =
+        typeof message.selectedAppId === 'number'
+          ? message.selectedAppId
+          : null;
       const result = await createMatchedDraft({
         mode: (message.mode as 'active' | 'clipboard') ?? 'active',
-        selectedAppId:
-          typeof message.selectedAppId === 'number'
-            ? message.selectedAppId
-            : null,
+        selectedAppId,
         selectedSteamCandidate:
           typeof message.selectedSteamCandidate === 'object' &&
           message.selectedSteamCandidate !== null
             ? (message.selectedSteamCandidate as SteamCandidate)
             : null,
-        steamPatchEntries: Array.isArray(message.steamPatchEntries)
-          ? (message.steamPatchEntries as SteamPatchCandidate[])
-          : null,
+        steamPatchEntries:
+          selectedAppId && Array.isArray(message.steamPatchEntries)
+            ? compactSteamPatchMessageEntries({
+                appId: selectedAppId,
+                patches: message.steamPatchEntries as SteamPatchCandidate[],
+              })
+            : null,
         sourceUrl:
           typeof message.sourceUrl === 'string'
             ? (message.sourceUrl as string)
@@ -3812,6 +4056,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse(
         await discoverSourceMatches(trackedItemId, {
           bypassBackoff: true,
+          expectedTitle:
+            typeof message.expectedTitle === 'string'
+              ? (message.expectedTitle as string)
+              : null,
           forceCatalog: true,
         }),
       );
@@ -3833,7 +4081,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
         return;
       }
-      sendResponse(await refreshMatchedSource(trackedItemId, sourceKind));
+      sendResponse(
+        await refreshMatchedSource(
+          trackedItemId,
+          sourceKind,
+          typeof message.sourceUrl === 'string'
+            ? (message.sourceUrl as string)
+            : null,
+        ),
+      );
       return;
     }
 
@@ -3850,9 +4106,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse(
         await syncTrackedSteamPatchEntries({
           appId,
-          patches: Array.isArray(message.patches)
-            ? (message.patches as SteamPatchCandidate[])
-            : [],
+          patches: compactSteamPatchMessageEntries({
+            appId,
+            patches: Array.isArray(message.patches)
+              ? (message.patches as SteamPatchCandidate[])
+              : [],
+          }),
           trackedItemId,
         }),
       );
@@ -3891,7 +4150,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           selectedSteamPatch,
           sourceKind,
           steamPatchEntries: Array.isArray(message.steamPatchEntries)
-            ? (message.steamPatchEntries as SteamPatchCandidate[])
+            ? compactSteamPatchMessageEntries({
+                appId: selectedSteamPatch.appId,
+                patches: message.steamPatchEntries as SteamPatchCandidate[],
+                requiredPatches: [selectedSteamPatch],
+              })
             : null,
           trackedItemId: String(message.trackedItemId ?? ''),
         }),
@@ -3900,6 +4163,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     if (message.type === 'gamevault:complete-draft') {
+      const selectedSteamPatch =
+        typeof message.selectedSteamPatch === 'object' &&
+        message.selectedSteamPatch !== null
+          ? (message.selectedSteamPatch as SteamPatchCandidate)
+          : null;
       const result = await completeDraft({
         mode: (message.mode as 'active' | 'clipboard') ?? 'active',
         selectedAppId:
@@ -3911,14 +4179,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           message.selectedSteamCandidate !== null
             ? (message.selectedSteamCandidate as SteamCandidate)
             : null,
-        selectedSteamPatch:
-          typeof message.selectedSteamPatch === 'object' &&
-          message.selectedSteamPatch !== null
-            ? (message.selectedSteamPatch as SteamPatchCandidate)
+        selectedSteamPatch,
+        steamPatchEntries:
+          selectedSteamPatch && Array.isArray(message.steamPatchEntries)
+            ? compactSteamPatchMessageEntries({
+                appId: selectedSteamPatch.appId,
+                patches: message.steamPatchEntries as SteamPatchCandidate[],
+                requiredPatches: [selectedSteamPatch],
+              })
             : null,
-        steamPatchEntries: Array.isArray(message.steamPatchEntries)
-          ? (message.steamPatchEntries as SteamPatchCandidate[])
-          : null,
         selectedDownloads: {
           fullUrl: String(message.selectedDownloads?.fullUrl ?? ''),
           patchUrl:
@@ -4072,7 +4341,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           payload: {
             selectedSteamPatch,
             steamPatchEntries: Array.isArray(message.steamPatchEntries)
-              ? (message.steamPatchEntries as SteamPatchCandidate[])
+              ? compactSteamPatchMessageEntries({
+                  appId: selectedSteamPatch.appId,
+                  patches: message.steamPatchEntries as SteamPatchCandidate[],
+                  requiredPatches: [selectedSteamPatch],
+                })
               : null,
             trackedItemId: String(message.trackedItemId ?? ''),
           },

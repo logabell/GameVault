@@ -964,6 +964,7 @@ select option {
   height: 100%;
   border-radius: inherit;
   background: linear-gradient(90deg, var(--accent), var(--accent-strong));
+  transition: width 180ms linear;
 }
 
 .progress-meta,
