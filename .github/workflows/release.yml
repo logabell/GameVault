@@ -50,6 +50,7 @@ jobs:
           path: |
             apps/desktop/release/*.exe
             apps/desktop/release/*.blockmap
+            apps/desktop/release/*.yml
           if-no-files-found: error
 
       - name: Publish GitHub release
@@ -61,3 +62,4 @@ jobs:
           files: |
             apps/desktop/release/*.exe
             apps/desktop/release/*.blockmap
+            apps/desktop/release/*.yml

@@ -47,6 +47,31 @@ async function removeTempRootAfterPendingSave(tempRoot: string): Promise<void> {
   await rm(tempRoot, { force: true, recursive: true });
 }
 
+describe('GameVaultDatabase settings', () => {
+  it('defaults app updater preferences and stores user choices', async () => {
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      expect(database.getSettings().appUpdates).toEqual({
+        checkAutomatically: true,
+        downloadAutomatically: false,
+        includePrereleases: false,
+      });
+
+      database.setSetting('appUpdates.checkAutomatically', 'false');
+      database.setSetting('appUpdates.downloadAutomatically', 'true');
+      database.setSetting('appUpdates.includePrereleases', 'true');
+
+      expect(database.getSettings().appUpdates).toEqual({
+        checkAutomatically: false,
+        downloadAutomatically: true,
+        includePrereleases: true,
+      });
+    } finally {
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+});
+
 describe('GameVaultDatabase persistence recovery', () => {
   it('keeps a last-good backup before replacing the live database', async () => {
     const { database, tempRoot } = await openTestDatabase();

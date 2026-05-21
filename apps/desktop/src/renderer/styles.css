@@ -506,6 +506,14 @@ code {
   padding: 13px 14px;
 }
 
+.app-update-banner__actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
 .library-surface,
 .surface-panel {
   padding: 14px;
@@ -2393,6 +2401,57 @@ code {
   display: grid;
   gap: 14px;
   margin-left: 52px;
+}
+
+.app-update-panel {
+  display: grid;
+  gap: 14px;
+  margin-left: 52px;
+}
+
+.app-update-status-grid,
+.app-update-preferences {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.app-update-status-card,
+.app-update-status-panel {
+  min-width: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--panel-strong);
+}
+
+.app-update-status-card {
+  display: grid;
+  gap: 5px;
+}
+
+.app-update-status-card strong,
+.app-update-status-panel strong {
+  color: var(--ink);
+}
+
+.app-update-status-card span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.app-update-status-panel {
+  display: grid;
+  gap: 10px;
+}
+
+.app-update-progress {
+  height: 8px;
+}
+
+.app-update-actions {
+  flex-wrap: wrap;
 }
 
 .download-behavior-global {
@@ -4322,6 +4381,9 @@ code {
   }
 
   .settings-scheduler-grid,
+  .app-update-panel,
+  .app-update-status-grid,
+  .app-update-preferences,
   .download-behavior-panel,
   .download-source-grid,
   .integration-status-grid,
@@ -4346,8 +4408,14 @@ code {
   }
 
   .integration-quick-actions,
+  .app-update-banner__actions,
   .integration-detection-note {
     margin-left: 0 !important;
+  }
+
+  .app-update-banner__actions {
+    justify-content: flex-start;
+    flex-wrap: wrap;
   }
 
   .settings-scheduler-grid > *,

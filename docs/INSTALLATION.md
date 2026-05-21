@@ -25,6 +25,12 @@ The first public/private release is `1.0.0`, so its installer is named `GameVaul
 
 GameVault's current Windows installer is not code-signed. Windows SmartScreen may ask for confirmation before running it.
 
+## App Updates
+
+Installed release builds check GitHub Releases for newer GameVault installers. When an update is available, GameVault can download it in the background and prompt you to restart when the installer is ready.
+
+The first updater-enabled release must still be installed manually from GitHub Releases. In-app updates apply to releases after that installed version.
+
 ## Browser Extension Setup
 
 GameVault ships the browser extension inside the desktop install. The desktop app shows the exact extension folder or manifest path to use during setup.

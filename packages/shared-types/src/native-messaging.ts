@@ -221,6 +221,7 @@ export type NativeMessageRequest =
   | {
       type: 'saveSettings';
       payload: {
+        appUpdates?: SettingsView['appUpdates'];
         duoStreamCreateFolderLaunchers?: boolean;
         duoStreamCreateSteamAppIdFiles?: boolean;
         duoStreamIntegrationEnabled?: boolean;

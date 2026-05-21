@@ -11836,6 +11836,11 @@ export class GameVaultService {
       settings = this.database.getSettings();
     }
     return {
+      appUpdates: settings.appUpdates ?? {
+        checkAutomatically: true,
+        downloadAutomatically: false,
+        includePrereleases: false,
+      },
       duoStreamCreateFolderLaunchers:
         settings.duoStreamCreateFolderLaunchers ?? true,
       duoStreamCreateSteamAppIdFiles:
@@ -11871,6 +11876,7 @@ export class GameVaultService {
   }
 
   async saveSettings(input: {
+    appUpdates?: SettingsView['appUpdates'];
     duoStreamCreateFolderLaunchers?: boolean;
     duoStreamCreateSteamAppIdFiles?: boolean;
     duoStreamIntegrationEnabled?: boolean;
@@ -11927,6 +11933,20 @@ export class GameVaultService {
         : [];
       this.database.setSetting('library.roots', JSON.stringify(libraryRoots));
       this.database.setSetting('library.rootPath', input.rootLibraryPath);
+    }
+    if (input.appUpdates !== undefined) {
+      this.database.setSetting(
+        'appUpdates.checkAutomatically',
+        input.appUpdates.checkAutomatically ? 'true' : 'false',
+      );
+      this.database.setSetting(
+        'appUpdates.downloadAutomatically',
+        input.appUpdates.downloadAutomatically ? 'true' : 'false',
+      );
+      this.database.setSetting(
+        'appUpdates.includePrereleases',
+        input.appUpdates.includePrereleases ? 'true' : 'false',
+      );
     }
     if (input.myJDownloaderEmail !== undefined) {
       this.database.setSetting('myjd.email', input.myJDownloaderEmail);

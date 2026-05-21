@@ -586,7 +586,50 @@ export interface JDownloaderSourcePreferences {
   steamrip: boolean;
 }
 
+export interface AppUpdatePreferences {
+  checkAutomatically: boolean;
+  downloadAutomatically: boolean;
+  includePrereleases: boolean;
+}
+
+export type AppUpdateStatus =
+  | 'unsupported'
+  | 'idle'
+  | 'checking'
+  | 'available'
+  | 'not_available'
+  | 'downloading'
+  | 'downloaded'
+  | 'installing'
+  | 'error';
+
+export interface AppUpdateRelease {
+  releaseDate: string | null;
+  releaseName: string | null;
+  releaseNotes: string | null;
+  version: string;
+}
+
+export interface AppUpdateProgress {
+  bytesPerSecond: number | null;
+  percent: number;
+  total: number | null;
+  transferred: number | null;
+}
+
+export interface AppUpdateState {
+  currentVersion: string;
+  downloadedAt: string | null;
+  error: string | null;
+  lastCheckedAt: string | null;
+  progress: AppUpdateProgress | null;
+  release: AppUpdateRelease | null;
+  status: AppUpdateStatus;
+  supported: boolean;
+}
+
 export interface SettingsRecord {
+  appUpdates?: AppUpdatePreferences;
   rootLibraryPath?: string | null;
   libraryRoots?: LibraryRootRecord[];
   renameGameFoldersOnImport?: boolean;

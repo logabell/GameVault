@@ -8,6 +8,7 @@ import {
 } from 'node:fs';
 
 import type {
+  AppUpdatePreferences,
   ConfirmedSteamMatch,
   DownloadJobPartRecord,
   DownloadJobRecord,
@@ -520,6 +521,17 @@ function serializeOnlineFixSourceInfo(
   value: OnlineFixSourceInfo | null | undefined,
 ): string {
   return JSON.stringify(normalizeOnlineFixSourceInfo(value) ?? null);
+}
+
+function normalizeAppUpdatePreferences(
+  map: Map<string, string | null>,
+): AppUpdatePreferences {
+  return {
+    checkAutomatically: map.get('appUpdates.checkAutomatically') !== 'false',
+    downloadAutomatically:
+      map.get('appUpdates.downloadAutomatically') === 'true',
+    includePrereleases: map.get('appUpdates.includePrereleases') === 'true',
+  };
 }
 
 function normalizeJDownloaderSourcePreferences(
@@ -3127,6 +3139,7 @@ export class GameVaultDatabase {
         typeof entry.folderName === 'string',
     );
     return {
+      appUpdates: normalizeAppUpdatePreferences(map),
       encryptedPassword: map.get('myjd.password') ?? null,
       ignoredImportFolders,
       jDownloaderEnabled: getDefaultJDownloaderEnabled(map),

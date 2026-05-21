@@ -60,6 +60,7 @@ import type {
   ActivityActionPayload,
   ActivityIssue,
   ActivityView,
+  AppUpdateState,
   BrowserTarget,
   BrowserExtensionInstallStatus,
   ConfirmedSteamMatch,
@@ -326,6 +327,11 @@ const IMPORTED_SOURCE_EDIT_OPTIONS: Array<{
   { label: 'AnkerGames', value: 'ankergames' },
 ];
 const DEFAULT_SETTINGS_DRAFT = {
+  appUpdates: {
+    checkAutomatically: true,
+    downloadAutomatically: false,
+    includePrereleases: false,
+  },
   duoStreamCreateFolderLaunchers: true,
   duoStreamCreateSteamAppIdFiles: true,
   duoStreamIntegrationEnabled: false,
@@ -343,6 +349,16 @@ const DEFAULT_SETTINGS_DRAFT = {
   sourceWatchIntervalHours: '8',
 };
 const ACTIVITY_LOGS_PER_PAGE = 10;
+const DEFAULT_APP_UPDATE_STATE: AppUpdateState = {
+  currentVersion: '',
+  downloadedAt: null,
+  error: null,
+  lastCheckedAt: null,
+  progress: null,
+  release: null,
+  status: 'idle',
+  supported: false,
+};
 
 type DownloadProgressPayload = {
   items: TrackedItemView[];
@@ -350,6 +366,10 @@ type DownloadProgressPayload = {
 
 type ActivityChangePayload = {
   activity: ActivityView;
+};
+
+type AppUpdateChangePayload = {
+  state: AppUpdateState;
 };
 
 type PlayniteReviewState = {
@@ -378,13 +398,16 @@ declare global {
       confirmManualDownloadReady(
         trackedItemId: string,
       ): Promise<TrackedItemView>;
+      checkForAppUpdate(): Promise<AppUpdateState>;
       configureSteamWishlistProfile(payload: {
         profileUrl: string;
       }): Promise<SteamWishlistView>;
       completeStagedInstall(trackedItemId: string): Promise<TrackedItemView>;
+      dismissAppUpdate(): Promise<AppUpdateState>;
       disconnectMyJDownloader(): Promise<ConnectionHealthSummary>;
       detectBrowserExtension(): Promise<BrowserExtensionInstallStatus>;
       detectJDownloader(): Promise<JDownloaderInstallStatus>;
+      downloadAppUpdate(): Promise<AppUpdateState>;
       getConnectionHealth(payload?: {
         forceRefresh?: boolean;
       }): Promise<ConnectionHealthSummary>;
@@ -393,6 +416,7 @@ declare global {
       }): Promise<DesktopHealthSummary>;
       getExtensionSetupInfo(): Promise<ExtensionSetupInfo>;
       getActivity(): Promise<ActivityView>;
+      getAppUpdateState(): Promise<AppUpdateState>;
       getLogs(): Promise<EventLogRecord[]>;
       getPlayniteStatus(payload?: {
         extensionsPath?: string | null;
@@ -403,8 +427,12 @@ declare global {
       getSteamWishlist(): Promise<SteamWishlistView>;
       listTrackedItems(): Promise<TrackedItemView[]>;
       markDownloadFailed(trackedItemId: string): Promise<TrackedItemView>;
+      installAppUpdate(): Promise<AppUpdateState>;
       onActivityChange(
         listener: (payload: ActivityChangePayload) => void,
+      ): () => void;
+      onAppUpdateChange(
+        listener: (payload: AppUpdateChangePayload) => void,
       ): () => void;
       onDownloadProgress(
         listener: (payload: DownloadProgressPayload) => void,
@@ -456,6 +484,7 @@ declare global {
         payload: RegisterExtensionNativeHostPayload,
       ): Promise<NativeHostRegistrationResult>;
       saveSettings(payload: {
+        appUpdates?: SettingsView['appUpdates'];
         duoStreamCreateFolderLaunchers?: boolean;
         duoStreamCreateSteamAppIdFiles?: boolean;
         duoStreamIntegrationEnabled?: boolean;
@@ -548,6 +577,109 @@ function formatBytes(value: number | null | undefined): string {
     unitIndex += 1;
   }
   return `${size.toFixed(size >= 10 || unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
+function formatAppVersion(version: string | null | undefined): string {
+  const trimmed = version?.trim();
+  return trimmed ? `v${trimmed.replace(/^v/i, '')}` : 'Unknown';
+}
+
+function formatAppUpdateProgress(state: AppUpdateState): string {
+  if (!state.progress) {
+    return 'Waiting for download progress';
+  }
+  const percent = `${Math.round(state.progress.percent)}%`;
+  const transferred =
+    state.progress.transferred != null && state.progress.total != null
+      ? `${formatBytes(state.progress.transferred)} of ${formatBytes(
+          state.progress.total,
+        )}`
+      : state.progress.transferred != null
+        ? formatBytes(state.progress.transferred)
+        : null;
+  const speed = state.progress.bytesPerSecond
+    ? `${formatBytes(state.progress.bytesPerSecond)}/s`
+    : null;
+  return [percent, transferred, speed].filter(Boolean).join(' | ');
+}
+
+function getAppUpdateHeadline(state: AppUpdateState): string {
+  switch (state.status) {
+    case 'available':
+      return `GameVault ${formatAppVersion(state.release?.version)} is available`;
+    case 'checking':
+      return 'Checking for GameVault updates';
+    case 'downloading':
+      return `Downloading GameVault ${formatAppVersion(
+        state.release?.version,
+      )}`;
+    case 'downloaded':
+      return `GameVault ${formatAppVersion(state.release?.version)} is ready`;
+    case 'error':
+      return 'Update check failed';
+    case 'installing':
+      return 'Installing GameVault update';
+    case 'not_available':
+      return 'GameVault is up to date';
+    case 'unsupported':
+      return 'App updates require a release build';
+    default:
+      return 'GameVault updates';
+  }
+}
+
+function getAppUpdateDetail(state: AppUpdateState): string {
+  switch (state.status) {
+    case 'available':
+      return state.release?.releaseDate
+        ? `Released ${formatDateLabel(state.release.releaseDate)}. Download when you are ready.`
+        : 'Download when you are ready.';
+    case 'checking':
+      return 'Looking at GitHub Releases for a newer installer.';
+    case 'downloading':
+      return formatAppUpdateProgress(state);
+    case 'downloaded':
+      return state.downloadedAt
+        ? `Downloaded ${formatRelativeTime(state.downloadedAt)}. Restart GameVault to install it.`
+        : 'Restart GameVault to install it.';
+    case 'error':
+      return state.error ?? 'Unable to check for updates.';
+    case 'installing':
+      return 'GameVault will close and restart after the installer finishes.';
+    case 'not_available':
+      return state.lastCheckedAt
+        ? `Last checked ${formatRelativeTime(state.lastCheckedAt)}.`
+        : 'No newer release was found.';
+    case 'unsupported':
+      return state.error ?? 'Auto updates run from the installed Windows app.';
+    default:
+      return `Current version ${formatAppVersion(state.currentVersion)}.`;
+  }
+}
+
+function getAppUpdateNoticeKey(state: AppUpdateState): string {
+  return [
+    state.status,
+    state.release?.version ?? '',
+    state.error ?? '',
+    state.downloadedAt ?? '',
+  ].join(':');
+}
+
+function shouldShowAppUpdateBanner(
+  state: AppUpdateState,
+  dismissedKey: string | null,
+): boolean {
+  if (!state.supported) return false;
+  if (
+    state.status !== 'available' &&
+    state.status !== 'downloaded' &&
+    state.status !== 'downloading' &&
+    state.status !== 'error'
+  ) {
+    return false;
+  }
+  return getAppUpdateNoticeKey(state) !== dismissedKey;
 }
 
 function formatPlayniteConfidence(
@@ -1031,6 +1163,7 @@ function hasConfiguredMyJDownloader(settings: SettingsView): boolean {
 }
 
 function createSettingsDraftFromSettings(loadedSettings: SettingsView): {
+  appUpdates: NonNullable<SettingsView['appUpdates']>;
   duoStreamCreateFolderLaunchers: boolean;
   duoStreamCreateSteamAppIdFiles: boolean;
   duoStreamIntegrationEnabled: boolean;
@@ -1048,6 +1181,14 @@ function createSettingsDraftFromSettings(loadedSettings: SettingsView): {
 } {
   const playniteExtensionsPath = loadedSettings.playniteExtensionsPath ?? '';
   return {
+    appUpdates: {
+      checkAutomatically:
+        loadedSettings.appUpdates?.checkAutomatically ?? true,
+      downloadAutomatically:
+        loadedSettings.appUpdates?.downloadAutomatically ?? false,
+      includePrereleases:
+        loadedSettings.appUpdates?.includePrereleases ?? false,
+    },
     duoStreamCreateFolderLaunchers:
       loadedSettings.duoStreamCreateFolderLaunchers ?? true,
     duoStreamCreateSteamAppIdFiles:
@@ -2476,6 +2617,14 @@ function App() {
   const [items, setItems] = useState<TrackedItemView[]>([]);
   const [progressClock, setProgressClock] = useState(() => Date.now());
   const [activity, setActivity] = useState<ActivityView | null>(null);
+  const [appUpdateState, setAppUpdateState] = useState<AppUpdateState>(
+    DEFAULT_APP_UPDATE_STATE,
+  );
+  const [appUpdateBusy, setAppUpdateBusy] = useState<
+    'check' | 'download' | 'install' | null
+  >(null);
+  const [dismissedAppUpdateNoticeKey, setDismissedAppUpdateNoticeKey] =
+    useState<string | null>(null);
   const [activityActionBusy, setActivityActionBusy] = useState<string | null>(
     null,
   );
@@ -2704,6 +2853,16 @@ function App() {
       : settingsSaveStatus === 'saving'
         ? 'Saving...'
         : 'Save Settings';
+  const appUpdateNoticeVisible = shouldShowAppUpdateBanner(
+    appUpdateState,
+    dismissedAppUpdateNoticeKey,
+  );
+  const appUpdateChecking =
+    appUpdateBusy === 'check' || appUpdateState.status === 'checking';
+  const appUpdateDownloading =
+    appUpdateBusy === 'download' || appUpdateState.status === 'downloading';
+  const appUpdateInstalling =
+    appUpdateBusy === 'install' || appUpdateState.status === 'installing';
   const selectedImportCandidates = useMemo(
     () =>
       importCandidates.filter(
@@ -3739,6 +3898,20 @@ function App() {
     setSettingsSaveStatus('idle');
   }
 
+  function updateAppUpdatePreference(
+    key: keyof NonNullable<SettingsView['appUpdates']>,
+    enabled: boolean,
+  ): void {
+    setSettingsDraft((current) => ({
+      ...current,
+      appUpdates: {
+        ...current.appUpdates,
+        [key]: enabled,
+      },
+    }));
+    setSettingsSaveStatus('idle');
+  }
+
   const refreshSettings = useCallback(async (): Promise<void> => {
     const nextSettings = await window.gameVaultApi.getSettings();
     setSettings(nextSettings);
@@ -3754,6 +3927,48 @@ function App() {
       await refreshSettings();
     } finally {
       setThemeBusy(false);
+    }
+  }
+
+  async function runAppUpdateAction(
+    action: 'check' | 'download' | 'install',
+  ): Promise<void> {
+    if (action === 'install') {
+      const confirmed = await showConfirm(
+        'GameVault will close and restart after the update installer finishes.',
+        {
+          confirmLabel: 'Restart',
+          title: 'Install Update',
+        },
+      );
+      if (!confirmed) {
+        return;
+      }
+    }
+
+    setAppUpdateBusy(action);
+    try {
+      const nextState =
+        action === 'check'
+          ? await window.gameVaultApi.checkForAppUpdate()
+          : action === 'download'
+            ? await window.gameVaultApi.downloadAppUpdate()
+            : await window.gameVaultApi.installAppUpdate();
+      setAppUpdateState(nextState);
+      setDismissedAppUpdateNoticeKey(null);
+    } catch (error) {
+      await showAlert(actionErrorMessage(error, 'Update action failed.'));
+    } finally {
+      setAppUpdateBusy(null);
+    }
+  }
+
+  async function dismissAppUpdateNotice(): Promise<void> {
+    setDismissedAppUpdateNoticeKey(getAppUpdateNoticeKey(appUpdateState));
+    try {
+      setAppUpdateState(await window.gameVaultApi.dismissAppUpdate());
+    } catch {
+      // Keep the local dismissal if the updater cannot be reached.
     }
   }
 
@@ -3778,6 +3993,7 @@ function App() {
     );
     try {
       const nextSettings = await window.gameVaultApi.saveSettings({
+        appUpdates: settingsDraft.appUpdates,
         duoStreamCreateFolderLaunchers:
           settingsDraft.duoStreamCreateFolderLaunchers,
         duoStreamCreateSteamAppIdFiles:
@@ -5050,6 +5266,26 @@ function App() {
     return window.gameVaultApi.onActivityChange((payload) => {
       setActivity(payload.activity);
     });
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void window.gameVaultApi
+      .getAppUpdateState()
+      .then((state) => {
+        if (!cancelled) {
+          setAppUpdateState(state);
+        }
+      })
+      .catch(() => undefined);
+    const unsubscribe = window.gameVaultApi.onAppUpdateChange((payload) => {
+      setAppUpdateState(payload.state);
+      setDismissedAppUpdateNoticeKey(null);
+    });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
   }, []);
 
   useEffect(() => {
@@ -9849,6 +10085,64 @@ function App() {
       </header>
 
       <main className="desktop-content">
+        {appUpdateNoticeVisible ? (
+          <section className="warning-banner app-update-banner">
+            <div>
+              <strong>{getAppUpdateHeadline(appUpdateState)}</strong>
+              <p className="muted-text">
+                {getAppUpdateDetail(appUpdateState)}
+              </p>
+            </div>
+            <div className="app-update-banner__actions">
+              {appUpdateState.status === 'available' ? (
+                <button
+                  className="primary-button settings-icon-text-button"
+                  disabled={appUpdateDownloading}
+                  onClick={() => void runAppUpdateAction('download')}
+                  type="button"
+                >
+                  <FontAwesomeIcon
+                    aria-hidden="true"
+                    icon={faCloudArrowDown}
+                  />
+                  <span>{appUpdateDownloading ? 'Downloading...' : 'Download'}</span>
+                </button>
+              ) : null}
+              {appUpdateState.status === 'downloaded' ? (
+                <button
+                  className="primary-button settings-icon-text-button"
+                  disabled={appUpdateInstalling}
+                  onClick={() => void runAppUpdateAction('install')}
+                  type="button"
+                >
+                  <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
+                  <span>{appUpdateInstalling ? 'Restarting...' : 'Restart'}</span>
+                </button>
+              ) : null}
+              {appUpdateState.status === 'error' ? (
+                <button
+                  className="ghost-button settings-icon-text-button"
+                  disabled={appUpdateChecking}
+                  onClick={() => void runAppUpdateAction('check')}
+                  type="button"
+                >
+                  <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
+                  <span>{appUpdateChecking ? 'Checking...' : 'Try Again'}</span>
+                </button>
+              ) : null}
+              <button
+                aria-label="Dismiss update notification"
+                className="inline-icon-button"
+                onClick={() => void dismissAppUpdateNotice()}
+                title="Dismiss"
+                type="button"
+              >
+                <FontAwesomeIcon aria-hidden="true" icon={faXmark} />
+              </button>
+            </div>
+          </section>
+        ) : null}
+
         {libraryAutomationWarning && section !== 'settings' ? (
           <section className="warning-banner">
             <div>
@@ -10221,6 +10515,184 @@ function App() {
                   />
                   <span aria-hidden="true" className="settings-toggle-track" />
                 </label>
+              </div>
+            </section>
+
+            <section
+              aria-labelledby="settings-app-updates-title"
+              className="settings-card settings-card--app-updates"
+            >
+              <div className="settings-card__heading">
+                <span
+                  aria-hidden="true"
+                  className="settings-card__icon settings-card__icon--integrations"
+                >
+                  <FontAwesomeIcon icon={faCloudArrowDown} />
+                </span>
+                <div>
+                  <h2 id="settings-app-updates-title">App Updates</h2>
+                  <p>GameVault version and installer updates.</p>
+                </div>
+              </div>
+              <div className="app-update-panel">
+                <div className="app-update-status-grid">
+                  <div className="app-update-status-card">
+                    <strong>Current Version</strong>
+                    <span>{formatAppVersion(appUpdateState.currentVersion)}</span>
+                  </div>
+                  <div className="app-update-status-card">
+                    <strong>Latest Release</strong>
+                    <span>
+                      {appUpdateState.release
+                        ? formatAppVersion(appUpdateState.release.version)
+                        : 'Not checked'}
+                    </span>
+                  </div>
+                  <div className="app-update-status-card">
+                    <strong>Last Checked</strong>
+                    <span>{formatRelativeTime(appUpdateState.lastCheckedAt)}</span>
+                  </div>
+                </div>
+                <div className="app-update-status-panel">
+                  <div>
+                    <strong>{getAppUpdateHeadline(appUpdateState)}</strong>
+                    <p className="muted-text">
+                      {getAppUpdateDetail(appUpdateState)}
+                    </p>
+                  </div>
+                  {appUpdateState.status === 'downloading' &&
+                  appUpdateState.progress ? (
+                    <div className="progress-track app-update-progress">
+                      <div
+                        className="progress-fill"
+                        style={{
+                          width: `${Math.round(
+                            appUpdateState.progress.percent,
+                          )}%`,
+                        }}
+                      />
+                    </div>
+                  ) : null}
+                </div>
+                <div className="app-update-preferences">
+                  <label className="settings-toggle-field">
+                    <span className="settings-label-with-help">
+                      Check automatically
+                    </span>
+                    <input
+                      checked={settingsDraft.appUpdates.checkAutomatically}
+                      className="settings-toggle-input"
+                      onChange={(event) => {
+                        const checkAutomatically = event.currentTarget.checked;
+                        setSettingsDraft((current) => ({
+                          ...current,
+                          appUpdates: {
+                            ...current.appUpdates,
+                            checkAutomatically,
+                            downloadAutomatically: checkAutomatically
+                              ? current.appUpdates.downloadAutomatically
+                              : false,
+                          },
+                        }));
+                        setSettingsSaveStatus('idle');
+                      }}
+                      type="checkbox"
+                    />
+                    <span
+                      aria-hidden="true"
+                      className="settings-toggle-track"
+                    />
+                  </label>
+                  <label className="settings-toggle-field">
+                    <span className="settings-label-with-help">
+                      Download automatically
+                    </span>
+                    <input
+                      checked={settingsDraft.appUpdates.downloadAutomatically}
+                      className="settings-toggle-input"
+                      disabled={!settingsDraft.appUpdates.checkAutomatically}
+                      onChange={(event) =>
+                        updateAppUpdatePreference(
+                          'downloadAutomatically',
+                          event.currentTarget.checked,
+                        )
+                      }
+                      type="checkbox"
+                    />
+                    <span
+                      aria-hidden="true"
+                      className="settings-toggle-track"
+                    />
+                  </label>
+                  <label className="settings-toggle-field">
+                    <span className="settings-label-with-help">
+                      Include pre-releases
+                    </span>
+                    <input
+                      checked={settingsDraft.appUpdates.includePrereleases}
+                      className="settings-toggle-input"
+                      onChange={(event) =>
+                        updateAppUpdatePreference(
+                          'includePrereleases',
+                          event.currentTarget.checked,
+                        )
+                      }
+                      type="checkbox"
+                    />
+                    <span
+                      aria-hidden="true"
+                      className="settings-toggle-track"
+                    />
+                  </label>
+                </div>
+                <div className="action-row app-update-actions">
+                  <button
+                    className="ghost-button settings-icon-text-button"
+                    disabled={
+                      !appUpdateState.supported ||
+                      appUpdateChecking ||
+                      appUpdateDownloading ||
+                      appUpdateInstalling
+                    }
+                    onClick={() => void runAppUpdateAction('check')}
+                    type="button"
+                  >
+                    <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
+                    <span>{appUpdateChecking ? 'Checking...' : 'Check Now'}</span>
+                  </button>
+                  <button
+                    className="ghost-button settings-icon-text-button"
+                    disabled={
+                      appUpdateState.status !== 'available' ||
+                      appUpdateDownloading ||
+                      appUpdateInstalling
+                    }
+                    onClick={() => void runAppUpdateAction('download')}
+                    type="button"
+                  >
+                    <FontAwesomeIcon
+                      aria-hidden="true"
+                      icon={faCloudArrowDown}
+                    />
+                    <span>
+                      {appUpdateDownloading ? 'Downloading...' : 'Download'}
+                    </span>
+                  </button>
+                  <button
+                    className="primary-button settings-icon-text-button"
+                    disabled={
+                      appUpdateState.status !== 'downloaded' ||
+                      appUpdateInstalling
+                    }
+                    onClick={() => void runAppUpdateAction('install')}
+                    type="button"
+                  >
+                    <FontAwesomeIcon aria-hidden="true" icon={faRotateRight} />
+                    <span>
+                      {appUpdateInstalling ? 'Restarting...' : 'Restart'}
+                    </span>
+                  </button>
+                </div>
               </div>
             </section>
 

@@ -11,8 +11,10 @@ const api = {
     ipcRenderer.invoke('gamevault:confirmManualDownloadReady', trackedItemId),
   configureSteamWishlistProfile: (payload: { profileUrl: string }) =>
     ipcRenderer.invoke('gamevault:configureSteamWishlistProfile', payload),
+  checkForAppUpdate: () => ipcRenderer.invoke('gamevault:checkForAppUpdate'),
   completeStagedInstall: (trackedItemId: string) =>
     ipcRenderer.invoke('gamevault:completeStagedInstall', trackedItemId),
+  dismissAppUpdate: () => ipcRenderer.invoke('gamevault:dismissAppUpdate'),
   disconnectMyJDownloader: () =>
     ipcRenderer.invoke('gamevault:disconnectMyJDownloader'),
   detectBrowserExtension: () =>
@@ -27,6 +29,7 @@ const api = {
   getExtensionSetupInfo: () =>
     ipcRenderer.invoke('gamevault:getExtensionSetupInfo'),
   getActivity: () => ipcRenderer.invoke('gamevault:getActivity'),
+  getAppUpdateState: () => ipcRenderer.invoke('gamevault:getAppUpdateState'),
   getLogs: () => ipcRenderer.invoke('gamevault:getLogs'),
   getPlayniteStatus: (payload?: { refresh?: boolean }) =>
     ipcRenderer.invoke('gamevault:getPlayniteStatus', payload ?? {}),
@@ -35,6 +38,18 @@ const api = {
   listTrackedItems: () => ipcRenderer.invoke('gamevault:listTrackedItems'),
   markDownloadFailed: (trackedItemId: string) =>
     ipcRenderer.invoke('gamevault:markDownloadFailed', trackedItemId),
+  downloadAppUpdate: () => ipcRenderer.invoke('gamevault:downloadAppUpdate'),
+  installAppUpdate: () => ipcRenderer.invoke('gamevault:installAppUpdate'),
+  onAppUpdateChange: (listener: (payload: unknown) => void) => {
+    const channel = 'gamevault:appUpdateChange';
+    const wrappedListener = (_event: unknown, payload: unknown) => {
+      listener(payload);
+    };
+    ipcRenderer.on(channel, wrappedListener);
+    return () => {
+      ipcRenderer.removeListener(channel, wrappedListener);
+    };
+  },
   onActivityChange: (listener: (payload: unknown) => void) => {
     const channel = 'gamevault:activityChange';
     const wrappedListener = (_event: unknown, payload: unknown) => {

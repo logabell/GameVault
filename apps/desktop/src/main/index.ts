@@ -6,6 +6,7 @@ import type {
   BrowserExtensionInstallStatus,
   ConfirmedSteamMatch,
   ExtensionSetupInfo,
+  AppUpdateState,
   RegisterExtensionNativeHostPayload,
 } from '@gamevault/shared-types';
 import type {
@@ -35,6 +36,7 @@ import {
   extractAnkerGamesDownloadFileName,
 } from './ankergames-download.js';
 import { createGameVaultService } from './create-gamevault-service.js';
+import { GameVaultAppUpdater } from './services/app-updater.js';
 import { GameVaultDatabase } from './services/database.js';
 import { NativeBridgeServer } from './services/bridge.js';
 import { detectBrowserExtension } from './services/browser-extension-detection.js';
@@ -56,6 +58,7 @@ let mainWindowShowPending = false;
 let tray: Tray | null = null;
 let bridge: NativeBridgeServer | null = null;
 let scheduler: GameVaultScheduler | null = null;
+let appUpdater: GameVaultAppUpdater | null = null;
 let quitting = false;
 const backgroundLaunch = process.argv.includes('--background');
 const DATABASE_FILE_NAME = 'gamevault.sqlite';
@@ -316,6 +319,19 @@ function showMainWindow() {
     revealMainWindow(window);
   }
   return window;
+}
+
+function getFallbackAppUpdateState(): AppUpdateState {
+  return {
+    currentVersion: app.getVersion(),
+    downloadedAt: null,
+    error: 'App updates are not initialized yet.',
+    lastCheckedAt: null,
+    progress: null,
+    release: null,
+    status: 'unsupported',
+    supported: false,
+  };
 }
 
 const BROWSER_RESOLVED_DOWNLOAD_HOSTS = new Set([
@@ -1264,6 +1280,27 @@ async function bootstrap() {
   scheduler = new GameVaultScheduler(service);
   scheduler.start();
 
+  appUpdater = new GameVaultAppUpdater({
+    currentVersion: app.getVersion(),
+    getPreferences: () => database.getSettings().appUpdates,
+    isPackaged: app.isPackaged,
+    notify: (title, body) => {
+      new Notification({
+        body,
+        icon: getAssetPath('gamevault-icon-256.png'),
+        title,
+      }).show();
+    },
+    onStateChange: (state) => {
+      const targetWindow = mainWindow;
+      if (!targetWindow || targetWindow.isDestroyed()) {
+        return;
+      }
+      targetWindow.webContents.send('gamevault:appUpdateChange', { state });
+    },
+  });
+  appUpdater.start();
+
   tray = new Tray(createTrayIcon());
   tray.setToolTip('GameVault');
   tray.setContextMenu(
@@ -1324,6 +1361,21 @@ async function bootstrap() {
   ipcMain.handle('gamevault:getDesktopHealth', async (_event, payload) =>
     service.getDesktopHealth(await getExtensionSetupInfo(), payload),
   );
+  ipcMain.handle('gamevault:getAppUpdateState', () =>
+    appUpdater?.getState() ?? getFallbackAppUpdateState(),
+  );
+  ipcMain.handle('gamevault:checkForAppUpdate', () =>
+    appUpdater?.checkForUpdates() ?? getFallbackAppUpdateState(),
+  );
+  ipcMain.handle('gamevault:downloadAppUpdate', () =>
+    appUpdater?.downloadUpdate() ?? getFallbackAppUpdateState(),
+  );
+  ipcMain.handle('gamevault:installAppUpdate', () =>
+    appUpdater?.installUpdate() ?? getFallbackAppUpdateState(),
+  );
+  ipcMain.handle('gamevault:dismissAppUpdate', () =>
+    appUpdater?.dismissUpdate() ?? getFallbackAppUpdateState(),
+  );
   ipcMain.handle('gamevault:getSettings', () => service.getSettings());
   ipcMain.handle('gamevault:getPlayniteStatus', (_event, payload) =>
     service.getPlayniteStatus(payload),
@@ -1349,9 +1401,11 @@ async function bootstrap() {
   ipcMain.handle('gamevault:disconnectMyJDownloader', () =>
     service.disconnectMyJDownloader(),
   );
-  ipcMain.handle('gamevault:saveSettings', (_event, payload) =>
-    service.saveSettings(payload),
-  );
+  ipcMain.handle('gamevault:saveSettings', async (_event, payload) => {
+    const nextSettings = await service.saveSettings(payload);
+    appUpdater?.refreshPreferences();
+    return nextSettings;
+  });
   ipcMain.handle('gamevault:saveOnboardingState', (_event, payload) =>
     service.saveOnboardingState(payload),
   );
@@ -1495,6 +1549,7 @@ async function bootstrap() {
   });
   app.on('before-quit', () => {
     quitting = true;
+    appUpdater?.stop();
     scheduler?.stop();
   });
 }

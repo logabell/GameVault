@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "7zip-bin-full": "^26.0.1",
+    "electron-updater": "^6.8.3",
     "sql.js": "^1.14.1"
   },
   "devDependencies": {
@@ -44,6 +45,13 @@
     "files": [
       "dist/**/*",
       "package.json"
+    ],
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "logabell",
+        "repo": "GameVault"
+      }
     ],
     "win": {
       "signAndEditExecutable": false,
