@@ -10596,6 +10596,231 @@ describe('GameVaultService SteamDB patch workflow', () => {
     }
   });
 
+  it('moves stalled source watch requests into cooldown', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-20T12:00:00.000Z'));
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting('sourceWatch.intervalHours', '1');
+      const item = database.upsertTrackedItem({
+        normalizedTitle: 'subnautica 2',
+        sourceKind: 'manual',
+        sourceUrl: null,
+        title: 'Subnautica 2',
+      });
+      for (const sourceKind of [
+        'ankergames',
+        'elamigos',
+        'steamrip',
+      ] satisfies SupportedSourceKind[]) {
+        database.upsertSourceMatch({
+          confidence: sourceKind === 'steamrip' ? 1 : 0,
+          createdAt: '2026-05-19T12:00:00.000Z',
+          isPrimary: false,
+          lastCheckedAt: '2026-05-19T12:00:00.000Z',
+          lastError: null,
+          method: 'manual',
+          normalizedTitle: 'subnautica 2',
+          score: sourceKind === 'steamrip' ? 1 : 0,
+          sourceKind,
+          sourceTitle: sourceKind === 'steamrip' ? 'Subnautica 2' : null,
+          sourceUrl:
+            sourceKind === 'steamrip'
+              ? 'https://steamrip.com/subnautica-2-free-download/'
+              : null,
+          status: sourceKind === 'steamrip' ? 'probable' : 'not_found',
+          trackedItemId: item.id,
+          updatedAt: '2026-05-19T12:00:00.000Z',
+          usable: sourceKind === 'steamrip',
+        });
+      }
+      database.upsertWatch({
+        endsAt: '2026-05-24T12:00:00.000Z',
+        lastCheckedAt: '2026-05-19T12:00:00.000Z',
+        nextCheckAt: '2026-05-20T12:00:00.000Z',
+        startedAt: '2026-05-19T12:00:00.000Z',
+        trackedItemId: item.id,
+      });
+
+      const sourceFetch: SourceFetch = vi.fn(
+        () => new Promise<Response>(() => undefined),
+      );
+      const service = createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+      );
+      const watchProgress: string[] = [];
+      const unsubscribe = service.onActivityChange((activity) => {
+        const task = activity.activeTasks.find(
+          (candidate) => candidate.id === 'source-watches',
+        );
+        if (
+          typeof task?.progressCurrent === 'number' &&
+          typeof task.progressTotal === 'number'
+        ) {
+          watchProgress.push(`${task.progressCurrent}/${task.progressTotal}`);
+        }
+      });
+
+      const result = service.processDueWatches(
+        new Date('2026-05-20T12:00:00.000Z'),
+      );
+      await vi.advanceTimersByTimeAsync(15000);
+      await result;
+      unsubscribe();
+
+      expect(watchProgress).toContain('0/1');
+      expect(watchProgress).toContain('1/1');
+      expect(database.getWatch(item.id)).toMatchObject({
+        lastCheckedAt: '2026-05-20T12:00:00.000Z',
+        nextCheckAt: '2026-05-20T13:00:00.000Z',
+        trackedItemId: item.id,
+      });
+      expect(
+        database.getMaintenanceJob(`source-watch:${item.id}`),
+      ).toMatchObject({
+        detail: 'Watched source check is cooling down.',
+        nextAttemptAt: '2026-05-20T13:00:00.000Z',
+        status: 'cooldown',
+      });
+      expect(
+        database.getSourceMatch(item.id, 'steamrip')?.lastError,
+      ).toBe('Source request timed out; retrying later.');
+    } finally {
+      vi.useRealTimers();
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
+  it('uses browser source checks while SteamRIP desktop is backed off', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-20T12:00:00.000Z'));
+    const { database, tempRoot } = await openTestDatabase();
+    try {
+      database.setSetting(
+        'sourcePause.steamrip.com.until',
+        '2026-05-20T12:30:00.000Z',
+      );
+      const items = [
+        {
+          normalizedTitle: 'black jacket',
+          sourceUrl: 'https://steamrip.com/black-jacket-free-download/',
+          title: 'Black Jacket',
+        },
+        {
+          normalizedTitle: 'subnautica 2',
+          sourceUrl: 'https://steamrip.com/subnautica-2-free-download/',
+          title: 'Subnautica 2',
+        },
+      ];
+      for (const itemSeed of items) {
+        const item = database.upsertTrackedItem({
+          normalizedTitle: itemSeed.normalizedTitle,
+          sourceKind: 'manual',
+          sourceUrl: null,
+          title: itemSeed.title,
+        });
+        for (const sourceKind of [
+          'ankergames',
+          'elamigos',
+          'steamrip',
+        ] satisfies SupportedSourceKind[]) {
+          database.upsertSourceMatch({
+            confidence: sourceKind === 'steamrip' ? 1 : 0,
+            createdAt: '2026-05-19T12:00:00.000Z',
+            isPrimary: false,
+            lastCheckedAt: '2026-05-19T12:00:00.000Z',
+            lastError: null,
+            method: 'manual',
+            normalizedTitle: itemSeed.normalizedTitle,
+            score: sourceKind === 'steamrip' ? 1 : 0,
+            sourceKind,
+            sourceTitle: sourceKind === 'steamrip' ? itemSeed.title : null,
+            sourceUrl: sourceKind === 'steamrip' ? itemSeed.sourceUrl : null,
+            status: sourceKind === 'steamrip' ? 'probable' : 'not_found',
+            trackedItemId: item.id,
+            updatedAt: '2026-05-19T12:00:00.000Z',
+            usable: sourceKind === 'steamrip',
+          });
+        }
+        database.upsertWatch({
+          endsAt: '2026-05-24T12:00:00.000Z',
+          lastCheckedAt: '2026-05-19T12:00:00.000Z',
+          nextCheckAt: '2026-05-20T12:00:00.000Z',
+          startedAt: '2026-05-19T12:00:00.000Z',
+          trackedItemId: item.id,
+        });
+      }
+
+      const sourceFetch = vi.fn(async (input: string) =>
+        input.includes('steamrip.com')
+          ? new Response('<title>Just a moment...</title>', { status: 403 })
+          : new Response('', { status: 200 }),
+      );
+      const browserSourceFetch = vi.fn(async (input: string) => {
+        const item = items.find((candidate) => candidate.sourceUrl === input);
+        if (!item) {
+          return new Response('', { status: 404 });
+        }
+        return new Response(
+          steamRipSourceHtml({
+            buildId:
+              item.normalizedTitle === 'black jacket'
+                ? '23306404'
+                : '23281399',
+            mirrorUrl: `https://gofile.io/d/${item.normalizedTitle.replaceAll(' ', '-')}`,
+            title: item.title,
+            version: '1.0.0',
+          }),
+          { status: 200 },
+        );
+      });
+
+      const service = createService(
+        database,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        sourceFetch,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        true,
+        undefined,
+        undefined,
+        {},
+        browserSourceFetch,
+      );
+
+      await service.processDueWatches(
+        new Date('2026-05-20T12:00:00.000Z'),
+      );
+
+      expect(
+        sourceFetch.mock.calls.filter(([input]) =>
+          input.includes('steamrip.com'),
+        ),
+      ).toHaveLength(0);
+      expect(browserSourceFetch).toHaveBeenCalledWith(
+        'https://steamrip.com/black-jacket-free-download/',
+        undefined,
+      );
+      expect(browserSourceFetch).toHaveBeenCalledWith(
+        'https://steamrip.com/subnautica-2-free-download/',
+        undefined,
+      );
+    } finally {
+      vi.useRealTimers();
+      await removeTempRootAfterPendingSave(tempRoot);
+    }
+  });
+
   it('normalizes existing short source watch cooldowns to the configured interval', async () => {
     const { database, tempRoot } = await openTestDatabase();
     try {

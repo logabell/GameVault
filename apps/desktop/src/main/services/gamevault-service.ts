@@ -200,6 +200,7 @@ const ANKERGAMES_MIN_DELAY_MS = IS_TEST_ENV ? 0 : 1500;
 const ANKERGAMES_RATE_LIMIT_BACKOFF_MS = IS_TEST_ENV ? 0 : 30 * 60 * 1000;
 const SOURCE_DEFAULT_MIN_DELAY_MS = IS_TEST_ENV ? 0 : 250;
 const SOURCE_RATE_LIMIT_BACKOFF_MS = IS_TEST_ENV ? 0 : 30 * 60 * 1000;
+const SOURCE_REQUEST_TIMEOUT_MS = 15000;
 const IMPORT_STEAM_MATCH_CONCURRENCY = 3;
 const STEAMDB_BUILD_LOOKUP_TTL_MS = 60 * 60 * 1000;
 const SOURCE_CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
@@ -423,6 +424,13 @@ function transientSourceRetryAfterMs(error: unknown): number | null {
   return error instanceof TransientSourceRequestError
     ? error.retryAfterMs
     : null;
+}
+
+function isAbortError(error: unknown): boolean {
+  return (
+    (error instanceof DOMException && error.name === 'AbortError') ||
+    (error instanceof Error && error.name === 'AbortError')
+  );
 }
 
 function isTransientMaintenanceError(message: string | null | undefined): boolean {
@@ -2009,6 +2017,58 @@ async function fetchWithTimeout(
   }
 }
 
+async function fetchSourceWithTimeout(
+  url: string,
+  init: RequestInit | undefined,
+  timeoutMs: number,
+  fetcher: (url: string, init?: RequestInit) => Promise<Response>,
+): Promise<Response> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeoutError = () =>
+    new TransientSourceRequestError(
+      'Source request timed out; retrying later.',
+      SOURCE_RATE_LIMIT_BACKOFF_MS,
+    );
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<Response>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      reject(timeoutError());
+    }, timeoutMs);
+  });
+  const request = (async () => {
+    const response = await fetcher(url, {
+      ...init,
+      signal: controller.signal,
+    });
+    const body = await response.arrayBuffer();
+    return new Response(body, {
+      headers: response.headers,
+      status: response.status,
+      statusText: response.statusText,
+    });
+  })();
+
+  try {
+    return await Promise.race([request, timeout]);
+  } catch (error) {
+    if (error instanceof TransientSourceRequestError) {
+      throw error;
+    }
+    if (timedOut || isAbortError(error)) {
+      throw timeoutError();
+    }
+    throw error;
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+    request.catch(() => undefined);
+  }
+}
+
 function parseTimestampMillis(value: string | null | undefined): number | null {
   if (!value) {
     return null;
@@ -2280,13 +2340,21 @@ export class GameVaultService {
         await sleep(waitMs);
       }
 
-      const response = await fetcher(input, init);
-      state.nextAllowedAt =
-        Date.now() +
-        (options.rateLimitStatuses.has(response.status)
-          ? retryAfterMs(response, options.defaultBackoffMs)
-          : options.minDelayMs);
-      return response;
+      try {
+        const response = await fetcher(input, init);
+        state.nextAllowedAt =
+          Date.now() +
+          (options.rateLimitStatuses.has(response.status)
+            ? retryAfterMs(response, options.defaultBackoffMs)
+            : options.minDelayMs);
+        return response;
+      } catch (error) {
+        if (error instanceof TransientSourceRequestError) {
+          state.nextAllowedAt =
+            Date.now() + (error.retryAfterMs ?? options.defaultBackoffMs);
+        }
+        throw error;
+      }
     });
 
     state.queue = request.then(
@@ -2305,13 +2373,30 @@ export class GameVaultService {
     const canUseBrowserSourceFetch = Boolean(
       this.browserSourceFetch && shouldUseBrowserSourceFetch(input),
     );
-    if (
-      options.skipIfBackoff &&
-      !options.bypassBackoff &&
-      !canUseBrowserSourceFetch
-    ) {
-      const retryAfterMs = this.sourceBackoffRemainingMs(input);
-      if (retryAfterMs > 0) {
+    const retryAfterMs = options.bypassBackoff
+      ? 0
+      : this.sourceBackoffRemainingMs(input);
+    if (retryAfterMs > 0) {
+      if (canUseBrowserSourceFetch && this.browserSourceFetch) {
+        return this.browserSourceFetch(input, init)
+          .then((response) =>
+            response.ok
+              ? response
+              : new Response('', {
+                  status: 403,
+                  statusText: 'Source host is backing off',
+                }),
+          )
+          .catch(
+            () =>
+              new Response('', {
+                status: 403,
+                statusText: 'Source host is backing off',
+              }),
+          );
+      }
+
+      if (options.skipIfBackoff) {
         throw new TransientSourceRequestError(
           `Source host is backing off; retry in ${formatDurationMs(
             retryAfterMs,
@@ -2324,7 +2409,13 @@ export class GameVaultService {
     return this.pacedFetch(
       input,
       init,
-      this.sourceFetch,
+      (requestInput, requestInit) =>
+        fetchSourceWithTimeout(
+          requestInput,
+          requestInit,
+          SOURCE_REQUEST_TIMEOUT_MS,
+          this.sourceFetch,
+        ),
       pacingOptions,
       options.bypassBackoff,
     )
@@ -6528,6 +6619,12 @@ export class GameVaultService {
           ...this.parseCatalogForUrl(sourceKind, url, await response.text()),
         );
       } catch (error) {
+        if (
+          error instanceof TransientSourceRequestError &&
+          error.retryAfterMs != null
+        ) {
+          this.persistSourceCooldown(url, error.retryAfterMs);
+        }
         lastError =
           error instanceof Error ? error.message : 'Catalog request failed';
         // Catalog discovery is best-effort; individual detail refreshes still work.
@@ -9672,6 +9769,9 @@ export class GameVaultService {
       });
     } catch (error) {
       if (error instanceof TransientSourceRequestError) {
+        if (error.retryAfterMs != null) {
+          this.persistSourceCooldown(match.sourceUrl, error.retryAfterMs);
+        }
         this.database.upsertSourceMatch({
           ...match,
           lastCheckedAt: now,
