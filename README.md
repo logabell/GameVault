@@ -8,11 +8,11 @@ GameVault is a local-first Windows desktop app and browser extension for trackin
 
 - Tracks installed games, discovered source pages, source versions, Steam matches, SteamDB patches, update status, and local file state.
 - Adds games from supported source pages through the browser extension.
-- Syncs Steam Wishlist items, matches exact Steam AppIDs, refreshes wishlist artwork, and helps clean up wishlist entries for installed games.
+- Syncs Steam Wishlist items
 - Integrates with Playnite through a bundled plugin for GameVault library sync, executable tracking, and IGDB metadata backfill.
 - Compares supported sources and watches tracked source/SteamDB metadata for updates.
 - Queues installs through direct desktop downloads, MyJDownloader handoff, or manual staged install flows.
-- Imports existing library folders and reports failed downloads, stale checks, rate limits, and source issues through the Activity view.
+- Imports existing library folders and reports failed downloads, stale checks, rate limits, and source issues
 
 ## Supported Sources
 
@@ -25,13 +25,6 @@ GameVault is a local-first Windows desktop app and browser extension for trackin
 - Steam and SteamDB for app matching, patch/build history, cover art, and wishlist sync.
 - Playnite for library sync, launch executable tracking, and metadata handoff.
 - MyJDownloader for optional remote download queueing. Real-Debrid can be configured inside JDownloader; GameVault does not store Real-Debrid credentials.
-
-## Documentation
-
-- [Installation](docs/INSTALLATION.md)
-- [User Guide](docs/USER_GUIDE.md)
-- [Troubleshooting](docs/TROUBLESHOOTING.md)
-- [Development Setup](docs/DEVELOPMENT.md)
 
 ## License
 
