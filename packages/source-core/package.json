@@ -1,6 +1,6 @@
 {
   "name": "@gamevault/source-core",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "type": "module",
   "main": "./dist/src/index.js",
@@ -16,7 +16,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@gamevault/shared-types": "1.2.0",
+    "@gamevault/shared-types": "1.2.1",
     "cheerio": "^1.0.0",
     "domhandler": "^5.0.3"
   }

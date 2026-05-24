@@ -33,7 +33,7 @@ The first updater-enabled release must still be installed manually from GitHub R
 
 ## Browser Extension Setup
 
-GameVault ships the browser extension inside the desktop install. The desktop app shows the exact extension folder or manifest path to use during setup.
+GameVault ships the browser extension inside the desktop install. On installed release builds, GameVault prepares a browser-readable copy in its user-data folder and shows the exact extension folder or manifest path to use during setup.
 
 ### Chrome Or Edge
 

@@ -40,6 +40,10 @@ import { GameVaultAppUpdater } from './services/app-updater.js';
 import { GameVaultDatabase } from './services/database.js';
 import { NativeBridgeServer } from './services/bridge.js';
 import { detectBrowserExtension } from './services/browser-extension-detection.js';
+import {
+  getAsarUnpackedPath,
+  prepareBrowserExtensionInstall,
+} from './services/extension-setup.js';
 import { detectJDownloader } from './services/jdownloader-detection.js';
 import { MyJDownloaderService } from './services/myjdownloader.js';
 import {
@@ -65,10 +69,6 @@ const DATABASE_FILE_NAME = 'gamevault.sqlite';
 const GAMEVAULT_APP_USER_MODEL_ID = 'com.gamevault.desktop';
 const LEGACY_DATABASE_FILE_NAME = 'vaulttrack.sqlite';
 const DIRECT_HTTP_PROGRESS_SAMPLE_INTERVAL_MS = 500;
-
-function getAsarUnpackedPath(filePath: string) {
-  return filePath.replace(/([/\\])app\.asar([/\\])/, '$1app.asar.unpacked$2');
-}
 
 function getAssetPath(fileName: string) {
   return join(__dirname, '..', 'assets', fileName);
@@ -109,6 +109,7 @@ function getNativeHostBundlePath() {
 
 async function getExtensionSetupInfo(): Promise<ExtensionSetupInfo> {
   const bundledExtensionPath = join(__dirname, '..', 'extension');
+  const unpackedBundledExtensionPath = getAsarUnpackedPath(bundledExtensionPath);
   const devExtensionPath = resolve(
     __dirname,
     '..',
@@ -120,11 +121,33 @@ async function getExtensionSetupInfo(): Promise<ExtensionSetupInfo> {
   const bundledManifestPath = join(bundledExtensionPath, 'manifest.json');
   const devManifestPath = join(devExtensionPath, 'manifest.json');
 
+  if (app.isPackaged) {
+    const preparedExtensionPath = join(
+      app.getPath('userData'),
+      'BrowserExtension',
+    );
+    const extensionPathExists = await prepareBrowserExtensionInstall({
+      sourceExtensionPath: unpackedBundledExtensionPath,
+      targetExtensionPath: preparedExtensionPath,
+    });
+    return {
+      browsers: ['chrome', 'edge', 'firefox'],
+      extensionPath: preparedExtensionPath,
+      extensionPathExists,
+      extensionPathUnavailableMessage:
+        'GameVault could not prepare the bundled browser extension. Reinstall GameVault, then refresh this setup guide.',
+      firefoxExtensionId: FIREFOX_EXTENSION_ID,
+      nativeHostName: GAMEVAULT_NATIVE_HOST_NAME,
+    };
+  }
+
   if (await fileExists(bundledManifestPath)) {
     return {
       browsers: ['chrome', 'edge', 'firefox'],
       extensionPath: bundledExtensionPath,
       extensionPathExists: true,
+      extensionPathUnavailableMessage:
+        'Extension build output was not found yet. Run the extension build, then refresh this setup guide.',
       firefoxExtensionId: FIREFOX_EXTENSION_ID,
       nativeHostName: GAMEVAULT_NATIVE_HOST_NAME,
     };
@@ -135,6 +158,8 @@ async function getExtensionSetupInfo(): Promise<ExtensionSetupInfo> {
     browsers: ['chrome', 'edge', 'firefox'],
     extensionPath: devExtensionExists ? devExtensionPath : bundledExtensionPath,
     extensionPathExists: devExtensionExists,
+    extensionPathUnavailableMessage:
+      'Extension build output was not found yet. Run the extension build, then refresh this setup guide.',
     firefoxExtensionId: FIREFOX_EXTENSION_ID,
     nativeHostName: GAMEVAULT_NATIVE_HOST_NAME,
   };

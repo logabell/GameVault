@@ -154,6 +154,7 @@ export interface ExtensionSetupInfo {
   browsers: BrowserTarget[];
   extensionPath: string;
   extensionPathExists: boolean;
+  extensionPathUnavailableMessage?: string;
   firefoxExtensionId?: string;
   nativeHostName: string;
 }

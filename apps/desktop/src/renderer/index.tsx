@@ -8725,8 +8725,8 @@ function App() {
 
             {!extensionSetupInfo?.extensionPathExists ? (
               <p className="onboarding-message">
-                Extension build output was not found yet. Run the extension
-                build, then refresh this setup guide.
+                {extensionSetupInfo?.extensionPathUnavailableMessage ??
+                  'Extension build output was not found yet. Run the extension build, then refresh this setup guide.'}
               </p>
             ) : null}
             {context === 'settings' && onboardingMessage ? (

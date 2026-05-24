@@ -1,6 +1,6 @@
 {
   "name": "@gamevault/desktop",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "description": "Desktop companion app for tracking GameVault library updates.",
   "author": "GameVault",
@@ -22,9 +22,9 @@
     "@fortawesome/fontawesome-svg-core": "^7.2.0",
     "@fortawesome/free-solid-svg-icons": "^7.2.0",
     "@fortawesome/react-fontawesome": "^3.3.1",
-    "@gamevault/shared-types": "1.2.0",
-    "@gamevault/source-core": "1.2.0",
-    "@gamevault/steam-core": "1.2.0",
+    "@gamevault/shared-types": "1.2.1",
+    "@gamevault/source-core": "1.2.1",
+    "@gamevault/steam-core": "1.2.1",
     "electron": "41.2.1",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
@@ -34,6 +34,7 @@
     "productName": "GameVault",
     "asar": true,
     "asarUnpack": [
+      "dist/extension/**/*",
       "dist/main/duostream/**/*",
       "dist/native-host/**/*",
       "dist/playnite-plugin/**/*",
