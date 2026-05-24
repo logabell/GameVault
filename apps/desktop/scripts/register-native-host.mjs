@@ -41,10 +41,25 @@ const chromiumManifestPath = join(nativeHostDir, `${hostName}.chromium.json`);
 const firefoxManifestPath = join(nativeHostDir, `${hostName}.firefox.json`);
 const manifestPaths = new Map();
 
+function getWindowsRegistryCommand() {
+  const windowsDirectory =
+    process.env.SystemRoot?.trim() || process.env.windir?.trim();
+  return windowsDirectory
+    ? join(windowsDirectory, 'System32', 'reg.exe')
+    : 'reg.exe';
+}
+
 function runRegCommand(command, args, { ignoreFailure = false } = {}) {
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(command, args, {
       stdio: 'inherit',
+    });
+    child.once('error', (error) => {
+      if (ignoreFailure) {
+        resolvePromise(undefined);
+        return;
+      }
+      rejectPromise(error);
     });
     child.on('exit', (code) => {
       if (code === 0 || ignoreFailure) {
@@ -117,10 +132,11 @@ for (const browser of browsers) {
     throw new Error(`Unsupported browser target: ${browser}`);
   }
 
-  await runRegCommand('reg.exe', ['delete', registryPath, '/f'], {
+  const registryCommand = getWindowsRegistryCommand();
+  await runRegCommand(registryCommand, ['delete', registryPath, '/f'], {
     ignoreFailure: true,
   });
-  await runRegCommand('reg.exe', [
+  await runRegCommand(registryCommand, [
     'add',
     registryPath,
     '/ve',

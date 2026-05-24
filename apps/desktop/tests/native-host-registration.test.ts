@@ -6,14 +6,26 @@ import { FIREFOX_EXTENSION_ID } from '@gamevault/shared-types';
 
 import {
   GAMEVAULT_NATIVE_HOST_NAME,
+  getWindowsRegistryCommand,
   isValidBrowserExtensionId,
   registerExtensionNativeHost,
 } from '../src/main/services/native-host-registration.js';
 
 describe('registerExtensionNativeHost', () => {
+  it('resolves reg.exe from the Windows system directory', () => {
+    expect(getWindowsRegistryCommand({ SystemRoot: 'C:\\Windows' })).toBe(
+      'C:\\Windows\\System32\\reg.exe',
+    );
+    expect(getWindowsRegistryCommand({ windir: 'D:\\Win' })).toBe(
+      'D:\\Win\\System32\\reg.exe',
+    );
+    expect(getWindowsRegistryCommand({})).toBe('reg.exe');
+  });
+
   it('writes the native host manifest and registers Chrome and Edge', async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), 'gamevault-native-host-'));
     const runCommand = vi.fn(async () => undefined);
+    const registryCommand = 'C:\\Windows\\System32\\reg.exe';
 
     try {
       const result = await registerExtensionNativeHost({
@@ -22,6 +34,7 @@ describe('registerExtensionNativeHost', () => {
         localAppData: tempRoot,
         nativeHostBundlePath: 'C:\\GameVault\\native-host\\index.cjs',
         now: () => new Date('2026-04-24T13:00:00.000Z'),
+        registryCommand,
         runCommand,
       });
 
@@ -50,7 +63,7 @@ describe('registerExtensionNativeHost', () => {
         type: 'stdio',
       });
 
-      expect(runCommand).toHaveBeenCalledWith('reg.exe', [
+      expect(runCommand).toHaveBeenCalledWith(registryCommand, [
         'add',
         `HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\${GAMEVAULT_NATIVE_HOST_NAME}`,
         '/ve',
@@ -60,7 +73,7 @@ describe('registerExtensionNativeHost', () => {
         result.manifestPath,
         '/f',
       ]);
-      expect(runCommand).toHaveBeenCalledWith('reg.exe', [
+      expect(runCommand).toHaveBeenCalledWith(registryCommand, [
         'add',
         `HKCU\\Software\\Microsoft\\Edge\\NativeMessagingHosts\\${GAMEVAULT_NATIVE_HOST_NAME}`,
         '/ve',
@@ -89,6 +102,7 @@ describe('registerExtensionNativeHost', () => {
   it('writes a Firefox native host manifest with allowed extensions', async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), 'gamevault-native-host-'));
     const runCommand = vi.fn(async () => undefined);
+    const registryCommand = 'C:\\Windows\\System32\\reg.exe';
 
     try {
       const result = await registerExtensionNativeHost({
@@ -97,6 +111,7 @@ describe('registerExtensionNativeHost', () => {
         localAppData: tempRoot,
         nativeHostBundlePath: 'C:\\GameVault\\native-host\\index.cjs',
         now: () => new Date('2026-04-24T13:30:00.000Z'),
+        registryCommand,
         runCommand,
       });
 
@@ -115,7 +130,7 @@ describe('registerExtensionNativeHost', () => {
         type: 'stdio',
       });
 
-      expect(runCommand).toHaveBeenCalledWith('reg.exe', [
+      expect(runCommand).toHaveBeenCalledWith(registryCommand, [
         'add',
         `HKCU\\Software\\Mozilla\\NativeMessagingHosts\\${GAMEVAULT_NATIVE_HOST_NAME}`,
         '/ve',

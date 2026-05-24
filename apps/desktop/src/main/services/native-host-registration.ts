@@ -15,6 +15,7 @@ interface NativeHostRegistrationOptions extends RegisterExtensionNativeHostPaylo
   localAppData?: string;
   nativeHostBundlePath: string;
   now?: () => Date;
+  registryCommand?: string;
   runCommand?: (
     command: string,
     args: string[],
@@ -30,6 +31,15 @@ const BROWSER_REGISTRY_PATHS: Record<BrowserTarget, string> = {
 
 function isChromiumBrowser(browser: BrowserTarget): boolean {
   return browser === 'chrome' || browser === 'edge';
+}
+
+export function getWindowsRegistryCommand(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const windowsDirectory = env.SystemRoot?.trim() || env.windir?.trim();
+  return windowsDirectory
+    ? join(windowsDirectory, 'System32', 'reg.exe')
+    : 'reg.exe';
 }
 
 export function isValidBrowserExtensionId(
@@ -103,6 +113,7 @@ export async function registerExtensionNativeHost(
   }
 
   const runCommand = options.runCommand ?? defaultRunCommand;
+  const registryCommand = options.registryCommand ?? getWindowsRegistryCommand();
   const localAppData =
     options.localAppData ??
     process.env.LOCALAPPDATA ??
@@ -168,10 +179,10 @@ export async function registerExtensionNativeHost(
 
   for (const browser of browsers) {
     const registryPath = BROWSER_REGISTRY_PATHS[browser];
-    await runCommand('reg.exe', ['delete', registryPath, '/f'], {
+    await runCommand(registryCommand, ['delete', registryPath, '/f'], {
       ignoreFailure: true,
     });
-    await runCommand('reg.exe', [
+    await runCommand(registryCommand, [
       'add',
       registryPath,
       '/ve',
